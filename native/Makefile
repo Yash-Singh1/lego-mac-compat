@@ -84,6 +84,34 @@ test-cursor-state: $(BUILD_DIR)/test_cursor_state
 portal2-runtime:
 	python3 tools/prepare_portal2_runtime.py --output "$(GUEST_RUNTIME_DIR)"
 
+# The converter ships compiled code and downloads its own private runtime.
+# Its users do not need Make, Python, Xcode, or a checkout of this repository.
+CONVERTER_APP := $(BUILD_DIR)/Portal2-Converter.app
+CONVERTER_SOURCES := converter/Conversion.swift converter/App.swift converter/main.swift
+SWIFTC := $(shell xcrun --find swiftc)
+
+$(BUILD_DIR)/converter-arm64: $(CONVERTER_SOURCES) | $(BUILD_DIR)
+	$(SWIFTC) -O -swift-version 5 -warnings-as-errors -target arm64-apple-macosx11.0 -sdk $(SDK) $^ -o $@
+
+$(BUILD_DIR)/converter-x86_64: $(CONVERTER_SOURCES) | $(BUILD_DIR)
+	$(SWIFTC) -O -swift-version 5 -warnings-as-errors -target x86_64-apple-macosx11.0 -sdk $(SDK) $^ -o $@
+
+.PHONY: portal2-converter test-portal2-converter
+portal2-converter: $(BUILD_DIR)/converter-arm64 $(BUILD_DIR)/converter-x86_64 $(BUILD_DIR)/game_loader converter/Info.plist Info-Portal2.plist
+	mkdir -p "$(CONVERTER_APP)/Contents/MacOS" "$(CONVERTER_APP)/Contents/Resources"
+	lipo -create $(BUILD_DIR)/converter-arm64 $(BUILD_DIR)/converter-x86_64 -output "$(CONVERTER_APP)/Contents/MacOS/Portal2Converter"
+	cp converter/Info.plist "$(CONVERTER_APP)/Contents/Info.plist"
+	cp $(BUILD_DIR)/game_loader Info-Portal2.plist "$(CONVERTER_APP)/Contents/Resources/"
+	codesign --force --sign - "$(CONVERTER_APP)/Contents/Resources/game_loader"
+	codesign --force --sign - "$(CONVERTER_APP)"
+	codesign --verify --deep --strict "$(CONVERTER_APP)"
+
+$(BUILD_DIR)/test_portal2_converter: converter/Conversion.swift tests/test_portal2_converter.swift | $(BUILD_DIR)
+	$(SWIFTC) -O -swift-version 5 -warnings-as-errors -target $(shell uname -m)-apple-macosx11.0 -sdk $(SDK) $^ -o $@
+
+test-portal2-converter: $(BUILD_DIR)/test_portal2_converter
+	./$(BUILD_DIR)/test_portal2_converter
+
 $(BUILD_DIR)/test_macho_file: tests/test_macho_file.c src/macho_file.c src/macho_file.h | $(BUILD_DIR)
 	$(CLANG) $(CFLAGS) -Isrc tests/test_macho_file.c src/macho_file.c -o $@
 
@@ -220,3 +248,4 @@ $(BUILD_DIR)/mkicon: icons/mkicon.swift | $(BUILD_DIR)
 
 clean:
 	rm -f $(BUILD_DIR)/mode32_probe $(BUILD_DIR)/game_loader $(BUILD_DIR)/controller_probe $(BUILD_DIR)/mkicon
+	rm -f $(BUILD_DIR)/converter-arm64 $(BUILD_DIR)/converter-x86_64 $(BUILD_DIR)/test_portal2_converter
