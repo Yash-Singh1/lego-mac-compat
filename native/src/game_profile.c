@@ -253,6 +253,18 @@ static const struct lp32_game_profile clone_wars_profile = {
     .stream_input_callback = 0x00453fb0,
 };
 
+/* Valve's launcher executable; Source itself is loaded from guest dylibs. */
+static const struct lp32_game_profile portal2_profile = {
+    .title = LP32_TITLE_PORTAL2,
+    .name = "Portal2",
+    .display_name = "Portal 2",
+    .log_directory = "Portal2Compat",
+    .image_file = "Portal2.image",
+    .entry_eip = 0x00001cf0,
+    .image_end = 0x0000335c,
+    .main_address = 0x00001d60,
+};
+
 static const struct lp32_game_profile unknown_profile = {
     .title = LP32_TITLE_UNKNOWN,
     .name = "unknown",
@@ -264,6 +276,7 @@ static const struct lp32_game_profile unknown_profile = {
 static const struct lp32_game_profile *const known_profiles[] = {
     &pirates_profile,
     &clone_wars_profile,
+    &portal2_profile,
 };
 
 static const struct lp32_game_profile *current_profile = &unknown_profile;

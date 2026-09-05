@@ -1,6 +1,7 @@
 #include "compat_runtime.h"
 #include "controller_bridge.h"
 #include "game_profile.h"
+#include "guest_dyld.h"
 #include "macho_loader.h"
 #include "objc_bridge.h"
 
@@ -597,7 +598,7 @@ static void runtime_diagnostic_line(const char *line)
 static const char *default_image_path(const char *argv0, char *buffer,
                                       size_t size)
 {
-    static const char *const candidates[] = {"LEGOPirates", "LEGOCloneWars"};
+    static const char *const candidates[] = {"LEGOPirates", "LEGOCloneWars", "Portal2"};
     const char *slash = strrchr(argv0, '/');
     size_t directory_length = slash ? (size_t)(slash - argv0) : 0;
     for (size_t index = 0; index < sizeof(candidates) / sizeof(candidates[0]); ++index) {
@@ -646,6 +647,12 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
     open_guest_diagnostic_log(argc > 0 ? argv[0] : NULL);
+    if (lp32_profile()->title == LP32_TITLE_PORTAL2) {
+        if (guest_dyld32_initialize(image_path) || chdir(guest_dyld32_game_root())) {
+            fprintf(stderr, "game_loader: unable to select Portal 2 data directory\n");
+            return EXIT_FAILURE;
+        }
+    }
 
     if (configure_guest_breakpoint(&image) != 0) {
         macho_image32_unload(&image);
@@ -673,6 +680,10 @@ int main(int argc, char **argv)
         int result = compat_runtime32_run_heap_self_test();
         macho_image32_unload(&image);
         return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (getenv("LP32_DYLD_SELFTEST")) {
+        return lp32_profile()->title == LP32_TITLE_PORTAL2 &&
+            guest_dyld32_self_test() == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
     if (getenv("LP32_FILE_SELFTEST")) {
         int result = compat_runtime32_run_file_self_test();
@@ -762,10 +773,19 @@ int main(int argc, char **argv)
         }
         uint32_t executable_path =
             compat_runtime32_copy_cstring(host_executable_path);
+        if (lp32_profile()->title == LP32_TITLE_PORTAL2) {
+            int length = snprintf(host_executable_path, sizeof(host_executable_path),
+                                  "%s/portal2_osx", guest_dyld32_game_root());
+            if (length < 0 || (size_t)length >= sizeof(host_executable_path)) return EXIT_FAILURE;
+            executable_path = compat_runtime32_copy_cstring(host_executable_path);
+        }
         const char *extra_argument_text = getenv("LP32_GUEST_EXTRA_ARGUMENT");
         uint32_t extra_argument = extra_argument_text && extra_argument_text[0] ?
             compat_runtime32_copy_cstring(extra_argument_text) : 0;
-        uint32_t guest_argc = extra_argument ? 2 : 1;
+        bool portal2 = lp32_profile()->title == LP32_TITLE_PORTAL2;
+        int argument_start = argc >= 2 && argv[1][0] != '-' ? 2 : 1;
+        uint32_t forwarded = portal2 ? (uint32_t)(argc - argument_start) : 0;
+        uint32_t guest_argc = 1 + (extra_argument ? 1 : 0) + (portal2 ? 3 : 0) + forwarded;
         uint32_t argv_address = compat_runtime32_allocate(
             (guest_argc + 1) * sizeof(uint32_t), 1);
         uint32_t empty_vector = compat_runtime32_allocate(sizeof(uint32_t), 1);
@@ -776,7 +796,19 @@ int main(int argc, char **argv)
         }
         uint32_t *guest_argv = (void *)(uintptr_t)argv_address;
         guest_argv[0] = executable_path;
-        if (extra_argument) guest_argv[1] = extra_argument;
+        uint32_t next_argument = 1;
+        if (portal2) {
+            guest_argv[next_argument++] = compat_runtime32_copy_cstring("-game");
+            guest_argv[next_argument++] = compat_runtime32_copy_cstring("portal2");
+            /* Bink's startup audio uses unbridged Carbon Sound Manager calls
+               (starting with NewSndCallBackUPP). Finder launches need the same
+               movie skip as diagnostic launches, before the engine starts. */
+            guest_argv[next_argument++] = compat_runtime32_copy_cstring("-novid");
+        }
+        if (extra_argument) guest_argv[next_argument++] = extra_argument;
+        for (uint32_t i = 0; i < forwarded; ++i) {
+            guest_argv[next_argument++] = compat_runtime32_copy_cstring(argv[argument_start + i]);
+        }
 
         const uint32_t main_arguments[] = {
             guest_argc, argv_address, empty_vector, empty_vector,
@@ -795,6 +827,9 @@ int main(int argc, char **argv)
             sizeof(main_arguments) / sizeof(main_arguments[0]));
         printf("game main returned/escaped: 0x%08" PRIx32 " trapped=%d\n",
                result, compat_runtime32_last_call_trapped());
+        if (lp32_profile()->title == LP32_TITLE_PORTAL2) {
+            return compat_runtime32_last_call_trapped() ? EXIT_FAILURE : (int)result;
+        }
     }
     macho_image32_unload(&image);
     return EXIT_SUCCESS;

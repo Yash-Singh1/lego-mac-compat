@@ -23,6 +23,9 @@ _lp32_import_gateway:
     /* Apply floating/escape state belonging to this host thread. */
     subq $16, %rsp
     movq %rax, (%rsp)
+    movq %r14, %rdi
+    callq _lp32_adjust_import_stack
+    movq %rax, %r14
     callq _lp32_apply_thread_return_state
     movl %eax, 8(%rsp)
 

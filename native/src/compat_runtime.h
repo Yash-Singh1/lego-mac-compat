@@ -31,6 +31,11 @@ uint64_t compat_runtime32_dispatch_import(const char *name,
    given import name, for function pointers the game expects to call back
    (the same mechanism dlsym results use).  0 if the thunk table is full. */
 uint32_t compat_runtime32_guest_callback(const char *name);
+/* Resolve a system import for a guest dylib to a thunk or shared data cell. */
+uint32_t compat_runtime32_resolve_symbol(const char *name, int data_hint);
+/* Return floating-point values through the guest x87 ABI. */
+uint64_t compat_runtime32_return_float(float value);
+uint64_t compat_runtime32_return_double(double value);
 
 /* Guest callback standing in for Feral's Content.loader MainEntry (returns 1
    so the title proceeds to its own main). */

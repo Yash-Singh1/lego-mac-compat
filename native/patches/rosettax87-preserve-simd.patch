@@ -1,0 +1,202 @@
+diff --git a/rosetta_core/CMakeLists.txt b/rosetta_core/CMakeLists.txt
+index 2a8dfcb..90cfd21 100644
+--- a/rosetta_core/CMakeLists.txt
++++ b/rosetta_core/CMakeLists.txt
+@@ -65,6 +65,13 @@ target_compile_options(rosetta_core_runtime PRIVATE
+     -fvectorize
+     -finline-functions
+     -fno-stack-protector
++    -fno-stack-check
++    # Do not turn our freestanding memory loops into calls to themselves.
++    -fno-builtin-memset
++    -fno-builtin-bzero
++    -fno-builtin-memcpy
++    -fno-builtin-memmove
++    -fno-builtin-strlen
+     -fno-exceptions
+     -fno-unwind-tables
+     -fno-asynchronous-unwind-tables
+diff --git a/rosetta_core/src/CustomTranslationHook.cpp b/rosetta_core/src/CustomTranslationHook.cpp
+index 5920e7a..6644e8f 100644
+--- a/rosetta_core/src/CustomTranslationHook.cpp
++++ b/rosetta_core/src/CustomTranslationHook.cpp
+@@ -48,7 +48,7 @@ void init_custom_translation_hook(uintptr_t translate_insn_addr,
+     }
+ }
+ 
+-int64_t hook_translate_insn(TranslationResult* result, IRBlock* block, IRInstr* instr_array,
++extern "C" __attribute__((used, noinline)) int64_t hook_translate_insn_impl(TranslationResult* result, IRBlock* block, IRInstr* instr_array,
+                             int64_t num_instrs, int64_t insn_idx) {
+     if (g_translation_hook && g_translation_hook->before)
+         g_translation_hook->before(result, block, instr_array, num_instrs, insn_idx);
+@@ -71,4 +71,61 @@ int64_t hook_translate_insn(TranslationResult* result, IRBlock* block, IRInstr*
+     }
+ 
+     return result_idx;
+-}
+\ No newline at end of file
++}
++// Rosetta can enter the translator with live guest SIMD registers. The
++// original translator preserves those values, but compiler-generated NEON
++// in our hook (for example X87Cache::perm initialization) may overwrite them.
++// Save at an assembly boundary so the optimizer cannot move SIMD work ahead
++// of the save. This cost is paid during translation, not per guest operation.
++__attribute__((naked))
++int64_t hook_translate_insn(TranslationResult*, IRBlock*, IRInstr*, int64_t, int64_t) {
++    __asm__ volatile(
++        "sub sp, sp, #544\n"
++        "stp q0, q1, [sp, #0]\n"
++        "stp q2, q3, [sp, #32]\n"
++        "stp q4, q5, [sp, #64]\n"
++        "stp q6, q7, [sp, #96]\n"
++        "stp q8, q9, [sp, #128]\n"
++        "stp q10, q11, [sp, #160]\n"
++        "stp q12, q13, [sp, #192]\n"
++        "stp q14, q15, [sp, #224]\n"
++        "stp q16, q17, [sp, #256]\n"
++        "stp q18, q19, [sp, #288]\n"
++        "stp q20, q21, [sp, #320]\n"
++        "stp q22, q23, [sp, #352]\n"
++        "stp q24, q25, [sp, #384]\n"
++        "stp q26, q27, [sp, #416]\n"
++        "stp q28, q29, [sp, #448]\n"
++        "stp q30, q31, [sp, #480]\n"
++        "str x29, [sp, #512]\n"
++        "str x30, [sp, #520]\n"
++        "mrs x16, fpcr\n"
++        "str x16, [sp, #528]\n"
++        "mrs x16, fpsr\n"
++        "str x16, [sp, #536]\n"
++        "bl _hook_translate_insn_impl\n"
++        "ldr x16, [sp, #528]\n"
++        "msr fpcr, x16\n"
++        "ldr x16, [sp, #536]\n"
++        "msr fpsr, x16\n"
++        "ldp q0, q1, [sp, #0]\n"
++        "ldp q2, q3, [sp, #32]\n"
++        "ldp q4, q5, [sp, #64]\n"
++        "ldp q6, q7, [sp, #96]\n"
++        "ldp q8, q9, [sp, #128]\n"
++        "ldp q10, q11, [sp, #160]\n"
++        "ldp q12, q13, [sp, #192]\n"
++        "ldp q14, q15, [sp, #224]\n"
++        "ldp q16, q17, [sp, #256]\n"
++        "ldp q18, q19, [sp, #288]\n"
++        "ldp q20, q21, [sp, #320]\n"
++        "ldp q22, q23, [sp, #352]\n"
++        "ldp q24, q25, [sp, #384]\n"
++        "ldp q26, q27, [sp, #416]\n"
++        "ldp q28, q29, [sp, #448]\n"
++        "ldp q30, q31, [sp, #480]\n"
++        "ldr x29, [sp, #512]\n"
++        "ldr x30, [sp, #520]\n"
++        "add sp, sp, #544\n"
++        "ret\n");
++}
+diff --git a/rosetta_core/src/DecodeOpcodeHook.cpp b/rosetta_core/src/DecodeOpcodeHook.cpp
+index 84552b3..570820f 100644
+--- a/rosetta_core/src/DecodeOpcodeHook.cpp
++++ b/rosetta_core/src/DecodeOpcodeHook.cpp
+@@ -152,7 +152,7 @@ static x86_decode_status decode_substitute(DecoderCtx* ctx, const uint8_t* bytes
+     return result;
+ }
+ 
+-x86_decode_status hook_decode_opcode(DecoderCtx* ctx, unsigned int offset, DecodedInsn* out, uint8_t* out_len) {
++extern "C" __attribute__((used, noinline)) x86_decode_status hook_decode_opcode_impl(DecoderCtx* ctx, unsigned int offset, DecodedInsn* out, uint8_t* out_len) {
+     // Test-only: force the decoder into 32-bit mode. build_ir_module hard-wires
+     // cpu_mode=0 (64-bit) in the AOT path, so legacy-only opcodes like ARPL (0x63,
+     // which is MOVSXD in 64-bit) are otherwise unreachable via aotinvoke. Setting
+@@ -206,3 +206,60 @@ x86_decode_status hook_decode_opcode(DecoderCtx* ctx, unsigned int offset, Decod
+ 
+     return result;
+ }
++
++// The decoder also runs with live guest SIMD state. The C++ calling
++// convention does not preserve all 128 bits of those registers. Save at
++// an assembly boundary, before compiler-generated NEON can overwrite them.
++// This cost is paid during translation, not per executed guest instruction.
++__attribute__((naked))
++x86_decode_status hook_decode_opcode(DecoderCtx*, unsigned int, DecodedInsn*, uint8_t*) {
++    __asm__ volatile(
++        "sub sp, sp, #544\n"
++        "stp q0, q1, [sp, #0]\n"
++        "stp q2, q3, [sp, #32]\n"
++        "stp q4, q5, [sp, #64]\n"
++        "stp q6, q7, [sp, #96]\n"
++        "stp q8, q9, [sp, #128]\n"
++        "stp q10, q11, [sp, #160]\n"
++        "stp q12, q13, [sp, #192]\n"
++        "stp q14, q15, [sp, #224]\n"
++        "stp q16, q17, [sp, #256]\n"
++        "stp q18, q19, [sp, #288]\n"
++        "stp q20, q21, [sp, #320]\n"
++        "stp q22, q23, [sp, #352]\n"
++        "stp q24, q25, [sp, #384]\n"
++        "stp q26, q27, [sp, #416]\n"
++        "stp q28, q29, [sp, #448]\n"
++        "stp q30, q31, [sp, #480]\n"
++        "str x29, [sp, #512]\n"
++        "str x30, [sp, #520]\n"
++        "mrs x16, fpcr\n"
++        "str x16, [sp, #528]\n"
++        "mrs x16, fpsr\n"
++        "str x16, [sp, #536]\n"
++        "bl _hook_decode_opcode_impl\n"
++        "ldr x16, [sp, #528]\n"
++        "msr fpcr, x16\n"
++        "ldr x16, [sp, #536]\n"
++        "msr fpsr, x16\n"
++        "ldp q0, q1, [sp, #0]\n"
++        "ldp q2, q3, [sp, #32]\n"
++        "ldp q4, q5, [sp, #64]\n"
++        "ldp q6, q7, [sp, #96]\n"
++        "ldp q8, q9, [sp, #128]\n"
++        "ldp q10, q11, [sp, #160]\n"
++        "ldp q12, q13, [sp, #192]\n"
++        "ldp q14, q15, [sp, #224]\n"
++        "ldp q16, q17, [sp, #256]\n"
++        "ldp q18, q19, [sp, #288]\n"
++        "ldp q20, q21, [sp, #320]\n"
++        "ldp q22, q23, [sp, #352]\n"
++        "ldp q24, q25, [sp, #384]\n"
++        "ldp q26, q27, [sp, #416]\n"
++        "ldp q28, q29, [sp, #448]\n"
++        "ldp q30, q31, [sp, #480]\n"
++        "ldr x29, [sp, #512]\n"
++        "ldr x30, [sp, #520]\n"
++        "add sp, sp, #544\n"
++        "ret\n");
++}
+diff --git a/rosetta_core/src/RuntimeSymbols.cpp b/rosetta_core/src/RuntimeSymbols.cpp
+index e1fbe4e..2707e8e 100644
+--- a/rosetta_core/src/RuntimeSymbols.cpp
++++ b/rosetta_core/src/RuntimeSymbols.cpp
+@@ -65,6 +65,10 @@ void* memset(void* dst, int c, size_t n) {
+     return rt_memset(dst, c, n);
+ }
+ 
++void bzero(void* dst, size_t n) {
++    rt_memset(dst, 0, n);
++}
++
+ int memcmp(const void* a, const void* b, size_t n) {
+     return rt_memcmp(a, b, n);
+ }
+diff --git a/rosetta_runtime/CMakeLists.txt b/rosetta_runtime/CMakeLists.txt
+index d118732..b8855f6 100644
+--- a/rosetta_runtime/CMakeLists.txt
++++ b/rosetta_runtime/CMakeLists.txt
+@@ -16,6 +16,13 @@ set(OPTIMIZATION_FLAGS
+     "-fvectorize"
+     "-finline-functions"
+     "-fno-stack-protector"
++    "-fno-stack-check"
++    # Do not turn our freestanding memory loops into calls to themselves.
++    "-fno-builtin-memset"
++    "-fno-builtin-bzero"
++    "-fno-builtin-memcpy"
++    "-fno-builtin-memmove"
++    "-fno-builtin-strlen"
+     "-fno-exceptions"
+     "-fno-unwind-tables"
+     "-fno-asynchronous-unwind-tables"

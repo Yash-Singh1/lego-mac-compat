@@ -4,7 +4,11 @@
 #include "arb_sampler_usage.h"
 #include "compat_runtime.h"
 #include "controller_bridge.h"
+#include "cursor_state.h"
 #include "game_profile.h"
+#include "guest_dyld.h"
+#include "gl_shader_bridge.h"
+#include "gl_misc_bridge.h"
 #include "name_match.h"
 
 #define GL_SILENCE_DEPRECATION 1
@@ -12,10 +16,15 @@
 #import <Carbon/Carbon.h>
 #import <OpenGL/OpenGL.h>
 #import <OpenGL/gl.h>
+#import <ImageIO/ImageIO.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <malloc/malloc.h>
+#import <IOKit/IOKitLib.h>
+#import <IOKit/pwr_mgt/IOPMLib.h>
 
 #include <dlfcn.h>
+#include <dispatch/dispatch.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdarg.h>
@@ -65,11 +74,15 @@ struct proxy_entry {
 
 static struct proxy_entry proxies[kProxyCapacity];
 static uint32_t proxy_count;
+static pthread_mutex_t proxy_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 static struct proxy_entry event_proxies[kEventProxyCapacity];
 static uint32_t event_proxy_count;
 static NSEvent *current_proxy_event;
 static bool logged_proxy_exhaustion;
 static uint64_t objc_bridge_swap_count;
+static pthread_mutex_t portal_cursor_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct lp32_cursor_state portal_cursor;
+static uint64_t portal_background_warps;
 
 /* Section ranges of the loaded guest image (class-name refs, CF constants). */
 #define bridge_image (compat_runtime32_image())
@@ -96,6 +109,7 @@ static char gl_program_dump_directory[PATH_MAX];
 
 static void arm_pending_gl_trace(void);
 static void trace_gl_frame_boundary(void);
+static CGLShareGroupObj context_share_group(CGLContextObj context);
 
 /*
  * Finder launches discard stderr.  Rendering diagnostics therefore need a
@@ -208,7 +222,7 @@ static void remember_fragment_program_samplers(GLuint program,
 {
     if (!program || !source) return;
     CGLContextObj context = CGLGetCurrentContext();
-    CGLShareGroupObj share_group = context ? CGLGetShareGroup(context) : NULL;
+    CGLShareGroupObj share_group = context_share_group(context);
     struct arb_sampler_usage usage;
     arb_sampler_usage_parse(source, source_size, &usage);
 
@@ -242,7 +256,7 @@ static bool fragment_program_sampler_usage(
     GLuint program, struct arb_sampler_usage *usage)
 {
     CGLContextObj context = CGLGetCurrentContext();
-    CGLShareGroupObj share_group = context ? CGLGetShareGroup(context) : NULL;
+    CGLShareGroupObj share_group = context_share_group(context);
     bool found = false;
     memset(usage, 0, sizeof(*usage));
     pthread_mutex_lock(&sampler_program_mutex);
@@ -267,7 +281,7 @@ static void forget_fragment_program_samplers(GLsizei count,
 {
     if (count <= 0 || !programs) return;
     CGLContextObj context = CGLGetCurrentContext();
-    CGLShareGroupObj share_group = context ? CGLGetShareGroup(context) : NULL;
+    CGLShareGroupObj share_group = context_share_group(context);
     pthread_mutex_lock(&sampler_program_mutex);
     for (size_t slot = 0; slot < kSamplerProgramCapacity; ++slot) {
         struct sampler_program_entry *entry = &sampler_programs[slot];
@@ -286,7 +300,7 @@ static void forget_fragment_program_samplers(GLsizei count,
 static GLuint sampler_fallback_texture_2d(void)
 {
     CGLContextObj context = CGLGetCurrentContext();
-    CGLShareGroupObj share_group = context ? CGLGetShareGroup(context) : NULL;
+    CGLShareGroupObj share_group = context_share_group(context);
     pthread_mutex_lock(&sampler_fallback_mutex);
     struct sampler_fallback_share_entry *available = NULL;
     for (size_t index = 0; index < kSamplerFallbackShareCapacity; ++index) {
@@ -394,9 +408,132 @@ static void restore_unbound_fragment_samplers(
 
 static id object_for_receiver(uint32_t receiver);
 
+@interface LP32GuestAutoreleasePool : NSObject
+@end
+@implementation LP32GuestAutoreleasePool
+@end
+
+/* A native object owns Cocoa state; its low-memory twin preserves the exact
+   fragile i386 ivar layout accessed directly by Source's compiled methods. */
+struct legacy_class32 {
+    uint32_t isa, superclass, name, version, info, instance_size;
+    uint32_t ivars, methods, cache, protocols;
+};
+struct legacy_method32 { uint32_t name, types, imp; };
+struct legacy_class_pair { const struct legacy_class32 *guest; Class host; };
+static struct legacy_class_pair legacy_classes[128];
+static unsigned legacy_class_count;
+static struct { Class host; uint32_t methods; } legacy_categories[128];
+static unsigned legacy_category_count;
+
+static const struct legacy_class32 *legacy_class_for_host(Class host)
+{
+    for (unsigned i = 0; i < legacy_class_count; ++i) {
+        if (legacy_classes[i].host == host) return legacy_classes[i].guest;
+        if (object_getClass(legacy_classes[i].host) == host) {
+            return (const void *)(uintptr_t)legacy_classes[i].guest->isa;
+        }
+    }
+    return NULL;
+}
+
 static bool proxy_object_is_retained(id object)
 {
     return object && ![object isKindOfClass:[NSAutoreleasePool class]];
+}
+
+/* Temporary Cocoa values use reclaimable opaque handles. NSDate factories
+   follow guest autorelease pools; CFString Create calls own a reference until
+   CFRelease. Source creates deadlines outside its inner pools, so the host
+   registry grows as needed. Generations protect delayed autoreleases from
+   releasing a reused slot. All registry access is serialized by proxy_lock. */
+enum { kValueProxyBase = 0x80000000u };
+struct value_proxy { id object; uint32_t references, generation, next_free; };
+struct value_autorelease { uint32_t handle, generation; unsigned depth; struct value_autorelease *next; };
+static struct value_proxy *value_proxies;
+static uint32_t value_proxy_count, value_proxy_capacity, value_free_slot = UINT32_MAX;
+static CFMutableDictionaryRef value_handles;
+static _Thread_local struct value_autorelease *pending_values;
+static _Thread_local unsigned guest_pool_depth;
+
+static struct value_proxy *value_proxy_for_handle(uint32_t handle)
+{
+    if ((handle & 0xc0000000u) != kValueProxyBase) return NULL;
+    uint32_t index = handle - kValueProxyBase;
+    return index < value_proxy_count && value_proxies[index].object ? &value_proxies[index] : NULL;
+}
+
+static void release_value_proxy(uint32_t handle)
+{
+    struct value_proxy *entry = value_proxy_for_handle(handle);
+    if (entry && !--entry->references) {
+        CFDictionaryRemoveValue(value_handles, entry->object);
+        [entry->object release]; entry->object = nil;
+        entry->next_free = value_free_slot;
+        value_free_slot = handle - kValueProxyBase;
+    }
+}
+
+static bool autorelease_value_proxy(uint32_t handle)
+{
+    struct value_proxy *entry = value_proxy_for_handle(handle);
+    struct value_autorelease *item = entry ? malloc(sizeof(*item)) : NULL;
+    if (!item) return false;
+    *item = (struct value_autorelease){handle, entry->generation, guest_pool_depth, pending_values};
+    pending_values = item;
+    return true;
+}
+
+static uint32_t proxy_for_owned_value(id value)
+{
+    if (!value) return 0;
+    pthread_mutex_lock(&proxy_lock);
+    if (!value_handles) value_handles = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
+    uint32_t handle = value_handles ? (uint32_t)(uintptr_t)CFDictionaryGetValue(value_handles, value) : 0;
+    if (!value_handles) { pthread_mutex_unlock(&proxy_lock); return 0; }
+    if (!handle) {
+        if (value_free_slot == UINT32_MAX && value_proxy_count == value_proxy_capacity) {
+            uint32_t capacity = value_proxy_capacity ? value_proxy_capacity * 2 : 256;
+            struct value_proxy *grown = capacity <= 0x10000000u ? realloc(value_proxies, (size_t)capacity * sizeof(*grown)) : NULL;
+            if (!grown) { pthread_mutex_unlock(&proxy_lock); return 0; }
+            memset(grown + value_proxy_capacity, 0, (capacity - value_proxy_capacity) * sizeof(*grown));
+            value_proxies = grown; value_proxy_capacity = capacity;
+        }
+        uint32_t index = value_free_slot;
+        if (index == UINT32_MAX) index = value_proxy_count++;
+        else value_free_slot = value_proxies[index].next_free;
+        struct value_proxy *entry = &value_proxies[index];
+        entry->object = [value retain]; entry->references = 0; ++entry->generation;
+        handle = kValueProxyBase + index;
+        CFDictionarySetValue(value_handles, value, (void *)(uintptr_t)handle);
+    }
+    struct value_proxy *entry = value_proxy_for_handle(handle);
+    ++entry->references;
+    pthread_mutex_unlock(&proxy_lock);
+    return handle;
+}
+
+static uint32_t proxy_for_autoreleased_value(id value)
+{
+    pthread_mutex_lock(&proxy_lock);
+    uint32_t handle = proxy_for_owned_value(value);
+    if (handle && !autorelease_value_proxy(handle)) { release_value_proxy(handle); handle = 0; }
+    pthread_mutex_unlock(&proxy_lock);
+    return handle;
+}
+
+static void drain_guest_values(void)
+{
+    pthread_mutex_lock(&proxy_lock);
+    while (pending_values && pending_values->depth >= guest_pool_depth) {
+        struct value_autorelease *item = pending_values;
+        pending_values = item->next;
+        struct value_proxy *entry = value_proxy_for_handle(item->handle);
+        if (entry && entry->generation == item->generation) release_value_proxy(item->handle);
+        free(item);
+    }
+    if (guest_pool_depth) --guest_pool_depth;
+    pthread_mutex_unlock(&proxy_lock);
 }
 
 static void reset_event_proxies(void)
@@ -449,14 +586,25 @@ static uint32_t event_proxy_for_object(id object)
     return handle;
 }
 
-static uint32_t proxy_for_object(id object)
+static uint32_t proxy_for_object_unlocked(id object)
 {
     if (!object) return 0;
+    for (unsigned i = 0; i < legacy_class_count; ++i) {
+        if (object == legacy_classes[i].host) return (uint32_t)(uintptr_t)legacy_classes[i].guest;
+    }
     if ([object isKindOfClass:[NSEvent class]]) {
         return event_proxy_for_object(object);
     }
+    bool pointer_wrapper = [object isKindOfClass:[NSValue class]] &&
+        !strcmp([(NSValue *)object objCType], @encode(void *));
     for (uint32_t index = 0; index < proxy_count; ++index) {
         if (proxies[index].object == object) return proxies[index].handle;
+        if (pointer_wrapper &&
+            [proxies[index].object isKindOfClass:[NSValue class]] &&
+            !strcmp([(NSValue *)proxies[index].object objCType], @encode(void *)) &&
+            [(NSValue *)object pointerValue] == [(NSValue *)proxies[index].object pointerValue]) {
+            return proxies[index].handle;
+        }
     }
     if (proxy_count >= kProxyCapacity) {
         if (!logged_proxy_exhaustion) {
@@ -470,10 +618,24 @@ static uint32_t proxy_for_object(id object)
         return 0;
     }
     uint32_t handle = kProxyBase + proxy_count * kProxyStride;
+    const struct legacy_class32 *legacy = legacy_class_for_host(object_getClass(object));
+    if (legacy) {
+        handle = compat_runtime32_allocate(legacy->instance_size, 1);
+        if (!handle) return 0;
+        *(uint32_t *)(uintptr_t)handle = (uint32_t)(uintptr_t)legacy;
+    }
     proxies[proxy_count].handle = handle;
     proxies[proxy_count].object = object;
     if (proxy_object_is_retained(object)) [object retain];
     ++proxy_count;
+    return handle;
+}
+
+static uint32_t proxy_for_object(id object)
+{
+    pthread_mutex_lock(&proxy_lock);
+    uint32_t handle = proxy_for_object_unlocked(object);
+    pthread_mutex_unlock(&proxy_lock);
     return handle;
 }
 
@@ -531,6 +693,50 @@ int objc_bridge32_run_proxy_self_test(void)
             return -1;
         }
 
+        NSView *parent = [[[NSView alloc] initWithFrame:NSMakeRect(20, 30, 100, 100)] autorelease];
+        NSView *child = [[[NSView alloc] initWithFrame:NSMakeRect(4, 5, 20, 20)] autorelease];
+        [parent addSubview:child];
+        selector = compat_runtime32_copy_cstring("convertPoint:toView:");
+        uint32_t point_arguments[] = {proxy_for_object(child), selector, 0, 0, proxy_for_object(parent)};
+        float input_point[] = {2, 3}, output_point[2];
+        memcpy(point_arguments + 2, input_point, sizeof(input_point));
+        uint64_t point_result = 0;
+        bool converted = objc_bridge32_dispatch("_objc_msgSend", point_arguments, &point_result);
+        memcpy(output_point, &point_result, sizeof(output_point));
+        compat_runtime32_deallocate(selector);
+        if (!converted || output_point[0] != 6 || output_point[1] != 8) {
+            fputs("compat32: Objective-C point conversion self-test failed\n", stderr);
+            return -1;
+        }
+
+        pthread_mutex_lock(&proxy_lock);
+        ++guest_pool_depth;
+        uint32_t outer_date = proxy_for_autoreleased_value([NSDate dateWithTimeIntervalSince1970:1]);
+        ++guest_pool_depth;
+        uint32_t retained_date = proxy_for_autoreleased_value([NSDate dateWithTimeIntervalSince1970:2]);
+        if (retained_date) ++value_proxy_for_handle(retained_date)->references;
+        uint32_t expired_date = proxy_for_autoreleased_value([NSDate dateWithTimeIntervalSince1970:3]);
+        release_value_proxy(expired_date);
+        uint32_t replacement_date = proxy_for_autoreleased_value([NSDate dateWithTimeIntervalSince1970:4]);
+        if (replacement_date) ++value_proxy_for_handle(replacement_date)->references;
+        bool dates_ok = outer_date && retained_date && replacement_date;
+        for (unsigned i = 0; i < 5000; ++i) {
+            uint32_t handle = proxy_for_autoreleased_value([NSDate dateWithTimeIntervalSince1970:10 + i]);
+            if (!handle) dates_ok = false;
+        }
+        drain_guest_values();
+        dates_ok = dates_ok && value_proxy_for_handle(outer_date) && value_proxy_for_handle(retained_date) &&
+            value_proxy_for_handle(replacement_date) && value_proxy_for_handle(retained_date)->references == 1 &&
+            value_proxy_for_handle(replacement_date)->references == 1;
+        release_value_proxy(retained_date); release_value_proxy(replacement_date);
+        drain_guest_values();
+        for (uint32_t i = 0; i < value_proxy_count; ++i) if (value_proxies[i].object) dates_ok = false;
+        pthread_mutex_unlock(&proxy_lock);
+        if (!dates_ok) {
+            fputs("compat32: Objective-C date/pool lifetime self-test failed\n", stderr);
+            return -1;
+        }
+
         for (uint32_t iteration = 0; iteration < 10000; ++iteration) {
             @autoreleasepool {
                 NSString *characters = (iteration & 1) ? @"w" : @"s";
@@ -561,7 +767,7 @@ int objc_bridge32_run_proxy_self_test(void)
             }
         }
 
-        if (proxy_count != 1 ||
+        if (proxy_count != 3 ||
             object_for_receiver(persistent_handle) != persistent) {
             fprintf(stderr,
                     "compat32: Objective-C proxy self-test leaked event "
@@ -578,7 +784,7 @@ int objc_bridge32_run_proxy_self_test(void)
     }
 }
 
-static uint32_t register_proxy_with_handle(id object, uint32_t handle)
+static uint32_t register_proxy_with_handle_unlocked(id object, uint32_t handle)
 {
     if (!object || !handle) return 0;
     for (uint32_t index = 0; index < proxy_count; ++index) {
@@ -604,9 +810,24 @@ static uint32_t register_proxy_with_handle(id object, uint32_t handle)
     return handle;
 }
 
-static id object_for_receiver(uint32_t receiver)
+static uint32_t register_proxy_with_handle(id object, uint32_t handle)
+{
+    pthread_mutex_lock(&proxy_lock);
+    uint32_t result = register_proxy_with_handle_unlocked(object, handle);
+    pthread_mutex_unlock(&proxy_lock);
+    return result;
+}
+
+static id object_for_receiver_unlocked(uint32_t receiver)
 {
     if (!receiver) return nil;
+    if ((receiver & 0xc0000000u) == kValueProxyBase) {
+        struct value_proxy *entry = value_proxy_for_handle(receiver);
+        return entry ? entry->object : nil;
+    }
+    for (unsigned i = 0; i < legacy_class_count; ++i) {
+        if ((uint32_t)(uintptr_t)legacy_classes[i].guest == receiver) return legacy_classes[i].host;
+    }
     for (uint32_t index = 0; index < event_proxy_count; ++index) {
         if (event_proxies[index].handle == receiver) {
             return event_proxies[index].object;
@@ -619,13 +840,16 @@ static id object_for_receiver(uint32_t receiver)
     }
 
     /* Old 32-bit CF constant strings are four-word records in __DATA. */
-    if (receiver >= bridge_image->cfstring_start &&
-        receiver < bridge_image->cfstring_end) {
+    if ((receiver >= bridge_image->cfstring_start &&
+         receiver < bridge_image->cfstring_end) ||
+        guest_dyld32_section_contains("__cfstring", receiver)) {
         const uint32_t *constant = (const void *)(uintptr_t)receiver;
         uint32_t bytes_address = constant[2];
         uint32_t length = constant[3];
-        if (bytes_address >= UINT32_C(0x00001000) &&
-            bytes_address < bridge_image->max_address && length < UINT32_C(0x100000)) {
+        if (length < UINT32_C(0x100000) &&
+            ((bytes_address >= UINT32_C(0x00001000) &&
+              bytes_address < bridge_image->max_address) ||
+             guest_dyld32_contains(bytes_address, length))) {
             NSString *string = [[[NSString alloc]
                 initWithBytes:(const void *)(uintptr_t)bytes_address
                        length:length
@@ -641,12 +865,22 @@ static id object_for_receiver(uint32_t receiver)
     }
 
     /* Legacy class references contain the class name rather than a Class. */
-    if (receiver >= bridge_image->cstring_start &&
-        receiver < bridge_image->cstring_end) {
+    if ((receiver >= bridge_image->cstring_start &&
+         receiver < bridge_image->cstring_end) ||
+        guest_dyld32_section_contains("__cstring", receiver) ||
+        guest_dyld32_section_contains("__class_names", receiver)) {
         const char *class_name = (const char *)(uintptr_t)receiver;
         return (id)objc_getClass(class_name);
     }
     return nil;
+}
+
+static id object_for_receiver(uint32_t receiver)
+{
+    pthread_mutex_lock(&proxy_lock);
+    id object = object_for_receiver_unlocked(receiver);
+    pthread_mutex_unlock(&proxy_lock);
+    return object;
 }
 
 static const char *skip_type_qualifiers(const char *type)
@@ -658,6 +892,260 @@ static const char *skip_type_qualifiers(const char *type)
 static id object_for_argument(uint32_t value)
 {
     return object_for_receiver(value);
+}
+
+void *objc_bridge32_host_object(uint32_t handle) { return object_for_argument(handle); }
+uint32_t objc_bridge32_guest_object(void *object) { return proxy_for_object((id)object); }
+
+struct guest_runloop_context {
+    uint32_t words[10];
+    uint32_t callback;
+};
+
+struct guest_power_context { uint32_t info, callback; };
+static void guest_power_callback(void *opaque, io_service_t service, uint32_t message, void *argument)
+{
+    struct guest_power_context *context = opaque;
+    uint32_t words[] = {context->info, service, message, (uint32_t)(uintptr_t)argument};
+    compat_runtime32_call(context->callback, words, 4);
+}
+
+static struct guest_runloop_context *runloop_context(uint32_t address, size_t words, uint32_t callback)
+{
+    struct guest_runloop_context *context = calloc(1, sizeof(*context));
+    if (!context) return NULL;
+    if (address) memcpy(context->words, (const void *)(uintptr_t)address, words * 4);
+    if (context->words[0]) { free(context); return NULL; } /* Only version 0 contexts. */
+    context->callback = callback;
+    if (context->words[2]) context->words[1] = compat_runtime32_call(context->words[2], context->words + 1, 1);
+    return context;
+}
+
+static void release_runloop_context(const void *opaque)
+{
+    struct guest_runloop_context *context = (void *)opaque;
+    if (context->words[3]) compat_runtime32_call(context->words[3], context->words + 1, 1);
+    free(context);
+}
+
+static void guest_timer_callback(CFRunLoopTimerRef timer, void *opaque)
+{
+    struct guest_runloop_context *context = opaque;
+    uint32_t args[] = {proxy_for_object((id)timer), context->words[1]};
+    if (context->callback) compat_runtime32_call(context->callback, args, 2);
+}
+
+static void guest_observer_callback(CFRunLoopObserverRef observer, CFRunLoopActivity activity, void *opaque)
+{
+    struct guest_runloop_context *context = opaque;
+    uint32_t args[] = {proxy_for_object((id)observer), (uint32_t)activity, context->words[1]};
+    if (context->callback) compat_runtime32_call(context->callback, args, 3);
+}
+
+static void guest_source_perform(void *opaque)
+{
+    struct guest_runloop_context *context = opaque;
+    if (context->words[9]) compat_runtime32_call(context->words[9], context->words + 1, 1);
+}
+
+static void guest_source_schedule(void *opaque, CFRunLoopRef loop, CFStringRef mode)
+{
+    struct guest_runloop_context *context = opaque;
+    uint32_t args[] = {context->words[1], proxy_for_object((id)loop), proxy_for_object((id)mode)};
+    if (context->words[7]) compat_runtime32_call(context->words[7], args, 3);
+}
+
+static void guest_source_cancel(void *opaque, CFRunLoopRef loop, CFStringRef mode)
+{
+    struct guest_runloop_context *context = opaque;
+    uint32_t args[] = {context->words[1], proxy_for_object((id)loop), proxy_for_object((id)mode)};
+    if (context->words[8]) compat_runtime32_call(context->words[8], args, 3);
+}
+
+static const struct legacy_method32 *legacy_method_for_object(id object, SEL selector)
+{
+    for (Class cls = object_getClass(object); cls; cls = class_getSuperclass(cls)) {
+        for (unsigned j = 0; j < legacy_category_count; ++j) {
+            if (legacy_categories[j].host != cls) continue;
+            const uint32_t *list = (const void *)(uintptr_t)legacy_categories[j].methods;
+            const struct legacy_method32 *methods = (const void *)(list + 2);
+            for (uint32_t i = 0; i < list[1]; ++i) {
+                if (!strcmp((const char *)(uintptr_t)methods[i].name, sel_getName(selector))) return methods + i;
+            }
+        }
+        const struct legacy_class32 *legacy = legacy_class_for_host(cls);
+        if (!legacy || !legacy->methods) continue;
+        const uint32_t *list = (const void *)(uintptr_t)legacy->methods;
+        const struct legacy_method32 *methods = (const void *)(list + 2);
+        for (uint32_t i = 0; i < list[1]; ++i) {
+            if (!strcmp((const char *)(uintptr_t)methods[i].name, sel_getName(selector))) return methods + i;
+        }
+    }
+    return NULL;
+}
+
+static uint32_t legacy_call_method(id object, SEL selector, const uint32_t *extra, size_t count)
+{
+    const struct legacy_method32 *method = legacy_method_for_object(object, selector);
+    if (!method || count > 8) return 0;
+    uint32_t arguments[10] = {proxy_for_object(object), method->name};
+    memcpy(arguments + 2, extra, count * 4);
+    if (getenv("LP32_TRACE_EVENTS") && (strstr(sel_getName(selector), "key") || strstr(sel_getName(selector), "Key")))
+        fprintf(stderr, "compat32: callback %s imp=%08x self=%08x\n", sel_getName(selector), method->imp, arguments[0]);
+    return compat_runtime32_call(method->imp, arguments, count + 2);
+}
+
+static uintptr_t legacy_scalar_method(id object, SEL selector, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d)
+{
+    const struct legacy_method32 *method = legacy_method_for_object(object, selector);
+    if (!method) return 0;
+    NSMethodSignature *signature = [NSMethodSignature signatureWithObjCTypes:(const char *)(uintptr_t)method->types];
+    NSUInteger count = [signature numberOfArguments] - 2;
+    if (count > 4) return 0;
+    uintptr_t values[4] = {a, b, c, d};
+    uint32_t extra[4] = {0};
+    for (NSUInteger i = 0; i < count; ++i) {
+        const char *type = [signature getArgumentTypeAtIndex:i + 2];
+        type = skip_type_qualifiers(type);
+        extra[i] = *type == '@' || *type == '#' ? proxy_for_object((id)values[i]) :
+            *type == ':' ? compat_runtime32_copy_cstring(sel_getName((SEL)values[i])) : (uint32_t)values[i];
+    }
+    return legacy_call_method(object, selector, extra, count);
+}
+
+static id legacy_object_method(id object, SEL selector, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d)
+{
+    return object_for_receiver((uint32_t)legacy_scalar_method(object, selector, a, b, c, d));
+}
+
+static id legacy_object_float3_method(id object, SEL selector, id a, uint32_t b, float c)
+{
+    uint32_t words[3] = {proxy_for_object(a), b, 0};
+    memcpy(words + 2, &c, 4);
+    return object_for_receiver(legacy_call_method(object, selector, words, 3));
+}
+
+static id legacy_object_float4_method(id object, SEL selector, id a, uint32_t b, uint32_t c, float d)
+{
+    uint32_t words[4] = {proxy_for_object(a), b, c, 0};
+    memcpy(words + 3, &d, 4);
+    return object_for_receiver(legacy_call_method(object, selector, words, 4));
+}
+
+static void legacy_rect_method(id object, SEL selector, NSRect rect)
+{
+    float fields[4] = {(float)rect.origin.x, (float)rect.origin.y,
+                       (float)rect.size.width, (float)rect.size.height};
+    uint32_t words[4];
+    memcpy(words, fields, sizeof(words));
+    (void)legacy_call_method(object, selector, words, 4);
+}
+
+static int legacy_install_methods(Class target, uint32_t address, bool category)
+{
+    if (!address) return 0;
+    if (!guest_dyld32_contains(address, 8)) return -1;
+    const uint32_t *list = (const void *)(uintptr_t)address;
+    const struct legacy_method32 *methods = (const void *)(list + 2);
+    if (list[1] > 256 || !guest_dyld32_contains(address, 8 + list[1] * 12)) return -1;
+    for (uint32_t j = 0; j < list[1]; ++j) {
+        const char *sel_name = (const char *)(uintptr_t)methods[j].name;
+        const char *types = (const char *)(uintptr_t)methods[j].types;
+        SEL selector = sel_registerName(sel_name);
+        NSMethodSignature *sig = [NSMethodSignature signatureWithObjCTypes:types];
+        NSUInteger count = [sig numberOfArguments];
+        if (count < 2 || count > 6) return -1;
+        IMP imp = *types == '@' ? (IMP)legacy_object_method : (IMP)legacy_scalar_method;
+        char encoding[256];
+        snprintf(encoding, sizeof(encoding), "%c@:", *types);
+        for (NSUInteger k = 2; k < count; ++k) {
+            const char *arg_type = skip_type_qualifiers([sig getArgumentTypeAtIndex:k]);
+            const char *append = NULL;
+            char scalar[2] = {*arg_type, 0};
+            if (*arg_type == '{' && !strcmp(sel_name, "drawRect:") && count == 3) {
+                imp = (IMP)legacy_rect_method;
+                append = "{CGRect={CGPoint=dd}{CGSize=dd}}";
+            } else if (strchr("@#:cCiIlLsSB*", *arg_type)) {
+                append = scalar;
+            } else if (*arg_type == '^') {
+                append = "^v";
+            } else if (*arg_type == 'f' && k + 1 == count && *types == '@' &&
+                       *[sig getArgumentTypeAtIndex:2] == '@' && (count == 5 || count == 6)) {
+                imp = count == 5 ? (IMP)legacy_object_float3_method : (IMP)legacy_object_float4_method;
+                append = "f";
+            } else {
+                fprintf(stderr, "compat32: unsupported legacy method %s %s\n", sel_name, types);
+                return -1;
+            }
+            if (strlen(encoding) + strlen(append) >= sizeof(encoding)) return -1;
+            strcat(encoding, append);
+        }
+        Method inherited = class_getInstanceMethod(class_getSuperclass(target), selector);
+        const char *native_types = inherited ? method_getTypeEncoding(inherited) : encoding;
+        if (category) class_replaceMethod(target, selector, imp, native_types);
+        else if (!class_addMethod(target, selector, imp, native_types)) return -1;
+    }
+    if (category) {
+        if (legacy_category_count == 128) return -1;
+        legacy_categories[legacy_category_count].host = target;
+        legacy_categories[legacy_category_count++].methods = address;
+    }
+    return 0;
+}
+
+int objc_bridge32_register_legacy_module(uint32_t address, uint32_t size)
+{
+    if (size % 16 || !guest_dyld32_contains(address, size)) return -1;
+    for (uint32_t offset = 0; offset < size; offset += 16) {
+        const uint32_t *module = (const void *)(uintptr_t)(address + offset);
+        if (module[0] != 7 || module[1] != 16) return -1;
+        if (!module[3]) continue;
+        const uint32_t *symtab = (const void *)(uintptr_t)module[3];
+        if (!guest_dyld32_contains(module[3], 12)) return -1;
+        uint32_t count = symtab[2] & 0xffff, categories = symtab[2] >> 16;
+        if (!guest_dyld32_contains(module[3], 12 + (count + categories) * 4)) return -1;
+        for (uint32_t i = 0; i < count; ++i) {
+            uint32_t class_address = symtab[3 + i];
+            if (!guest_dyld32_contains(class_address, sizeof(struct legacy_class32))) return -1;
+            const struct legacy_class32 *guest = (const void *)(uintptr_t)class_address;
+            const char *name = (const char *)(uintptr_t)guest->name;
+            const char *parent_name = (const char *)(uintptr_t)guest->superclass;
+            if (!guest_dyld32_contains(guest->name, 1) || !guest_dyld32_contains(guest->superclass, 1) ||
+                !guest_dyld32_contains(guest->isa, sizeof(struct legacy_class32)) ||
+                guest->instance_size < 4 || guest->instance_size > 65536) return -1;
+            Class parent = objc_getClass(parent_name);
+            Class cls = objc_getClass(name);
+            if (cls && legacy_class_for_host(cls) == guest) continue;
+            if (cls || !parent || legacy_class_count == 128) {
+                fprintf(stderr, "compat32: cannot register legacy class %s : %s\n", name, parent_name);
+                return -1;
+            }
+            cls = objc_allocateClassPair(parent, name, 0);
+            if (!cls) return -1;
+            legacy_classes[legacy_class_count++] = (struct legacy_class_pair){guest, cls};
+            const struct legacy_class32 *meta = (const void *)(uintptr_t)guest->isa;
+            if (legacy_install_methods(cls, guest->methods, false) ||
+                legacy_install_methods(object_getClass(cls), meta->methods, false)) return -1;
+            objc_registerClassPair(cls);
+            if (!strcmp(name, "NSValveApplication") && NSApp && object_getClass(NSApp) == [NSApplication class]) {
+                object_setClass(NSApp, cls);
+            }
+            fprintf(stderr, "compat32: registered guest Cocoa class %s (%u-byte guest instance)\n", name, guest->instance_size);
+        }
+        for (uint32_t i = 0; i < categories; ++i) {
+            uint32_t ptr = symtab[3 + count + i];
+            if (!guest_dyld32_contains(ptr, 20)) return -1;
+            const uint32_t *category = (const void *)(uintptr_t)ptr;
+            const char *class_name = (const char *)(uintptr_t)category[1];
+            Class cls = objc_getClass(class_name);
+            /* The ObjC runtime tolerates a category whose target class is not
+               present. Old WebKit's private NSWindowGraphicsContext is one. */
+            if (!cls) continue;
+            if (legacy_install_methods(cls, category[2], true) ||
+                legacy_install_methods(object_getClass(cls), category[3], true)) return -1;
+        }
+    }
+    return 0;
 }
 
 static NSBundle *legacy_game_bundle(void)
@@ -727,6 +1215,13 @@ static bool invoke_simple_message(id receiver, const char *selector_name,
             }
             case '^': {
                 void *value = (void *)(uintptr_t)guest_arguments[word];
+                /* Opaque Core Graphics objects are represented by the same
+                   low handles as Cocoa objects, despite their ^ encoding. */
+                if (strncmp(type, "^{CGImage=", 10) == 0 ||
+                    strncmp(type, "^{CGColor=", 10) == 0 ||
+                    strncmp(type, "^{CGContext=", 12) == 0) {
+                    value = object_for_argument(guest_arguments[word]);
+                }
                 [invocation setArgument:&value atIndex:index];
                 break;
             }
@@ -756,6 +1251,10 @@ static bool invoke_simple_message(id receiver, const char *selector_name,
                     NSSize value = NSMakeSize(fields[0], fields[1]);
                     [invocation setArgument:&value atIndex:index];
                     word += 2;
+                } else if (strncmp(type, "{_NSRange=", 10) == 0) {
+                    NSRange value = NSMakeRange(guest_arguments[word], guest_arguments[word + 1]);
+                    [invocation setArgument:&value atIndex:index];
+                    word += 2;
                 } else {
                     return false;
                 }
@@ -778,11 +1277,37 @@ static bool invoke_simple_message(id receiver, const char *selector_name,
 
     const char *return_type = skip_type_qualifiers([signature methodReturnType]);
     switch (*return_type) {
+        case '{': {
+            /* Darwin i386 returns these eight-byte structures in EDX:EAX,
+               even though host AppKit uses sixteen-byte CGFloat geometry. */
+            if (strncmp(return_type, "{CGPoint=", 9) == 0) {
+                NSPoint value; [invocation getReturnValue:&value];
+                float fields[2] = {(float)value.x, (float)value.y};
+                memcpy(guest_result, fields, sizeof(fields)); return true;
+            }
+            if (strncmp(return_type, "{CGSize=", 8) == 0) {
+                NSSize value; [invocation getReturnValue:&value];
+                float fields[2] = {(float)value.width, (float)value.height};
+                memcpy(guest_result, fields, sizeof(fields)); return true;
+            }
+            if (strncmp(return_type, "{_NSRange=", 10) == 0) {
+                NSRange value; [invocation getReturnValue:&value];
+                *guest_result = (uint32_t)value.location | ((uint64_t)(uint32_t)value.length << 32);
+                return true;
+            }
+            return false;
+        }
         case 'v': *guest_result = 0; return true;
         case '@': case '#': {
             id value = nil;
             [invocation getReturnValue:&value];
-            *guest_result = proxy_for_returned_object(receiver, value);
+            if (getenv("LP32_TRACE_EVENTS") && [value isKindOfClass:[NSEvent class]])
+                fprintf(stderr, "compat32: delivered event %p type=%lu via=%s\n", (void *)value,
+                    (unsigned long)[(NSEvent *)value type], selector_name);
+            if (lp32_profile()->title == LP32_TITLE_PORTAL2 && receiver == [NSDate class] &&
+                (!strcmp(selector_name, "date") || !strncmp(selector_name, "dateWith", 8)))
+                *guest_result = proxy_for_autoreleased_value(value);
+            else *guest_result = proxy_for_returned_object(receiver, value);
             return true;
         }
         case ':': {
@@ -812,6 +1337,8 @@ static bool invoke_simple_message(id receiver, const char *selector_name,
         case 'i': case 'l': { int32_t value = 0; [invocation getReturnValue:&value]; *guest_result = (uint32_t)value; return true; }
         case 'I': case 'L': { uint32_t value = 0; [invocation getReturnValue:&value]; *guest_result = value; return true; }
         case 'q': case 'Q': { uint64_t value = 0; [invocation getReturnValue:&value]; *guest_result = value; return true; }
+        case 'f': { float value = 0; [invocation getReturnValue:&value]; *guest_result = compat_runtime32_return_float(value); return true; }
+        case 'd': { double value = 0; [invocation getReturnValue:&value]; *guest_result = compat_runtime32_return_double(value); return true; }
         default: return false;
     }
 }
@@ -1391,6 +1918,151 @@ static bool background_test_mode(void)
     static int enabled = -1;
     if (enabled < 0) enabled = getenv("LP32_BACKGROUND_TEST") != NULL;
     return enabled;
+}
+
+static int portal_host_cursor_hidden(void *context, bool hidden)
+{
+    (void)context;
+    return hidden ? CGDisplayHideCursor(kCGNullDirectDisplay) :
+                    CGDisplayShowCursor(kCGNullDirectDisplay);
+}
+
+static int portal_host_cursor_captured(void *context, bool captured)
+{
+    (void)context;
+    return CGAssociateMouseAndMouseCursorPosition(!captured);
+}
+
+static int portal_host_cursor_warp(void *context, float x, float y)
+{
+    (void)context;
+    return CGWarpMouseCursorPosition(CGPointMake(x, y));
+}
+
+static const struct lp32_cursor_host portal_cursor_host = {
+    NULL, portal_host_cursor_hidden, portal_host_cursor_captured, portal_host_cursor_warp,
+};
+
+/* The window and AppKit flags below are main-thread only. Guest mouse calls
+   use the locked state, never AppKit getters from the engine's worker thread. */
+static NSWindow *portal_cursor_window;
+static bool portal_application_active;
+static bool portal_window_key;
+
+static void update_portal_cursor_focus(void)
+{
+    bool focused = portal_application_active && portal_window_key && !background_test_mode();
+    pthread_mutex_lock(&portal_cursor_lock);
+    bool changed = focused != portal_cursor.focused;
+    int error = lp32_cursor_focus(&portal_cursor, &portal_cursor_host, focused);
+    if (error || (changed && getenv("LP32_TRACE_DISPLAY"))) {
+        fprintf(stderr, "compat32: Portal mouse focus=%d hide-count=%u capture-requested=%d "
+                "host-hidden=%d host-captured=%d suppressed-warps=%llu result=%d\n",
+                focused, portal_cursor.hide_count, portal_cursor.capture_requested,
+                portal_cursor.host_hidden, portal_cursor.host_captured,
+                (unsigned long long)portal_background_warps, error);
+    }
+    pthread_mutex_unlock(&portal_cursor_lock);
+}
+
+static void observe_portal_cursor_focus(NSWindow *window)
+{
+    portal_cursor_window = window;
+    portal_application_active = [NSApp isActive];
+    portal_window_key = [window isKeyWindow];
+    static bool observing;
+    if (!observing) {
+        observing = true;
+        NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+        [center addObserverForName:NSApplicationWillResignActiveNotification
+                           object:NSApp queue:nil usingBlock:^(NSNotification *note) {
+            (void)note;
+            /* isActive is still YES during WillResignActive. Keep an explicit
+               flag so a following window notification cannot recapture. */
+            portal_application_active = false;
+            update_portal_cursor_focus();
+        }];
+        [center addObserverForName:NSApplicationDidBecomeActiveNotification
+                           object:NSApp queue:nil usingBlock:^(NSNotification *note) {
+            (void)note;
+            portal_application_active = true;
+            portal_window_key = [portal_cursor_window isKeyWindow];
+            update_portal_cursor_focus();
+        }];
+        [center addObserverForName:NSWindowDidBecomeKeyNotification
+                           object:nil queue:nil usingBlock:^(NSNotification *note) {
+            if ([note object] != portal_cursor_window) return;
+            portal_window_key = true;
+            update_portal_cursor_focus();
+        }];
+        [center addObserverForName:NSWindowDidResignKeyNotification
+                           object:nil queue:nil usingBlock:^(NSNotification *note) {
+            if ([note object] != portal_cursor_window) return;
+            portal_window_key = false;
+            update_portal_cursor_focus();
+        }];
+        [center addObserverForName:NSWindowWillCloseNotification
+                           object:nil queue:nil usingBlock:^(NSNotification *note) {
+            if ([note object] != portal_cursor_window) return;
+            portal_cursor_window = nil;
+            portal_window_key = false;
+            update_portal_cursor_focus();
+        }];
+    }
+    update_portal_cursor_focus();
+}
+
+static int compare_frame_ns(const void *left, const void *right)
+{
+    uint64_t a = *(const uint64_t *)left, b = *(const uint64_t *)right;
+    return (a > b) - (a < b);
+}
+
+/* Source owns its NSOpenGLContext instead of using OpenGLView.swapBuffers.
+   Keep its presentation measurement separate from the LEGO frame pacer. */
+static void portal_flush_buffer(NSOpenGLContext *context)
+{
+    static int stats_enabled = -1;
+    if (stats_enabled < 0)
+        stats_enabled = getenv("LP32_PORTAL_FRAME_STATS") != NULL ||
+                        compat_runtime32_frame_profile_enabled;
+    uint64_t start = stats_enabled ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
+    [context flushBuffer];
+    ++objc_bridge_swap_count;
+    if (stats_enabled) {
+        enum { interval = 240 };
+        static uint64_t last, durations[interval], total, flush, draws;
+        static unsigned count;
+        uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        if (last) {
+            durations[count++] = now - last;
+            total += now - last;
+            flush += now - start;
+            draws += gl_frame_diagnostics.draw_calls;
+            if (count == interval) {
+                qsort(durations, count, sizeof(*durations), compare_frame_ns);
+                pthread_mutex_lock(&portal_cursor_lock);
+                bool focused = portal_cursor.focused;
+                pthread_mutex_unlock(&portal_cursor_lock);
+                NSRect window_frame = [NSThread isMainThread] ?
+                    [portal_cursor_window frame] : NSZeroRect;
+                fprintf(stderr, "compat32: Portal frames swap=%llu focused=%d fps=%.2f "
+                        "mean=%.2fms p50=%.2fms p95=%.2fms p99=%.2fms "
+                        "flush=%.2fms draws=%.0f window={%.0f,%.0f,%.0f,%.0f}\n",
+                        (unsigned long long)objc_bridge_swap_count, focused,
+                        1e9 * count / total, (double)total / count / 1e6,
+                        durations[count / 2] / 1e6, durations[count * 95 / 100] / 1e6,
+                        durations[count * 99 / 100] / 1e6, (double)flush / count / 1e6,
+                        (double)draws / count, window_frame.origin.x, window_frame.origin.y,
+                        window_frame.size.width, window_frame.size.height);
+                if (compat_runtime32_frame_profile_enabled)
+                    compat_runtime32_report_import_profile(20);
+                count = 0; total = 0; flush = 0; draws = 0;
+            }
+        }
+        last = now;
+    }
+    trace_gl_frame_boundary();
 }
 
 /*
@@ -2654,6 +3326,8 @@ struct guest_buffer_state {
     CGLShareGroupObj share_group;
     GLuint buffer;
     bool flush_on_unmap;
+    bool size_known;
+    GLint size;
 };
 
 struct guest_buffer_mapping {
@@ -2821,10 +3495,116 @@ static GLenum buffer_binding_for_target(GLenum target)
     }
 }
 
+/* A driver query during map/flush/unmap drains threaded GL commands. Shadow
+   only bindings observed through the bridge; unknown state uses the driver.
+   Element bindings are safe here because no VAO or push/pop-client-attrib
+   entry points are exposed. Adding those requires invalidating this cache. */
+static struct {
+    CGLContextObj context;
+    GLuint buffers[4];
+    bool known[4];
+    CGLShareGroupObj share_group;
+    bool share_known;
+} portal_buffer_bindings[64];
+static pthread_mutex_t portal_buffer_bindings_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static bool portal_buffer_cache_enabled(void)
+{
+    static int disabled = -1;
+    if (disabled < 0) disabled = getenv("LP32_NO_BUFFER_CACHE") != NULL;
+    return lp32_profile()->title == LP32_TITLE_PORTAL2 && !disabled;
+}
+
+static int buffer_target_index(GLenum target)
+{
+    switch (target) {
+    case GL_ARRAY_BUFFER: return 0;
+    case GL_ELEMENT_ARRAY_BUFFER: return 1;
+    case GL_PIXEL_PACK_BUFFER: return 2;
+    case GL_PIXEL_UNPACK_BUFFER: return 3;
+    default: return -1;
+    }
+}
+
+static CGLShareGroupObj context_share_group(CGLContextObj context)
+{
+    if (!context) return NULL;
+    if (!portal_buffer_cache_enabled()) return CGLGetShareGroup(context);
+    pthread_mutex_lock(&portal_buffer_bindings_lock);
+    for (size_t i = 0; i < 64; ++i) {
+        if (portal_buffer_bindings[i].context == context &&
+            portal_buffer_bindings[i].share_known) {
+            CGLShareGroupObj group = portal_buffer_bindings[i].share_group;
+            pthread_mutex_unlock(&portal_buffer_bindings_lock);
+            return group;
+        }
+    }
+    pthread_mutex_unlock(&portal_buffer_bindings_lock);
+    /* Despite its immutable result, CGLGetShareGroup calls into the GL
+       command processor and waits for queued work when MTGL is enabled. */
+    CGLShareGroupObj group = CGLGetShareGroup(context);
+    pthread_mutex_lock(&portal_buffer_bindings_lock);
+    size_t empty = 64;
+    for (size_t i = 0; i < 64; ++i) {
+        if (portal_buffer_bindings[i].context == context) { empty = i; break; }
+        if (!portal_buffer_bindings[i].context && empty == 64) empty = i;
+    }
+    if (empty < 64) {
+        portal_buffer_bindings[empty].context = context;
+        portal_buffer_bindings[empty].share_group = group;
+        portal_buffer_bindings[empty].share_known = true;
+    }
+    pthread_mutex_unlock(&portal_buffer_bindings_lock);
+    return group;
+}
+
+static void remember_buffer_binding(GLenum target, GLuint buffer)
+{
+    int target_index = buffer_target_index(target);
+    if (target_index < 0 || !portal_buffer_cache_enabled()) return;
+    CGLContextObj context = CGLGetCurrentContext();
+    if (!context) return;
+    pthread_mutex_lock(&portal_buffer_bindings_lock);
+    size_t empty = 64;
+    for (size_t i = 0; i < 64; ++i) {
+        if (portal_buffer_bindings[i].context == context) { empty = i; break; }
+        if (!portal_buffer_bindings[i].context && empty == 64) empty = i;
+    }
+    if (empty < 64) {
+        portal_buffer_bindings[empty].context = context;
+        portal_buffer_bindings[empty].buffers[target_index] = buffer;
+        portal_buffer_bindings[empty].known[target_index] = true;
+    }
+    pthread_mutex_unlock(&portal_buffer_bindings_lock);
+}
+
+static void forget_buffer_bindings(CGLContextObj context)
+{
+    pthread_mutex_lock(&portal_buffer_bindings_lock);
+    for (size_t i = 0; i < 64; ++i)
+        if (portal_buffer_bindings[i].context == context)
+            memset(&portal_buffer_bindings[i], 0, sizeof(portal_buffer_bindings[i]));
+    pthread_mutex_unlock(&portal_buffer_bindings_lock);
+}
+
 static GLuint bound_buffer_for_target(GLenum target)
 {
     GLenum binding = buffer_binding_for_target(target);
     if (!binding) return 0;
+    if (portal_buffer_cache_enabled()) {
+        CGLContextObj context = CGLGetCurrentContext();
+        int index = buffer_target_index(target);
+        pthread_mutex_lock(&portal_buffer_bindings_lock);
+        for (size_t i = 0; i < 64; ++i) {
+            if (portal_buffer_bindings[i].context == context &&
+                portal_buffer_bindings[i].known[index]) {
+                GLuint buffer = portal_buffer_bindings[i].buffers[index];
+                pthread_mutex_unlock(&portal_buffer_bindings_lock);
+                return buffer;
+            }
+        }
+        pthread_mutex_unlock(&portal_buffer_bindings_lock);
+    }
     GLint buffer = 0;
     glGetIntegerv(binding, &buffer);
     return buffer > 0 ? (GLuint)buffer : 0;
@@ -2834,7 +3614,7 @@ static struct guest_buffer_state *buffer_state_for_name(
     CGLContextObj context, GLuint buffer, bool create)
 {
     if (!buffer) return NULL;
-    CGLShareGroupObj share_group = context ? CGLGetShareGroup(context) : NULL;
+    CGLShareGroupObj share_group = context_share_group(context);
     struct guest_buffer_state *empty = NULL;
     for (size_t index = 0;
          index < sizeof(guest_buffer_states) / sizeof(guest_buffer_states[0]);
@@ -2859,6 +3639,42 @@ static struct guest_buffer_state *buffer_state_for_name(
         logged_guest_buffer_state_exhaustion = true;
     }
     return NULL;
+}
+
+static GLint mapped_buffer_size(GLenum target, struct guest_buffer_state *state)
+{
+    if (portal_buffer_cache_enabled() && state && state->size_known) return state->size;
+    GLint size = 0;
+    glGetBufferParameteriv(target, GL_BUFFER_SIZE, &size);
+    if (state) { state->size = size; state->size_known = true; }
+    return size;
+}
+
+/* Keep the guest's low-address staging allocation, but commit it through a
+   native map. BufferSubData makes Apple's Metal-backed GL driver repeatedly
+   end render passes and enqueue GPU copies, even for small streaming writes.
+   The native map respects the buffer's APPLE serialization/flush policies and
+   allows CPU writes to the existing storage. This is only used for validated
+   shadow-map ranges; guest BufferSubData calls retain their normal semantics. */
+static void upload_mapped_buffer_range(GLenum target, GLintptr offset,
+                                       GLsizeiptr size, const void *data)
+{
+    static dispatch_once_t once;
+    static bool native_copy;
+    dispatch_once(&once, ^{
+        native_copy = getenv("LP32_NO_MAPPED_UPLOAD") == NULL;
+    });
+    if (native_copy && lp32_profile()->title == LP32_TITLE_PORTAL2 && size > 0) {
+        void *mapped = glMapBuffer(target, GL_WRITE_ONLY);
+        if (mapped) {
+            memcpy((unsigned char *)mapped + offset, data, (size_t)size);
+            glFlushMappedBufferRangeAPPLE(target, offset, size);
+            if (glUnmapBuffer(target) == GL_TRUE) return;
+            /* If the driver invalidated the store during unmap, the shadow
+               still contains the complete upload and can restore the range. */
+        }
+    }
+    glBufferSubData(target, offset, size, data);
 }
 
 static struct guest_buffer_mapping *active_buffer_mapping(
@@ -2927,7 +3743,15 @@ static void deactivate_buffer_mapping(struct guest_buffer_mapping *mapping)
 static void discard_buffer_state(CGLContextObj context, GLuint buffer)
 {
     if (!buffer) return;
-    CGLShareGroupObj share_group = context ? CGLGetShareGroup(context) : NULL;
+    CGLShareGroupObj share_group = context_share_group(context);
+    /* Shared objects can remain bound in another context after deletion.
+       Invalidate the cached binding rather than assuming it became zero. */
+    pthread_mutex_lock(&portal_buffer_bindings_lock);
+    for (size_t i = 0; i < 64; ++i)
+        for (size_t j = 0; j < 4; ++j)
+            if (portal_buffer_bindings[i].buffers[j] == buffer)
+                portal_buffer_bindings[i].known[j] = false;
+    pthread_mutex_unlock(&portal_buffer_bindings_lock);
     for (size_t index = 0;
          index < sizeof(guest_buffer_mappings) / sizeof(guest_buffer_mappings[0]);
          ++index) {
@@ -3594,7 +4418,7 @@ static bool mark_texture_for_trace(GLenum target, GLuint texture)
 {
     if (!texture || !gl_render_trace_generation) return false;
     CGLContextObj context = CGLGetCurrentContext();
-    CGLShareGroupObj share_group = context ? CGLGetShareGroup(context) : NULL;
+    CGLShareGroupObj share_group = context_share_group(context);
     size_t start = ((size_t)texture * 2654435761u + (size_t)target) %
         kTracedTextureCapacity;
     for (size_t probe = 0; probe < kTracedTextureCapacity; ++probe) {
@@ -3887,7 +4711,7 @@ static void forget_mipmap_repairs(GLsizei count, const GLuint *textures)
 {
     if (count <= 0 || !textures) return;
     CGLContextObj context = CGLGetCurrentContext();
-    CGLShareGroupObj share_group = context ? CGLGetShareGroup(context) : NULL;
+    CGLShareGroupObj share_group = context_share_group(context);
     pthread_mutex_lock(&mipmap_repair_mutex);
     for (GLsizei index = 0; index < count; ++index) {
         for (size_t slot = 0; slot < kMipmapRepairCapacity; ++slot) {
@@ -3930,6 +4754,7 @@ static GLenum canonical_mipmap_target(GLenum target)
 
 static void repair_bound_texture_mipmap_range(GLenum upload_target)
 {
+    if (lp32_profile()->title == LP32_TITLE_PORTAL2) return;
     GLenum target = canonical_mipmap_target(upload_target);
     static int repair_disabled = -1;
     if (repair_disabled < 0) {
@@ -3975,7 +4800,7 @@ static void repair_bound_texture_mipmap_range(GLenum upload_target)
     if (base_width <= 0 || base_height <= 0 || !base_format) return;
 
     CGLContextObj context = CGLGetCurrentContext();
-    CGLShareGroupObj share_group = context ? CGLGetShareGroup(context) : NULL;
+    CGLShareGroupObj share_group = context_share_group(context);
     pthread_mutex_lock(&mipmap_repair_mutex);
     struct mipmap_repair_entry *entry = mipmap_repair_entry_for(
         share_group, target, (GLuint)texture, true);
@@ -4082,7 +4907,7 @@ static void repair_mipmap_range_for_parameter(GLenum upload_target,
                   GL_TEXTURE_BINDING_CUBE_MAP, &texture);
     if (texture <= 0) return;
     CGLContextObj context = CGLGetCurrentContext();
-    CGLShareGroupObj share_group = context ? CGLGetShareGroup(context) : NULL;
+    CGLShareGroupObj share_group = context_share_group(context);
     uint64_t level_generation =
         __atomic_load_n(&texture_level_generation, __ATOMIC_ACQUIRE);
 
@@ -4592,7 +5417,29 @@ FAST_GL(glBindBuffer)
             arguments[0], arguments[1]);
     }
     glBindBuffer(arguments[0], arguments[1]);
+    remember_buffer_binding(arguments[0], arguments[1]);
     return 0;
+}
+
+FAST_GL(CGLGetCurrentContext)
+{
+    (void)arguments; (void)return_address;
+    static int uncached = -1;
+    if (uncached < 0) uncached = getenv("LP32_NO_CGL_CONTEXT_CACHE") != NULL;
+    if (uncached) {
+        CGLContextObj context = CGLGetCurrentContext();
+        return context ? proxy_for_object([NSValue valueWithPointer:context]) : 0;
+    }
+    static _Thread_local CGLContextObj previous;
+    static _Thread_local uint32_t proxy;
+    CGLContextObj context = CGLGetCurrentContext();
+    if (context != previous) {
+        @autoreleasepool {
+            proxy = context ? proxy_for_object([NSValue valueWithPointer:context]) : 0;
+        }
+        previous = context;
+    }
+    return proxy;
 }
 
 FAST_GL(glActiveTexture)
@@ -4717,14 +5564,31 @@ FAST_GL(glStencilOp)  { (void)return_address; glStencilOp(arguments[0], argument
 FAST_GL(glGetIntegerv){ (void)return_address; glGetIntegerv(arguments[0], (GLint *)(uintptr_t)arguments[1]); return 0; }
 FAST_GL(glGetFloatv)  { (void)return_address; glGetFloatv(arguments[0], (GLfloat *)(uintptr_t)arguments[1]); return 0; }
 
+/* Match gl_shader_bridge's core/ARB name sharing, without running the full
+   import-name dispatch chain for every shader constant update. */
+FAST_GL(glUniform4fv) { (void)return_address; glUniform4fv(arguments[0], arguments[1], (const GLfloat *)(uintptr_t)arguments[2]); return 0; }
+FAST_GL(glUniform1i)  { (void)return_address; glUniform1i(arguments[0], arguments[1]); return 0; }
+FAST_GL(glUniform1f)
+{
+    (void)return_address;
+    GLfloat value;
+    memcpy(&value, arguments + 1, sizeof(value));
+    glUniform1f(arguments[0], value);
+    return 0;
+}
+FAST_GL(glUseProgram) { (void)return_address; glUseProgram(arguments[0]); return 0; }
+
 #undef FAST_GL
 
 lp32_fast_import_fn objc_bridge32_fast_import(const char *import_name)
 {
+    if (!strcmp(import_name, "_CGLGetCurrentContext") &&
+        getenv("LP32_NO_CGL_CONTEXT_CACHE")) return NULL;
     static const struct {
         const char *name;
         lp32_fast_import_fn handler;
     } table[] = {
+        {"_CGLGetCurrentContext", fast_CGLGetCurrentContext},
         {"glVertexAttribPointer", fast_glVertexAttribPointer},
         {"glVertexAttribPointerARB", fast_glVertexAttribPointer},
         {"glEnableVertexAttribArray", fast_glEnableVertexAttribArray},
@@ -4768,9 +5632,25 @@ lp32_fast_import_fn objc_bridge32_fast_import(const char *import_name)
         {"_glStencilOp", fast_glStencilOp},
         {"_glGetIntegerv", fast_glGetIntegerv},
         {"_glGetFloatv", fast_glGetFloatv},
+        {"glUniform4fv", fast_glUniform4fv},
+        {"glUniform4fvARB", fast_glUniform4fv},
+        {"glUniform1i", fast_glUniform1i},
+        {"glUniform1iARB", fast_glUniform1i},
+        {"glUniform1f", fast_glUniform1f},
+        {"glUniform1fARB", fast_glUniform1f},
+        {"glUseProgram", fast_glUseProgram},
+        {"glUseProgramObjectARB", fast_glUseProgram},
     };
     for (size_t index = 0; index < sizeof(table) / sizeof(table[0]); ++index) {
-        if (strcmp(import_name, table[index].name) == 0) {
+        const char *candidate = table[index].name;
+        const char *query = import_name;
+        if (!strncmp(candidate, "_gl", 3)) ++candidate;
+        if (!strncmp(query, "_gl", 3)) ++query;
+        if ((!strncmp(candidate, "glUniform", 9) ||
+             !strncmp(candidate, "glUseProgram", 12)) &&
+            (lp32_profile()->title != LP32_TITLE_PORTAL2 ||
+             getenv("LP32_NO_FAST_GLSL"))) continue;
+        if (strcmp(query, candidate) == 0) {
             return table[index].handler;
         }
     }
@@ -4804,8 +5684,16 @@ int objc_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
                  (import_name[0] == '_' && import_name[1] == 'g' &&
                   import_name[2] == 'l');
     if (is_gl) {
-        return objc_bridge32_dispatch_body(import_name, import_length,
-                                           arguments, result);
+        if (gl_shader_bridge32_dispatch(import_name, arguments, result)) return 1;
+        if (gl_misc_bridge32_dispatch(import_name, arguments, result)) return 1;
+        if (objc_bridge32_dispatch_body(import_name, import_length, arguments, result)) return 1;
+        /* Static Mach-O imports include '_'; dlsym spells the same GL API
+           without it. Existing bridges contain both naming conventions. */
+        if (import_name[0] == '_') return objc_bridge32_dispatch_body(import_name + 1, import_length - 1, arguments, result);
+        char alternate[256];
+        if (import_length + 1 >= sizeof(alternate)) return 0;
+        alternate[0] = '_'; memcpy(alternate + 1, import_name, import_length + 1);
+        return objc_bridge32_dispatch_body(alternate, import_length + 1, arguments, result);
     }
     @autoreleasepool {
         return objc_bridge32_dispatch_body(import_name, import_length,
@@ -4820,6 +5708,164 @@ static int objc_bridge32_dispatch_body(const char *import_name,
 {
     if (LP32_NAME_IS(import_name, import_length, "_CGMainDisplayID")) {
         *result = preferred_game_display_id();
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_SetThemeCursor")) {
+        NSCursor *cursor = [NSCursor arrowCursor];
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        switch (arguments[0]) {
+            case 1: cursor = [NSCursor dragCopyCursor]; break;
+            case 2: cursor = [NSCursor dragLinkCursor]; break;
+            case 3: cursor = [NSCursor contextualMenuCursor]; break;
+            case 4: cursor = [NSCursor IBeamCursor]; break;
+            case 5: case 6: cursor = [NSCursor crosshairCursor]; break;
+            case 8: cursor = [NSCursor closedHandCursor]; break;
+            case 9: cursor = [NSCursor openHandCursor]; break;
+            case 10: cursor = [NSCursor pointingHandCursor]; break;
+            case 15: cursor = [NSCursor resizeLeftCursor]; break;
+            case 16: cursor = [NSCursor resizeRightCursor]; break;
+            case 17: cursor = [NSCursor resizeLeftRightCursor]; break;
+            case 18: cursor = [NSCursor operationNotAllowedCursor]; break;
+            case 19: cursor = [NSCursor resizeUpCursor]; break;
+            case 20: cursor = [NSCursor resizeDownCursor]; break;
+            case 21: cursor = [NSCursor resizeUpDownCursor]; break;
+        }
+#pragma clang diagnostic pop
+        [cursor set]; *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGSetDisplayTransferByTable")) {
+        /* The compatibility app uses a composited window. Desktop-wide gamma
+           changes cannot be scoped to that drawable. Report the limitation. */
+        static bool reported;
+        if (!reported) fprintf(stderr, "compat32: display-wide gamma adjustment is unavailable in the windowed bridge\n");
+        reported = true;
+        *result = kCGErrorNotImplemented; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGGetDisplayTransferByTable")) {
+        *result = CGGetDisplayTransferByTable(arguments[0], arguments[1],
+            (CGGammaValue *)(uintptr_t)arguments[2], (CGGammaValue *)(uintptr_t)arguments[3],
+            (CGGammaValue *)(uintptr_t)arguments[4], (uint32_t *)(uintptr_t)arguments[5]);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGGetActiveDisplayList") ||
+        LP32_NAME_IS(import_name, import_length, "_CGGetOnlineDisplayList")) {
+        CGDirectDisplayID *displays = (void *)(uintptr_t)arguments[1];
+        uint32_t *count = (void *)(uintptr_t)arguments[2];
+        *result = LP32_NAME_IS(import_name, import_length, "_CGGetActiveDisplayList") ?
+            CGGetActiveDisplayList(arguments[0], displays, count) :
+            CGGetOnlineDisplayList(arguments[0], displays, count);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_TransformProcessType")) {
+        *result = [[NSApplication sharedApplication] setActivationPolicy:NSApplicationActivationPolicyRegular] ? 0 : (uint32_t)-1;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_SetFrontProcess")) {
+        if (!background_test_mode()) [[NSApplication sharedApplication] activateIgnoringOtherApps:YES];
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_GetGlobalMouse")) {
+        /* Carbon Point is two shorts in vertical, horizontal order. Its
+           desktop origin is the top-left of the primary display, whereas
+           AppKit's global mouse position is measured from the bottom-left. */
+        int16_t *point = (void *)(uintptr_t)arguments[0];
+        NSPoint mouse = [NSEvent mouseLocation];
+        CGFloat primary_height = CGDisplayBounds(CGMainDisplayID()).size.height;
+        if (point) {
+            point[0] = (int16_t)(primary_height - mouse.y);
+            point[1] = (int16_t)mouse.x;
+        }
+        *result = 0; return 1;
+    }
+    if (lp32_profile()->title == LP32_TITLE_PORTAL2 &&
+        (LP32_NAME_IS(import_name, import_length, "_ShowWindow") ||
+         LP32_NAME_IS(import_name, import_length, "_CollapseWindow") ||
+         LP32_NAME_IS(import_name, import_length, "_SetUserFocusWindow") ||
+         LP32_NAME_IS(import_name, import_length, "_InvalWindowRect"))) {
+        /* Source still calls Carbon when restoring fullscreen after a focus
+           change. Modern NSWindow.windowRef is NULL: expose the Cocoa proxy
+           instead (below), and perform these operations on its native window.
+           Do not synchronously wait for AppKit from the engine thread. */
+        id object = object_for_argument(arguments[0]);
+        NSWindow *window = [object isKindOfClass:[NSWindow class]] ? object : nil;
+        if (getenv("LP32_TRACE_DISPLAY"))
+            fprintf(stderr, "compat32: %s window=%08x cocoa=%p\n",
+                    import_name, arguments[0], (void *)window);
+        bool invalidate = LP32_NAME_IS(import_name, import_length, "_InvalWindowRect");
+        bool collapse = LP32_NAME_IS(import_name, import_length, "_CollapseWindow");
+        bool focus = LP32_NAME_IS(import_name, import_length, "_SetUserFocusWindow");
+        bool minimize = collapse && arguments[1];
+        void (^operation)(void) = ^{
+            if (invalidate) [[window contentView] setNeedsDisplay:YES];
+            else if (collapse && !background_test_mode()) {
+                if (minimize) [window miniaturize:nil];
+                else [window deminiaturize:nil];
+            } else if (focus) {
+                if (!background_test_mode()) [window makeKeyWindow];
+            } else if (!collapse) [window orderFront:nil];
+        };
+        if ([NSThread isMainThread]) operation();
+        else dispatch_async(dispatch_get_main_queue(), operation);
+        *result = window || !arguments[0] ? 0 : (uint32_t)paramErr;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_SetSystemUIMode")) {
+        [[NSApplication sharedApplication] setPresentationOptions:
+            arguments[0] ? (NSApplicationPresentationAutoHideDock | NSApplicationPresentationAutoHideMenuBar) : NSApplicationPresentationDefault];
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_NSClassFromString")) {
+        *result = proxy_for_object(NSClassFromString(object_for_argument(arguments[0]))); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_NSTemporaryDirectory")) {
+        *result = proxy_for_object(NSTemporaryDirectory()); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_NSHomeDirectory")) {
+        *result = proxy_for_object(NSHomeDirectory()); return 1;
+    }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    if (LP32_NAME_IS(import_name, import_length, "_FSFindFolder")) {
+        *result = (uint32_t)FSFindFolder((SInt16)arguments[0], arguments[1], arguments[2] != 0,
+                                       (FSRef *)(uintptr_t)arguments[3]); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_FSRefMakePath")) {
+        *result = (uint32_t)FSRefMakePath((const FSRef *)(uintptr_t)arguments[0],
+                                        (UInt8 *)(uintptr_t)arguments[1], arguments[2]); return 1;
+    }
+#pragma clang diagnostic pop
+    if (LP32_NAME_IS(import_name, import_length, "_CFDataGetLength")) {
+        *result = (uint32_t)[(NSData *)object_for_argument(arguments[0]) length]; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringCreateWithCString") ||
+        LP32_NAME_IS(import_name, import_length, "_CFStringCreateWithCStringNoCopy")) {
+        CFStringRef string = CFStringCreateWithCString(NULL, (const char *)(uintptr_t)arguments[1], arguments[2]);
+        *result = lp32_profile()->title == LP32_TITLE_PORTAL2 ?
+            proxy_for_owned_value((id)string) : proxy_for_object((id)string);
+        if (string) CFRelease(string);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFURLCreateWithFileSystemPath")) {
+        CFURLRef url = CFURLCreateWithFileSystemPath(NULL, (CFStringRef)object_for_argument(arguments[1]), arguments[2], arguments[3] != 0);
+        *result = proxy_for_object((id)url);
+        if (url) CFRelease(url);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGImageSourceCreateWithURL")) {
+        CGImageSourceRef source = CGImageSourceCreateWithURL(
+            (CFURLRef)object_for_argument(arguments[0]),
+            (CFDictionaryRef)object_for_argument(arguments[1]));
+        *result = proxy_for_object((id)source);
+        if (source) CFRelease(source);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGImageSourceCreateImageAtIndex")) {
+        CGImageRef image = CGImageSourceCreateImageAtIndex(
+            (CGImageSourceRef)object_for_argument(arguments[0]), arguments[1],
+            (CFDictionaryRef)object_for_argument(arguments[2]));
+        *result = proxy_for_object((id)image);
+        if (image) CGImageRelease(image);
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CGDisplayIDToOpenGLDisplayMask")) {
@@ -4847,6 +5893,23 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                     [[mode description] UTF8String]);
         }
         *result = proxy_for_object(mode);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGDisplayCopyDisplayMode")) {
+        CGDisplayModeRef mode = CGDisplayCopyDisplayMode(arguments[0]);
+        *result = proxy_for_object((id)mode);
+        if (mode) CGDisplayModeRelease(mode);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGDisplayModeGetWidth") ||
+        LP32_NAME_IS(import_name, import_length, "_CGDisplayModeGetHeight") ||
+        LP32_NAME_IS(import_name, import_length, "_CGDisplayModeGetRefreshRate") ||
+        LP32_NAME_IS(import_name, import_length, "_CGDisplayModeRelease")) {
+        CGDisplayModeRef mode = (CGDisplayModeRef)object_for_argument(arguments[0]);
+        if (LP32_NAME_IS(import_name, import_length, "_CGDisplayModeGetWidth")) *result = (uint32_t)CGDisplayModeGetWidth(mode);
+        else if (LP32_NAME_IS(import_name, import_length, "_CGDisplayModeGetHeight")) *result = (uint32_t)CGDisplayModeGetHeight(mode);
+        else if (LP32_NAME_IS(import_name, import_length, "_CGDisplayModeGetRefreshRate")) *result = compat_runtime32_return_double(CGDisplayModeGetRefreshRate(mode));
+        else *result = 0; /* Proxy lifetime owns the retained mode. */
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CGWindowLevelForKey")) {
@@ -4887,6 +5950,22 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         set_guest_display_mode(NSZeroSize);
         [presenting_view applyGuestDisplayMode];
         *result = kCGErrorSuccess;
+        return 1;
+    }
+    if (lp32_profile()->title == LP32_TITLE_PORTAL2 &&
+        (LP32_NAME_IS(import_name, import_length, "_CGDisplayHideCursor") ||
+         LP32_NAME_IS(import_name, import_length, "_CGDisplayShowCursor"))) {
+        /* Source repeats hide/show until its visibility query changes. Keep
+           that logical count while inactive, without hiding the host pointer. */
+        bool hide = LP32_NAME_IS(import_name, import_length, "_CGDisplayHideCursor");
+        pthread_mutex_lock(&portal_cursor_lock);
+        *result = lp32_cursor_hide(&portal_cursor, &portal_cursor_host, hide);
+        if (getenv("LP32_TRACE_DISPLAY")) {
+            fprintf(stderr, "compat32: %s result=%d hide-count=%u focused=%d host-hidden=%d\n",
+                    import_name, (int32_t)*result, portal_cursor.hide_count,
+                    portal_cursor.focused, portal_cursor.host_hidden);
+        }
+        pthread_mutex_unlock(&portal_cursor_lock);
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CGDisplayCapture") ||
@@ -4966,6 +6045,83 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         *result = proxy_for_object(best);
         return 1;
     }
+    if (LP32_NAME_IS(import_name, import_length, "_CGGetLastMouseDelta")) {
+        CGGetLastMouseDelta((int32_t *)(uintptr_t)arguments[0], (int32_t *)(uintptr_t)arguments[1]);
+        *result = 0;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGDisplayPixelsWide")) {
+        *result = (uint32_t)CGDisplayPixelsWide(arguments[0]); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGDisplayBounds")) {
+        CGRect bounds = CGDisplayBounds(arguments[1]);
+        float *guest = (void *)(uintptr_t)arguments[0];
+        guest[0] = bounds.origin.x; guest[1] = bounds.origin.y;
+        guest[2] = bounds.size.width; guest[3] = bounds.size.height;
+        *result = arguments[0]; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGDisplayPixelsHigh")) {
+        *result = (uint32_t)CGDisplayPixelsHigh(arguments[0]); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGDisplayIsActive")) {
+        *result = CGDisplayIsActive(arguments[0]); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGCursorIsVisible")) {
+        if (lp32_profile()->title == LP32_TITLE_PORTAL2) {
+            pthread_mutex_lock(&portal_cursor_lock);
+            *result = portal_cursor.hide_count == 0;
+            pthread_mutex_unlock(&portal_cursor_lock);
+            if (getenv("LP32_TRACE_DISPLAY")) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+                unsigned state = (unsigned)*result * 2 + !!CGCursorIsVisible();
+#pragma clang diagnostic pop
+                static _Thread_local unsigned previous_state = UINT32_MAX;
+                if (state != previous_state)
+                    fprintf(stderr, "compat32: cursor guest-visible=%u native-visible=%u\n",
+                            state >> 1, state & 1);
+                previous_state = state;
+            }
+            return 1;
+        }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        *result = CGCursorIsVisible(); return 1;
+#pragma clang diagnostic pop
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGWarpMouseCursorPosition")) {
+        const float *point = (const void *)arguments;
+        if (lp32_profile()->title == LP32_TITLE_PORTAL2) {
+            pthread_mutex_lock(&portal_cursor_lock);
+            if (!portal_cursor.focused && ++portal_background_warps == 1 &&
+                getenv("LP32_TRACE_DISPLAY"))
+                fprintf(stderr, "compat32: suppressing background Portal cursor warps\n");
+            *result = lp32_cursor_warp(&portal_cursor, &portal_cursor_host, point[0], point[1]);
+            pthread_mutex_unlock(&portal_cursor_lock);
+            return 1;
+        }
+        *result = CGWarpMouseCursorPosition(CGPointMake(point[0], point[1])); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGAssociateMouseAndMouseCursorPosition")) {
+        if (lp32_profile()->title == LP32_TITLE_PORTAL2) {
+            pthread_mutex_lock(&portal_cursor_lock);
+            *result = lp32_cursor_capture(&portal_cursor, &portal_cursor_host, !arguments[0]);
+            if (getenv("LP32_TRACE_DISPLAY"))
+                fprintf(stderr, "compat32: mouse cursor %s result=%d focused=%d host-captured=%d\n",
+                        arguments[0] ? "released" : "captured", (int32_t)*result,
+                        portal_cursor.focused, portal_cursor.host_captured);
+            pthread_mutex_unlock(&portal_cursor_lock);
+            return 1;
+        }
+        *result = CGAssociateMouseAndMouseCursorPosition(!!arguments[0]);
+        if (getenv("LP32_TRACE_DISPLAY"))
+            fprintf(stderr, "compat32: mouse cursor %s result=%d\n",
+                    arguments[0] ? "released" : "captured", (int32_t)*result);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGOpenGLDisplayMaskToDisplayID")) {
+        *result = CGOpenGLDisplayMaskToDisplayID(arguments[0]); return 1;
+    }
     if (LP32_NAME_IS(import_name, import_length, "_CGLChoosePixelFormat")) {
         /* Attributes are an int-terminated list; strip kCGLPFAFullScreen
            (no longer honoured) and let CGL pick the rest. */
@@ -5038,6 +6194,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     if (LP32_NAME_IS(import_name, import_length, "_CGLDestroyContext")) {
         NSValue *wrapper = object_for_argument(arguments[0]);
         CGLContextObj context = wrapper ? [wrapper pointerValue] : NULL;
+        forget_buffer_bindings(context);
         *result = context ? (uint32_t)CGLDestroyContext(context) : kCGLBadContext;
         return 1;
     }
@@ -5105,13 +6262,16 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CGLGetCurrentContext")) {
-        CGLContextObj context = CGLGetCurrentContext();
-        *result = context ? proxy_for_object([NSValue valueWithPointer:context]) : 0;
+        *result = fast_CGLGetCurrentContext(arguments, 0);
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CGLSetCurrentContext") ||
         LP32_NAME_IS(import_name, import_length, "_CGLLockContext") ||
         LP32_NAME_IS(import_name, import_length, "_CGLUnlockContext") ||
+        LP32_NAME_IS(import_name, import_length, "_CGLEnable") ||
+        LP32_NAME_IS(import_name, import_length, "_CGLDisable") ||
+        LP32_NAME_IS(import_name, import_length, "_CGLIsEnabled") ||
+        LP32_NAME_IS(import_name, import_length, "_CGLGetParameter") ||
         LP32_NAME_IS(import_name, import_length, "_CGLSetParameter")) {
         NSValue *wrapper = object_for_argument(arguments[0]);
         CGLContextObj context = wrapper ? [wrapper pointerValue] : NULL;
@@ -5122,6 +6282,14 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             error = CGLLockContext(context);
         } else if (LP32_NAME_IS(import_name, import_length, "_CGLUnlockContext")) {
             error = CGLUnlockContext(context);
+        } else if (LP32_NAME_IS(import_name, import_length, "_CGLEnable")) {
+            error = CGLEnable(context, arguments[1]);
+        } else if (LP32_NAME_IS(import_name, import_length, "_CGLDisable")) {
+            error = CGLDisable(context, arguments[1]);
+        } else if (LP32_NAME_IS(import_name, import_length, "_CGLIsEnabled")) {
+            error = CGLIsEnabled(context, arguments[1], (GLint *)(uintptr_t)arguments[2]);
+        } else if (LP32_NAME_IS(import_name, import_length, "_CGLGetParameter")) {
+            error = CGLGetParameter(context, arguments[1], (GLint *)(uintptr_t)arguments[2]);
         } else {
             const GLint *values = (const GLint *)(uintptr_t)arguments[2];
             GLint override_value = 0;
@@ -5172,6 +6340,16 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     }
     if (LP32_NAME_IS(import_name, import_length, "glBufferData") ||
         LP32_NAME_IS(import_name, import_length, "glBufferDataARB")) {
+        if (portal_buffer_cache_enabled()) {
+            struct guest_buffer_state *state = buffer_state_for_name(
+                CGLGetCurrentContext(), bound_buffer_for_target(arguments[0]), false);
+            /* Source orphans streaming buffers with the same size every
+               frame. Their size stays valid on success or rejected parameters
+               (GL leaves the previous store on validation errors). Only an actual
+               size change needs a driver query on the next map. */
+            if (state && state->size != (int32_t)arguments[1])
+                state->size_known = false;
+        }
         if (trace_gl_render_call()) {
             gl_trace_printf(
                 "compat32: glBufferData swap=%llu target=%04x size=%d "
@@ -5219,12 +6397,11 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     }
     if (LP32_NAME_IS(import_name, import_length, "glMapBuffer") ||
         LP32_NAME_IS(import_name, import_length, "glMapBufferARB")) {
-        GLint byte_count = 0;
-        glGetBufferParameteriv(arguments[0], GL_BUFFER_SIZE, &byte_count);
         CGLContextObj context = CGLGetCurrentContext();
         GLuint buffer = bound_buffer_for_target(arguments[0]);
         struct guest_buffer_state *state =
             buffer_state_for_name(context, buffer, true);
+        GLint byte_count = mapped_buffer_size(arguments[0], state);
         struct guest_buffer_mapping *mapping = state ? begin_buffer_mapping(
             context, arguments[0], buffer, state) : NULL;
         if (!mapping || byte_count < 0) {
@@ -5268,14 +6445,13 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "glMapBufferRange")) {
-        GLint byte_count = 0;
-        glGetBufferParameteriv(arguments[0], GL_BUFFER_SIZE, &byte_count);
         int32_t signed_offset = (int32_t)arguments[1];
         int32_t signed_size = (int32_t)arguments[2];
         CGLContextObj context = CGLGetCurrentContext();
         GLuint buffer = bound_buffer_for_target(arguments[0]);
         struct guest_buffer_state *state =
             buffer_state_for_name(context, buffer, true);
+        GLint byte_count = mapped_buffer_size(arguments[0], state);
         struct guest_buffer_mapping *mapping = state ? begin_buffer_mapping(
             context, arguments[0], buffer, state) : NULL;
         bool valid = mapping && byte_count >= 0 && signed_offset >= 0 &&
@@ -5346,7 +6522,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         bool upload_all = writable && !explicit_flush &&
             (mapping->range_mapping || state->flush_on_unmap);
         if (mapping->size && upload_all) {
-            glBufferSubData(mapping->target,
+            upload_mapped_buffer_range(mapping->target,
                             (GLintptr)mapping->mapped_offset,
                             (GLsizeiptr)mapping->size,
                             (const void *)(uintptr_t)mapping->storage);
@@ -5379,7 +6555,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             mapping->access != GL_READ_ONLY && offset <= mapping->size &&
             size <= mapping->size - offset;
         if (valid) {
-            glBufferSubData(mapping->target, (GLintptr)offset,
+            upload_mapped_buffer_range(mapping->target, (GLintptr)offset,
                             (GLsizeiptr)size,
                             (const void *)(uintptr_t)(mapping->storage + offset));
         }
@@ -5405,7 +6581,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             (mapping->access_flags & GL_MAP_WRITE_BIT) != 0 &&
             offset <= mapping->size && size <= mapping->size - offset;
         if (valid) {
-            glBufferSubData(mapping->target,
+            upload_mapped_buffer_range(mapping->target,
                             (GLintptr)(mapping->mapped_offset + offset),
                             (GLsizeiptr)size,
                             (const void *)(uintptr_t)(mapping->storage + offset));
@@ -6060,6 +7236,13 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         *result = 0; return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_IORegistryEntrySearchCFProperty")) {
+        if (lp32_profile()->title == LP32_TITLE_PORTAL2) {
+            CFTypeRef property = IORegistryEntrySearchCFProperty(arguments[0], (const char *)(uintptr_t)arguments[1],
+                (CFStringRef)object_for_argument(arguments[2]), NULL, arguments[4]);
+            *result = proxy_for_object((id)property);
+            if (property) CFRelease(property);
+            return 1;
+        }
         NSString *key = object_for_argument(arguments[2]);
         uint32_t identifier = 0;
         if ([key isEqualToString:@"vendor-id"]) identifier = UINT32_C(0x106b);
@@ -6068,9 +7251,95 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         *result = proxy_for_object(data);
         return 1;
     }
+    if (LP32_NAME_IS(import_name, import_length, "_IOServiceMatching")) {
+        CFMutableDictionaryRef matching = IOServiceMatching((const char *)(uintptr_t)arguments[0]);
+        *result = proxy_for_object((id)matching);
+        if (matching) CFRelease(matching);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_IORegisterForSystemPower")) {
+        struct guest_power_context *context = malloc(sizeof(*context));
+        if (!context) { *result = 0; return 1; }
+        *context = (struct guest_power_context){arguments[0], arguments[2]};
+        IONotificationPortRef port = NULL;
+        *result = IORegisterForSystemPower(context, &port, guest_power_callback, (io_object_t *)(uintptr_t)arguments[3]);
+        if (arguments[1]) *(uint32_t *)(uintptr_t)arguments[1] = port ? proxy_for_object([NSValue valueWithPointer:port]) : 0;
+        if (!*result) free(context); /* Successful callbacks stay valid for the process lifetime. */
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_IONotificationPortGetRunLoopSource")) {
+        NSValue *wrapper = object_for_argument(arguments[0]);
+        IONotificationPortRef port = wrapper ? [wrapper pointerValue] : NULL;
+        *result = port ? proxy_for_object((id)IONotificationPortGetRunLoopSource(port)) : 0;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_IONotificationPortDestroy")) {
+        NSValue *wrapper = object_for_argument(arguments[0]);
+        if (wrapper) IONotificationPortDestroy([wrapper pointerValue]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_IOAllowPowerChange")) {
+        *result = (uint32_t)IOAllowPowerChange(arguments[0], (intptr_t)arguments[1]); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_IODeregisterForSystemPower")) {
+        *result = (uint32_t)IODeregisterForSystemPower((io_object_t *)(uintptr_t)arguments[0]); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_IOServiceClose")) {
+        *result = (uint32_t)IOServiceClose(arguments[0]); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_IORegistryEntryCreateCFProperty")) {
+        CFTypeRef property = IORegistryEntryCreateCFProperty(arguments[0],
+            (CFStringRef)object_for_argument(arguments[1]), NULL, arguments[3]);
+        *result = proxy_for_object((id)property);
+        if (property) CFRelease(property);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_IOServiceGetMatchingServices")) {
+        CFDictionaryRef matching = (CFDictionaryRef)object_for_argument(arguments[1]);
+        if (matching) CFRetain(matching); /* IOKit consumes one reference. */
+        *result = (uint32_t)IOServiceGetMatchingServices(arguments[0], matching, (io_iterator_t *)(uintptr_t)arguments[2]);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_IOIteratorNext")) {
+        *result = IOIteratorNext(arguments[0]); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_IOObjectRelease")) {
+        *result = (uint32_t)IOObjectRelease(arguments[0]); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_IORegistryEntryGetParentEntry")) {
+        *result = (uint32_t)IORegistryEntryGetParentEntry(arguments[0], (const char *)(uintptr_t)arguments[1], (io_registry_entry_t *)(uintptr_t)arguments[2]);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_IORegistryEntryCreateCFProperties")) {
+        CFMutableDictionaryRef properties = NULL;
+        *result = (uint32_t)IORegistryEntryCreateCFProperties(arguments[0], &properties, NULL, arguments[3]);
+        if (arguments[1]) *(uint32_t *)(uintptr_t)arguments[1] = proxy_for_object((id)properties);
+        if (properties) CFRelease(properties);
+        return 1;
+    }
 
     if (LP32_NAME_IS(import_name, import_length, "_CFBundleGetMainBundle")) {
         *result = proxy_for_object(legacy_game_bundle());
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFUUIDGetConstantUUIDWithBytes")) {
+        CFUUIDRef uuid = CFUUIDGetConstantUUIDWithBytes(NULL,
+            arguments[1], arguments[2], arguments[3], arguments[4],
+            arguments[5], arguments[6], arguments[7], arguments[8],
+            arguments[9], arguments[10], arguments[11], arguments[12],
+            arguments[13], arguments[14], arguments[15], arguments[16]);
+        *result = proxy_for_object((id)uuid);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_PasteboardCreate")) {
+        PasteboardRef pasteboard = NULL;
+        *result = (uint32_t)PasteboardCreate((CFStringRef)object_for_argument(arguments[0]), &pasteboard);
+        if (arguments[1]) *(uint32_t *)(uintptr_t)arguments[1] = proxy_for_object((id)pasteboard);
+        if (pasteboard) CFRelease(pasteboard);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_PasteboardSynchronize")) {
+        *result = (uint32_t)PasteboardSynchronize((PasteboardRef)object_for_argument(arguments[0]));
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFBundleCopyExecutableURL")) {
@@ -6142,10 +7411,17 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFRelease")) {
+        pthread_mutex_lock(&proxy_lock);
+        release_value_proxy(arguments[0]);
+        pthread_mutex_unlock(&proxy_lock);
         *result = 0;
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFRetain")) {
+        pthread_mutex_lock(&proxy_lock);
+        struct value_proxy *entry = value_proxy_for_handle(arguments[0]);
+        if (entry) ++entry->references;
+        pthread_mutex_unlock(&proxy_lock);
         *result = arguments[0];
         return 1;
     }
@@ -6171,6 +7447,29 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                                      arguments[3]);
         return 1;
     }
+    if (LP32_NAME_IS(import_name, import_length, "_Long2Fix")) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        *result = (uint32_t)Long2Fix((int32_t)arguments[0]); return 1;
+#pragma clang diagnostic pop
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringGetBytes")) {
+        CFStringRef string = (CFStringRef)object_for_argument(arguments[0]);
+        CFIndex used = 0;
+        *result = string ? (uint32_t)CFStringGetBytes(string,
+            CFRangeMake((int32_t)arguments[1], (int32_t)arguments[2]), arguments[3],
+            arguments[4], arguments[5], (UInt8 *)(uintptr_t)arguments[6],
+            (int32_t)arguments[7], arguments[8] ? &used : NULL) : 0;
+        if (arguments[8]) *(int32_t *)(uintptr_t)arguments[8] = (int32_t)used;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFCharacterSetGetPredefined")) {
+        *result = proxy_for_object((id)CFCharacterSetGetPredefined(arguments[0])); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFCharacterSetIsLongCharacterMember")) {
+        CFCharacterSetRef set = (CFCharacterSetRef)object_for_argument(arguments[0]);
+        *result = set && CFCharacterSetIsLongCharacterMember(set, arguments[1]); return 1;
+    }
     if (LP32_NAME_IS(import_name, import_length, "_CFStringCompare")) {
         NSString *left = object_for_argument(arguments[0]);
         NSString *right = object_for_argument(arguments[1]);
@@ -6193,7 +7492,9 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         CFIndex length = (int32_t)arguments[2];
         CFStringRef string = CFStringCreateWithBytes(NULL, bytes, length,
                                                      arguments[3], false);
-        *result = proxy_for_object([(NSString *)string autorelease]);
+        *result = lp32_profile()->title == LP32_TITLE_PORTAL2 ?
+            proxy_for_owned_value((id)string) : proxy_for_object((id)string);
+        if (string) CFRelease(string);
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFArrayGetCount")) {
@@ -6356,9 +7657,81 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFRunLoopGetCurrent")) {
+        if (lp32_profile()->title == LP32_TITLE_PORTAL2) {
+            *result = proxy_for_object((id)CFRunLoopGetCurrent()); return 1;
+        }
         /* A host-thread token is sufficient because Add/Remove operate on
            the current run loop for this title's IOKit notification path. */
         *result = proxy_for_object([NSThread currentThread]);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFRunLoopTimerCreate")) {
+        double fire, interval;
+        memcpy(&fire, arguments + 1, 8); memcpy(&interval, arguments + 3, 8);
+        struct guest_runloop_context *context = runloop_context(arguments[8], 5, arguments[7]);
+        if (!context) { *result = 0; return 1; }
+        CFRunLoopTimerContext native = {0, context, NULL, release_runloop_context, NULL};
+        CFRunLoopTimerRef timer = CFRunLoopTimerCreate(NULL, fire, interval, arguments[5], (int32_t)arguments[6], guest_timer_callback, &native);
+        *result = proxy_for_object((id)timer);
+        if (timer) CFRelease(timer); else release_runloop_context(context);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFRunLoopObserverCreate")) {
+        struct guest_runloop_context *context = runloop_context(arguments[5], 5, arguments[4]);
+        if (!context) { *result = 0; return 1; }
+        CFRunLoopObserverContext native = {0, context, NULL, release_runloop_context, NULL};
+        CFRunLoopObserverRef observer = CFRunLoopObserverCreate(NULL, arguments[1], arguments[2], (int32_t)arguments[3], guest_observer_callback, &native);
+        *result = proxy_for_object((id)observer);
+        if (observer) CFRelease(observer); else release_runloop_context(context);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFRunLoopSourceCreate")) {
+        struct guest_runloop_context *context = runloop_context(arguments[2], 10, 0);
+        if (!context) { *result = 0; return 1; }
+        CFRunLoopSourceContext native = {0, context, NULL, release_runloop_context, NULL, NULL, NULL,
+                                         guest_source_schedule, guest_source_cancel, guest_source_perform};
+        CFRunLoopSourceRef source = CFRunLoopSourceCreate(NULL, (int32_t)arguments[1], &native);
+        *result = proxy_for_object((id)source);
+        if (source) CFRelease(source); else release_runloop_context(context);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFRunLoopTimerSetNextFireDate")) {
+        double fire; memcpy(&fire, arguments + 1, 8);
+        CFRunLoopTimerSetNextFireDate((CFRunLoopTimerRef)object_for_argument(arguments[0]), fire);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFRunLoopSourceSignal")) {
+        CFRunLoopSourceSignal((CFRunLoopSourceRef)object_for_argument(arguments[0])); *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFRunLoopStop") ||
+        LP32_NAME_IS(import_name, import_length, "_CFRunLoopWakeUp")) {
+        CFRunLoopRef loop = (CFRunLoopRef)object_for_argument(arguments[0]);
+        if (LP32_NAME_IS(import_name, import_length, "_CFRunLoopStop")) CFRunLoopStop(loop);
+        else CFRunLoopWakeUp(loop);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFRunLoopRunInMode")) {
+        double duration; memcpy(&duration, arguments + 1, 8);
+        *result = (uint32_t)CFRunLoopRunInMode((CFStringRef)object_for_argument(arguments[0]), duration, arguments[3]); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFRunLoopAddTimer") ||
+        LP32_NAME_IS(import_name, import_length, "_CFRunLoopRemoveTimer") ||
+        LP32_NAME_IS(import_name, import_length, "_CFRunLoopAddObserver") ||
+        LP32_NAME_IS(import_name, import_length, "_CFRunLoopRemoveObserver") ||
+        LP32_NAME_IS(import_name, import_length, "_CFRunLoopAddSource") ||
+        LP32_NAME_IS(import_name, import_length, "_CFRunLoopRemoveSource") ||
+        LP32_NAME_IS(import_name, import_length, "_CFRunLoopContainsSource")) {
+        CFRunLoopRef loop = (CFRunLoopRef)object_for_argument(arguments[0]);
+        id object = object_for_argument(arguments[1]);
+        CFStringRef mode = (CFStringRef)object_for_argument(arguments[2]);
+        *result = 0;
+        if (LP32_NAME_IS(import_name, import_length, "_CFRunLoopAddTimer")) CFRunLoopAddTimer(loop, (CFRunLoopTimerRef)object, mode);
+        else if (LP32_NAME_IS(import_name, import_length, "_CFRunLoopRemoveTimer")) CFRunLoopRemoveTimer(loop, (CFRunLoopTimerRef)object, mode);
+        else if (LP32_NAME_IS(import_name, import_length, "_CFRunLoopAddObserver")) CFRunLoopAddObserver(loop, (CFRunLoopObserverRef)object, mode);
+        else if (LP32_NAME_IS(import_name, import_length, "_CFRunLoopRemoveObserver")) CFRunLoopRemoveObserver(loop, (CFRunLoopObserverRef)object, mode);
+        else if (LP32_NAME_IS(import_name, import_length, "_CFRunLoopAddSource")) CFRunLoopAddSource(loop, (CFRunLoopSourceRef)object, mode);
+        else if (LP32_NAME_IS(import_name, import_length, "_CFRunLoopRemoveSource")) CFRunLoopRemoveSource(loop, (CFRunLoopSourceRef)object, mode);
+        else *result = CFRunLoopContainsSource(loop, (CFRunLoopSourceRef)object, mode);
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFShow")) {
@@ -6446,9 +7819,73 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         return 1;
     }
 
-    if (LP32_NAME_IS(import_name, import_length, "_objc_msgSend")) {
+    if (LP32_NAME_IS(import_name, import_length, "_objc_msgSendSuper")) {
+        const uint32_t *sup = (const void *)(uintptr_t)arguments[0];
+        id receiver = sup ? object_for_receiver(sup[0]) : nil;
+        Class parent = sup ? (Class)object_for_receiver(sup[1]) : Nil;
+        const char *name = (const char *)(uintptr_t)arguments[1];
+        if (!receiver || !parent || !name) return 0;
+        SEL selector = sel_registerName(name);
+        struct objc_super super = {receiver, parent};
+        Method method = class_getInstanceMethod(parent, selector);
+        if (!method) return 0;
+        NSMethodSignature *sig = [NSMethodSignature signatureWithObjCTypes:method_getTypeEncoding(method)];
+        NSUInteger count = [sig numberOfArguments] - 2;
+        if (count > 1) return 0;
+        if (count && *[sig getArgumentTypeAtIndex:2] == '{') {
+            const float *r = (const void *)(arguments + 2);
+            ((void (*)(struct objc_super *, SEL, NSRect))objc_msgSendSuper)(&super, selector, NSMakeRect(r[0], r[1], r[2], r[3]));
+            *result = 0;
+        } else {
+            id argument = count ? object_for_argument(arguments[2]) : nil;
+            uintptr_t value = ((uintptr_t (*)(struct objc_super *, SEL, id))objc_msgSendSuper)(&super, selector, argument);
+            const char *type = [sig methodReturnType];
+            *result = *type == '@' ? proxy_for_object((id)value) : *type == 'v' ? 0 : (uint32_t)value;
+        }
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_objc_msgSend") ||
+        LP32_NAME_IS(import_name, import_length, "_objc_msgSend_fpret")) {
         id receiver = object_for_receiver(arguments[0]);
         const char *selector_name = (const char *)(uintptr_t)arguments[1];
+        if (getenv("LP32_TRACE_EVENTS") && selector_name && [receiver isKindOfClass:[NSEvent class]])
+            fprintf(stderr, "compat32: event %p handle=%08x type=%lu selector=%s\n", (void *)receiver,
+                arguments[0], (unsigned long)[(NSEvent *)receiver type], selector_name);
+        if (getenv("LP32_TRACE_DATES") && selector_name &&
+            ([receiver isKindOfClass:[NSDate class]] || receiver == [NSDate class] ||
+             receiver == [NSAutoreleasePool class] || [receiver isKindOfClass:[LP32GuestAutoreleasePool class]]))
+            fprintf(stderr, "compat32: date/pool %s receiver=%s\n", selector_name,
+                receiver ? class_getName(object_getClass(receiver)) : "nil");
+        if (lp32_profile()->title == LP32_TITLE_PORTAL2 && selector_name) {
+            /* A guest pool spans import calls, while each host dispatch has
+               its own nested pool. Creating an actual NSAutoreleasePool here
+               would let the dispatch pop destroy the guest's pool early. */
+            if (receiver == [NSAutoreleasePool class] &&
+                (!strcmp(selector_name, "alloc") || !strcmp(selector_name, "new"))) {
+                static _Thread_local LP32GuestAutoreleasePool *token;
+                if (!token) token = [[LP32GuestAutoreleasePool alloc] init];
+                ++guest_pool_depth;
+                *result = proxy_for_object(token);
+                return 1;
+            }
+            if ([receiver isKindOfClass:[LP32GuestAutoreleasePool class]]) {
+                if (!strcmp(selector_name, "release") || !strcmp(selector_name, "drain")) drain_guest_values();
+                *result = !strcmp(selector_name, "init") ? arguments[0] : 0;
+                return 1;
+            }
+            pthread_mutex_lock(&proxy_lock);
+            struct value_proxy *date = value_proxy_for_handle(arguments[0]);
+            bool handled_date = date != NULL;
+            if (date && (!strcmp(selector_name, "retain") || !strcmp(selector_name, "copy") || !strcmp(selector_name, "copyWithZone:"))) {
+                ++date->references; *result = arguments[0];
+            } else if (date && !strcmp(selector_name, "release")) {
+                release_value_proxy(arguments[0]); *result = 0;
+            } else if (date && !strcmp(selector_name, "autorelease")) {
+                *result = autorelease_value_proxy(arguments[0]) ? arguments[0] : 0;
+            } else handled_date = false;
+            pthread_mutex_unlock(&proxy_lock);
+            if (handled_date) return 1;
+        }
         static int trace_selectors = -1;
         if (trace_selectors < 0) {
             trace_selectors = getenv("LP32_TRACE_OBJC_SELECTORS") != NULL;
@@ -6463,6 +7900,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
            those without doing them (the window is still ordered in). */
         if (background_test_mode() && selector_name) {
             if (strcmp(selector_name, "activateIgnoringOtherApps:") == 0 ||
+                strcmp(selector_name, "activate") == 0 ||
                 strcmp(selector_name, "makeKeyWindow") == 0 ||
                 strcmp(selector_name, "makeMainWindow") == 0) {
                 *result = 0;
@@ -6492,9 +7930,22 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                     arguments[0], selector_name ? selector_name : "(null)");
             return 0;
         }
+        if (lp32_profile()->title == LP32_TITLE_PORTAL2 &&
+            strcmp(selector_name, "flushBuffer") == 0 &&
+            [receiver isKindOfClass:[NSOpenGLContext class]]) {
+            portal_flush_buffer(receiver);
+            *result = 0;
+            return 1;
+        }
         if (strcmp(selector_name, "CGLContextObj") == 0) {
             CGLContextObj context = [(NSOpenGLContext *)receiver CGLContextObj];
             *result = context ? proxy_for_object([NSValue valueWithPointer:context]) : 0;
+            return 1;
+        }
+        if (lp32_profile()->title == LP32_TITLE_PORTAL2 &&
+            strcmp(selector_name, "windowRef") == 0 &&
+            [receiver isKindOfClass:[NSWindow class]]) {
+            *result = arguments[0];
             return 1;
         }
         if (strcmp(selector_name, "terminate:") == 0 &&
@@ -6523,6 +7974,9 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                                                        styleMask:arguments[6]
                                                          backing:arguments[7]
                                                            defer:arguments[8] != 0];
+            if (lp32_profile()->title == LP32_TITLE_PORTAL2 &&
+                [value isKindOfClass:objc_getClass("AppWindow")])
+                observe_portal_cursor_focus(value);
             *result = proxy_for_object(value);
             return 1;
         }
@@ -6645,6 +8099,16 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                     ReleaseEvent(carbon_event);
                 }
             }
+            if (lp32_profile()->title == LP32_TITLE_PORTAL2 && background_test_mode()) {
+                /* The benchmark keeps rendering on a secondary display
+                   without stealing focus. Source otherwise waits ~50 ms in
+                   its inactive event pump, obscuring rendering costs. */
+                NSEvent *event = [(NSApplication *)receiver
+                    nextEventMatchingMask:arguments[2] untilDate:[NSDate distantPast]
+                    inMode:object_for_argument(arguments[4]) dequeue:arguments[5] != 0];
+                *result = proxy_for_object(event);
+                return 1;
+            }
         }
         bool invoked = invoke_simple_message(receiver, selector_name,
                                              arguments, result);
@@ -6718,6 +8182,9 @@ uint32_t objc_bridge32_pointer_import(const char *import_name)
     if (LP32_NAME_IS(import_name, import_length, "_kCFRunLoopDefaultMode")) {
         return proxy_for_object((NSString *)kCFRunLoopDefaultMode);
     }
+    if (LP32_NAME_IS(import_name, import_length, "_kCFRunLoopCommonModes")) {
+        return proxy_for_object((NSString *)kCFRunLoopCommonModes);
+    }
     if (LP32_NAME_IS(import_name, import_length, "_kTISPropertyInputSourceLanguages")) {
         return proxy_for_object((NSString *)kTISPropertyInputSourceLanguages);
     }
@@ -6784,6 +8251,143 @@ int objc_bridge32_run_gl_parameter_self_test(void)
     return 0;
 }
 
+/* Readback alone cannot catch an upload corrupting draws already queued on
+   the GPU. Exercise serialized overwrites, nonoverlapping unsynchronized
+   ranges, and orphaning while earlier draws are still in flight. */
+static int test_mapped_buffer_draw_order(void)
+{
+    GLuint texture = 0, framebuffer = 0;
+    glGenTextures(1, &texture);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 16, 4, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glGenFramebuffersEXT(1, &framebuffer);
+    glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, framebuffer);
+    glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT,
+                              GL_TEXTURE_2D, texture, 0);
+    int status = -1;
+    if (glCheckFramebufferStatusEXT(GL_FRAMEBUFFER_EXT) != GL_FRAMEBUFFER_COMPLETE_EXT)
+        goto done;
+    glViewport(0, 0, 16, 4);
+    glDisable(GL_DITHER);
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glVertexPointer(2, GL_FLOAT, 0, NULL);
+    static const unsigned char colors[4][4] = {
+        {255, 0, 0, 255}, {0, 255, 0, 255},
+        {0, 0, 255, 255}, {255, 255, 255, 255},
+    };
+    uint64_t result = 0;
+    for (unsigned mode = 0; mode < 3; ++mode) {
+        objc_bridge32_dispatch("glBufferParameteriAPPLE",
+            (const uint32_t[]){GL_ARRAY_BUFFER, GL_BUFFER_SERIALIZED_MODIFY_APPLE,
+                              mode == 0}, &result);
+        objc_bridge32_dispatch("glBufferParameteriAPPLE",
+            (const uint32_t[]){GL_ARRAY_BUFFER, GL_BUFFER_FLUSHING_UNMAP_APPLE, 0},
+            &result);
+        objc_bridge32_dispatch("glBufferData",
+            (const uint32_t[]){GL_ARRAY_BUFFER, 128, 0, GL_STREAM_DRAW}, &result);
+        glClearColor(0, 0, 0, 0);
+        glClear(GL_COLOR_BUFFER_BIT);
+        for (unsigned panel = 0; panel < 4; ++panel) {
+            if (mode == 2)
+                objc_bridge32_dispatch("glBufferData",
+                    (const uint32_t[]){GL_ARRAY_BUFFER, 128, 0, GL_STREAM_DRAW}, &result);
+            unsigned offset = mode == 1 ? panel * 32 : 0;
+            float x = -1.0f + panel * 0.5f;
+            float vertices[] = {x, -1, x + .5f, -1, x, 1, x + .5f, 1};
+            objc_bridge32_dispatch("glMapBuffer",
+                (const uint32_t[]){GL_ARRAY_BUFFER, GL_WRITE_ONLY}, &result);
+            if (!result) goto done;
+            memcpy((void *)(uintptr_t)((uint32_t)result + offset), vertices, sizeof(vertices));
+            objc_bridge32_dispatch("glFlushMappedBufferRangeAPPLE",
+                (const uint32_t[]){GL_ARRAY_BUFFER, offset, sizeof(vertices)}, &result);
+            objc_bridge32_dispatch("glUnmapBuffer",
+                (const uint32_t[]){GL_ARRAY_BUFFER}, &result);
+            glColor4ubv(colors[panel]);
+            glDrawArrays(GL_TRIANGLE_STRIP, offset / 8, 4);
+            glFlush();
+        }
+        for (unsigned panel = 0; panel < 4; ++panel) {
+            unsigned char pixel[4];
+            glReadPixels(panel * 4 + 2, 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
+            if (memcmp(pixel, colors[panel], 4)) {
+                fprintf(stderr, "gl-buffer-selftest: queued draw mode=%u panel=%u: %u,%u,%u,%u\n",
+                        mode, panel, pixel[0], pixel[1], pixel[2], pixel[3]);
+                goto done;
+            }
+        }
+    }
+    status = glGetError() == GL_NO_ERROR ? 0 : -1;
+done:
+    glDisableClientState(GL_VERTEX_ARRAY);
+    glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, 0);
+    glDeleteFramebuffersEXT(1, &framebuffer);
+    glDeleteTextures(1, &texture);
+    return status;
+}
+
+static int test_large_mapped_buffer_upload(void)
+{
+    if (CGLEnable(CGLGetCurrentContext(), kCGLCEMPEngine) != kCGLNoError)
+        return -1;
+    enum { size = 3 * 65536 + 113 };
+    unsigned char *actual = malloc(size);
+    if (!actual) return -1;
+    memset(actual, 0x5c, size);
+    uint64_t result = 0;
+    objc_bridge32_dispatch("glBufferData",
+        (const uint32_t[]){GL_ARRAY_BUFFER, size, 0, GL_STREAM_DRAW}, &result);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, size, actual);
+
+    /* Odd offsets and a tail across several upload chunks. An explicit flush
+       must snapshot its bytes even if the game overwrites the map afterward. */
+    objc_bridge32_dispatch("glMapBufferRange",
+        (const uint32_t[]){GL_ARRAY_BUFFER, 13, size - 31,
+                          GL_MAP_WRITE_BIT | GL_MAP_FLUSH_EXPLICIT_BIT}, &result);
+    if (!result) { free(actual); return -1; }
+    unsigned char *mapped = (void *)(uintptr_t)(uint32_t)result;
+    for (size_t i = 0; i < size - 31; ++i)
+        mapped[i] = (unsigned char)(i * 37 + i / 257);
+    objc_bridge32_dispatch("glFlushMappedBufferRange",
+        (const uint32_t[]){GL_ARRAY_BUFFER, 7, size - 50}, &result);
+    memset(mapped, 0xee, size - 31);
+    objc_bridge32_dispatch("glUnmapBuffer",
+        (const uint32_t[]){GL_ARRAY_BUFFER}, &result);
+    glGetBufferSubData(GL_ARRAY_BUFFER, 0, size, actual);
+    int status = 0;
+    for (size_t i = 0; i < size; ++i) {
+        size_t source = i - 13;
+        unsigned char expected = i >= 20 && i < size - 30 ?
+            (unsigned char)(source * 37 + source / 257) : 0x5c;
+        if (actual[i] != expected) {
+            fprintf(stderr,
+                "gl-buffer-selftest: large explicit upload byte %zu: %02x != %02x\n",
+                i, actual[i], expected);
+            status = -1;
+            break;
+        }
+    }
+    /* The implicit-unmap path must also commit the complete large range. */
+    objc_bridge32_dispatch("glMapBufferRange",
+        (const uint32_t[]){GL_ARRAY_BUFFER, 0, size,
+                          GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT}, &result);
+    if (!result) { free(actual); return -1; }
+    memset((void *)(uintptr_t)(uint32_t)result, 0x8a, size);
+    objc_bridge32_dispatch("glUnmapBuffer",
+        (const uint32_t[]){GL_ARRAY_BUFFER}, &result);
+    glGetBufferSubData(GL_ARRAY_BUFFER, 0, size, actual);
+    for (size_t i = 0; i < size; ++i) {
+        if (actual[i] != 0x8a) {
+            fprintf(stderr, "gl-buffer-selftest: large implicit upload byte %zu\n", i);
+            status = -1;
+            break;
+        }
+    }
+    if (glGetError() != GL_NO_ERROR) status = -1;
+    free(actual);
+    return status;
+}
+
 int objc_bridge32_run_gl_buffer_self_test(void)
 {
 #pragma clang diagnostic push
@@ -6827,6 +8431,7 @@ int objc_bridge32_run_gl_buffer_self_test(void)
         return -1;
     }
 
+    uint64_t primary_proxy = fast_CGLGetCurrentContext(NULL, 0);
     enum { kTestSize = 32 };
     unsigned char initial_a[kTestSize];
     unsigned char initial_b[kTestSize];
@@ -6838,7 +8443,7 @@ int objc_bridge32_run_gl_buffer_self_test(void)
     uint64_t dispatch_result = 0;
     int status = 0;
 
-    glBindBuffer(GL_ARRAY_BUFFER, buffers[0]);
+    fast_glBindBuffer((const uint32_t[]){GL_ARRAY_BUFFER, buffers[0]}, 0);
     glBufferData(GL_ARRAY_BUFFER, kTestSize, initial_a, GL_DYNAMIC_DRAW);
     const uint32_t disable_flush[] = {
         GL_ARRAY_BUFFER, GL_BUFFER_FLUSHING_UNMAP_APPLE, GL_FALSE,
@@ -6884,7 +8489,7 @@ int objc_bridge32_run_gl_buffer_self_test(void)
         status = -1;
         goto cleanup;
     }
-    glBindBuffer(GL_ARRAY_BUFFER, buffers[0]);
+    fast_glBindBuffer((const uint32_t[]){GL_ARRAY_BUFFER, buffers[0]}, 0);
     objc_bridge32_dispatch("glMapBuffer", map_arguments, &dispatch_result);
     if (!dispatch_result) {
         fputs("gl-buffer-selftest: shared-context map failed\n", stderr);
@@ -6907,8 +8512,16 @@ int objc_bridge32_run_gl_buffer_self_test(void)
         }
     }
 
+    uint64_t shared_proxy = fast_CGLGetCurrentContext(NULL, 0);
+    if (!primary_proxy || !shared_proxy || primary_proxy == shared_proxy ||
+        [object_for_argument((uint32_t)shared_proxy) pointerValue] != shared_context) {
+        fputs("gl-buffer-selftest: context proxy did not follow context switch\n", stderr);
+        status = -1;
+        goto cleanup;
+    }
+
     /* A second buffer on the same target must retain the default TRUE. */
-    glBindBuffer(GL_ARRAY_BUFFER, buffers[1]);
+    fast_glBindBuffer((const uint32_t[]){GL_ARRAY_BUFFER, buffers[1]}, 0);
     glBufferData(GL_ARRAY_BUFFER, kTestSize, initial_b, GL_DYNAMIC_DRAW);
     objc_bridge32_dispatch("glMapBuffer", map_arguments, &dispatch_result);
     uint32_t second_mapping = (uint32_t)dispatch_result;
@@ -6996,18 +8609,87 @@ int objc_bridge32_run_gl_buffer_self_test(void)
         }
     }
 
+    /* Reallocation must invalidate cached size, even from a shared context. */
+    const uint32_t resize_arguments[] = {GL_ARRAY_BUFFER, 96, 0, GL_DYNAMIC_DRAW};
+    objc_bridge32_dispatch("glBufferData", resize_arguments, &dispatch_result);
+    const uint32_t resized_map[] = {GL_ARRAY_BUFFER, 0, 96,
+                                    GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT};
+    objc_bridge32_dispatch("glMapBufferRange", resized_map, &dispatch_result);
+    if (!dispatch_result) {
+        fputs("gl-buffer-selftest: cached size survived reallocation\n", stderr);
+        status = -1;
+        goto cleanup;
+    }
+    memset((void *)(uintptr_t)(uint32_t)dispatch_result, 0x69, 96);
+    objc_bridge32_dispatch("glUnmapBuffer", unmap_arguments, &dispatch_result);
+    unsigned char resized_actual[96];
+    glGetBufferSubData(GL_ARRAY_BUFFER, 0, 96, resized_actual);
+    for (size_t i = 0; i < sizeof(resized_actual); ++i) {
+        if (resized_actual[i] != 0x69) { status = -1; goto cleanup; }
+    }
+
+    /* Orphaning at the same size must keep maps usable. An invalid usage
+       must preserve both the old allocation and its cached size. */
+    objc_bridge32_dispatch("glBufferDataARB", resize_arguments, &dispatch_result);
+    objc_bridge32_dispatch("glMapBufferRange", resized_map, &dispatch_result);
+    if (!dispatch_result) { status = -1; goto cleanup; }
+    memset((void *)(uintptr_t)(uint32_t)dispatch_result, 0x87, 96);
+    objc_bridge32_dispatch("glUnmapBuffer", unmap_arguments, &dispatch_result);
+    while (glGetError() != GL_NO_ERROR) {}
+    const uint32_t invalid_usage[] = {GL_ARRAY_BUFFER, 96, 0, 0xffffffff};
+    objc_bridge32_dispatch("glBufferData", invalid_usage, &dispatch_result);
+    if (glGetError() != GL_INVALID_ENUM) { status = -1; goto cleanup; }
+    GLint retained_size = 0;
+    glGetBufferParameteriv(GL_ARRAY_BUFFER, GL_BUFFER_SIZE, &retained_size);
+    glGetBufferSubData(GL_ARRAY_BUFFER, 0, 96, resized_actual);
+    if (retained_size != 96) { status = -1; goto cleanup; }
+    for (size_t i = 0; i < sizeof(resized_actual); ++i) {
+        if (resized_actual[i] != 0x87) { status = -1; goto cleanup; }
+    }
+    /* A subsequent shrink still invalidates the previous larger size. */
+    const uint32_t shrink_arguments[] = {GL_ARRAY_BUFFER, 16, 0, GL_DYNAMIC_DRAW};
+    objc_bridge32_dispatch("glBufferData", shrink_arguments, &dispatch_result);
+    const uint32_t read_arguments[] = {GL_ARRAY_BUFFER, GL_READ_ONLY};
+    objc_bridge32_dispatch("glMapBuffer", read_arguments, &dispatch_result);
+    struct guest_buffer_mapping *shrunk = active_buffer_mapping(
+        shared_context, GL_ARRAY_BUFFER, buffers[1]);
+    if (!dispatch_result || !shrunk || shrunk->size != 16) {
+        fputs("gl-buffer-selftest: stale size after shrink\n", stderr);
+        status = -1;
+        goto cleanup;
+    }
+    objc_bridge32_dispatch("glUnmapBuffer", unmap_arguments, &dispatch_result);
+
+    if (test_large_mapped_buffer_upload()) {
+        status = -1;
+        goto cleanup;
+    }
+    if (test_mapped_buffer_draw_order()) {
+        status = -1;
+        goto cleanup;
+    }
+
 cleanup:
     {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
         CGLSetCurrentContext(context);
 #pragma clang diagnostic pop
+        if (fast_CGLGetCurrentContext(NULL, 0) != primary_proxy ||
+            bound_buffer_for_target(GL_ARRAY_BUFFER) != buffers[0]) {
+            fputs("gl-buffer-selftest: bindings leaked between contexts\n", stderr);
+            status = -1;
+        }
         uint32_t guest_buffers = compat_runtime32_allocate(sizeof(buffers), 0);
         if (guest_buffers) {
             memcpy((void *)(uintptr_t)guest_buffers, buffers, sizeof(buffers));
             const uint32_t delete_arguments[] = {2, guest_buffers};
             objc_bridge32_dispatch("glDeleteBuffers", delete_arguments,
                                    &dispatch_result);
+            if (bound_buffer_for_target(GL_ARRAY_BUFFER) != 0) {
+                fputs("gl-buffer-selftest: deleted binding remained cached\n", stderr);
+                status = -1;
+            }
             compat_runtime32_deallocate(guest_buffers);
         } else {
             glDeleteBuffers(2, buffers);
@@ -7017,11 +8699,14 @@ cleanup:
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     CGLSetCurrentContext(NULL);
+    if (fast_CGLGetCurrentContext(NULL, 0) != 0) status = -1;
+    forget_buffer_bindings(shared_context);
+    forget_buffer_bindings(context);
     CGLDestroyContext(shared_context);
     CGLDestroyContext(context);
 #pragma clang diagnostic pop
     if (status == 0) {
-        puts("gl-buffer-selftest: PASS (per-object Apple and core mapped-range staging)");
+        puts("gl-buffer-selftest: PASS (mapped ranges, large uploads, queued draws, context/binding caches, resize, orphan, allocation error and deletion)");
     }
     return status;
 }
@@ -7457,10 +9142,10 @@ int objc_bridge32_run_gl_texture_self_test(void)
             GLint maximum = -1;
             glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL,
                                 &maximum);
-            if (maximum != 5) {
+            if (maximum != (lp32_profile()->title == LP32_TITLE_PORTAL2 ? 6 : 5)) {
                 fprintf(stderr,
                         "gl-texture-selftest: incomplete chain was not "
-                        "clamped: max=%d expected=5\n", maximum);
+                        "following the title policy: max=%d\n", maximum);
                 status = -1;
             }
             glCompressedTexImage2D(
@@ -7504,10 +9189,10 @@ int objc_bridge32_run_gl_texture_self_test(void)
                 }
                 glGetTexParameteriv(GL_TEXTURE_CUBE_MAP,
                                     GL_TEXTURE_MAX_LEVEL, &maximum);
-                if (maximum != 5) {
+                if (maximum != (lp32_profile()->title == LP32_TITLE_PORTAL2 ? 6 : 5)) {
                     fprintf(stderr,
                             "gl-texture-selftest: incomplete cube chain was "
-                            "not clamped: max=%d expected=5\n", maximum);
+                            "not following the title policy: max=%d\n", maximum);
                     status = -1;
                 }
                 for (unsigned int face = 0; face < 5; ++face) {
@@ -7521,10 +9206,10 @@ int objc_bridge32_run_gl_texture_self_test(void)
                 }
                 glGetTexParameteriv(GL_TEXTURE_CUBE_MAP,
                                     GL_TEXTURE_MAX_LEVEL, &maximum);
-                if (maximum != 5) {
+                if (maximum != (lp32_profile()->title == LP32_TITLE_PORTAL2 ? 6 : 5)) {
                     fprintf(stderr,
                             "gl-texture-selftest: five-face cube level "
-                            "escaped clamp: max=%d expected=5\n", maximum);
+                            "violated the title policy: max=%d\n", maximum);
                     status = -1;
                 }
                 glCompressedTexImage2D(
@@ -7557,8 +9242,8 @@ int objc_bridge32_run_gl_texture_self_test(void)
     if (status == 0) {
         puts("gl-texture-selftest: PASS (DXT1/DXT5 direct and sliced "
              "uploads survive shared contexts and texture-name reuse; "
-             "3D image/subimage dispatch works; incomplete 2D/cubemap "
-             "ranges are clamped and restored)");
+             "3D image/subimage dispatch works; 2D/cubemap ranges "
+             "follow the title policy)");
     }
     return status;
 }

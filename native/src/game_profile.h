@@ -5,8 +5,7 @@
  * Per-title knowledge.  Everything the compatibility layer has to know about
  * a specific recovered game image (guest addresses of hooks and data slots,
  * product names, bundle layout) lives here, so the same loader binary can
- * serve every TT Games title built on this engine, whichever studio (Feral,
- * TransGaming) did the Mac port.  Fields set to
+ * serve the TT Games ports and Valve's Source engine. Fields set to
  * zero/NULL mean "this title does not need or does not have that patch".
  */
 
@@ -19,6 +18,7 @@ enum lp32_title {
     LP32_TITLE_UNKNOWN = 0,
     LP32_TITLE_PIRATES,
     LP32_TITLE_CLONE_WARS,
+    LP32_TITLE_PORTAL2,
 };
 
 /* Splash-dismiss repeat latch (see game_loader.c). */

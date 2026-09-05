@@ -10,6 +10,7 @@
 enum macho_import32_kind {
     MACHO_IMPORT32_POINTER,
     MACHO_IMPORT32_STUB,
+    MACHO_IMPORT32_FUNCTION_POINTER,
 };
 
 struct macho_import32 {

@@ -1,4 +1,5 @@
 #include "macho_loader.h"
+#include "macho_file.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -22,6 +23,8 @@
 struct source_file {
     const uint8_t *bytes;
     size_t size;
+    void *mapping;
+    size_t mapping_size;
 };
 
 /*
@@ -71,8 +74,13 @@ static int open_source(const char *path, struct source_file *source)
     errno = saved_errno;
     if (mapping == MAP_FAILED) return fail_errno("mmap recovered Mach-O");
 
-    source->bytes = mapping;
-    source->size = (size_t)status.st_size;
+    source->mapping = mapping;
+    source->mapping_size = (size_t)status.st_size;
+    if (macho_file32_slice(mapping, source->mapping_size,
+                           &source->bytes, &source->size) != 0) {
+        munmap(mapping, source->mapping_size);
+        return fail_message("file has no valid i386 Mach-O slice");
+    }
     return 0;
 }
 
@@ -285,7 +293,8 @@ static int collect_imports(struct macho_image32 *image)
                 if (type == S_NON_LAZY_SYMBOL_POINTERS ||
                     type == S_LAZY_SYMBOL_POINTERS) {
                     stride = sizeof(uint32_t);
-                    kind = MACHO_IMPORT32_POINTER;
+                    kind = type == S_LAZY_SYMBOL_POINTERS ?
+                        MACHO_IMPORT32_FUNCTION_POINTER : MACHO_IMPORT32_POINTER;
                 } else if (type == S_SYMBOL_STUBS && sections[section_index].reserved2) {
                     stride = sections[section_index].reserved2;
                     kind = MACHO_IMPORT32_STUB;
@@ -388,7 +397,7 @@ int macho_image32_load(const char *path, struct macho_image32 *image)
     if (result == 0) result = collect_imports(image);
 
     int saved_errno = errno;
-    munmap((void *)source.bytes, source.size);
+    munmap(source.mapping, source.mapping_size);
     errno = saved_errno;
     return result;
 }

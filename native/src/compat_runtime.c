@@ -1,7 +1,12 @@
 #include "compat_runtime.h"
+#include "wide_format.h"
 #include "audio_bridge.h"
 #include "controller_bridge.h"
 #include "game_profile.h"
+#include "guest_dyld.h"
+#include "guest_memory.h"
+#include "network_bridge.h"
+#include "font_bridge.h"
 #include "objc_bridge.h"
 #include "name_match.h"
 
@@ -13,27 +18,40 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <iconv.h>
 #include <i386/user_ldt.h>
 #include <limits.h>
+#include <locale.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <mach-o/dyld.h>
 #include <math.h>
 #include <pthread.h>
+#include <sched.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/file.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <wchar.h>
+#include <uuid/uuid.h>
 
 extern uint32_t run_compat32(uint32_t eip, uint32_t esp, uint16_t cs32);
 extern void lp32_import_gateway(void);
+extern const uint8_t lp32_context_start[], lp32_context_end[];
+extern const uint8_t lp32_context_setjmp[], lp32_context_fast_setjmp[], lp32_context_sigsetjmp[];
+extern const uint8_t lp32_context_longjmp[], lp32_context_fast_longjmp[];
+extern const uint8_t lp32_context_save_helper[], lp32_context_restore_helper[];
 
 uint16_t lp32_cs32;
 _Thread_local int lp32_leave_guest;
@@ -92,6 +110,42 @@ struct __attribute__((packed)) far_ptr32 {
 static struct macho_image32 *current_image;
 static _Thread_local int last_call_trapped;
 static uint32_t keymgr_slots[64];
+static pthread_t source_threads[256];
+static pthread_mutex_t source_thread_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t guest_sigchld_handler;
+static volatile sig_atomic_t guest_sigchld_pending;
+static iconv_t guest_converters[64];
+static pthread_mutex_t converter_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void defer_guest_sigchld(int signal_number)
+{
+    (void)signal_number;
+    guest_sigchld_pending = 1;
+}
+
+static uint32_t source_thread_handle(pthread_t thread)
+{
+    pthread_mutex_lock(&source_thread_lock);
+    unsigned empty = 0;
+    for (unsigned i = 1; i < 256; ++i) {
+        if (source_threads[i] && pthread_equal(source_threads[i], thread)) {
+            pthread_mutex_unlock(&source_thread_lock);
+            return i;
+        }
+        if (!source_threads[i] && !empty) empty = i;
+    }
+    if (empty) source_threads[empty] = thread;
+    pthread_mutex_unlock(&source_thread_lock);
+    return empty;
+}
+
+static pthread_t source_thread_for_handle(uint32_t handle)
+{
+    pthread_mutex_lock(&source_thread_lock);
+    pthread_t thread = handle < 256 ? source_threads[handle] : NULL;
+    pthread_mutex_unlock(&source_thread_lock);
+    return thread;
+}
 
 enum {
     kGuestHeapBase = 0x02000000,
@@ -267,6 +321,7 @@ enum {
 struct guest_file_entry {
     uint32_t handle;
     FILE *file;
+    int (*close)(FILE *);
 };
 
 static struct guest_file_entry guest_files[kGuestFileCapacity];
@@ -295,6 +350,9 @@ struct __attribute__((packed, aligned(4))) guest_dirent32 {
 
 _Static_assert(offsetof(struct guest_dirent32, d_name) == 8,
                "legacy Darwin i386 dirent layout");
+/* The ino64 record has fixed-width fields and the same layout on both ABIs. */
+_Static_assert(offsetof(struct dirent, d_name) == 21 && sizeof(struct dirent) == 1048,
+               "Darwin dirent$INODE64 layout");
 
 struct guest_directory_entry {
     uint32_t handle;
@@ -333,7 +391,7 @@ static uint32_t guest_cond_count;
 static uint32_t guest_cond_capacity;
 static uint64_t guest_sync_released_count;
 static pthread_mutex_t guest_sync_table_lock = PTHREAD_MUTEX_INITIALIZER;
-static char dynamic_symbol_names[kDynamicThunkCapacity][96];
+static char dynamic_symbol_names[kDynamicThunkCapacity][512];
 static uint32_t dynamic_symbol_count;
 
 /*
@@ -453,7 +511,7 @@ static void unlock_host_file(void)
     pthread_mutex_unlock(&guest_file_lock);
 }
 
-static uint32_t guest_handle_for_file(FILE *file)
+static uint32_t guest_handle_for_file_with_closer(FILE *file, int (*closer)(FILE *))
 {
     if (!file) return 0;
     pthread_mutex_lock(&guest_file_lock);
@@ -477,6 +535,7 @@ static uint32_t guest_handle_for_file(FILE *file)
                           index * kGuestFileHandleStride;
         entry->handle = handle;
         entry->file = file;
+        entry->close = closer;
         guest_file_next_index = (index + 1) % kGuestFileCapacity;
         ++guest_file_active_count;
         if (guest_file_active_count > guest_file_peak_count) {
@@ -494,7 +553,7 @@ static uint32_t guest_handle_for_file(FILE *file)
     /* Ownership transfers to this function even on exhaustion.  The former
        implementation leaked this FILE and its descriptor whenever its
        monotonic 1,024-entry table filled. */
-    fclose(file);
+    closer(file);
     errno = EMFILE;
     if (exhaustion == 1 || getenv("LP32_TRACE_FILES")) {
         fprintf(stderr,
@@ -503,6 +562,11 @@ static uint32_t guest_handle_for_file(FILE *file)
                 active, kGuestFileCapacity, exhaustion);
     }
     return 0;
+}
+
+static uint32_t guest_handle_for_file(FILE *file)
+{
+    return guest_handle_for_file_with_closer(file, fclose);
 }
 
 static int guest_close_file(uint32_t handle)
@@ -515,17 +579,32 @@ static int guest_close_file(uint32_t handle)
         return EOF;
     }
 
+    int (*closer)(FILE *) = fclose;
     if (handle != kGuestStdinHandle && handle != kGuestStdoutHandle &&
         handle != kGuestStderrHandle) {
         uint32_t index = ((handle - kGuestFileHandleBase) %
                           kGuestFileGenerationStride) /
                          kGuestFileHandleStride;
+        closer = guest_files[index].close;
         guest_files[index].file = NULL;
         if (guest_file_active_count) --guest_file_active_count;
     }
-    int result = fclose(file);
+    int result = closer(file);
     pthread_mutex_unlock(&guest_file_lock);
     return result;
+}
+
+static void copy_directory_entry(void *output, const struct dirent *host, bool ino64)
+{
+    if (ino64) { memcpy(output, host, sizeof(*host)); return; }
+    struct guest_dirent32 *guest = output;
+    size_t length = strnlen(host->d_name, sizeof(guest->d_name) - 1);
+    memset(guest, 0, sizeof(*guest));
+    guest->d_ino = (uint32_t)host->d_ino;
+    guest->d_reclen = (uint16_t)((offsetof(struct guest_dirent32, d_name) + length + 1 + 3) & ~3u);
+    guest->d_type = host->d_type;
+    guest->d_namlen = (uint8_t)length;
+    memcpy(guest->d_name, host->d_name, length);
 }
 
 static uint32_t guest_handle_for_directory(DIR *directory)
@@ -536,7 +615,7 @@ static uint32_t guest_handle_for_directory(DIR *directory)
         struct guest_directory_entry *entry = &guest_directories[index];
         if (entry->directory) continue;
         if (!entry->guest_dirent) {
-            entry->guest_dirent = guest_allocate(sizeof(struct guest_dirent32), true);
+            entry->guest_dirent = guest_allocate(sizeof(struct dirent), true);
             if (!entry->guest_dirent) break;
         }
         entry->handle = kGuestDirectoryHandleBase +
@@ -1123,7 +1202,7 @@ static int build_transition_bridge(void)
     emit_landing32(code + kLanding32AltOffset, 0);
 
     for (uint32_t index = 0; index < current_image->import_count; ++index) {
-        if (current_image->imports[index].kind != MACHO_IMPORT32_STUB) continue;
+        if (current_image->imports[index].kind == MACHO_IMPORT32_POINTER) continue;
         uint8_t *thunk = code + kImportThunksOffset + index * kImportThunkSize;
         /* push $import_index; ljmp *gateway_far_pointer */
         thunk[0] = 0x68;
@@ -1132,12 +1211,22 @@ static int build_transition_bridge(void)
         thunk[6] = 0x2d;
         emit_u32(thunk + 7, kBridgeCodeBase + kGatewayFarPointerOffset);
 
+        if (current_image->imports[index].kind == MACHO_IMPORT32_FUNCTION_POINTER) {
+            uint32_t *slot = (void *)(uintptr_t)current_image->imports[index].address;
+            *slot = (uint32_t)(uintptr_t)thunk;
+            continue;
+        }
         uint8_t *stub = (void *)(uintptr_t)current_image->imports[index].address;
         int64_t displacement = (int64_t)(uintptr_t)thunk -
                                ((int64_t)(uintptr_t)stub + 5);
         if (displacement < INT32_MIN || displacement > INT32_MAX) {
             errno = ERANGE;
             return runtime_error("i386 import thunk displacement");
+        }
+        uintptr_t page = (uintptr_t)stub & ~(uintptr_t)0xfff;
+        size_t span = (((uintptr_t)stub + 5 + 0xfff) & ~(uintptr_t)0xfff) - page;
+        if (mprotect((void *)page, span, PROT_READ | PROT_WRITE | PROT_EXEC)) {
+            return runtime_error("mprotect guest import stub");
         }
         stub[0] = 0xe9;
         emit_u32(stub + 1, (uint32_t)(int32_t)displacement);
@@ -1180,6 +1269,12 @@ static int build_transition_bridge(void)
         data_cells += 4;
     }
 
+    size_t context_size = (uintptr_t)lp32_context_end - (uintptr_t)lp32_context_start;
+    if (context_size > 0x1000) return runtime_error("guest context page overflow");
+    memcpy(code + 0xc000, lp32_context_start, context_size);
+    uint32_t helper = compat_runtime32_guest_callback("_lp32_context_signal_mask");
+    emit_u32(code + 0xc000 + (lp32_context_save_helper - lp32_context_start), helper);
+    emit_u32(code + 0xc000 + (lp32_context_restore_helper - lp32_context_start), helper);
     if (mprotect(code, kBridgeCodeSize, PROT_READ | PROT_EXEC) != 0) {
         return runtime_error("mprotect transition bridge");
     }
@@ -1188,12 +1283,22 @@ static int build_transition_bridge(void)
 
 static uint32_t guest_thunk_for_dynamic_symbol(const char *name)
 {
+    if (lp32_profile()->title == LP32_TITLE_PORTAL2) {
+        const uint8_t *entry = NULL;
+        if (!strcmp(name, "_setjmp")) entry = lp32_context_setjmp;
+        else if (!strcmp(name, "__setjmp")) entry = lp32_context_fast_setjmp;
+        else if (!strcmp(name, "_sigsetjmp")) entry = lp32_context_sigsetjmp;
+        else if (!strcmp(name, "_longjmp") || !strcmp(name, "_siglongjmp")) entry = lp32_context_longjmp;
+        else if (!strcmp(name, "__longjmp")) entry = lp32_context_fast_longjmp;
+        if (entry) return kBridgeCodeBase + 0xc000 + (uint32_t)(entry - lp32_context_start);
+    }
     for (uint32_t index = 0; index < dynamic_symbol_count; ++index) {
         if (strcmp(dynamic_symbol_names[index], name) == 0) {
             return kBridgeCodeBase + kDynamicThunksOffset + index * kImportThunkSize;
         }
     }
-    if (dynamic_symbol_count >= kDynamicThunkCapacity || strlen(name) >= 96) return 0;
+    if (dynamic_symbol_count >= kDynamicThunkCapacity ||
+        strlen(name) >= sizeof(dynamic_symbol_names[0])) return 0;
     uint32_t index = dynamic_symbol_count++;
     strcpy(dynamic_symbol_names[index], name);
     return kBridgeCodeBase + kDynamicThunksOffset + index * kImportThunkSize;
@@ -1202,6 +1307,51 @@ static uint32_t guest_thunk_for_dynamic_symbol(const char *name)
 uint32_t compat_runtime32_guest_callback(const char *name)
 {
     return guest_thunk_for_dynamic_symbol(name);
+}
+
+uint32_t compat_runtime32_resolve_symbol(const char *name, int data_hint)
+{
+    (void)data_hint;
+    if (!strcmp(name, "__DefaultRuneLocale")) {
+        /* Darwin's cached rune arrays are identical; the two obsolete function
+           pointers before them are 32-bit in the guest, so offsets differ. */
+        static uint32_t locale;
+        if (!locale) {
+            locale = compat_runtime32_allocate(3164, 1);
+            if (!locale) return 0;
+            uint8_t *bytes = (void *)(uintptr_t)locale;
+            memcpy(bytes, &_DefaultRuneLocale, 40);
+            memcpy(bytes + 52, _DefaultRuneLocale.__runetype, 1024);
+            memcpy(bytes + 1076, _DefaultRuneLocale.__maplower, 1024);
+            memcpy(bytes + 2100, _DefaultRuneLocale.__mapupper, 1024);
+        }
+        return locale;
+    }
+    uint32_t value = guest_standard_file_import(name);
+    if (!value) value = objc_bridge32_pointer_import(name);
+    bool data = value || !strcmp(name, "_errno") ||
+        !strcmp(name, "_mach_task_self_") || !strcmp(name, "_environ") ||
+        !strcmp(name, "___stack_chk_guard") || !strcmp(name, "___mb_cur_max") || !strcmp(name, "___CFConstantStringClassReference") ||
+        !strcmp(name, "_kCFAllocatorDefault") || !strcmp(name, "_kIOMasterPortDefault") ||
+        !strncmp(name, "__ZTV", 5) || !strncmp(name, "__ZTI", 5) ||
+        !strcmp(name, "__ZNSs4_Rep20_S_empty_rep_storageE") ||
+        !strncmp(name, ".objc_class_name_", 17);
+    if (!data) return guest_thunk_for_dynamic_symbol(name);
+    struct data_symbol { char *name; uint32_t address; };
+    static struct data_symbol cells[256];
+    static unsigned count;
+    for (unsigned i = 0; i < count; ++i) if (!strcmp(cells[i].name, name)) return cells[i].address;
+    if (count == sizeof(cells) / sizeof(cells[0])) return 0;
+    uint32_t address = compat_runtime32_allocate(128, 1);
+    char *copy = strdup(name);
+    if (!address || !copy) { free(copy); return 0; }
+    cells[count++] = (struct data_symbol){copy, address};
+    if (!strcmp(name, "_mach_task_self_")) value = mach_task_self();
+    if (!strcmp(name, "___stack_chk_guard")) value = UINT32_C(0x6b71329a);
+    if (!strcmp(name, "___mb_cur_max")) value = (uint32_t)MB_CUR_MAX;
+    *(uint32_t *)(uintptr_t)address = value;
+    if (!strcmp(name, "_errno")) guest_errno_address = address;
+    return address;
 }
 
 static bool ensure_cg_library(void)
@@ -2093,6 +2243,40 @@ struct __attribute__((packed, aligned(4))) guest_stat32 {
 
 _Static_assert(sizeof(struct guest_stat32) == 96, "Darwin i386 stat layout");
 
+struct __attribute__((packed, aligned(4))) guest_stat64_32 {
+    int32_t device;
+    uint16_t mode, links;
+    uint64_t inode;
+    uint32_t uid, gid;
+    int32_t rdevice;
+    int32_t accessed[2], modified[2], changed[2], born[2];
+    int64_t size, blocks;
+    int32_t block_size;
+    uint32_t flags, generation;
+    int32_t spare;
+    int64_t qspare[2];
+};
+_Static_assert(sizeof(struct guest_stat64_32) == 108, "Darwin i386 stat$INODE64 layout");
+
+static void copy_stat64_32(struct guest_stat64_32 *guest, const struct stat *host)
+{
+    memset(guest, 0, sizeof(*guest));
+    guest->device = host->st_dev; guest->mode = host->st_mode;
+    guest->links = host->st_nlink; guest->inode = host->st_ino;
+    guest->uid = host->st_uid; guest->gid = host->st_gid; guest->rdevice = host->st_rdev;
+    guest->accessed[0] = (int32_t)host->st_atimespec.tv_sec;
+    guest->accessed[1] = (int32_t)host->st_atimespec.tv_nsec;
+    guest->modified[0] = (int32_t)host->st_mtimespec.tv_sec;
+    guest->modified[1] = (int32_t)host->st_mtimespec.tv_nsec;
+    guest->changed[0] = (int32_t)host->st_ctimespec.tv_sec;
+    guest->changed[1] = (int32_t)host->st_ctimespec.tv_nsec;
+    guest->born[0] = (int32_t)host->st_birthtimespec.tv_sec;
+    guest->born[1] = (int32_t)host->st_birthtimespec.tv_nsec;
+    guest->size = host->st_size; guest->blocks = host->st_blocks;
+    guest->block_size = host->st_blksize; guest->flags = host->st_flags;
+    guest->generation = host->st_gen;
+}
+
 /* Darwin's legacy i386 ABI uses four-byte longs and pointers in struct tm.
    The current host structure has eight-byte tm_gmtoff and tm_zone fields. */
 struct __attribute__((packed, aligned(4))) guest_tm32 {
@@ -2119,6 +2303,15 @@ _Static_assert(sizeof(struct guest_tm32) == 44,
 _Static_assert(sizeof(struct guest_timeval32) == 8,
                "Darwin i386 timeval layout");
 
+static struct tm copy_guest_tm_to_host(const struct guest_tm32 *guest)
+{
+    return (struct tm){.tm_sec = guest->tm_sec, .tm_min = guest->tm_min,
+        .tm_hour = guest->tm_hour, .tm_mday = guest->tm_mday, .tm_mon = guest->tm_mon,
+        .tm_year = guest->tm_year, .tm_wday = guest->tm_wday, .tm_yday = guest->tm_yday,
+        .tm_isdst = guest->tm_isdst, .tm_gmtoff = guest->tm_gmtoff,
+        .tm_zone = (char *)(uintptr_t)guest->tm_zone};
+}
+
 static uint32_t copy_host_tm_to_guest(const struct tm *host,
                                       struct guest_tm32 *guest)
 {
@@ -2135,11 +2328,10 @@ static uint32_t copy_host_tm_to_guest(const struct tm *host,
     guest->tm_isdst = host->tm_isdst;
     guest->tm_gmtoff = (int32_t)host->tm_gmtoff;
     if (host->tm_zone) {
-        size_t size = strlen(host->tm_zone) + 1;
-        guest->tm_zone = guest_allocate(size, false);
-        if (guest->tm_zone) {
-            memcpy((void *)(uintptr_t)guest->tm_zone, host->tm_zone, size);
-        }
+        static _Thread_local uint32_t cached_zone;
+        if (!cached_zone || strcmp((const char *)(uintptr_t)cached_zone, host->tm_zone))
+            cached_zone = compat_runtime32_copy_cstring(host->tm_zone);
+        guest->tm_zone = cached_zone;
     }
     return (uint32_t)(uintptr_t)guest;
 }
@@ -2626,6 +2818,9 @@ static uint64_t return_guest_double(double value)
     return 0;
 }
 
+uint64_t compat_runtime32_return_float(float value) { return return_guest_float(value); }
+uint64_t compat_runtime32_return_double(double value) { return return_guest_double(value); }
+
 static void *run_guest_thread(void *opaque)
 {
     struct guest_thread_context context = *(struct guest_thread_context *)opaque;
@@ -2633,6 +2828,10 @@ static void *run_guest_thread(void *opaque)
     if (getenv("LP32_TRACE_THREADS")) {
         uint64_t thread_id = 0;
         pthread_threadid_np(NULL, &thread_id);
+        if (lp32_profile()->title == LP32_TITLE_PORTAL2) {
+            fprintf(stderr, "compat32: guest thread tid=%llu entry=0x%08x argument=0x%08x\n",
+                    (unsigned long long)thread_id, context.function, context.argument);
+        } else {
         uint32_t record = *(uint32_t *)(uintptr_t)context.argument;
         fprintf(stderr,
                 "compat32: guest thread tid=%llu entry=0x%08x record=0x%08x "
@@ -2640,6 +2839,7 @@ static void *run_guest_thread(void *opaque)
                 (unsigned long long)thread_id, context.function, record,
                 record ? *(uint32_t *)(uintptr_t)record : 0,
                 record ? (const char *)(uintptr_t)(record + 8) : "");
+        }
     }
     uint32_t result = compat_runtime32_call(context.function, &context.argument, 1);
     if (getenv("LP32_TRACE_THREADS")) {
@@ -2830,9 +3030,31 @@ static uint64_t dispatch_import_chained(uint32_t import_id, const char *name,
     return result;
 }
 
+/* Source was built with Clang's i386 ABI: the callee pops the hidden
+   objc_msgSend_stret result pointer. The older LEGO callers clean it up. */
+uint32_t *lp32_adjust_import_stack(uint32_t *stack)
+{
+    const char *name = import_name_for_id(stack[0]);
+    if (lp32_profile()->title == LP32_TITLE_PORTAL2 &&
+        (!strcmp(name, "_objc_msgSend_stret") || !strcmp(name, "_CGDisplayBounds"))) {
+        stack[2] = stack[1];
+        return stack + 1;
+    }
+    return stack;
+}
+
 uint64_t lp32_dispatch_import(uint32_t import_id, const uint32_t *arguments,
                               uint32_t return_address)
 {
+    /* Never mode-switch, allocate, or lock from an asynchronous native signal
+       handler. Deliver SIGCHLD when the guest next crosses the bridge. */
+    if (guest_sigchld_pending && __atomic_exchange_n(&guest_sigchld_pending, 0, __ATOMIC_RELAXED)) {
+        uint32_t handler = __atomic_load_n(&guest_sigchld_handler, __ATOMIC_RELAXED);
+        if (handler > 1) {
+            uint32_t signal_number = SIGCHLD;
+            compat_runtime32_call(handler, &signal_number, 1);
+        }
+    }
     lp32_fast_import_fn *fast_slot = fast_import_slot(import_id);
     lp32_fast_import_fn fast = fast_slot ? *fast_slot : NULL;
     if (!compat_runtime32_frame_profile_enabled) {
@@ -3091,8 +3313,498 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
                                       const uint32_t *arguments,
                                       uint32_t return_address)
 {
+    char unix_name[512];
+    const char *unix_suffix = strstr(name, "$UNIX2003");
+    if (unix_suffix && !unix_suffix[9] && (size_t)(unix_suffix - name) < sizeof(unix_name)) {
+        size_t length = (size_t)(unix_suffix - name);
+        memcpy(unix_name, name, length);
+        unix_name[length] = 0;
+        name = unix_name;
+    }
     dispatch_name_length = strlen(name);
     dispatch_name_matched = false;
+    uint64_t network_result;
+    if (network_bridge32_dispatch(name, arguments, &network_result)) return network_result;
+    if (font_bridge32_dispatch(name, arguments, &network_result)) return network_result;
+    if (import_is(name, "_NewPtr")) return guest_allocate(arguments[0], false);
+    if (import_is(name, "_DisposePtr")) { guest_deallocate(arguments[0]); return 0; }
+    if (import_is(name, "_MPCreateCriticalRegion")) {
+        uint32_t handle = guest_allocate(4, true);
+        if (!handle || !host_mutex_for_guest(handle, true)) {
+            if (handle) guest_deallocate(handle);
+            return (uint32_t)-108;
+        }
+        *(uint32_t *)(uintptr_t)arguments[0] = handle; return 0;
+    }
+    if (import_is(name, "_MPDeleteCriticalRegion")) {
+        uint32_t status = guest_mutex_destroy(arguments[0]);
+        if (!status) guest_deallocate(arguments[0]);
+        return status ? (uint32_t)-50 : 0;
+    }
+    if (import_is(name, "_MPEnterCriticalRegion") || import_is(name, "_MPExitCriticalRegion")) {
+        pthread_mutex_t *mutex = host_mutex_for_guest(arguments[0], false);
+        if (!mutex) return (uint32_t)-50;
+        if (import_is(name, "_MPExitCriticalRegion")) return pthread_mutex_unlock(mutex) ? (uint32_t)-50 : 0;
+        int32_t duration = (int32_t)arguments[1];
+        if (duration == INT32_MAX) return pthread_mutex_lock(mutex) ? (uint32_t)-50 : 0;
+        uint64_t wait_ns = duration < 0 ? (uint64_t)-(int64_t)duration * 1000 : (uint64_t)duration * 1000000;
+        struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+        uint64_t end = (uint64_t)now.tv_sec * 1000000000 + now.tv_nsec + wait_ns;
+        for (;;) {
+            int status = pthread_mutex_trylock(mutex);
+            if (!status) return 0;
+            if (status != EBUSY) return (uint32_t)-50;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            uint64_t current = (uint64_t)now.tv_sec * 1000000000 + now.tv_nsec;
+            if (current >= end) return (uint32_t)-29296; /* kMPTimeoutErr */
+            struct timespec pause = {0, (long)(end - current < 1000000 ? end - current : 1000000)};
+            nanosleep(&pause, NULL);
+        }
+    }
+    if (import_is(name, "_NSIsSymbolNameDefined") || import_is(name, "_NSLookupAndBindSymbol")) {
+        const char *symbol = (const char *)(uintptr_t)arguments[0];
+        if (symbol && *symbol == '_') ++symbol;
+        uint32_t address = guest_dyld32_symbol((uint32_t)(uintptr_t)RTLD_DEFAULT, symbol);
+        if (!address) (void)guest_dyld32_error();
+        return import_is(name, "_NSIsSymbolNameDefined") ? address != 0 : address;
+    }
+    if (import_is(name, "_NSAddressOfSymbol")) return arguments[0];
+    if (import_is(name, "_NSModuleForSymbol")) return guest_dyld32_symbol_module(arguments[0]);
+    if (import_is(name, "_NSLibraryNameForModule")) return guest_dyld32_module_name(arguments[0]);
+    if (import_is(name, "_uuid_generate")) { uuid_generate((void *)(uintptr_t)arguments[0]); return 0; }
+    if (import_is(name, "_malloc_size")) {
+        uint32_t mapped_size = guest_memory32_size(arguments[0]);
+        if (mapped_size) return mapped_size;
+        pthread_mutex_lock(&guest_heap_lock);
+        uint32_t *metadata = NULL;
+        uint32_t size = guest_heap_validate_header_locked(arguments[0], &metadata, NULL) ? metadata[0] : 0;
+        pthread_mutex_unlock(&guest_heap_lock);
+        return size;
+    }
+    if (import_is(name, "_uuid_parse")) return (uint32_t)uuid_parse((const char *)(uintptr_t)arguments[0], (void *)(uintptr_t)arguments[1]);
+    if (import_is(name, "_uuid_unparse")) { uuid_unparse((const void *)(uintptr_t)arguments[0], (void *)(uintptr_t)arguments[1]); return 0; }
+    if (import_is(name, "_mmap")) {
+        int64_t offset = (int64_t)((uint64_t)arguments[5] | (uint64_t)arguments[6] << 32);
+        return guest_memory32_map(arguments[0], arguments[1], (int)arguments[2], (int)arguments[3], (int)arguments[4], offset);
+    }
+    if (import_is(name, "_munmap")) return (uint32_t)guest_memory32_unmap(arguments[0], arguments[1]);
+    if (import_is(name, "_mprotect")) return (uint32_t)guest_memory32_protect(arguments[0], arguments[1], (int)arguments[2]);
+    if (import_is(name, "_madvise")) return (uint32_t)guest_memory32_advise(arguments[0], arguments[1], (int)arguments[2]);
+    if (import_is(name, "_msync")) return (uint32_t)guest_memory32_sync(arguments[0], arguments[1], (int)arguments[2]);
+    if (import_is(name, "_OSMemoryBarrier")) { __atomic_thread_fence(__ATOMIC_SEQ_CST); return 0; }
+    if (import_is(name, "_iconv_open")) {
+        iconv_t converter = iconv_open((const char *)(uintptr_t)arguments[0], (const char *)(uintptr_t)arguments[1]);
+        if (converter == (iconv_t)-1) return UINT32_MAX;
+        pthread_mutex_lock(&converter_lock);
+        for (unsigned i = 0; i < 64; ++i) if (!guest_converters[i]) {
+            guest_converters[i] = converter;
+            pthread_mutex_unlock(&converter_lock);
+            return UINT32_C(0xffc00000) + i;
+        }
+        pthread_mutex_unlock(&converter_lock);
+        iconv_close(converter);
+        errno = EMFILE;
+        return UINT32_MAX;
+    }
+    if (import_is(name, "_iconv") || import_is(name, "_iconv_close")) {
+        unsigned index = arguments[0] - UINT32_C(0xffc00000);
+        pthread_mutex_lock(&converter_lock);
+        if (index >= 64 || !guest_converters[index]) {
+            pthread_mutex_unlock(&converter_lock);
+            errno = EBADF;
+            return UINT32_MAX;
+        }
+        uint32_t result;
+        if (import_is(name, "_iconv_close")) {
+            result = (uint32_t)iconv_close(guest_converters[index]);
+            guest_converters[index] = NULL;
+        } else {
+            uint32_t *in_ptr = (void *)(uintptr_t)arguments[1], *in_size = (void *)(uintptr_t)arguments[2];
+            uint32_t *out_ptr = (void *)(uintptr_t)arguments[3], *out_size = (void *)(uintptr_t)arguments[4];
+            char *in = in_ptr ? (char *)(uintptr_t)*in_ptr : NULL;
+            char *out = out_ptr ? (char *)(uintptr_t)*out_ptr : NULL;
+            size_t in_left = in_size ? *in_size : 0, out_left = out_size ? *out_size : 0;
+            result = (uint32_t)iconv(guest_converters[index], in_ptr ? &in : NULL, in_size ? &in_left : NULL,
+                                    out_ptr ? &out : NULL, out_size ? &out_left : NULL);
+            if (in_ptr) *in_ptr = (uint32_t)(uintptr_t)in;
+            if (out_ptr) *out_ptr = (uint32_t)(uintptr_t)out;
+            if (in_size) *in_size = (uint32_t)in_left;
+            if (out_size) *out_size = (uint32_t)out_left;
+        }
+        pthread_mutex_unlock(&converter_lock);
+        return result;
+    }
+    if (import_is(name, "_raise")) return (uint32_t)raise((int)arguments[0]);
+    if (import_is(name, "_sigaction")) {
+        const uint32_t *action = (const void *)(uintptr_t)arguments[1];
+        uint32_t *old_action = (void *)(uintptr_t)arguments[2];
+        struct sigaction native = {0}, old_native = {0};
+        uint32_t previous = __atomic_load_n(&guest_sigchld_handler, __ATOMIC_RELAXED);
+        if (action) {
+            if (action[0] > 1 && (arguments[0] != SIGCHLD || (action[2] & SA_SIGINFO))) {
+                errno = ENOTSUP;
+                return (uint32_t)-1;
+            }
+            native.sa_handler = action[0] > 1 ? defer_guest_sigchld : (void (*)(int))(uintptr_t)action[0];
+            native.sa_mask = action[1]; native.sa_flags = (int)action[2];
+        }
+        int result = sigaction((int)arguments[0], action ? &native : NULL, &old_native);
+        if (!result) {
+            if (old_action) {
+                old_action[0] = old_native.sa_handler == defer_guest_sigchld ? previous :
+                    old_native.sa_handler == SIG_IGN ? 1 : 0;
+                old_action[1] = old_native.sa_mask; old_action[2] = (uint32_t)old_native.sa_flags;
+            }
+            if (action && arguments[0] == SIGCHLD) __atomic_store_n(&guest_sigchld_handler, action[0], __ATOMIC_RELAXED);
+        }
+        return (uint32_t)result;
+    }
+    if (import_is(name, "_sigprocmask")) return (uint32_t)sigprocmask((int)arguments[0], (const sigset_t *)(uintptr_t)arguments[1], (sigset_t *)(uintptr_t)arguments[2]);
+    if (import_is(name, "_wait")) return (uint32_t)wait((int *)(uintptr_t)arguments[0]);
+    if (import_is(name, "_waitpid")) return (uint32_t)waitpid((pid_t)arguments[0], (int *)(uintptr_t)arguments[1], (int)arguments[2]);
+    if (import_is(name, "_alphasort")) {
+        const uint32_t *left = (const void *)(uintptr_t)arguments[0];
+        const uint32_t *right = (const void *)(uintptr_t)arguments[1];
+        const struct guest_dirent32 *a = (const void *)(uintptr_t)*left;
+        const struct guest_dirent32 *b = (const void *)(uintptr_t)*right;
+        return (uint32_t)strcoll(a->d_name, b->d_name);
+    }
+    if (import_is(name, "_scandir")) {
+        struct dirent **entries = NULL;
+        int count = scandir((const char *)(uintptr_t)arguments[0], &entries, NULL, NULL);
+        if (count < 0) return (uint32_t)-1;
+        uint32_t array = count ? guest_allocate((size_t)count * 4, true) : 0;
+        uint32_t *out = (void *)(uintptr_t)array;
+        unsigned used = 0;
+        bool ok = !count || array;
+        for (int i = 0; i < count; ++i) {
+            if (ok) {
+                uint32_t pointer = guest_allocate(sizeof(struct guest_dirent32), true);
+                if (!pointer) ok = false;
+                else {
+                    struct guest_dirent32 *entry = (void *)(uintptr_t)pointer;
+                    entry->d_ino = (uint32_t)entries[i]->d_ino;
+                    entry->d_type = entries[i]->d_type;
+                    size_t length = strnlen(entries[i]->d_name, 255);
+                    entry->d_namlen = (uint8_t)length;
+                    entry->d_reclen = (uint16_t)((8 + length + 1 + 3) & ~(size_t)3);
+                    memcpy(entry->d_name, entries[i]->d_name, length);
+                    uint32_t keep = arguments[2] ? compat_runtime32_call(arguments[2], &pointer, 1) : 1;
+                    if (arguments[2] && compat_runtime32_last_call_trapped()) ok = false;
+                    if (ok && keep) out[used++] = pointer;
+                    else compat_runtime32_deallocate(pointer);
+                }
+            }
+            free(entries[i]);
+        }
+        free(entries);
+        if (!ok) {
+            for (unsigned i = 0; i < used; ++i) compat_runtime32_deallocate(out[i]);
+            if (array) compat_runtime32_deallocate(array);
+            errno = ENOMEM;
+            return (uint32_t)-1;
+        }
+        if (arguments[3]) guest_qsort((void *)(uintptr_t)array, used, 4, arguments[3]);
+        *(uint32_t *)(uintptr_t)arguments[1] = array;
+        return used;
+    }
+    if (import_is(name, "_semaphore_create")) return (uint32_t)semaphore_create(arguments[0], (semaphore_t *)(uintptr_t)arguments[1], (int)arguments[2], (int)arguments[3]);
+    if (import_is(name, "_semaphore_destroy")) return (uint32_t)semaphore_destroy(arguments[0], arguments[1]);
+    if (import_is(name, "_semaphore_wait")) return (uint32_t)semaphore_wait(arguments[0]);
+    if (import_is(name, "_semaphore_signal")) return (uint32_t)semaphore_signal(arguments[0]);
+    if (import_is(name, "_semaphore_signal_all")) return (uint32_t)semaphore_signal_all(arguments[0]);
+    if (import_is(name, "_semaphore_timedwait")) {
+        mach_timespec_t limit = {arguments[1], (clock_res_t)arguments[2]};
+        return (uint32_t)semaphore_timedwait(arguments[0], limit);
+    }
+    if (import_is(name, "_stat$INODE64") || import_is(name, "_stat64") ||
+        import_is(name, "_lstat$INODE64") || import_is(name, "_lstat64") ||
+        import_is(name, "_fstat$INODE64") || import_is(name, "_fstat64")) {
+        struct stat host;
+        int result = (import_is(name, "_fstat$INODE64") || import_is(name, "_fstat64")) ? fstat((int)arguments[0], &host) :
+            (import_is(name, "_lstat$INODE64") || import_is(name, "_lstat64")) ? lstat((const char *)(uintptr_t)arguments[0], &host) :
+            stat((const char *)(uintptr_t)arguments[0], &host);
+        if (!result) copy_stat64_32((void *)(uintptr_t)arguments[1], &host);
+        return (uint32_t)result;
+    }
+    if (import_is(name, "_lseek")) {
+        int64_t offset = (int64_t)((uint64_t)arguments[1] | (uint64_t)arguments[2] << 32);
+        return (uint64_t)lseek((int)arguments[0], offset, (int)arguments[3]);
+    }
+    if (import_is(name, "_fdopen")) {
+        return guest_handle_for_file(fdopen((int)arguments[0], (const char *)(uintptr_t)arguments[1]));
+    }
+    if (import_is(name, "_popen")) {
+        return guest_handle_for_file_with_closer(popen((const char *)(uintptr_t)arguments[0],
+            (const char *)(uintptr_t)arguments[1]), pclose);
+    }
+    if (import_is(name, "_pclose")) return (uint32_t)guest_close_file(arguments[0]);
+    if (import_is(name, "_fseeko") || import_is(name, "_ftello") ||
+        import_is(name, "_fgetpos") || import_is(name, "_fsetpos")) {
+        FILE *file = lock_host_file_for_guest(arguments[0]);
+        if (!file) return UINT64_MAX;
+        uint64_t result;
+        if (import_is(name, "_fseeko")) {
+            int64_t offset = (int64_t)((uint64_t)arguments[1] | (uint64_t)arguments[2] << 32);
+            result = (uint32_t)fseeko(file, offset, (int)arguments[3]);
+        } else if (import_is(name, "_ftello")) result = (uint64_t)ftello(file);
+        else if (import_is(name, "_fgetpos")) result = (uint32_t)fgetpos(file, (fpos_t *)(uintptr_t)arguments[1]);
+        else result = (uint32_t)fsetpos(file, (const fpos_t *)(uintptr_t)arguments[1]);
+        unlock_host_file();
+        return result;
+    }
+    if (import_is(name, "_setvbuf")) {
+        FILE *file = lock_host_file_for_guest(arguments[0]);
+        if (!file) return (uint32_t)-1;
+        int result = setvbuf(file, (char *)(uintptr_t)arguments[1], (int)arguments[2], arguments[3]);
+        unlock_host_file();
+        return (uint32_t)result;
+    }
+    if (import_is(name, "_wctob")) return (uint32_t)wctob(arguments[0]);
+    if (import_is(name, "_btowc")) return (uint32_t)btowc((int)arguments[0]);
+    if (import_is(name, "___tolower")) return (uint32_t)tolower((int)arguments[0]);
+    if (import_is(name, "___toupper")) return (uint32_t)toupper((int)arguments[0]);
+    if (import_is(name, "___maskrune")) return (uint32_t)__maskrune((int)arguments[0], arguments[1]);
+    if (import_is(name, "_setlocale")) {
+        const char *result = setlocale((int)arguments[0], (const char *)(uintptr_t)arguments[1]);
+        return result ? compat_runtime32_copy_cstring(result) : 0;
+    }
+    if (import_is(name, "_wcslen")) return (uint32_t)wcslen((const wchar_t *)(uintptr_t)arguments[0]);
+    if (import_is(name, "_mbstowcs")) return (uint32_t)mbstowcs((wchar_t *)(uintptr_t)arguments[0], (const char *)(uintptr_t)arguments[1], arguments[2]);
+    if (import_is(name, "_wcstombs")) return (uint32_t)wcstombs((char *)(uintptr_t)arguments[0], (const wchar_t *)(uintptr_t)arguments[1], arguments[2]);
+    if (import_is(name, "_wcscpy")) return (uint32_t)(uintptr_t)wcscpy((wchar_t *)(uintptr_t)arguments[0], (const wchar_t *)(uintptr_t)arguments[1]);
+    if (import_is(name, "_wcsncpy")) return (uint32_t)(uintptr_t)wcsncpy((wchar_t *)(uintptr_t)arguments[0], (const wchar_t *)(uintptr_t)arguments[1], arguments[2]);
+    if (import_is(name, "_wcscat")) return (uint32_t)(uintptr_t)wcscat((wchar_t *)(uintptr_t)arguments[0], (const wchar_t *)(uintptr_t)arguments[1]);
+    if (import_is(name, "_wcscmp")) return (uint32_t)wcscmp((const wchar_t *)(uintptr_t)arguments[0], (const wchar_t *)(uintptr_t)arguments[1]);
+    if (import_is(name, "_wcsncmp")) return (uint32_t)wcsncmp((const wchar_t *)(uintptr_t)arguments[0], (const wchar_t *)(uintptr_t)arguments[1], arguments[2]);
+    if (import_is(name, "_wcschr")) return (uint32_t)(uintptr_t)wcschr((const wchar_t *)(uintptr_t)arguments[0], (wchar_t)arguments[1]);
+    if (import_is(name, "_wmemcpy") || import_is(name, "_wmemmove") || import_is(name, "_wmemset")) {
+        wchar_t *out = (void *)(uintptr_t)arguments[0];
+        if (import_is(name, "_wmemcpy")) wmemcpy(out, (const wchar_t *)(uintptr_t)arguments[1], arguments[2]);
+        else if (import_is(name, "_wmemmove")) wmemmove(out, (const wchar_t *)(uintptr_t)arguments[1], arguments[2]);
+        else wmemset(out, (wchar_t)arguments[1], arguments[2]);
+        return arguments[0];
+    }
+    if (import_is(name, "_wmemcmp")) return (uint32_t)wmemcmp((const wchar_t *)(uintptr_t)arguments[0], (const wchar_t *)(uintptr_t)arguments[1], arguments[2]);
+    if (import_is(name, "_wmemchr")) return (uint32_t)(uintptr_t)wmemchr((const wchar_t *)(uintptr_t)arguments[0], (wchar_t)arguments[1], arguments[2]);
+    if (import_is(name, "_mbrtowc")) return (uint32_t)mbrtowc((wchar_t *)(uintptr_t)arguments[0], (const char *)(uintptr_t)arguments[1], arguments[2], (mbstate_t *)(uintptr_t)arguments[3]);
+    if (import_is(name, "_wcrtomb")) return (uint32_t)wcrtomb((char *)(uintptr_t)arguments[0], (wchar_t)arguments[1], (mbstate_t *)(uintptr_t)arguments[2]);
+    if (import_is(name, "_fileno") || import_is(name, "_getc") || import_is(name, "_getwc")) {
+        FILE *file = lock_host_file_for_guest(arguments[0]);
+        if (!file) return (uint32_t)EOF;
+        uint32_t result = import_is(name, "_fileno") ? (uint32_t)fileno(file) :
+            import_is(name, "_getc") ? (uint32_t)getc(file) : (uint32_t)getwc(file);
+        unlock_host_file();
+        return result;
+    }
+    if (import_is(name, "_fputs") || import_is(name, "_putc") || import_is(name, "_ungetc") ||
+        import_is(name, "_putwc") || import_is(name, "_ungetwc")) {
+        FILE *file = lock_host_file_for_guest(arguments[1]);
+        if (!file) return (uint32_t)EOF;
+        uint32_t result = import_is(name, "_fputs") ? (uint32_t)fputs((const char *)(uintptr_t)arguments[0], file) :
+            import_is(name, "_putc") ? (uint32_t)putc((int)arguments[0], file) :
+            import_is(name, "_ungetc") ? (uint32_t)ungetc((int)arguments[0], file) :
+            import_is(name, "_putwc") ? (uint32_t)putwc(arguments[0], file) : (uint32_t)ungetwc(arguments[0], file);
+        unlock_host_file();
+        return result;
+    }
+    if (import_is(name, "___fixunsdfdi") || import_is(name, "___fixunssfdi")) {
+        double value = import_is(name, "___fixunssfdi") ? guest_float(arguments[0]) : guest_double(arguments);
+        return !(value > 0) ? 0 : value >= 18446744073709551616.0 ? UINT64_MAX : (uint64_t)value;
+    }
+    if (import_is(name, "_getenv")) {
+        const char *value = getenv((const char *)(uintptr_t)arguments[0]);
+        return value ? compat_runtime32_copy_cstring(value) : 0;
+    }
+    if (import_is(name, "_setenv")) {
+        return (uint32_t)setenv((const char *)(uintptr_t)arguments[0],
+                               (const char *)(uintptr_t)arguments[1], (int)arguments[2]);
+    }
+    if (import_is(name, "_getcwd")) {
+        char buffer[PATH_MAX];
+        char *result = getcwd(arguments[0] ? (char *)(uintptr_t)arguments[0] : buffer,
+                             arguments[0] ? arguments[1] : sizeof(buffer));
+        return result ? (arguments[0] ? arguments[0] : compat_runtime32_copy_cstring(result)) : 0;
+    }
+    if (import_is(name, "__NSGetExecutablePath") && lp32_profile()->title == LP32_TITLE_PORTAL2) {
+        char path[PATH_MAX];
+        int n = snprintf(path, sizeof(path), "%s/portal2_osx", guest_dyld32_game_root());
+        uint32_t *size = (void *)(uintptr_t)arguments[1];
+        if (n < 0 || !size) return (uint32_t)-1;
+        if (*size <= (uint32_t)n) { *size = (uint32_t)n + 1; return (uint32_t)-1; }
+        memcpy((void *)(uintptr_t)arguments[0], path, (size_t)n + 1);
+        return 0;
+    }
+    if (import_is(name, "_lp32_context_signal_mask")) {
+        sigset_t *mask = (void *)(uintptr_t)(arguments[0] + 32);
+        return (uint32_t)(arguments[1] ? pthread_sigmask(SIG_SETMASK, mask, NULL) : pthread_sigmask(SIG_SETMASK, NULL, mask));
+    }
+    if (import_is(name, "_getrusage")) {
+        if (!arguments[1]) { errno = EFAULT; return (uint32_t)-1; }
+        struct rusage usage;
+        int status = getrusage((int)arguments[0], &usage);
+        if (!status) {
+            int32_t values[18] = {(int32_t)usage.ru_utime.tv_sec, usage.ru_utime.tv_usec,
+                (int32_t)usage.ru_stime.tv_sec, usage.ru_stime.tv_usec,
+                (int32_t)usage.ru_maxrss, (int32_t)usage.ru_ixrss, (int32_t)usage.ru_idrss,
+                (int32_t)usage.ru_isrss, (int32_t)usage.ru_minflt, (int32_t)usage.ru_majflt,
+                (int32_t)usage.ru_nswap, (int32_t)usage.ru_inblock, (int32_t)usage.ru_oublock,
+                (int32_t)usage.ru_msgsnd, (int32_t)usage.ru_msgrcv, (int32_t)usage.ru_nsignals,
+                (int32_t)usage.ru_nvcsw, (int32_t)usage.ru_nivcsw};
+            memcpy((void *)(uintptr_t)arguments[1], values, sizeof(values));
+        }
+        return (uint32_t)status;
+    }
+    if (import_is(name, "_getpid")) return (uint32_t)getpid();
+    if (import_is(name, "_getuid")) return (uint32_t)getuid();
+    if (import_is(name, "_geteuid")) return (uint32_t)geteuid();
+    if (import_is(name, "_getgid")) return (uint32_t)getgid();
+    if (import_is(name, "_getegid")) return (uint32_t)getegid();
+    if (import_is(name, "_getpagesize")) return (uint32_t)getpagesize();
+    if (import_is(name, "_sysconf")) return (uint32_t)sysconf((int)arguments[0]);
+    if (import_is(name, "_mkdtemp")) return (uint32_t)(uintptr_t)mkdtemp((char *)(uintptr_t)arguments[0]);
+    if (import_is(name, "_mkstemp")) return (uint32_t)mkstemp((char *)(uintptr_t)arguments[0]);
+    if (import_is(name, "_mkstemps")) return (uint32_t)mkstemps((char *)(uintptr_t)arguments[0], (int)arguments[1]);
+    if (import_is(name, "_sysctl")) {
+        uint32_t *guest_size = (void *)(uintptr_t)arguments[3];
+        size_t size = guest_size ? *guest_size : 0;
+        int result = sysctl((int *)(uintptr_t)arguments[0], arguments[1],
+                           (void *)(uintptr_t)arguments[2], guest_size ? &size : NULL,
+                           (void *)(uintptr_t)arguments[4], arguments[5]);
+        if (guest_size) *guest_size = (uint32_t)size;
+        return (uint32_t)result;
+    }
+    if (import_is(name, "_dladdr")) {
+        uint32_t offset = 0;
+        const char *path = guest_dyld32_describe(arguments[0], &offset);
+        uint32_t *info = (void *)(uintptr_t)arguments[1];
+        if (!path || !info) return 0;
+        info[0] = compat_runtime32_copy_cstring(path);
+        info[1] = arguments[0] - offset;
+        info[2] = info[3] = 0;
+        return 1;
+    }
+    if (import_is(name, "_access")) return (uint32_t)access((const char *)(uintptr_t)arguments[0], (int)arguments[1]);
+    if (import_is(name, "_open")) return (uint32_t)open((const char *)(uintptr_t)arguments[0], (int)arguments[1], (mode_t)arguments[2]);
+    if (import_is(name, "_close")) return (uint32_t)close((int)arguments[0]);
+    if (import_is(name, "_dup")) return (uint32_t)dup((int)arguments[0]);
+    if (import_is(name, "_dup2")) return (uint32_t)dup2((int)arguments[0], (int)arguments[1]);
+    if (import_is(name, "_pipe")) return (uint32_t)pipe((int *)(uintptr_t)arguments[0]);
+    if (import_is(name, "_flock")) return (uint32_t)flock((int)arguments[0], (int)arguments[1]);
+    if (import_is(name, "_fsync")) return (uint32_t)fsync((int)arguments[0]);
+    if (import_is(name, "_ftruncate")) return (uint32_t)ftruncate((int)arguments[0], (int64_t)((uint64_t)arguments[1] | (uint64_t)arguments[2] << 32));
+    if (import_is(name, "_read")) return (uint32_t)read((int)arguments[0], (void *)(uintptr_t)arguments[1], arguments[2]);
+    if (import_is(name, "_write")) return (uint32_t)write((int)arguments[0], (const void *)(uintptr_t)arguments[1], arguments[2]);
+    if (import_is(name, "_fchmod")) return (uint32_t)fchmod((int)arguments[0], (mode_t)arguments[1]);
+    if (import_is(name, "_time")) {
+        int32_t value = (int32_t)time(NULL);
+        if (arguments[0]) *(int32_t *)(uintptr_t)arguments[0] = value;
+        return (uint32_t)value;
+    }
+    if (import_is(name, "_unlink")) return (uint32_t)unlink((const char *)(uintptr_t)arguments[0]);
+    if (import_is(name, "_puts")) return (uint32_t)puts((const char *)(uintptr_t)arguments[0]);
+    if (import_is(name, "_putchar")) return (uint32_t)putchar((int)arguments[0]);
+    if (import_is(name, "_sleep")) return sleep(arguments[0]);
+    if (import_is(name, "_strcasecmp")) return (uint32_t)strcasecmp((const char *)(uintptr_t)arguments[0], (const char *)(uintptr_t)arguments[1]);
+    if (import_is(name, "_strspn")) return (uint32_t)strspn((const char *)(uintptr_t)arguments[0], (const char *)(uintptr_t)arguments[1]);
+    if (import_is(name, "_strcspn")) return (uint32_t)strcspn((const char *)(uintptr_t)arguments[0], (const char *)(uintptr_t)arguments[1]);
+    if (import_is(name, "_strpbrk")) return (uint32_t)(uintptr_t)strpbrk((const char *)(uintptr_t)arguments[0], (const char *)(uintptr_t)arguments[1]);
+    if (import_is(name, "_strcoll")) return (uint32_t)strcoll((const char *)(uintptr_t)arguments[0], (const char *)(uintptr_t)arguments[1]);
+    if (import_is(name, "_strncat")) {
+        strncat((char *)(uintptr_t)arguments[0], (const char *)(uintptr_t)arguments[1], arguments[2]);
+        return arguments[0];
+    }
+    if (import_is(name, "_realpath") || import_is(name, "_realpath$DARWIN_EXTSN")) {
+        char path[PATH_MAX];
+        if (!realpath((const char *)(uintptr_t)arguments[0], path)) return 0;
+        if (!arguments[1]) return compat_runtime32_copy_cstring(path);
+        strcpy((char *)(uintptr_t)arguments[1], path);
+        return arguments[1];
+    }
+    if (import_is(name, "_strncasecmp")) return (uint32_t)strncasecmp((const char *)(uintptr_t)arguments[0], (const char *)(uintptr_t)arguments[1], arguments[2]);
+    if (import_is(name, "___bzero")) { memset((void *)(uintptr_t)arguments[0], 0, arguments[1]); return 0; }
+    if (import_is(name, "_memset_pattern16")) {
+        memset_pattern16((void *)(uintptr_t)arguments[0], (const void *)(uintptr_t)arguments[1], arguments[2]);
+        return 0;
+    }
+    if (import_is(name, "_OSAtomicCompareAndSwap64") || import_is(name, "_OSAtomicCompareAndSwap64Barrier")) {
+        uint64_t expected = (uint64_t)arguments[0] | ((uint64_t)arguments[1] << 32);
+        uint64_t desired = (uint64_t)arguments[2] | ((uint64_t)arguments[3] << 32);
+        return __atomic_compare_exchange_n((uint64_t *)(uintptr_t)arguments[4], &expected, desired,
+                                            false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    }
+    if (import_is(name, "_atol")) return (uint32_t)strtol((const char *)(uintptr_t)arguments[0], NULL, 10);
+    if (import_is(name, "_strtol") || import_is(name, "_strtoul")) {
+        char *end = NULL;
+        uint32_t result = import_is(name, "_strtol") ?
+            (uint32_t)strtol((const char *)(uintptr_t)arguments[0], &end, (int)arguments[2]) :
+            (uint32_t)strtoul((const char *)(uintptr_t)arguments[0], &end, (int)arguments[2]);
+        if (arguments[1]) *(uint32_t *)(uintptr_t)arguments[1] = (uint32_t)(uintptr_t)end;
+        return result;
+    }
+    if (import_is(name, "_strtod") || import_is(name, "_atof")) {
+        char *end = NULL;
+        double result = strtod((const char *)(uintptr_t)arguments[0], &end);
+        if (import_is(name, "_strtod") && arguments[1]) *(uint32_t *)(uintptr_t)arguments[1] = (uint32_t)(uintptr_t)end;
+        return return_guest_double(result);
+    }
+    if (import_is(name, "_finite") || import_is(name, "___isfinited")) return isfinite(guest_double(arguments));
+    if (import_is(name, "_isnan") || import_is(name, "___isnand")) return isnan(guest_double(arguments));
+    if (import_is(name, "_isinf") || import_is(name, "___isinfd")) return isinf(guest_double(arguments));
+    if (import_is(name, "_powf")) return return_guest_float(powf(guest_float(arguments[0]), guest_float(arguments[1])));
+    if (import_is(name, "_pthread_self")) return source_thread_handle(pthread_self());
+    if (import_is(name, "_pthread_mach_thread_np")) {
+        pthread_t thread = source_thread_for_handle(arguments[0]);
+        return thread ? pthread_mach_thread_np(thread) : MACH_PORT_NULL;
+    }
+    if (import_is(name, "_thread_resume")) return (uint32_t)thread_resume(arguments[0]);
+    if (import_is(name, "_thread_policy_set")) return (uint32_t)thread_policy_set(arguments[0], arguments[1], (thread_policy_t)(uintptr_t)arguments[2], arguments[3]);
+    if (import_is(name, "_sched_get_priority_min")) return (uint32_t)sched_get_priority_min(arguments[0]);
+    if (import_is(name, "_sched_get_priority_max")) return (uint32_t)sched_get_priority_max(arguments[0]);
+    if (import_is(name, "_pthread_equal")) {
+        pthread_mutex_lock(&source_thread_lock);
+        pthread_t a = arguments[0] < 256 ? source_threads[arguments[0]] : NULL;
+        pthread_t b = arguments[1] < 256 ? source_threads[arguments[1]] : NULL;
+        uint32_t result = a && b && pthread_equal(a, b);
+        pthread_mutex_unlock(&source_thread_lock);
+        return result;
+    }
+    if (import_is(name, "_pthread_main_np")) return (uint32_t)pthread_main_np();
+    if (import_is(name, "_pthread_setname_np")) return (uint32_t)pthread_setname_np((const char *)(uintptr_t)arguments[0]);
+    if (import_is(name, "_pthread_yield_np")) return (uint32_t)sched_yield();
+    if (import_is(name, "_pthread_key_delete")) {
+        if (arguments[0] >= 128) return EINVAL;
+        guest_pthread_values[arguments[0]] = 0;
+        return 0;
+    }
+    if (import_is(name, "_pthread_getschedparam")) {
+        pthread_t thread = source_thread_for_handle(arguments[0]);
+        return thread ? (uint32_t)pthread_getschedparam(thread, (int *)(uintptr_t)arguments[1],
+                      (struct sched_param *)(uintptr_t)arguments[2]) : ESRCH;
+    }
+    if (import_is(name, "_pthread_join") || import_is(name, "_pthread_detach")) {
+        uint32_t handle = arguments[0];
+        pthread_t thread = source_thread_for_handle(handle);
+        if (!thread) return ESRCH;
+        if (import_is(name, "_pthread_detach")) return (uint32_t)pthread_detach(thread);
+        void *value = NULL;
+        int result = pthread_join(thread, &value);
+        if (!result) {
+            if (arguments[1]) *(uint32_t *)(uintptr_t)arguments[1] = (uint32_t)(uintptr_t)value;
+            pthread_mutex_lock(&source_thread_lock);
+            if (source_threads[handle] == thread) source_threads[handle] = NULL;
+            pthread_mutex_unlock(&source_thread_lock);
+        }
+        return (uint32_t)result;
+    }
+    if (import_is(name, "_pthread_cond_timedwait")) {
+        pthread_cond_t *condition = host_cond_for_guest(arguments[0], true);
+        pthread_mutex_t *mutex = host_mutex_for_guest(arguments[1], false);
+        const int32_t *time = (const void *)(uintptr_t)arguments[2];
+        if (!condition || !mutex || !time) return EINVAL;
+        struct timespec limit = {time[0], time[1]};
+        return (uint32_t)pthread_cond_timedwait(condition, mutex, &limit);
+    }
     const uint8_t *stage = import_stage_slot(import_id);
     if (stage && *stage >= kImportStageAudio) {
         return dispatch_bridge_stages(import_id, name, arguments,
@@ -3106,11 +3818,22 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         /* A nonzero status cleanly disables the obsolete libgcc facility. */
         return value ? 0 : 1;
     }
-    if (import_is(name, "_dlopen")) return 1;
+    if (import_is(name, "_dlopen")) {
+        if (lp32_profile()->title == LP32_TITLE_PORTAL2) {
+            return guest_dyld32_open((const char *)(uintptr_t)arguments[0], (int)arguments[1]);
+        }
+        return 1;
+    }
     if (import_is(name, "_dlsym")) {
         const char *symbol = (const char *)(uintptr_t)arguments[1];
+        if (lp32_profile()->title == LP32_TITLE_PORTAL2) return guest_dyld32_symbol(arguments[0], symbol);
         if (!symbol || !dlsym(RTLD_DEFAULT, symbol)) return 0;
         return guest_thunk_for_dynamic_symbol(symbol);
+    }
+    if (import_is(name, "_dlerror")) return guest_dyld32_error();
+    if (import_is(name, "_dlclose")) {
+        return lp32_profile()->title == LP32_TITLE_PORTAL2 ?
+            (uint32_t)guest_dyld32_close(arguments[0]) : 0;
     }
     if (import_is(name, kControllerGlyphCallbackName)) {
         controller_bridge32_button_glyph(arguments[0],
@@ -3307,6 +4030,11 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
     if (import_is(name, "_malloc")) {
         return guest_allocate_at(arguments[0], false, return_address);
     }
+    if (import_is(name, "_valloc")) {
+        uint32_t pointer = guest_memory32_map(0, arguments[0] ? arguments[0] : 1,
+            PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        return pointer == UINT32_MAX ? 0 : pointer;
+    }
     if (import_is(name, "__Znwm") || import_is(name, "__Znam")) {
         return guest_allocate_at(arguments[0], false, return_address);
     }
@@ -3316,11 +4044,23 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
             guest_allocate_at((size_t)size, true, return_address) : 0;
     }
     if (import_is(name, "_realloc")) {
+        uint32_t old_size = guest_memory32_size(arguments[0]);
+        if (old_size) {
+            uint32_t pointer = arguments[1] ? guest_allocate_at(arguments[1], false, return_address) : 0;
+            if (!arguments[1] || pointer) {
+                if (pointer) memcpy((void *)(uintptr_t)pointer, (const void *)(uintptr_t)arguments[0],
+                    old_size < arguments[1] ? old_size : arguments[1]);
+                guest_memory32_unmap(arguments[0], old_size);
+            }
+            return pointer;
+        }
         return guest_reallocate(arguments[0], arguments[1], return_address);
     }
     if (import_is(name, "_free") || import_is(name, "__ZdlPv") ||
         import_is(name, "__ZdaPv")) {
-        guest_deallocate(arguments[0]);
+        uint32_t size = guest_memory32_size(arguments[0]);
+        if (size) guest_memory32_unmap(arguments[0], size);
+        else guest_deallocate(arguments[0]);
         return 0;
     }
     if (import_is(name, "__ZNSt8ios_base4InitC1Ev") ||
@@ -3459,11 +4199,12 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         if (copy) memcpy((void *)(uintptr_t)copy, source, size);
         return copy;
     }
-    if (import_is(name, "_stat")) {
+    if (import_is(name, "_stat") || import_is(name, "_fstat") || import_is(name, "_lstat")) {
         const char *path = (const char *)(uintptr_t)arguments[0];
         struct guest_stat32 *guest = (void *)(uintptr_t)arguments[1];
         struct stat host;
-        int status = stat(path, &host);
+        int status = import_is(name, "_fstat") ? fstat((int)arguments[0], &host) :
+            import_is(name, "_lstat") ? lstat(path, &host) : stat(path, &host);
         if (status == 0 && guest) {
             memset(guest, 0, sizeof(*guest));
             guest->st_dev = host.st_dev;
@@ -3504,15 +4245,59 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         }
         return (uint32_t)status;
     }
-    if (import_is(name, "_localtime_r")) {
+    if (import_is(name, "_asctime") || import_is(name, "_asctime_r") ||
+        import_is(name, "_ctime") || import_is(name, "_ctime_r")) {
+        static _Thread_local uint32_t storage;
+        char *output;
+        if (import_is(name, "_asctime_r") || import_is(name, "_ctime_r")) output = (void *)(uintptr_t)arguments[1];
+        else {
+            if (!storage) storage = guest_allocate(26, true);
+            output = (void *)(uintptr_t)storage;
+        }
+        if (!output || !arguments[0]) return 0;
+        char *result;
+        if (import_is(name, "_asctime") || import_is(name, "_asctime_r")) {
+            struct tm native = copy_guest_tm_to_host((const void *)(uintptr_t)arguments[0]);
+            result = asctime_r(&native, output);
+        } else {
+            time_t native = *(int32_t *)(uintptr_t)arguments[0];
+            result = ctime_r(&native, output);
+        }
+        return (uint32_t)(uintptr_t)result;
+    }
+    if (import_is(name, "_strftime")) {
+        struct tm native = copy_guest_tm_to_host((const void *)(uintptr_t)arguments[3]);
+        return (uint32_t)strftime((char *)(uintptr_t)arguments[0], arguments[1],
+            (const char *)(uintptr_t)arguments[2], &native);
+    }
+    if (import_is(name, "_mktime") || import_is(name, "_timegm")) {
+        struct guest_tm32 *guest = (void *)(uintptr_t)arguments[0];
+        struct tm native = {0};
+        native.tm_sec = guest->tm_sec; native.tm_min = guest->tm_min;
+        native.tm_hour = guest->tm_hour; native.tm_mday = guest->tm_mday;
+        native.tm_mon = guest->tm_mon; native.tm_year = guest->tm_year;
+        native.tm_wday = guest->tm_wday; native.tm_yday = guest->tm_yday;
+        native.tm_isdst = guest->tm_isdst;
+        time_t value = import_is(name, "_mktime") ? mktime(&native) : timegm(&native);
+        if (value < INT32_MIN || value > INT32_MAX) { errno = EOVERFLOW; return UINT32_MAX; }
+        copy_host_tm_to_guest(&native, guest);
+        return (uint32_t)value;
+    }
+    if (import_is(name, "_localtime_r") || import_is(name, "_gmtime_r") ||
+        import_is(name, "_localtime") || import_is(name, "_gmtime")) {
         const int32_t *guest_time =
             (const void *)(uintptr_t)arguments[0];
-        struct guest_tm32 *guest_result =
-            (void *)(uintptr_t)arguments[1];
+        struct guest_tm32 *guest_result;
+        if (import_is(name, "_localtime") || import_is(name, "_gmtime")) {
+            static _Thread_local uint32_t storage;
+            if (!storage) storage = guest_allocate(sizeof(struct guest_tm32), true);
+            guest_result = (void *)(uintptr_t)storage;
+        } else guest_result = (void *)(uintptr_t)arguments[1];
         if (!guest_time || !guest_result) return 0;
         time_t host_time = (time_t)*guest_time;
         struct tm host_result;
-        if (!localtime_r(&host_time, &host_result)) return 0;
+        bool local = import_is(name, "_localtime_r") || import_is(name, "_localtime");
+        if (!(local ? localtime_r(&host_time, &host_result) : gmtime_r(&host_time, &host_result))) return 0;
         return copy_host_tm_to_guest(&host_result, guest_result);
     }
     if (import_is(name, "_sysctlbyname")) {
@@ -3539,6 +4324,11 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         guest_qsort((void *)(uintptr_t)arguments[0], arguments[1], arguments[2],
                     arguments[3]);
         return 0;
+    }
+    if (import_is(name, "_vswprintf") || import_is(name, "_swprintf")) {
+        return (uint32_t)guest_vwformat((void *)(uintptr_t)arguments[0], arguments[1],
+            (const void *)(uintptr_t)arguments[2], import_is(name, "_vswprintf") ?
+                (const void *)(uintptr_t)arguments[3] : arguments + 3);
     }
     if (import_is(name, "_sprintf") || import_is(name, "_snprintf") ||
         import_is(name, "_vsprintf") || import_is(name, "_vsnprintf") ||
@@ -3619,6 +4409,23 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
     if (import_is(name, "_fclose")) {
         return (uint32_t)guest_close_file(arguments[0]);
     }
+    if (import_is(name, "_fflush") || import_is(name, "_fgets") ||
+        import_is(name, "_fgetc") || import_is(name, "_fputc") ||
+        import_is(name, "_rewind")) {
+        uint32_t handle = import_is(name, "_fgets") ? arguments[2] :
+                          import_is(name, "_fputc") ? arguments[1] : arguments[0];
+        if (import_is(name, "_fflush") && !handle) return (uint32_t)fflush(NULL);
+        FILE *file = lock_host_file_for_guest(handle);
+        if (!file) return import_is(name, "_fgets") ? 0 : (uint32_t)EOF;
+        uint32_t result;
+        if (import_is(name, "_fflush")) result = (uint32_t)fflush(file);
+        else if (import_is(name, "_fgetc")) result = (uint32_t)fgetc(file);
+        else if (import_is(name, "_fputc")) result = (uint32_t)fputc((int)arguments[0], file);
+        else if (import_is(name, "_rewind")) { rewind(file); result = 0; }
+        else result = fgets((char *)(uintptr_t)arguments[0], (int)arguments[1], file) ? arguments[0] : 0;
+        unlock_host_file();
+        return result;
+    }
     if (import_is(name, "_fread")) {
         FILE *file = lock_host_file_for_guest(arguments[3]);
         if (!file) return 0;
@@ -3696,33 +4503,42 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         free(scratch);
         return (uint32_t)formatted;
     }
-    if (import_is(name, "_opendir")) {
+    if (import_is(name, "_opendir") || import_is(name, "_opendir$INODE64")) {
         const char *path = (const char *)(uintptr_t)arguments[0];
         DIR *directory = path ? opendir(path) : NULL;
         return guest_handle_for_directory(directory);
     }
-    if (import_is(name, "_readdir")) {
+    if (import_is(name, "_readdir") || import_is(name, "_readdir$INODE64")) {
         pthread_mutex_lock(&guest_directory_lock);
         struct guest_directory_entry *entry =
             guest_directory_for_handle(arguments[0]);
         struct dirent *host = entry ? readdir(entry->directory) : NULL;
         uint32_t result = 0;
         if (host && entry->guest_dirent) {
-            struct guest_dirent32 *guest =
-                (void *)(uintptr_t)entry->guest_dirent;
-            size_t name_length = strnlen(host->d_name, sizeof(guest->d_name) - 1);
-            memset(guest, 0, sizeof(*guest));
-            guest->d_ino = (uint32_t)host->d_ino;
-            guest->d_reclen = (uint16_t)((offsetof(struct guest_dirent32, d_name) +
-                                          name_length + 1 + 3) & ~3u);
-            guest->d_type = host->d_type;
-            guest->d_namlen = (uint8_t)name_length;
-            memcpy(guest->d_name, host->d_name, name_length);
-            guest->d_name[name_length] = '\0';
+            copy_directory_entry((void *)(uintptr_t)entry->guest_dirent, host,
+                                 import_is(name, "_readdir$INODE64"));
             result = entry->guest_dirent;
         }
         pthread_mutex_unlock(&guest_directory_lock);
         return result;
+    }
+    if (import_is(name, "_readdir_r") || import_is(name, "_readdir_r$INODE64")) {
+        if (!arguments[1] || !arguments[2]) return EINVAL;
+        *(uint32_t *)(uintptr_t)arguments[2] = 0;
+        pthread_mutex_lock(&guest_directory_lock);
+        struct guest_directory_entry *entry = guest_directory_for_handle(arguments[0]);
+        int saved_errno = errno;
+        errno = 0;
+        struct dirent *host = entry ? readdir(entry->directory) : NULL;
+        int error = entry ? errno : EBADF;
+        errno = saved_errno;
+        if (host) {
+            copy_directory_entry((void *)(uintptr_t)arguments[1], host,
+                                 import_is(name, "_readdir_r$INODE64"));
+            *(uint32_t *)(uintptr_t)arguments[2] = arguments[1];
+        }
+        pthread_mutex_unlock(&guest_directory_lock);
+        return (uint32_t)error;
     }
     if (import_is(name, "_closedir")) {
         pthread_mutex_lock(&guest_directory_lock);
@@ -3782,14 +4598,30 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         return import_is(name, "___udivdi3") ?
             dividend / divisor : dividend % divisor;
     }
-    if (import_is(name, "___moddi3")) {
+    if (import_is(name, "___divdi3") || import_is(name, "___moddi3")) {
         int64_t dividend = (int64_t)((uint64_t)arguments[0] |
             ((uint64_t)arguments[1] << 32));
         int64_t divisor = (int64_t)((uint64_t)arguments[2] |
             ((uint64_t)arguments[3] << 32));
-        return divisor ? (uint64_t)(dividend % divisor) : 0;
+        if (!divisor) { raise(SIGFPE); return 0; }
+        bool divide = import_is(name, "___divdi3");
+        if (dividend == INT64_MIN && divisor == -1) return divide ? (uint64_t)INT64_MIN : 0;
+        return (uint64_t)(divide ? dividend / divisor : dividend % divisor);
     }
-    if (import_is(name, "___error")) return guest_errno_address;
+    if (import_is(name, "___error")) {
+        if (!guest_errno_address) guest_errno_address = guest_allocate(4, true);
+        if (guest_errno_address) *(int *)(uintptr_t)guest_errno_address = errno;
+        return guest_errno_address;
+    }
+    if (import_is(name, "_UpTime")) return mach_absolute_time();
+    if (import_is(name, "_AbsoluteToNanoseconds") || import_is(name, "_NanosecondsToAbsolute")) {
+        mach_timebase_info_data_t timebase;
+        mach_timebase_info(&timebase);
+        uint64_t value = (uint64_t)arguments[0] | ((uint64_t)arguments[1] << 32);
+        return import_is(name, "_AbsoluteToNanoseconds") ?
+            (uint64_t)((__uint128_t)value * timebase.numer / timebase.denom) :
+            (uint64_t)((__uint128_t)value * timebase.denom / timebase.numer);
+    }
     if (import_is(name, "_mach_absolute_time")) {
         uint64_t value = mach_absolute_time();
         static uint32_t traced_clocks;
@@ -3833,7 +4665,7 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         import_is(name, "_OSAtomicAdd32Barrier")) {
         return fast_OSAtomicAdd32(arguments, return_address);
     }
-    if (import_is(name, "_OSAtomicCompareAndSwap32")) {
+    if (import_is(name, "_OSAtomicCompareAndSwap32") || import_is(name, "_OSAtomicCompareAndSwap32Barrier")) {
         return fast_OSAtomicCompareAndSwap32(arguments, return_address);
     }
     if (import_is(name, "_pthread_once")) {
@@ -3874,6 +4706,15 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
     if (import_is(name, "_sinf")) return return_guest_float(sinf(guest_float(arguments[0])));
     if (import_is(name, "_cosf")) return return_guest_float(cosf(guest_float(arguments[0])));
     if (import_is(name, "_ceilf")) return return_guest_float(ceilf(guest_float(arguments[0])));
+    if (import_is(name, "_floorf")) return return_guest_float(floorf(guest_float(arguments[0])));
+    if (import_is(name, "_roundf")) return return_guest_float(roundf(guest_float(arguments[0])));
+    if (import_is(name, "_truncf")) return return_guest_float(truncf(guest_float(arguments[0])));
+    if (import_is(name, "_acosf")) return return_guest_float(acosf(guest_float(arguments[0])));
+    if (import_is(name, "_asinf")) return return_guest_float(asinf(guest_float(arguments[0])));
+    if (import_is(name, "_atanf")) return return_guest_float(atanf(guest_float(arguments[0])));
+    if (import_is(name, "_tanf")) return return_guest_float(tanf(guest_float(arguments[0])));
+    if (import_is(name, "_atan2f")) return return_guest_float(atan2f(guest_float(arguments[0]), guest_float(arguments[1])));
+    if (import_is(name, "_fmodf")) return return_guest_float(fmodf(guest_float(arguments[0]), guest_float(arguments[1])));
 
     if (import_is(name, "_log")) return return_guest_double(log(guest_double(arguments)));
     if (import_is(name, "_exp")) return return_guest_double(exp(guest_double(arguments)));
@@ -3882,6 +4723,17 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
     if (import_is(name, "_atan")) return return_guest_double(atan(guest_double(arguments)));
     if (import_is(name, "_ceil")) return return_guest_double(ceil(guest_double(arguments)));
     if (import_is(name, "_floor")) return return_guest_double(floor(guest_double(arguments)));
+    if (import_is(name, "_log10")) return return_guest_double(log10(guest_double(arguments)));
+    if (import_is(name, "_acos")) return return_guest_double(acos(guest_double(arguments)));
+    if (import_is(name, "_asin")) return return_guest_double(asin(guest_double(arguments)));
+    if (import_is(name, "_tan")) return return_guest_double(tan(guest_double(arguments)));
+    if (import_is(name, "_cosh")) return return_guest_double(cosh(guest_double(arguments)));
+    if (import_is(name, "_sinh")) return return_guest_double(sinh(guest_double(arguments)));
+    if (import_is(name, "_tanh")) return return_guest_double(tanh(guest_double(arguments)));
+    if (import_is(name, "_atan2")) return return_guest_double(atan2(guest_double(arguments), guest_double(arguments + 2)));
+    if (import_is(name, "_fmod")) return return_guest_double(fmod(guest_double(arguments), guest_double(arguments + 2)));
+    if (import_is(name, "_frexp")) return return_guest_double(frexp(guest_double(arguments), (int *)(uintptr_t)arguments[2]));
+    if (import_is(name, "_modf")) return return_guest_double(modf(guest_double(arguments), (double *)(uintptr_t)arguments[2]));
     if (import_is(name, "_rint")) return return_guest_double(rint(guest_double(arguments)));
     if (import_is(name, "_ldexp")) {
         return return_guest_double(ldexp(guest_double(arguments), (int)arguments[2]));
@@ -3907,11 +4759,13 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         import_is(name, "_pthread_setschedparam")) {
         return 0;
     }
-    if (import_is(name, "_pthread_create")) {
+    if (import_is(name, "_pthread_create") || import_is(name, "_pthread_create_suspended_np")) {
         struct guest_thread_context *context = malloc(sizeof(*context));
         if (!context) return (uint32_t)ENOMEM;
         context->function = arguments[2];
-        {
+        if (lp32_profile()->title == LP32_TITLE_PORTAL2) {
+            context->argument = arguments[3];
+        } else {
             /* The engine's sole pthread_create site (Pirates 0x2fxxxx, Clone
                Wars 0x314bc4) hands the thread entry the address of a
                stack-local task-record pointer.  Native pthread scheduling
@@ -3941,7 +4795,9 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
             }
         }
         pthread_t thread;
-        int status = pthread_create(&thread, NULL, run_guest_thread, context);
+        int status = import_is(name, "_pthread_create_suspended_np") ?
+            pthread_create_suspended_np(&thread, NULL, run_guest_thread, context) :
+            pthread_create(&thread, NULL, run_guest_thread, context);
         if (status != 0) {
             free(context);
             return (uint32_t)status;
@@ -3949,7 +4805,8 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         uint32_t *guest_thread = (void *)(uintptr_t)arguments[0];
         if (guest_thread) {
             static uint32_t next_handle = 1;
-            *guest_thread = __atomic_fetch_add(&next_handle, 1, __ATOMIC_RELAXED);
+            *guest_thread = lp32_profile()->title == LP32_TITLE_PORTAL2 ?
+                source_thread_handle(thread) : __atomic_fetch_add(&next_handle, 1, __ATOMIC_RELAXED);
         }
         return 0;
     }
@@ -4068,6 +4925,10 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         return 0;
     }
 
+    if (lp32_profile()->title == LP32_TITLE_PORTAL2 && !strncmp(name, "_IO", 3)) {
+        uint64_t result = 0;
+        if (objc_bridge32_dispatch(name, arguments, &result)) return result;
+    }
     if (import_is(name, "_IOServiceMatching") ||
         import_is(name, "_IOIteratorNext") ||
         import_is(name, "_IONotificationPortCreate") ||
@@ -4098,10 +4959,37 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
     }
     if (import_is(name, "_IOServiceAddInterestNotification") ||
         import_is(name, "_IOServiceAddMatchingNotification")) return UINT32_C(0xe00002c7);
-    if (import_is(name, "_CFRunLoopAddSource") ||
-        import_is(name, "_CFRunLoopRemoveSource")) return 0;
-    if (import_is(name, "_CFRunLoopContainsSource")) return 0;
+    if (lp32_profile()->title != LP32_TITLE_PORTAL2 &&
+        (import_is(name, "_CFRunLoopAddSource") || import_is(name, "_CFRunLoopRemoveSource") ||
+         import_is(name, "_CFRunLoopContainsSource"))) return 0;
 
+    if (import_is(name, "___cxa_atexit") || import_is(name, "___cxa_finalize")) {
+        /* Dylibs stay resident. Keep guest destructors in guest space; host
+           atexit cannot call an i386 function pointer. */
+        struct destructor { uint32_t function, argument, dso; };
+        static struct destructor destructors[4096];
+        static unsigned count;
+        static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+        pthread_mutex_lock(&lock);
+        if (import_is(name, "___cxa_atexit")) {
+            if (count == sizeof(destructors) / sizeof(destructors[0])) {
+                pthread_mutex_unlock(&lock);
+                return (uint32_t)-1;
+            }
+            destructors[count++] = (struct destructor){arguments[0], arguments[1], arguments[2]};
+        } else {
+            for (unsigned i = count; i; --i) {
+                struct destructor d = destructors[i - 1];
+                if (!d.function || (arguments[0] && arguments[0] != d.dso)) continue;
+                destructors[i - 1].function = 0;
+                pthread_mutex_unlock(&lock);
+                compat_runtime32_call(d.function, &d.argument, 1);
+                pthread_mutex_lock(&lock);
+            }
+        }
+        pthread_mutex_unlock(&lock);
+        return 0;
+    }
     if (import_is(name, "___cxa_guard_acquire")) {
         uint8_t *guard = (void *)(uintptr_t)arguments[0];
         if (*guard) return 0;
@@ -4173,6 +5061,12 @@ static uint64_t dispatch_bridge_stages(uint32_t import_id, const char *name,
             " args=%08" PRIx32 ",%08" PRIx32 ",%08" PRIx32 ",%08" PRIx32 "\n",
             import_id, name, return_address, arguments[0], arguments[1],
             arguments[2], arguments[3]);
+    if (lp32_profile()->title == LP32_TITLE_PORTAL2) {
+        /* A trap on Source's worker thread must not leave its Cocoa main
+           loop running indefinitely after the worker has escaped. */
+        fflush(NULL);
+        _Exit(EXIT_FAILURE);
+    }
     last_call_trapped = 1;
     lp32_leave_guest = 1;
     return 0;

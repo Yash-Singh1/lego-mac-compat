@@ -1,4 +1,5 @@
 #include "audio_bridge.h"
+#include "audio_queue_bridge.h"
 #include "compat_runtime.h"
 #include "game_profile.h"
 #include "name_match.h"
@@ -35,6 +36,9 @@ static AUGraph unit_owner_graphs[kGuestAudioHandleCapacity];
 static uint32_t graph_object_count;
 static uint32_t unit_object_count;
 static pthread_mutex_t audio_object_lock = PTHREAD_MUTEX_INITIALIZER;
+static AudioComponent component_objects[128];
+static unsigned component_count;
+enum { kGuestComponentHandleBase = 0x7f0a0000 };
 
 struct guest_audio_buffer {
     uint32_t channels;
@@ -1552,7 +1556,50 @@ static OSStatus set_unit_parameter_for_guest(const uint32_t *arguments,
 int audio_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
                             uint64_t *result)
 {
+    if (audio_queue_bridge32_dispatch(import_name, arguments, result)) return 1;
     const size_t import_length = strlen(import_name);
+    if (LP32_NAME_IS(import_name, import_length, "_FindNextComponent")) {
+        pthread_mutex_lock(&audio_object_lock);
+        uint32_t index = arguments[0] - kGuestComponentHandleBase;
+        AudioComponent previous = arguments[0] && index < component_count ? component_objects[index] : NULL;
+        AudioComponent component = AudioComponentFindNext(previous,
+            (const AudioComponentDescription *)(uintptr_t)arguments[1]);
+        *result = 0;
+        if (component) {
+            unsigned slot;
+            for (slot = 0; slot < component_count; ++slot) if (component_objects[slot] == component) break;
+            if (slot < 128) {
+                if (slot == component_count) component_objects[component_count++] = component;
+                *result = kGuestComponentHandleBase + slot;
+            }
+        }
+        pthread_mutex_unlock(&audio_object_lock);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_OpenAComponent")) {
+        uint32_t index = arguments[0] - kGuestComponentHandleBase;
+        AudioUnit unit = NULL;
+        OSStatus status = index < component_count ? AudioComponentInstanceNew(component_objects[index], &unit) : kAudio_ParamError;
+        uint32_t handle = unit ? guest_handle_for_unit(unit, NULL) : 0;
+        if (arguments[1]) *(uint32_t *)(uintptr_t)arguments[1] = handle;
+        *result = (uint32_t)status;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_AudioUnitInitialize") ||
+        LP32_NAME_IS(import_name, import_length, "_AudioUnitUninitialize") ||
+        LP32_NAME_IS(import_name, import_length, "_AudioOutputUnitStart") ||
+        LP32_NAME_IS(import_name, import_length, "_AudioOutputUnitStop")) {
+        AudioUnit unit = synchronized_unit_for_guest(arguments[0]);
+        OSStatus status = kAudio_ParamError;
+        if (unit) {
+            if (LP32_NAME_IS(import_name, import_length, "_AudioUnitInitialize")) status = AudioUnitInitialize(unit);
+            else if (LP32_NAME_IS(import_name, import_length, "_AudioUnitUninitialize")) status = AudioUnitUninitialize(unit);
+            else if (LP32_NAME_IS(import_name, import_length, "_AudioOutputUnitStart")) status = AudioOutputUnitStart(unit);
+            else status = AudioOutputUnitStop(unit);
+        }
+        *result = (uint32_t)status;
+        return 1;
+    }
     if (LP32_NAME_IS(import_name, import_length, "_NewAUGraph")) {
         AUGraph graph = NULL;
         OSStatus status = NewAUGraph(&graph);
