@@ -253,6 +253,51 @@ static const struct lp32_game_profile clone_wars_profile = {
     .stream_input_callback = 0x00453fb0,
 };
 
+/* Feral 1.0.1 (2014). HID Utilities is the same GCC library as Clone
+   Wars. Feral's newer input layer applies ControllerMappings.txt itself. */
+static const struct lp32_controller_layout marvel_controller = {
+    .hid_device_list = 0x0160895c,
+    .hid_last_error = 0x01608950,
+    .hid_get_element_value = {
+        .address = 0x00fefee2,
+        .expected = {0x55, 0x89, 0xe5, 0x83, 0xec, 0x68},
+        .length = 6,
+    },
+    .hid_build_device_list = {
+        .address = 0x00ff6e68,
+        .expected = {0x55, 0x89, 0xe5, 0x83, 0xec, 0x58},
+        .length = 6,
+    },
+    .hid_get_first_device = 0x00ff0175,
+    .hid_get_next_device = 0x00ff0186,
+    .convert_hid_state = 0x004311a0,
+};
+
+/* ScreenWidth/Height/RefreshRate setters: 0x432a00/0x432a30/0x432b20. */
+static const struct lp32_display_layout marvel_display = {
+    .screen_width = 0x016b9ccc,
+    .screen_height = 0x016b9cd0,
+    .refresh_rate = 0x016b9ce4,
+};
+
+/* This crt calls main directly from start. */
+static const struct lp32_game_profile marvel_profile = {
+    .title = LP32_TITLE_MARVEL,
+    .name = "LEGOMarvel",
+    .display_name = "LEGO Marvel Super Heroes",
+    .log_directory = "LEGOMarvelCompat",
+    .image_file = "LEGOMarvel.image",
+    .entry_eip = 0x00002720,
+    .image_end = 0x01753000,
+    .main_address = 0x0025bc00,
+    .callee_pops_struct_return = 1,
+    .thread_argument_is_direct = 1,
+    .controller = &marvel_controller,
+    .display = &marvel_display,
+    .application_should_terminate = 0x0043d1a0,
+    .application_will_unhide = 0x0043d220,
+};
+
 static const struct lp32_game_profile unknown_profile = {
     .title = LP32_TITLE_UNKNOWN,
     .name = "unknown",
@@ -264,6 +309,7 @@ static const struct lp32_game_profile unknown_profile = {
 static const struct lp32_game_profile *const known_profiles[] = {
     &pirates_profile,
     &clone_wars_profile,
+    &marvel_profile,
 };
 
 static const struct lp32_game_profile *current_profile = &unknown_profile;
@@ -282,6 +328,7 @@ const struct lp32_game_profile *lp32_profile_named(const char *name)
         }
     }
     /* Accept the friendlier spellings used on the command line. */
+    if (strcasecmp(name, "marvel") == 0) return &marvel_profile;
     if (strcasecmp(name, "pirates") == 0) return &pirates_profile;
     if (strcasecmp(name, "clonewars") == 0 || strcasecmp(name, "lsw3") == 0) {
         return &clone_wars_profile;

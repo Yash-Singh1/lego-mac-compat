@@ -19,6 +19,7 @@ enum lp32_title {
     LP32_TITLE_UNKNOWN = 0,
     LP32_TITLE_PIRATES,
     LP32_TITLE_CLONE_WARS,
+    LP32_TITLE_MARVEL,
 };
 
 /* Splash-dismiss repeat latch (see game_loader.c). */
@@ -160,6 +161,8 @@ struct lp32_game_profile {
     const char *image_file;         /* Contents/SharedSupport/<image_file> */
     uint32_t entry_eip;             /* detection key */
     uint32_t image_end;             /* detection key (max_address) */
+    uint8_t thread_argument_is_direct; /* persistent task object, not a stack-local pointer */
+    uint8_t callee_pops_struct_return; /* Clang i386 sret ABI (Marvel) */
     uint32_t main_address;          /* 0 = derive from the crt start stub */
     const struct lp32_startup_latch_patch *startup_latch;
     const struct lp32_controller_layout *controller;
@@ -169,6 +172,8 @@ struct lp32_game_profile {
     const struct lp32_display_layout *display;
     const struct lp32_render_pool *render_pool;
     const struct lp32_activator_layout *activator;
+    uint32_t application_should_terminate; /* NuMacApplicationDelegate */
+    uint32_t application_will_unhide;
     /* NuSound streamer render callback (diagnostics only: lets the audio
        bridge read the stream's refill-request ring). 0 = unknown. */
     uint32_t stream_input_callback;

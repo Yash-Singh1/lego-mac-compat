@@ -3,6 +3,8 @@
 #include "game_profile.h"
 #include "macho_loader.h"
 #include "objc_bridge.h"
+#include "hitch_recorder.h"
+#include "steam_bridge.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -39,6 +41,8 @@ static void flush_guest_instruction(uintptr_t address);
 
 static void open_guest_diagnostic_log(const char *executable_path)
 {
+    /* A read-only storage probe must not truncate a player's session log. */
+    if (getenv("LP32_STEAM_STORAGE_PROBE")) return;
     const char *home = getenv("HOME");
     if (!home || !home[0]) return;
 
@@ -597,7 +601,7 @@ static void runtime_diagnostic_line(const char *line)
 static const char *default_image_path(const char *argv0, char *buffer,
                                       size_t size)
 {
-    static const char *const candidates[] = {"LEGOPirates", "LEGOCloneWars"};
+    static const char *const candidates[] = {"LEGOPirates", "LEGOCloneWars", "LEGOMarvel"};
     const char *slash = strrchr(argv0, '/');
     size_t directory_length = slash ? (size_t)(slash - argv0) : 0;
     for (size_t index = 0; index < sizeof(candidates) / sizeof(candidates[0]); ++index) {
@@ -679,6 +683,16 @@ int main(int argc, char **argv)
         macho_image32_unload(&image);
         return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
+    if (getenv("LP32_CTYPE_SELFTEST")) {
+        int result = compat_runtime32_run_ctype_self_test();
+        macho_image32_unload(&image);
+        return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (getenv("LP32_STEAM_STORAGE_PROBE")) {
+        int result = steam_bridge32_probe_storage();
+        macho_image32_unload(&image);
+        return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
     if (getenv("LP32_CG_SELFTEST")) {
         int result = compat_runtime32_run_cg_self_test();
         macho_image32_unload(&image);
@@ -727,6 +741,31 @@ int main(int argc, char **argv)
         install_texture_bind_guard() != 0) {
         macho_image32_unload(&image);
         return EXIT_FAILURE;
+    }
+
+    if (objc_bridge32_prepare_shader_cache() != 0) {
+        macho_image32_unload(&image);
+        return EXIT_FAILURE;
+    }
+
+    /* Automatic only for Marvel; no full import profiling or draw dumps. */
+    const char *hitch_option = getenv("LP32_HITCH_LOG");
+    if ((hitch_option && strcmp(hitch_option, "0")) ||
+        (!hitch_option && lp32_profile()->title == LP32_TITLE_MARVEL)) {
+        char path[PATH_MAX];
+        const char *home = getenv("HOME");
+        int length = snprintf(path, sizeof(path), "%s/Library/Logs/%s/hitches-%ld-%llu.log",
+                              home ? home : "/tmp", lp32_profile()->log_directory,
+                              (long)getpid(), (unsigned long long)hitch_now());
+        const char *destination = hitch_option && strchr(hitch_option, '/') ?
+                                  hitch_option : path;
+        const char *threshold = getenv("LP32_HITCH_MS");
+        if (length > 0 && (size_t)length < sizeof(path) &&
+            hitch_start(destination, threshold ? strtod(threshold, NULL) : 25.0) == 0) {
+            GUEST_DIAGNOSTIC("compat32: automatic hitch recorder: %s\n", destination);
+        } else {
+            perror("compat32: hitch recorder unavailable");
+        }
     }
 
     const uint32_t *initializers =

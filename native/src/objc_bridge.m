@@ -1,4 +1,5 @@
 #include "objc_bridge.h"
+#include "hitch_recorder.h"
 #include "arb_program_guard.h"
 #include "audio_bridge.h"
 #include "arb_sampler_usage.h"
@@ -9,6 +10,7 @@
 
 #define GL_SILENCE_DEPRECATION 1
 #import <AppKit/AppKit.h>
+#import <IOKit/pwr_mgt/IOPMLib.h>
 #import <Carbon/Carbon.h>
 #import <OpenGL/OpenGL.h>
 #import <OpenGL/gl.h>
@@ -392,6 +394,39 @@ static void restore_unbound_fragment_samplers(
     glActiveTexture((GLenum)restore->active_texture);
 }
 
+/* Borrowed strings (GL driver strings, selectors and NSString C strings)
+   are not freed by the guest. Intern copies by content so repeated queries
+   retain stable pointers without growing the low heap. Keep distinct values
+   alive even after their host object or GL context is destroyed. */
+static uint32_t intern_guest_cstring(const char *value)
+{
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static struct guest_cstring_entry {
+        uint32_t guest;
+        struct guest_cstring_entry *next;
+    } *strings;
+    if (!value) return 0;
+    pthread_mutex_lock(&lock);
+    for (struct guest_cstring_entry *entry = strings; entry; entry = entry->next) {
+        if (strcmp((const char *)(uintptr_t)entry->guest, value) == 0) {
+            uint32_t guest = entry->guest;
+            pthread_mutex_unlock(&lock);
+            return guest;
+        }
+    }
+    struct guest_cstring_entry *entry = malloc(sizeof(*entry));
+    uint32_t guest = entry ? compat_runtime32_copy_cstring(value) : 0;
+    if (guest) {
+        entry->guest = guest;
+        entry->next = strings;
+        strings = entry;
+    } else {
+        free(entry);
+    }
+    pthread_mutex_unlock(&lock);
+    return guest;
+}
+
 static id object_for_receiver(uint32_t receiver);
 
 static bool proxy_object_is_retained(id object)
@@ -483,6 +518,47 @@ static uint32_t proxy_for_returned_object(id receiver, id object)
                                              proxy_for_object(object);
 }
 
+/* CFDataGetBytePtr borrows its buffer from the data object. Tie the low-address
+   copy to that object too; Marvel reads its cached data on every draw. */
+@interface LP32DataBuffer : NSObject {
+@public
+    uint32_t guest;
+    NSUInteger capacity;
+}
+@end
+@implementation LP32DataBuffer
+- (void)dealloc
+{
+    if (guest) compat_runtime32_deallocate(guest);
+    [super dealloc];
+}
+@end
+
+static uint32_t guest_bytes_for_data(NSData *data)
+{
+    static char buffer_key;
+    if (!data) return 0;
+    @synchronized(data) {
+        LP32DataBuffer *buffer = objc_getAssociatedObject(data, &buffer_key);
+        if (!buffer) {
+            buffer = [[[LP32DataBuffer alloc] init] autorelease];
+            objc_setAssociatedObject(data, &buffer_key, buffer,
+                                      OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        NSUInteger length = [data length];
+        NSUInteger needed = length ? length : 1;
+        if (buffer->capacity < needed) {
+            uint32_t guest = compat_runtime32_reallocate(buffer->guest, needed);
+            if (!guest) return 0;
+            buffer->guest = guest;
+            buffer->capacity = needed;
+        }
+        /* Refresh in place for NSMutableData as well. */
+        if (length) memcpy((void *)(uintptr_t)buffer->guest, [data bytes], length);
+        return buffer->guest;
+    }
+}
+
 int objc_bridge32_run_proxy_self_test(void)
 {
     @autoreleasepool {
@@ -531,6 +607,45 @@ int objc_bridge32_run_proxy_self_test(void)
             return -1;
         }
 
+        uint32_t utf8_selector = compat_runtime32_copy_cstring("UTF8String");
+        const uint32_t string_args[] = {persistent_handle, utf8_selector};
+        uint64_t first_string = 0;
+        if (!utf8_selector || !objc_bridge32_dispatch("_objc_msgSend", string_args,
+                                                       &first_string) ||
+            !first_string) return -1;
+        for (unsigned query = 0; query < 10000; ++query) {
+            uint64_t string = 0;
+            if (!objc_bridge32_dispatch("_objc_msgSend", string_args, &string) ||
+                string != first_string ||
+                strcmp((const char *)(uintptr_t)string, "persistent-proxy")) {
+                fputs("compat32: NSString C-string lifetime self-test failed\n", stderr);
+                return -1;
+            }
+        }
+        compat_runtime32_deallocate(utf8_selector);
+
+        NSMutableData *data = [NSMutableData dataWithBytes:"data" length:4];
+        const uint32_t data_args[] = {proxy_for_object(data)};
+        uint64_t first_bytes = 0;
+        if (!objc_bridge32_dispatch("_CFDataGetBytePtr", data_args, &first_bytes) ||
+            !first_bytes) return -1;
+        for (unsigned query = 0; query < 10000; ++query) {
+            uint64_t bytes = 0;
+            if (!objc_bridge32_dispatch("_CFDataGetBytePtr", data_args, &bytes) ||
+                bytes != first_bytes || memcmp((void *)(uintptr_t)bytes, "data", 4)) {
+                fputs("compat32: CFData byte-pointer lifetime self-test failed\n", stderr);
+                return -1;
+            }
+        }
+        [data appendBytes:" appended" length:9];
+        uint64_t grown_bytes = 0;
+        if (!objc_bridge32_dispatch("_CFDataGetBytePtr", data_args, &grown_bytes) ||
+            !grown_bytes || memcmp((void *)(uintptr_t)grown_bytes, "data appended", 13)) {
+            fputs("compat32: mutable CFData refresh self-test failed\n", stderr);
+            return -1;
+        }
+
+        uint32_t persistent_count = proxy_count;
         for (uint32_t iteration = 0; iteration < 10000; ++iteration) {
             @autoreleasepool {
                 NSString *characters = (iteration & 1) ? @"w" : @"s";
@@ -561,7 +676,7 @@ int objc_bridge32_run_proxy_self_test(void)
             }
         }
 
-        if (proxy_count != 1 ||
+        if (proxy_count != persistent_count ||
             object_for_receiver(persistent_handle) != persistent) {
             fprintf(stderr,
                     "compat32: Objective-C proxy self-test leaked event "
@@ -571,7 +686,7 @@ int objc_bridge32_run_proxy_self_test(void)
         }
         reset_event_proxies();
         printf("Objective-C proxy self-test: PASS "
-               "(10000 messages, +%zu bytes; 10000 events, persistent=%u, "
+               "(10000 messages, +%zu bytes; stable CFData; 10000 events, persistent=%u, "
                "event=%u)\n", invocation_growth, proxy_count,
                event_proxy_count);
         return 0;
@@ -788,13 +903,14 @@ static bool invoke_simple_message(id receiver, const char *selector_name,
         case ':': {
             SEL value = (SEL)0;
             [invocation getReturnValue:&value];
-            *guest_result = value ? compat_runtime32_copy_cstring(sel_getName(value)) : 0;
+            *guest_result = value ? intern_guest_cstring(sel_getName(value)) : 0;
             return true;
         }
         case '*': {
             const char *value = NULL;
             [invocation getReturnValue:&value];
-            *guest_result = value ? compat_runtime32_copy_cstring(value) : 0;
+            *guest_result = [receiver isKindOfClass:[NSString class]] ?
+                intern_guest_cstring(value) : compat_runtime32_copy_cstring(value);
             return true;
         }
         case '^': {
@@ -1243,6 +1359,7 @@ enum { kFramePacerDefaultCap = 60 };
    frame-rate-bound simulation at 1000+ fps on this hardware. */
 static bool frame_pacer_enabled = true;
 static int frame_pacer_requested_interval;
+static uint64_t frame_pacer_interval_ns;
 
 static bool frame_pacer_takes_over_swap_interval(GLint requested)
 {
@@ -1326,6 +1443,7 @@ static void frame_pacer_wait(NSWindow *window)
     static mach_timebase_info_data_t timebase;
 
     if (!frame_pacer_enabled) {
+        frame_pacer_interval_ns = 0;
         next_slot_ns = 0;
         return;
     }
@@ -1334,12 +1452,14 @@ static void frame_pacer_wait(NSWindow *window)
         cached_fps_swap = objc_bridge_swap_count;
     }
     if (cached_fps <= 0.0) {
+        frame_pacer_interval_ns = 0;
         next_slot_ns = 0;
         return;
     }
     uint64_t now_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     uint64_t work_ns = last_present_ns ? now_ns - last_present_ns : 0;
     uint64_t interval_ns = frame_pacer_choose_interval(cached_fps, work_ns);
+    frame_pacer_interval_ns = interval_ns;
     if (next_slot_ns > now_ns) {
         if (!timebase.denom) mach_timebase_info(&timebase);
         uint64_t wait_ns = next_slot_ns - now_ns;
@@ -2064,8 +2184,15 @@ static NSOpenGLPixelFormat *legacy_pixel_format(void)
     }
     trace_gl_frame_boundary();
     if (!compat_runtime32_frame_profile_enabled) {
+        uint64_t work_end = hitch_recorder_enabled ? hitch_now() : 0;
         [[self openGLContext] flushBuffer];
+        uint64_t flush_end = hitch_recorder_enabled ? hitch_now() : 0;
         frame_pacer_wait([self window]);
+        if (hitch_recorder_enabled) {
+            hitch_frame(swap_count, work_end, flush_end, hitch_now(),
+                        frame_pacer_interval_ns,
+                        [NSApp isActive] || getenv("LP32_BACKGROUND_TEST"));
+        }
         audio_bridge32_note_frame_presented();
         return;
     }
@@ -2222,8 +2349,14 @@ static NSOpenGLPixelFormat *legacy_pixel_format(void)
        dispatch - flush. */
     uint64_t flush_start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     [[self openGLContext] flushBuffer];
+    uint64_t hitch_flush_end = hitch_recorder_enabled ? hitch_now() : 0;
     frame_pacer_wait([self window]);
     uint64_t flush_end = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (hitch_recorder_enabled) {
+        hitch_frame(swap_count, flush_start, hitch_flush_end, flush_end,
+                    frame_pacer_interval_ns,
+                    [NSApp isActive] || getenv("LP32_BACKGROUND_TEST"));
+    }
     audio_bridge32_note_frame_presented();
     stats.last_flush_ns = flush_end - flush_start;
     stats.flush_ns_total += stats.last_flush_ns;
@@ -2386,6 +2519,28 @@ static NSOpenGLPixelFormat *legacy_pixel_format(void)
     [_window release];
     [_openGLView release];
     [super dealloc];
+}
+@end
+
+/* Modern host counterpart for Marvel's application delegate. Dispatch its
+   two state changes back into the selected image; never terminate over an
+   in-progress guest save operation. */
+@interface NuMacApplicationDelegate : NSObject <NSApplicationDelegate>
+@end
+@implementation NuMacApplicationDelegate
+- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender
+{
+    (void)sender;
+    uint32_t function = lp32_profile()->application_should_terminate;
+    const uint32_t args[] = {0, 0, 0};
+    return function ? compat_runtime32_call(function, args, 3) : NSTerminateCancel;
+}
+- (void)applicationWillUnhide:(NSNotification *)notification
+{
+    (void)notification;
+    uint32_t function = lp32_profile()->application_will_unhide;
+    const uint32_t args[] = {0, 0, 0};
+    if (function) compat_runtime32_call(function, args, 3);
 }
 @end
 
@@ -4352,7 +4507,7 @@ static uint32_t guest_gl_string(GLenum name)
         (buffer_mode && strcmp(buffer_mode, "subdata") == 0);
     bool prefer_map_range = buffer_mode && strcmp(buffer_mode, "maprange") == 0;
     if (name != GL_EXTENSIONS || (!prefer_subdata && !prefer_map_range)) {
-        return compat_runtime32_copy_cstring(value);
+        return intern_guest_cstring(value);
     }
 
     static const char apple_extension[] = "GL_APPLE_flush_buffer_range";
@@ -4380,7 +4535,7 @@ static uint32_t guest_gl_string(GLenum name)
         cursor = end;
     }
     filtered[output] = '\0';
-    uint32_t guest_value = compat_runtime32_copy_cstring(filtered);
+    uint32_t guest_value = intern_guest_cstring(filtered);
     free(filtered);
     static bool logged;
     if (!logged) {
@@ -4564,6 +4719,7 @@ FAST_GL(glProgramLocalParameter4fvARB)
 
 FAST_GL(glBindProgramARB)
 {
+    if (hitch_recorder_enabled) hitch_program(arguments[0], arguments[1]);
     (void)return_address;
     ++gl_frame_diagnostics.program_binds;
     if (trace_gl_render_call()) {
@@ -4777,6 +4933,54 @@ lp32_fast_import_fn objc_bridge32_fast_import(const char *import_name)
     return NULL;
 }
 
+/* Earlier Marvel caches omitted all shader constants because the guest's
+ * inline ctype table was missing. Preserve those files, then let the game
+ * compile valid metadata once. Other titles keep their existing caches. */
+int objc_bridge32_prepare_shader_cache(void)
+{
+    if (lp32_profile()->title != LP32_TITLE_MARVEL) return 0;
+    @autoreleasepool {
+        const char *override = getenv("LP32_APPLICATION_SUPPORT_DIR");
+        NSString *support = override && override[0] ?
+            [NSString stringWithUTF8String:override] :
+            [NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory,
+                                                NSUserDomainMask, YES) firstObject];
+        if (!support) return -1;
+        NSString *root = [support stringByAppendingPathComponent:
+            @"Feral Interactive/LEGO Marvel Super Heroes"];
+        NSString *marker = [root stringByAppendingPathComponent:
+            @".lp32-shader-cache-ctype-v1"];
+        NSFileManager *files = [NSFileManager defaultManager];
+        if ([files fileExistsAtPath:marker]) return 0;
+        NSError *error = nil;
+        if (![files createDirectoryAtPath:root withIntermediateDirectories:YES
+                               attributes:nil error:&error]) {
+            fprintf(stderr, "compat32: cannot prepare Marvel shader cache: %s\n",
+                    [[error description] UTF8String]);
+            return -1;
+        }
+        NSString *cache = [root stringByAppendingPathComponent:@"CachedShadersGL"];
+        if ([files fileExistsAtPath:cache]) {
+            NSString *backup = [cache stringByAppendingFormat:
+                @".before-ctype-%@", [[NSUUID UUID] UUIDString]];
+            if (![files moveItemAtPath:cache toPath:backup error:&error]) {
+                fprintf(stderr, "compat32: cannot back up Marvel shader cache: %s\n",
+                        [[error description] UTF8String]);
+                return -1;
+            }
+            fprintf(stderr, "compat32: rebuilding Marvel shader cache; backup: %s\n",
+                    [backup fileSystemRepresentation]);
+        }
+        if (![@"1\n" writeToFile:marker atomically:YES
+                       encoding:NSUTF8StringEncoding error:&error]) {
+            fprintf(stderr, "compat32: cannot mark Marvel shader cache migration: %s\n",
+                    [[error description] UTF8String]);
+            return -1;
+        }
+    }
+    return 0;
+}
+
 int objc_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
                            uint64_t *result)
 {
@@ -4818,6 +5022,14 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                                        const uint32_t *arguments,
                                        uint64_t *result)
 {
+    if (LP32_NAME_IS(import_name, import_length, "_IOPMAssertionCreateWithName")) {
+        CFStringRef type = (CFStringRef)object_for_argument(arguments[0]);
+        CFStringRef name = (CFStringRef)object_for_argument(arguments[2]);
+        IOPMAssertionID assertion = kIOPMNullAssertionID;
+        *result = IOPMAssertionCreateWithName(type, arguments[1], name, &assertion);
+        if (arguments[3]) *(uint32_t *)(uintptr_t)arguments[3] = assertion;
+        return 1;
+    }
     if (LP32_NAME_IS(import_name, import_length, "_CGMainDisplayID")) {
         *result = preferred_game_display_id();
         return 1;
@@ -4829,7 +5041,8 @@ static int objc_bridge32_dispatch_body(const char *import_name,
 #pragma clang diagnostic pop
         return 1;
     }
-    if (LP32_NAME_IS(import_name, import_length, "_CGDisplayAvailableModes")) {
+    if (LP32_NAME_IS(import_name, import_length, "_CGDisplayAvailableModes") ||
+        LP32_NAME_IS(import_name, import_length, "_CGDisplayCopyAllDisplayModes")) {
         materialize_automatic_display_mode();
         NSArray *modes = legacy_modes_for_display(arguments[0]);
         if (getenv("LP32_TRACE_DISPLAY")) {
@@ -4839,7 +5052,8 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         *result = proxy_for_object(modes);
         return 1;
     }
-    if (LP32_NAME_IS(import_name, import_length, "_CGDisplayCurrentMode")) {
+    if (LP32_NAME_IS(import_name, import_length, "_CGDisplayCurrentMode") ||
+        LP32_NAME_IS(import_name, import_length, "_CGDisplayCopyDisplayMode")) {
         materialize_automatic_display_mode();
         NSDictionary *mode = legacy_current_mode_for_display(arguments[0]);
         if (getenv("LP32_TRACE_DISPLAY")) {
@@ -4847,6 +5061,27 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                     [[mode description] UTF8String]);
         }
         *result = proxy_for_object(mode);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGDisplayModeGetWidth") ||
+        LP32_NAME_IS(import_name, import_length, "_CGDisplayModeGetHeight")) {
+        NSDictionary *mode = object_for_argument(arguments[0]);
+        NSString *key = LP32_NAME_IS(import_name, import_length, "_CGDisplayModeGetWidth") ? @"Width" : @"Height";
+        *result = [[mode objectForKey:key] unsignedIntValue];
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGDisplayModeGetRefreshRate")) {
+        NSDictionary *mode = object_for_argument(arguments[0]);
+        double refresh = [[mode objectForKey:@"RefreshRate"] doubleValue];
+        memcpy(result, &refresh, sizeof(refresh));
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGDisplayModeCopyPixelEncoding")) {
+        *result = proxy_for_object(@"--------RRRRRRRRGGGGGGGGBBBBBBBB");
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGDisplayModeRelease")) {
+        *result = 0;
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CGWindowLevelForKey")) {
@@ -5102,6 +5337,12 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         NSValue *wrapper = object_for_argument(arguments[0]);
         CGLRendererInfoObj info = wrapper ? [wrapper pointerValue] : NULL;
         *result = info ? (uint32_t)CGLDestroyRendererInfo(info) : kCGLBadRendererInfo;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGLFlushDrawable")) {
+        NSValue *wrapper = object_for_argument(arguments[0]);
+        CGLContextObj context = wrapper ? [wrapper pointerValue] : NULL;
+        *result = context ? CGLFlushDrawable(context) : kCGLBadContext;
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CGLGetCurrentContext")) {
@@ -5709,6 +5950,18 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         note_texture_level_change();
         glGenerateMipmap(arguments[0]); *result = 0; return 1;
     }
+    if (LP32_NAME_IS(import_name, import_length, "glEnableIndexedEXT")) {
+        glEnableIndexedEXT(arguments[0], arguments[1]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "glDisableIndexedEXT")) {
+        glDisableIndexedEXT(arguments[0], arguments[1]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "glColorMaskIndexedEXT")) {
+        glColorMaskIndexedEXT(arguments[0], arguments[1], arguments[2], arguments[3], arguments[4]);
+        *result = 0; return 1;
+    }
     if (LP32_NAME_IS(import_name, import_length, "glDrawBuffers") ||
         LP32_NAME_IS(import_name, import_length, "glDrawBuffersARB")) {
         const GLenum *buffers = (const void *)(uintptr_t)arguments[1];
@@ -6015,6 +6268,14 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     }
     /* Fixed-function immediate mode used by the Clone Wars Feral layer for
        its loading/letterbox quads. */
+    if (LP32_NAME_IS(import_name, import_length, "_glPushAttrib")) {
+        glPushAttrib(arguments[0]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glPopAttrib")) {
+        glPopAttrib();
+        *result = 0; return 1;
+    }
     if (LP32_NAME_IS(import_name, import_length, "_glBegin")) {
         glBegin(arguments[0]);
         *result = 0; return 1;
@@ -6116,6 +6377,31 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                     symbol ? symbol : "(null)");
         }
         *result = thunk;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFBundleCopyLocalizedString")) {
+        NSBundle *bundle = object_for_argument(arguments[0]);
+        *result = proxy_for_object([bundle localizedStringForKey:object_for_argument(arguments[1])
+                                                           value:object_for_argument(arguments[2])
+                                                           table:object_for_argument(arguments[3])]);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_NSHomeDirectory")) {
+        const char *test_home = getenv("LP32_TEST_HOME_DIR");
+        *result = proxy_for_object(test_home && test_home[0] ?
+            [NSString stringWithUTF8String:test_home] : NSHomeDirectory());
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFURLCopyFileSystemPath")) {
+        NSURL *url = object_for_argument(arguments[0]);
+        CFStringRef path = CFURLCopyFileSystemPath((CFURLRef)url, arguments[1]);
+        *result = proxy_for_object((id)path);
+        if (path) CFRelease(path);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringGetCharacterAtIndex")) {
+        NSString *string = object_for_argument(arguments[0]);
+        *result = [string characterAtIndex:arguments[1]];
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFBundleCopyResourceURL")) {
@@ -6251,14 +6537,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFDataGetBytePtr")) {
         NSData *data = object_for_argument(arguments[0]);
-        if (!data) {
-            *result = 0;
-            return 1;
-        }
-        NSUInteger length = [data length];
-        uint32_t copy = compat_runtime32_allocate(length ? length : 1, 0);
-        if (copy && length) memcpy((void *)(uintptr_t)copy, [data bytes], length);
-        *result = copy;
+        *result = guest_bytes_for_data(data);
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFBooleanGetValue")) {
@@ -6457,6 +6736,23 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             fprintf(stderr, "compat32: objc swap=%llu %s receiver=%s\n",
                     (unsigned long long)objc_bridge_swap_count, selector_name,
                     receiver ? class_getName(object_getClass(receiver)) : "(none)");
+        }
+        /* Marvel drains pools across bridge calls. The dispatch pool has
+           already drained any nested host pool by then, so keep its guest
+           pool token inert; host temporaries retain their per-call lifetime. */
+        if (lp32_profile()->title == LP32_TITLE_MARVEL && selector_name) {
+            static NSObject *pool_token;
+            if (receiver == [NSAutoreleasePool class] &&
+                (strcmp(selector_name, "alloc") == 0 || strcmp(selector_name, "new") == 0)) {
+                if (!pool_token) pool_token = [[NSObject alloc] init];
+                *result = proxy_for_object(pool_token);
+                return 1;
+            }
+            if (pool_token && receiver == pool_token) {
+                *result = (strcmp(selector_name, "drain") == 0 ||
+                           strcmp(selector_name, "release") == 0) ? 0 : arguments[0];
+                return 1;
+            }
         }
         /* Unattended test runs must never take focus away from the user: the
            game activates itself and makes its window key at startup, so answer
@@ -6838,6 +7134,20 @@ int objc_bridge32_run_gl_buffer_self_test(void)
     uint64_t dispatch_result = 0;
     int status = 0;
 
+    uint32_t extensions = guest_gl_string(GL_EXTENSIONS);
+    if (!extensions) {
+        fputs("gl-buffer-selftest: extension string is missing\n", stderr);
+        status = -1;
+        goto cleanup;
+    }
+    for (unsigned query = 0; query < 10000; ++query) {
+        if (guest_gl_string(GL_EXTENSIONS) != extensions) {
+            fputs("gl-buffer-selftest: extension query leaks guest storage\n", stderr);
+            status = -1;
+            goto cleanup;
+        }
+    }
+
     glBindBuffer(GL_ARRAY_BUFFER, buffers[0]);
     glBufferData(GL_ARRAY_BUFFER, kTestSize, initial_a, GL_DYNAMIC_DRAW);
     const uint32_t disable_flush[] = {
@@ -6881,6 +7191,11 @@ int objc_bridge32_run_gl_buffer_self_test(void)
     if (error != kCGLNoError) {
         fprintf(stderr,
                 "gl-buffer-selftest: shared make-current failed: %d\n", error);
+        status = -1;
+        goto cleanup;
+    }
+    if (guest_gl_string(GL_EXTENSIONS) != extensions) {
+        fputs("gl-buffer-selftest: shared context duplicated extension storage\n", stderr);
         status = -1;
         goto cleanup;
     }

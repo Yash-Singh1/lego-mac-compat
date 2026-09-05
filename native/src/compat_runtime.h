@@ -21,6 +21,7 @@ void compat_runtime32_heap_frame(uint64_t swap_count);
 int compat_runtime32_run_heap_self_test(void);
 int compat_runtime32_run_file_self_test(void);
 int compat_runtime32_run_cg_self_test(void);
+int compat_runtime32_run_ctype_self_test(void);
 int compat_runtime32_run_sync_self_test(void);
 uint32_t compat_runtime32_cg_object_count(void);
 uint32_t compat_runtime32_cg_string_count(void);

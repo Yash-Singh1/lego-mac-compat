@@ -285,7 +285,8 @@ static int collect_imports(struct macho_image32 *image)
                 if (type == S_NON_LAZY_SYMBOL_POINTERS ||
                     type == S_LAZY_SYMBOL_POINTERS) {
                     stride = sizeof(uint32_t);
-                    kind = MACHO_IMPORT32_POINTER;
+                    kind = type == S_LAZY_SYMBOL_POINTERS ?
+                        MACHO_IMPORT32_FUNCTION_POINTER : MACHO_IMPORT32_POINTER;
                 } else if (type == S_SYMBOL_STUBS && sections[section_index].reserved2) {
                     stride = sections[section_index].reserved2;
                     kind = MACHO_IMPORT32_STUB;

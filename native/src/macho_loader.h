@@ -5,11 +5,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define MACHO_IMAGE32_MAX_IMPORTS 512
+#define MACHO_IMAGE32_MAX_IMPORTS 1024
 
 enum macho_import32_kind {
     MACHO_IMPORT32_POINTER,
     MACHO_IMPORT32_STUB,
+    MACHO_IMPORT32_FUNCTION_POINTER,
 };
 
 struct macho_import32 {
