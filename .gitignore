@@ -1,0 +1,13 @@
+# Reverse-engineering notes, disassembly dumps, captures and unpacked game images
+/analysis/
+# Local snapshots of earlier builds, saves and documents
+/backup/
+# One-off probes and conversion helpers (native/tools/ is part of the build)
+/tools/
+/.research-tools/
+# Build output, including the assembled game bundles (they contain the games)
+native/build/
+
+.DS_Store
+*.dSYM/
+__pycache__/
