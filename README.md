@@ -42,8 +42,10 @@ choose a specific version folder; ambiguous downloads are not mixed.
 Steam copies require Steam to be running and signed in to an account that owns
 Portal 2. The loader bridges the game's 32-bit Steam interfaces to the installed
 64-bit Steam client. It does not remove ownership or authentication checks.
-Folder support is included when building the converter from this branch;
-previously published converter releases are unchanged.
+Folder support is available in
+[Portal 2 Converter 0.0.0-dev.2](https://github.com/Yash-Singh1/lego-mac-compat/releases/tag/portal2-converter-v0.0.0-dev.2)
+and when building the converter from this branch. The older dev.1 release
+accepts app bundles only.
 The supplied depot build has been checked through the opening single-player
 room. Full playthrough and online features remain unverified.
 
