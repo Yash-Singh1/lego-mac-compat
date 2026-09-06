@@ -19,6 +19,52 @@ make GAME=portal2 SOURCE_APP="/Volumes/Storage/games/mac/Portal 2.app" bundle
 open build/Portal2-Compat.app
 ```
 
+The same target also accepts a flat Steam installation or a parent containing
+DepotDownloader's `depots/621/<version>` and `depots/623/<version>`:
+
+```sh
+make GAME=portal2 SOURCE_GAME="/Volumes/Storage/games/mac/portal2" bundle
+```
+
+`SOURCE_APP` remains supported. `SOURCE_GAME` can also name `Portal 2.app`,
+`steamapps/common/Portal 2`, or the Steam library folder. Both Make and the
+converter use `converter/Source.swift` to discover and combine the source
+files. Depot 621 supplies content and `portal2_osx`; depot 623 supplies the Mac
+libraries. `.DepotDownloader` staging files are excluded. No input files are
+modified. Make stages a fresh game tree, retains the existing output's saves
+and local options, and swaps directories so old libraries cannot survive a
+release change. GUI conversion retains its numbered, separate output behavior.
+
+The supplied **23973718** depot build passes conversion, signing, and real
+launcher/dependency loading. With Steam signed in, the converted app loads
+`sp_a1_intro1` and renders the opening relaxation room and LOOK UP tutorial
+prompt. A 90-second background test completed without a crash, and the game's
+framebuffer was inspected. This is a startup/rendering check; sustained
+playthrough, co-op, Workshop, and controller gameplay remain unverified. Steam must be running and signed in to an account
+that owns Portal 2. `steam_bridge.c` connects the original i386 Steam API library
+to the installed x86_64 Steam client using guest interface proxies and libffi.
+It preserves Steam's authentication and ownership requirements. Both the older
+SteamClient017 initialization facade and SteamClient020 interfaces are needed.
+
+The bridge metadata records virtual-method order from Valve's matching SDK
+headers, including private slots that are absent from the SDK JSON. Regenerate
+`src/steam_abi.inc` with `tools/generate_steam_abi.py` using SDK 1.53a's JSON and
+headers, plus `isteamclient017.h` from SDK 1.32 and `isteaminput005.h` from SDK 1.52.
+These inputs are needed only when regenerating metadata, not when building or
+using the converter. Unsupported interface/argument layouts fail explicitly;
+this is not a complete Steamworks implementation. In particular, callback
+payloads containing native pointers and application-supplied C++ callback
+objects need additional translation. Unregistered private Steam callbacks are
+released without being delivered to the game. The loader retains its own crash
+handler because Steam's native Breakpad cannot unwind the mixed-mode stacks.
+
+Other depot startup fixes include `bin/osx32` library search, matching duplicate
+guest Cocoa class layouts, 8,192 dynamic import slots on separate i386 code
+pages, the newer audio-device query, and the client's wide-string parsing
+calls. `LP32_CAPTURE_FRAME` now also captures Source's own OpenGL presenter. If CoreGraphics reports no active
+displays while AppKit still lists connected screens, Portal 2 can enumerate
+those screens instead of dereferencing an empty adapter list.
+
 `portal2-runtime` downloads Apple's 4.72 GB
 [Lion archive](https://support.apple.com/en-us/106383), verifies its checksum,
 and extracts only the i386 C++ runtime libraries. It never runs the installer
@@ -49,10 +95,16 @@ arch -x86_64 build/Portal2-Compat.app/Contents/MacOS/Portal2Compat -fullscreen -
 ```
 
 The loader skips Portal 2's startup movies by supplying `-novid` on every
-launch, including Finder and Dock launches. Their Bink audio uses legacy
-Carbon Sound Manager calls that are not bridged (`NewSndCallBackUPP` is the
-first); attempting to play them previously exited before reaching the menu.
-In-game audio uses the existing AudioQueue bridge.
+launch, including Finder and Dock launches. Bink videos opened by the game,
+including the Community Test Chambers introduction, now bridge legacy
+Sound Manager PCM playback and ordered completion callbacks to Core Audio.
+Their asynchronous file loading uses native Time Manager tasks with converted
+i386 records and callbacks. Previously the introduction exited on the
+unimplemented `NewSndCallBackUPP` import, after Steam had initialized normally.
+The supplied `intro_movie.bik` has passed two open/decode/play/close cycles
+through the original Bink library, in addition to synthetic callback-order,
+pause/resume, cancellation and timer tests. Workshop map downloads and play
+remain unverified. The engine's other audio uses the existing AudioQueue bridge.
 
 Launching normally uses the saved video settings. Avoid `-windowed` when
 testing fullscreen. The development bundle is currently saved at fullscreen
@@ -277,11 +329,15 @@ The important differences are:
   conversion of 32-bit string arrays. Legacy ATS/ATSUI font calls use CoreText
   for font selection, glyph metrics, shaping and bitmap drawing.
 - AudioQueue output has low-memory buffer mirrors and native-to-guest
-  callbacks. BSD sockets, page mappings, suspended threads and guest
+  callbacks. Bink's Sound Manager bridge supports queued 8/16-bit PCM,
+  completion callbacks, pause/resume, volume and channel disposal; it is not
+  a full implementation of the legacy Sound Manager or its compressed codecs.
+  BSD sockets, page mappings, suspended threads and guest
   `setjmp`/`longjmp` support the engine's additional runtime requirements.
 
 The loader currently targets the supplied `portal2_osx` image (entry `0x1cf0`,
-image end `0x335c`), not every historical Portal 2 release. Dynamic unloading,
+image end `0x335c`), which is also used by the supplied flat depot; it does not
+cover every historical Portal 2 release. Dynamic unloading,
 full dyld search semantics, arbitrary legacy Objective-C signatures and a
 complete C++/OpenGL compatibility surface are not implemented.
 Both windowed and fullscreen presentation use Cocoa. Display-wide gamma
@@ -300,6 +356,8 @@ expose limits in other retained Cocoa-object and thread registries.
 
 ```sh
 make test-macho-file test-guest-dyld
+make test-portal2-converter
+python3 tests/test_portal2_depots.py --source /path/to/depot-download
 make test-gl-shader-bridge
 make test-cursor-state
 make GAME=portal2 test-portal2-loader
@@ -340,3 +398,20 @@ binding invalidation on deletion.
 The Portal 2 loader check maps the real
 launcher and dependencies without executing game constructors or entering
 the UI. Passing these checks is not evidence that the game is playable.
+
+The depot integration test converts the real download into a disposable app,
+checks both depot overlays and library hashes, signs and loads the result,
+and rebuilds it with Make. It checks that saves/options survive, obsolete
+libraries disappear, and the download remains unchanged. It opens no windows.
+The dynamic-linker fixtures run with both `bin` and `bin/osx32` layouts.
+
+The guest dylib fixtures also exercise a local mock x86_64 Steam client through
+real i386 calls: interface ordinals (including private and legacy slots),
+64-bit Steam IDs, strings, mixed float/double arguments, callbacks and API call
+results. More than 2,200 imported symbols cover the expanded thunk region.
+The mock tests require neither Steam nor an account.
+
+Wide-text fixtures cover Unicode, field widths, assignment suppression,
+floating-point and 64-bit integers, and guards around i386 long/pointer output
+cells. Native Steam fixture binaries and generated loader stress inputs are
+original test code; no game or Steam client binaries are tracked.

@@ -271,13 +271,11 @@ final class Converter {
               !(converterApp.pathExtension == "app" && isInside(destination, converterApp)) else {
             throw ConversionError.message("Choose an output folder outside the original game and the converter app.")
         }
-        let contents = source.appendingPathComponent("Contents")
-        let image = contents.appendingPathComponent("MacOS/portal2_osx").resolvingSymlinksInPath()
-        guard fm.fileExists(atPath: image.path) else {
-            throw ConversionError.message("Could not find Portal 2's game files. Choose the original Mac version of Portal 2.app.")
-        }
+        let layout = try Portal2Source.discover(source)
+        try layout.checkDestination(destination)
+        let image = layout.image
         try cancellation.check()
-        progress("Preparing compatibility files…", "Your original app and existing converted copies stay untouched.")
+        progress("Preparing compatibility files…", "Your original game files and existing converted copies stay untouched.")
         let runtime = try prepareRuntime()
         let temp = destination.appendingPathComponent(".portal2-converting-\(UUID().uuidString)")
         try fm.createDirectory(at: temp, withIntermediateDirectories: false)
@@ -287,11 +285,14 @@ final class Converter {
         for directory in ["MacOS", "Resources", "SharedSupport"] {
             try fm.createDirectory(at: output.appendingPathComponent(directory), withIntermediateDirectories: true)
         }
-        progress("Copying Portal 2…", "The game is about 11 GB. Your saves in the original copy come with it.")
-        try run("/usr/bin/ditto", ["--noextattr", "--noqtn", contents.appendingPathComponent("MacOS").resolvingSymlinksInPath().path,
-                                  output.appendingPathComponent("SharedSupport/Portal2").path])
-        try run("/usr/bin/ditto", ["--noextattr", "--noqtn", contents.appendingPathComponent("Resources").resolvingSymlinksInPath().path,
-                                  output.appendingPathComponent("Resources").path])
+        progress("Copying Portal 2…", "Combining the game files into your new app. Saves stored in the source come with it.")
+        try layout.copyGame(to: output.appendingPathComponent("SharedSupport/Portal2"), check: cancellation.check)
+        if let resources = layout.resources {
+            try run("/usr/bin/ditto", ["--noextattr", "--noqtn", resources.path,
+                                      output.appendingPathComponent("Resources").path])
+        } else if let icon = layout.icon {
+            try fm.copyItem(at: icon, to: output.appendingPathComponent("Resources/game.icns"))
+        }
         try cancellation.check()
         try fm.copyItem(at: image, to: output.appendingPathComponent("SharedSupport/Portal2.image"))
         try fm.setAttributes([.posixPermissions: 0o644], ofItemAtPath: output.appendingPathComponent("SharedSupport/Portal2.image").path)

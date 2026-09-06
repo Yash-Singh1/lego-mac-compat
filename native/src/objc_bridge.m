@@ -1093,6 +1093,27 @@ static int legacy_install_methods(Class target, uint32_t address, bool category)
     return 0;
 }
 
+static bool legacy_same_layout(const struct legacy_class32 *a,
+                               const struct legacy_class32 *b)
+{
+    if (a->instance_size != b->instance_size) return false;
+    if (!a->ivars || !b->ivars) return a->ivars == b->ivars;
+    if (!guest_dyld32_contains(a->ivars, 4) || !guest_dyld32_contains(b->ivars, 4)) return false;
+    const uint32_t *x = (const void *)(uintptr_t)a->ivars;
+    const uint32_t *y = (const void *)(uintptr_t)b->ivars;
+    if (x[0] != y[0] || x[0] > 256 ||
+        !guest_dyld32_contains(a->ivars, 4 + x[0] * 12) ||
+        !guest_dyld32_contains(b->ivars, 4 + y[0] * 12)) return false;
+    for (uint32_t i = 0; i < x[0]; ++i) {
+        const uint32_t *u = x + 1 + i * 3, *v = y + 1 + i * 3;
+        if (u[2] != v[2] || !guest_dyld32_contains(u[0], 1) || !guest_dyld32_contains(v[0], 1) ||
+            !guest_dyld32_contains(u[1], 1) || !guest_dyld32_contains(v[1], 1) ||
+            strcmp((const char *)(uintptr_t)u[0], (const char *)(uintptr_t)v[0]) ||
+            strcmp((const char *)(uintptr_t)u[1], (const char *)(uintptr_t)v[1])) return false;
+    }
+    return true;
+}
+
 int objc_bridge32_register_legacy_module(uint32_t address, uint32_t size)
 {
     if (size % 16 || !guest_dyld32_contains(address, size)) return -1;
@@ -1116,6 +1137,17 @@ int objc_bridge32_register_legacy_module(uint32_t address, uint32_t size)
             Class parent = objc_getClass(parent_name);
             Class cls = objc_getClass(name);
             if (cls && legacy_class_for_host(cls) == guest) continue;
+            // Recent Portal 2 depots include the same Cocoa classes in both
+            // launcher/libtogl and shaderapidx9. Keep the first implementation
+            // and alias the later class pointer, as the ObjC name table does.
+            // Only coalesce guest classes with a matching fragile layout.
+            const struct legacy_class32 *existing = cls ? legacy_class_for_host(cls) : NULL;
+            if (existing && legacy_same_layout(existing, guest) &&
+                class_getSuperclass(cls) == parent && legacy_class_count < 128) {
+                legacy_classes[legacy_class_count++] = (struct legacy_class_pair){guest, cls};
+                fprintf(stderr, "compat32: coalesced duplicate guest Cocoa class %s\n", name);
+                continue;
+            }
             if (cls || !parent || legacy_class_count == 128) {
                 fprintf(stderr, "compat32: cannot register legacy class %s : %s\n", name, parent_name);
                 return -1;
@@ -2018,6 +2050,79 @@ static int compare_frame_ns(const void *left, const void *right)
     return (a > b) - (a < b);
 }
 
+/* Optional framebuffer capture is shared by the Source and LEGO presenters. */
+static void capture_game_frame(uint64_t swap_count)
+{
+    static bool captured_frame;
+    const char *capture_path = getenv("LP32_CAPTURE_FRAME");
+    const char *capture_number_text = getenv("LP32_CAPTURE_FRAME_NUMBER");
+    uint64_t capture_number = capture_number_text ?
+        strtoull(capture_number_text, NULL, 10) : 1;
+    const char *capture_interval_text = getenv("LP32_CAPTURE_INTERVAL");
+    uint64_t capture_interval = capture_interval_text ?
+        strtoull(capture_interval_text, NULL, 10) : 0;
+    bool capture_due = swap_count >= capture_number &&
+        (!capture_interval || (swap_count - capture_number) % capture_interval == 0);
+    if ((!captured_frame || capture_interval) && capture_due &&
+        capture_path && capture_path[0]) {
+        GLint viewport[4] = {0, 0, 0, 0};
+        GLint old_read_buffer = GL_BACK;
+        GLint old_pack_alignment = 4;
+        glGetIntegerv(GL_VIEWPORT, viewport);
+        glGetIntegerv(GL_READ_BUFFER, &old_read_buffer);
+        glGetIntegerv(GL_PACK_ALIGNMENT, &old_pack_alignment);
+        if (viewport[2] > 0 && viewport[3] > 0) {
+            size_t row_size = (size_t)viewport[2] * 3;
+            size_t byte_size = row_size * (size_t)viewport[3];
+            uint8_t *pixels = malloc(byte_size);
+            if (pixels) {
+                glReadBuffer(GL_BACK);
+                glPixelStorei(GL_PACK_ALIGNMENT, 1);
+                glReadPixels(viewport[0], viewport[1], viewport[2], viewport[3],
+                             GL_RGB, GL_UNSIGNED_BYTE, pixels);
+                bool has_visible_pixel = false;
+                for (size_t offset = 0; offset < byte_size; ++offset) {
+                    if (pixels[offset] > 2) {
+                        has_visible_pixel = true;
+                        break;
+                    }
+                }
+                if (has_visible_pixel) {
+                    char sequenced_path[4096];
+                    const char *output_path = capture_path;
+                    if (getenv("LP32_CAPTURE_SEQUENCE")) {
+                        int length = snprintf(sequenced_path,
+                                              sizeof(sequenced_path),
+                                              "%s.swap-%llu.ppm", capture_path,
+                                              (unsigned long long)swap_count);
+                        if (length > 0 && (size_t)length < sizeof(sequenced_path)) {
+                            output_path = sequenced_path;
+                        }
+                    }
+                    FILE *file = fopen(output_path, "wb");
+                    if (file) {
+                        fprintf(file, "P6\n%d %d\n255\n", viewport[2], viewport[3]);
+                        for (GLint row = viewport[3] - 1; row >= 0; --row) {
+                            fwrite(pixels + (size_t)row * row_size, row_size, 1,
+                                   file);
+                        }
+                        fclose(file);
+                        fprintf(stderr,
+                                "compat32: captured non-black swap %llu %dx%d at %s\n",
+                                (unsigned long long)swap_count,
+                                viewport[2], viewport[3], output_path);
+                        captured_frame = capture_interval == 0;
+                    }
+                }
+                free(pixels);
+            }
+        }
+        glReadBuffer((GLenum)old_read_buffer);
+        glPixelStorei(GL_PACK_ALIGNMENT, old_pack_alignment);
+    }
+
+}
+
 /* Source owns its NSOpenGLContext instead of using OpenGLView.swapBuffers.
    Keep its presentation measurement separate from the LEGO frame pacer. */
 static void portal_flush_buffer(NSOpenGLContext *context)
@@ -2027,6 +2132,7 @@ static void portal_flush_buffer(NSOpenGLContext *context)
         stats_enabled = getenv("LP32_PORTAL_FRAME_STATS") != NULL ||
                         compat_runtime32_frame_profile_enabled;
     uint64_t start = stats_enabled ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
+    capture_game_frame(objc_bridge_swap_count + 1);
     [context flushBuffer];
     ++objc_bridge_swap_count;
     if (stats_enabled) {
@@ -2255,7 +2361,6 @@ static NSOpenGLPixelFormat *legacy_pixel_format(void)
 - (void)swapBuffers
 {
     static bool logged_first_frame;
-    static bool captured_frame;
     static bool posted_debug_key;
     static bool posted_title_key;
     static bool posted_title_skip_return;
@@ -2668,72 +2773,7 @@ static NSOpenGLPixelFormat *legacy_pixel_format(void)
         glReadBuffer(old_read_buffer);
         glPixelStorei(GL_PACK_ALIGNMENT, old_pack_alignment);
     }
-    const char *capture_path = getenv("LP32_CAPTURE_FRAME");
-    const char *capture_number_text = getenv("LP32_CAPTURE_FRAME_NUMBER");
-    uint64_t capture_number = capture_number_text ?
-        strtoull(capture_number_text, NULL, 10) : 1;
-    const char *capture_interval_text = getenv("LP32_CAPTURE_INTERVAL");
-    uint64_t capture_interval = capture_interval_text ?
-        strtoull(capture_interval_text, NULL, 10) : 0;
-    bool capture_due = swap_count >= capture_number &&
-        (!capture_interval || (swap_count - capture_number) % capture_interval == 0);
-    if ((!captured_frame || capture_interval) && capture_due &&
-        capture_path && capture_path[0]) {
-        GLint viewport[4] = {0, 0, 0, 0};
-        GLint old_read_buffer = GL_BACK;
-        GLint old_pack_alignment = 4;
-        glGetIntegerv(GL_VIEWPORT, viewport);
-        glGetIntegerv(GL_READ_BUFFER, &old_read_buffer);
-        glGetIntegerv(GL_PACK_ALIGNMENT, &old_pack_alignment);
-        if (viewport[2] > 0 && viewport[3] > 0) {
-            size_t row_size = (size_t)viewport[2] * 3;
-            size_t byte_size = row_size * (size_t)viewport[3];
-            uint8_t *pixels = malloc(byte_size);
-            if (pixels) {
-                glReadBuffer(GL_BACK);
-                glPixelStorei(GL_PACK_ALIGNMENT, 1);
-                glReadPixels(viewport[0], viewport[1], viewport[2], viewport[3],
-                             GL_RGB, GL_UNSIGNED_BYTE, pixels);
-                bool has_visible_pixel = false;
-                for (size_t offset = 0; offset < byte_size; ++offset) {
-                    if (pixels[offset] > 2) {
-                        has_visible_pixel = true;
-                        break;
-                    }
-                }
-                if (has_visible_pixel) {
-                    char sequenced_path[4096];
-                    const char *output_path = capture_path;
-                    if (getenv("LP32_CAPTURE_SEQUENCE")) {
-                        int length = snprintf(sequenced_path,
-                                              sizeof(sequenced_path),
-                                              "%s.swap-%llu.ppm", capture_path,
-                                              (unsigned long long)swap_count);
-                        if (length > 0 && (size_t)length < sizeof(sequenced_path)) {
-                            output_path = sequenced_path;
-                        }
-                    }
-                    FILE *file = fopen(output_path, "wb");
-                    if (file) {
-                        fprintf(file, "P6\n%d %d\n255\n", viewport[2], viewport[3]);
-                        for (GLint row = viewport[3] - 1; row >= 0; --row) {
-                            fwrite(pixels + (size_t)row * row_size, row_size, 1,
-                                   file);
-                        }
-                        fclose(file);
-                        fprintf(stderr,
-                                "compat32: captured non-black swap %llu %dx%d at %s\n",
-                                (unsigned long long)swap_count,
-                                viewport[2], viewport[3], output_path);
-                        captured_frame = capture_interval == 0;
-                    }
-                }
-                free(pixels);
-            }
-        }
-        glReadBuffer((GLenum)old_read_buffer);
-        glPixelStorei(GL_PACK_ALIGNMENT, old_pack_alignment);
-    }
+    capture_game_frame(swap_count);
     trace_gl_frame_boundary();
     if (!compat_runtime32_frame_profile_enabled) {
         [[self openGLContext] flushBuffer];
@@ -5757,6 +5797,14 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             CGGetOnlineDisplayList(arguments[0], displays, count);
         return 1;
     }
+    if (LP32_NAME_IS(import_name, import_length, "_GetCurrentProcess")) {
+        // ProcessSerialNumber remains a pair of 32-bit words in both ABIs.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        *result = (uint32_t)GetCurrentProcess((ProcessSerialNumber *)(uintptr_t)arguments[0]);
+#pragma clang diagnostic pop
+        return 1;
+    }
     if (LP32_NAME_IS(import_name, import_length, "_TransformProcessType")) {
         *result = [[NSApplication sharedApplication] setActivationPolicy:NSApplicationActivationPolicyRegular] ? 0 : (uint32_t)-1;
         return 1;
@@ -6064,7 +6112,24 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         *result = (uint32_t)CGDisplayPixelsHigh(arguments[0]); return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CGDisplayIsActive")) {
-        *result = CGDisplayIsActive(arguments[0]); return 1;
+        *result = CGDisplayIsActive(arguments[0]);
+        // Source enumerates adapters only on active displays. WindowServer
+        // can report no active displays while AppKit still exposes connected
+        // screens (for example, while displays sleep). Keep those available
+        // for this windowed renderer instead of handing Source zero adapters.
+        if (!*result && lp32_profile()->title == LP32_TITLE_PORTAL2) {
+            uint32_t active_count = 0;
+            if (CGGetActiveDisplayList(0, NULL, &active_count) == kCGErrorSuccess && !active_count) {
+                for (NSScreen *screen in [NSScreen screens]) {
+                    if ([[[screen deviceDescription] objectForKey:@"NSScreenNumber"] unsignedIntValue] == arguments[0]) {
+                        *result = 1;
+                        break;
+                    }
+                }
+            }
+        }
+        if (getenv("LP32_TRACE_DISPLAY")) fprintf(stderr, "compat32: display active %u -> %llu\n", arguments[0], (unsigned long long)*result);
+        return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CGCursorIsVisible")) {
         if (lp32_profile()->title == LP32_TITLE_PORTAL2) {

@@ -55,8 +55,8 @@ final class DropView: NSView {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var window: NSWindow!
     private let drop = DropView()
-    private let status = label("Drop Portal 2.app here", size: 20, weight: .semibold)
-    private let detail = label("Use your original Mac copy of the game.", size: 13)
+    private let status = label("Drop Portal 2 here", size: 20, weight: .semibold)
+    private let detail = label("A Mac app, Steam game folder, or downloaded depots.\nFor Steam, choose the “Portal 2” folder inside\nsteamapps/common.", size: 13)
     private let footnote = label("Creates a new copy. Your original game and saves stay untouched.", size: 11)
     private let progress = NSProgressIndicator()
     private let choose = NSButton(title: "Choose Portal 2…", target: nil, action: #selector(chooseSource))
@@ -158,11 +158,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         choosing = true
         let panel = NSOpenPanel()
-        panel.message = "Choose your original Mac copy of Portal 2."
+        panel.message = "For Steam, choose the Portal 2 folder inside steamapps/common.\nDefault location: ~/Library/Application Support/Steam/steamapps/common/Portal 2\nYou can also choose Portal 2.app or a folder of downloaded depots."
         panel.prompt = "Choose Game"
-        panel.allowedContentTypes = [.applicationBundle]
-        panel.canChooseDirectories = false
+        panel.allowedContentTypes = [.applicationBundle, .folder]
+        panel.treatsFilePackagesAsDirectories = false
+        panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
+        let steamGame = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Steam/steamapps/common/Portal 2")
+        if FileManager.default.fileExists(atPath: steamGame.appendingPathComponent("portal2_osx").path) {
+            panel.directoryURL = steamGame
+        }
         panel.beginSheetModal(for: window) { response in
             self.choosing = false
             if response == .OK, let url = panel.url { self.selectDestination(for: url) }
@@ -222,16 +228,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         case .success(let url):
             result = url
             status.stringValue = "Your Portal 2 app is ready."
-            detail.stringValue = url.path
+            detail.stringValue = url.path + "\nFor Steam copies, open Steam before launching the game."
             choose.title = "Open Game"
             secondary.title = "Show in Finder"
             secondary.isHidden = false
         case .failure(ConversionError.cancelled):
-            status.stringValue = "Drop Portal 2.app here"
+            status.stringValue = "Drop Portal 2 here"
             detail.stringValue = "Conversion cancelled. You can try again whenever you're ready."
         case .failure(let error):
             status.stringValue = "Let’s try that again."
-            detail.stringValue = "Drop Portal 2.app here, or choose it below."
+            detail.stringValue = "Drop Portal 2 here, or choose it below."
             if !quitting { showError(error) }
         }
         if quitting { NSApp.reply(toApplicationShouldTerminate: true) }

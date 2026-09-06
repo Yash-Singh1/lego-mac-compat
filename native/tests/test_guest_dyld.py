@@ -25,6 +25,10 @@ install-name: /usr/lib/libSystem.B.dylib
 exports:
   - archs: [ i386 ]
     symbols: [
+      _NewTimerUPP, _DisposeTimerUPP, _InstallTimeTask, _PrimeTime, _PrimeTimeTask, _RemoveTimeTask,
+      _NewSndCallBackUPP, _DisposeSndCallBackUPP, _SndNewChannel, _SndDisposeChannel, _SndDoCommand, _SndDoImmediate, _SndChannelStatus, _OTAtomicAdd32,
+      _wcsstr, _wcsrchr, _wcsncat, _wcscoll, _wcstod, _wcstof, _wcstol, _swscanf, _strtoull, _strtoll, _getenv, _bootstrap_look_up, _bootstrap_port, _mach_task_self_, _mach_port_allocate,
+      _mach_port_type, _mach_port_deallocate, _mach_port_mod_refs, _mach_msg, _kill, _kill$UNIX2003,
       _opendir$INODE64, _readdir$INODE64, _readdir_r, _closedir, _closedir$UNIX2003, _setlocale, _vswprintf, _swprintf, _wcscmp, _strlen,
       _getrusage, _asinf, _atanf, _finite, ___fixunssfdi, _GetGlobalMouse,
       _CGDisplayHideCursor, _CGDisplayShowCursor, _CGCursorIsVisible,
@@ -32,7 +36,7 @@ exports:
       ___divdi3, ___moddi3, _setjmp, __setjmp, _sigsetjmp, _longjmp,
       __longjmp, _siglongjmp, _sigprocmask, _sigprocmask$UNIX2003, _memcpy, ___memset_chk,
       _pthread_create_suspended_np, _pthread_mach_thread_np, _thread_resume, _pthread_join, _pthread_join$UNIX2003, _usleep,
-      _usleep$UNIX2003, _AudioQueueNewOutput, _AudioQueueAddPropertyListener, _AudioQueueAllocateBuffer, _AudioQueueSetParameter, _AudioQueueGetParameter,
+      _usleep$UNIX2003, _GetCurrentProcess, _AudioObjectGetPropertyData, _AudioQueueNewOutput, _AudioQueueAddPropertyListener, _AudioQueueAllocateBuffer, _AudioQueueSetParameter, _AudioQueueGetParameter,
       _AudioQueueEnqueueBuffer, _AudioQueueStart, _AudioQueueStop, _AudioQueueRemovePropertyListener, _AudioQueueFreeBuffer, _AudioQueueDispose,
       _strcmp, _lp32_unavailable, _stat, _stat$INODE64, _open$UNIX2003, _open,
       _close, _close$UNIX2003, _lseek, _scandir, _alphasort, _free,
@@ -56,6 +60,16 @@ exports:
     ]
 ...
 """)
+    # Source, CEF and Steam together exceed the original 2048 import slots.
+    # Keep uncalled strong references, then execute real imports above them.
+    padding = [f"lp32_fixture_unused_{i}" for i in range(2200)]
+    tbd = root / "libSystem.tbd"
+    tbd.write_text(tbd.read_text().replace("dyld_stub_binder", ", ".join("_" + n for n in padding) + ", dyld_stub_binder"))
+    (root / "many_imports.c").write_text(
+        "\n".join(f"extern void {n}(void);" for n in padding) +
+        "\nvoid (*fixture_imports[])(void) = {" + ",".join(padding) + "};\n")
+    run("xcrun", "clang", "-arch", "x86_64", "-dynamiclib",
+        str(NATIVE / "tests/fixtures/steam_host.c"), "-o", str(root / "steamclient.dylib"))
     (root / "dep.c").write_text("""
 int value = 11;
 int *value_pointer = &value;
@@ -81,13 +95,20 @@ int dependency_value(void) { return *value_pointer; }
 #include <netdb.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreGraphics/CoreGraphics.h>
+extern unsigned bootstrap_port;
+extern int bootstrap_look_up(unsigned, const char *, unsigned *);
 extern int dependency_value(void);
 extern int strcmp(const char *, const char *) __attribute__((weak_import));
 extern int lp32_unavailable(void) __attribute__((weak_import));
 extern int check_directory(void);
 extern int check_font(void);
 extern int check_context(void);
+extern int check_mach_ipc(void);
+extern int check_steam(void);
+extern int check_wide_scan(void);
 extern int check_audio_threads(void);
+extern int check_sound_manager(void);
+extern int check_time_manager(void);
 extern int MPCreateCriticalRegion(void **);
 extern int MPDeleteCriticalRegion(void *);
 extern int MPEnterCriticalRegion(void *, int);
@@ -111,8 +132,16 @@ __attribute__((constructor)) static void initialize(void) {
 }
 int LauncherMain(void) {
     if (!strcmp || lp32_unavailable) return -4;
+    unsigned missing_service = 123;
+    if (!bootstrap_port || !bootstrap_look_up(bootstrap_port,
+            "org.32bitgoofy.test.nonexistent-service", &missing_service) || missing_service) return -58;
+    int scan_error = check_wide_scan(); if (scan_error) return scan_error;
+    int steam_error = check_steam(); if (steam_error) return steam_error;
+    int ipc_error = check_mach_ipc(); if (ipc_error) return ipc_error;
     int context_error = check_context(); if (context_error) return context_error;
     int audio_error = check_audio_threads(); if (audio_error) return audio_error;
+    int timer_error = check_time_manager(); if (timer_error) return timer_error;
+    int sound_error = check_sound_manager(); if (sound_error) return sound_error;
     int font_error = check_font(); if (font_error) return font_error;
     void *system = dlopen("/usr/lib/libSystem.B.dylib", RTLD_LAZY);
     if (!system || dlopen("/usr/lib/libSystem.B.dylib", RTLD_LAZY) != system) return -17;
@@ -317,7 +346,7 @@ int check_directory(void) {
                 "-L" + str(root / "bin"), "-lfixture_dep", "-o", str(root / "bin/libfixture_reexport.dylib"))
             dependency = "fixture_reexport"
         run(*flags, "-dynamiclib", "-Wl,-install_name,@loader_path/launcher.dylib",
-            str(root / "launcher.c"), str(NATIVE / "tests/fixtures/font.c"), str(NATIVE / "tests/fixtures/context.c"), str(NATIVE / "tests/fixtures/audio_threads.c"), str(root / "directory.o"), "-L" + str(root / "bin"), "-l" + dependency,
+            str(root / "launcher.c"), str(root / "many_imports.c"), str(NATIVE / "tests/fixtures/font.c"), str(NATIVE / "tests/fixtures/context.c"), str(NATIVE / "tests/fixtures/mach_ipc.c"), str(NATIVE / "tests/fixtures/steam_guest.c"), str(NATIVE / "tests/fixtures/wide_scan.c"), str(NATIVE / "tests/fixtures/audio_threads.c"), str(NATIVE / "tests/fixtures/sound_manager.c"), str(NATIVE / "tests/fixtures/time_manager.c"), str(root / "directory.o"), "-L" + str(root / "bin"), "-l" + dependency,
             "-o", str(root / "bin/launcher.dylib"))
         run(*flags, "-Wl,-e,_start,-no_pie", str(root / "start.S"), "-o", str(root / "portal2_osx"))
         # Exercise universal i386 selection on a real generated dylib.
@@ -338,6 +367,19 @@ int check_directory(void) {
         struct.pack_into("<I", malformed, 20, 0xFFFFFFFF)
         (root / "bin/broken.dylib").write_bytes(malformed)
         environment = dict(os.environ, LP32_GAME="portal2", LP32_DYLD_SELFTEST="1",
-                           LP32_DYLD_FIXTURE_SELFTEST="1")
+                           LP32_DYLD_FIXTURE_SELFTEST="1", LP32_STEAM_FIXTURE=str(root / "steamclient.dylib"))
         run("arch", "-x86_64", str(LOADER), str(root / "portal2_osx"), env=environment)
+        # Re-run the same real i386 code under the newer Mac depot layout.
+        # The launcher's explicit bin/ paths must find libraries in osx32 too.
+        binaries = list((root / "bin").iterdir())
+        osx32 = root / "bin/osx32"
+        osx32.mkdir()
+        for binary in binaries:
+            binary.rename(osx32 / binary.name)
+        try:
+            run("arch", "-x86_64", str(LOADER), str(root / "portal2_osx"), env=environment)
+        finally:
+            for binary in osx32.iterdir():
+                binary.rename(root / "bin" / binary.name)
+            osx32.rmdir()
         print(f"Guest dylib fixtures: PASS (macOS {version}, preferred address 0x{address:x})")

@@ -27,9 +27,25 @@ Supported and candidate games:
 ## Portal 2 converter
 
 The `portal2` branch includes a small native Mac app. Drop your original
-**Portal 2.app** onto **Portal2-Converter.app** (or open the converter and click
+**Portal 2.app**, **Steam game folder**, or **depot download folder** onto **Portal2-Converter.app** (or open the converter and click
 **Choose Portal 2…**), choose an output folder, and wait for **Open Game**.
 There is no separate validation step. You can cancel while it works.
+
+For a Steam installation, select `steamapps/common/Portal 2` (selecting the
+Steam library folder also works). For separate DepotDownloader downloads,
+select their parent folder, such as `/Volumes/Storage/games/mac/portal2`.
+The converter combines the shared content in depot **621** with the Mac client
+in depot **623**, including `bin/osx32`. You do not need to make an `.app`
+bundle or combine the folders yourself. If several versions are present,
+choose a specific version folder; ambiguous downloads are not mixed.
+
+Steam copies require Steam to be running and signed in to an account that owns
+Portal 2. The loader bridges the game's 32-bit Steam interfaces to the installed
+64-bit Steam client. It does not remove ownership or authentication checks.
+Folder support is included when building the converter from this branch;
+previously published converter releases are unchanged.
+The supplied depot build has been checked through the opening single-player
+room. Full playthrough and online features remain unverified.
 
 The converter needs no Make, Python, Xcode, or Terminal to use. It includes the
 compiled compatibility loader and automatically downloads the required Apple
@@ -38,9 +54,9 @@ game needs Rosetta 2 on Apple Silicon. Compatibility is experimental, with the
 same limitations as the command-line build; this does not guarantee support
 for every future macOS release.
 
-Your original app stays untouched. Each conversion creates a new
+Your original app or downloaded files stay untouched. Each conversion creates a new
 `Portal2-Compat.app`; if that name already exists, it uses a numbered name.
-Saves and settings inside the source app are copied with it. Progress in a
+Saves and settings inside the selected source are copied with it. Progress in a
 previously converted copy stays in that copy; the converter never overwrites
 or merges it. Portal 2 keeps its saves under the converted app's
 `Contents/SharedSupport/Portal2/portal2/SAVE/`, so keep that app when rebuilding.
@@ -48,7 +64,7 @@ or merges it. Portal 2 keeps its saves under the converted app's
 The first conversion downloads Apple's 4.72 GB Lion archive and extracts two
 libraries without running the installer or changing system libraries. Files
 are cached in `~/Library/Caches/org.32bitgoofy.Portal2Converter/`. Allow room
-for the roughly 11 GB output and about 15 GB of download/extraction space on
+for the roughly 11–13 GB output and about 15 GB of download/extraction space on
 the first run; later conversions reuse the cached libraries.
 
 To build the converter once from this checkout (requires Xcode command-line
@@ -68,7 +84,7 @@ notarization for normal Gatekeeper distribution.
 
 Requirements: macOS 11 or later, Xcode command-line tools (`xcode-select
 --install`), Rosetta 2 on Apple Silicon (`softwareupdate --install-rosetta`),
-and the original game application. Pirates additionally needs Python 3 (the
+and the original game application (or Portal 2 Mac game files). Pirates additionally needs Python 3 (the
 one that comes with the command-line tools is fine) and network access the
 first time, to fetch the `unicorn` package. Portal 2 additionally needs Python 3
 and network access for the automatic, one-time runtime download performed by
@@ -80,12 +96,13 @@ make GAME=pirates   SOURCE_APP="/path/to/LEGO Pirates of the Caribbean.app" bund
 make GAME=clonewars SOURCE_APP="/path/to/LEGO Star Wars III.app"           bundle
 make portal2-runtime
 make GAME=portal2   SOURCE_APP="/path/to/Portal 2.app"   bundle
+make GAME=portal2   SOURCE_GAME="/path/to/portal2"       bundle
 ```
 
 For Portal 2, `make portal2-runtime` downloads Apple's 4.72 GB Lion installer
 and extracts the two required 32-bit C++ libraries automatically. It caches the
 download in `native/build/runtime-downloads/` and places the libraries in
-`native/build/guest-runtime/`. The bundle command then copies them inside
+`native/build/guest-runtime/`. The Portal 2 bundle target also prepares the runtime automatically, then copies it inside
 `Portal2-Compat.app`. Later runs verify and reuse the cached libraries. The
 installer is never run, and your Mac's system libraries are not changed.
 
@@ -94,7 +111,10 @@ This compiles the loader and assembles a self-contained app in
 the game's data, resources and Cg framework copied in. The original app is
 only read. Open the built app from Finder or the Dock. Portal 2 builds
 `Portal2-Compat.app`; its current limitations and development checks are
-documented in [native/PORTAL2.md](native/PORTAL2.md).
+documented in [native/PORTAL2.md](native/PORTAL2.md). Portal 2 rebuilds assemble
+a fresh game tree and preserve the output's existing `SAVE` folder and local
+`config.cfg`, `video.txt`, and `videodefaults.txt`; stale libraries from another
+release are removed. The GUI always produces a separate numbered app.
 
 Pirates ships with a SecuROM-packed executable. The build recovers the plain
 Mach-O from it automatically: `native/tools/unpack_securom.py` emulates the

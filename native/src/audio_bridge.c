@@ -1,5 +1,6 @@
 #include "audio_bridge.h"
 #include "audio_queue_bridge.h"
+#include "sound_manager_bridge.h"
 #include "compat_runtime.h"
 #include "game_profile.h"
 #include "name_match.h"
@@ -1557,6 +1558,7 @@ int audio_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
                             uint64_t *result)
 {
     if (audio_queue_bridge32_dispatch(import_name, arguments, result)) return 1;
+    if (sound_manager_bridge32_dispatch(import_name, arguments, result)) return 1;
     const size_t import_length = strlen(import_name);
     if (LP32_NAME_IS(import_name, import_length, "_FindNextComponent")) {
         pthread_mutex_lock(&audio_object_lock);
@@ -2067,6 +2069,23 @@ int audio_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
                 (void *)(uintptr_t)arguments[5]);
         }
         trace_audio_status("AudioDeviceGetProperty", status);
+        *result = (uint32_t)status;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_AudioObjectGetPropertyData")) {
+        const AudioObjectPropertyAddress *address = (const void *)(uintptr_t)arguments[1];
+        OSStatus status = kAudioHardwareUnknownPropertyError;
+        // These device-ID properties have identical layouts in both ABIs.
+        // Other properties may contain native pointers and need converters.
+        if (address && (address->mSelector == kAudioHardwarePropertyDefaultInputDevice ||
+                        address->mSelector == kAudioHardwarePropertyDefaultOutputDevice ||
+                        address->mSelector == kAudioHardwarePropertyDefaultSystemOutputDevice ||
+                        address->mSelector == kAudioHardwarePropertyDevices)) {
+            status = AudioObjectGetPropertyData(arguments[0], address, arguments[2],
+                (const void *)(uintptr_t)arguments[3], (UInt32 *)(uintptr_t)arguments[4],
+                (void *)(uintptr_t)arguments[5]);
+        }
+        trace_audio_status("AudioObjectGetPropertyData", status);
         *result = (uint32_t)status;
         return 1;
     }

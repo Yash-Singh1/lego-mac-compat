@@ -1,4 +1,5 @@
 #include "guest_dyld.h"
+#include "steam_bridge.h"
 #include "macho_file.h"
 #include "compat_runtime.h"
 #include "objc_bridge.h"
@@ -51,6 +52,7 @@ static struct module32 modules[kModuleLimit];
 static unsigned module_count;
 static uint32_t module_cursor = kModuleBase;
 static char game_root[PATH_MAX];
+static const char *binary_directory = "bin";
 static pthread_mutex_t loader_lock;
 static pthread_once_t loader_once = PTHREAD_ONCE_INIT;
 static _Thread_local char loader_error[1024];
@@ -194,20 +196,21 @@ static int resolve_path(const char *name, const char *parent, char out[PATH_MAX]
     } else if (!strncmp(name, "@executable_path/", 17)) {
         n = snprintf(candidate, sizeof(candidate), "%s/%s", game_root, name + 17);
     } else if (!strncmp(name, "@rpath/", 7)) {
-        n = snprintf(candidate, sizeof(candidate), "%s/bin/%s", game_root, name + 7);
+        n = snprintf(candidate, sizeof(candidate), "%s/%s/%s", game_root, binary_directory, name + 7);
     } else if (name[0] == '/') {
         n = snprintf(candidate, sizeof(candidate), "%s", name);
     } else {
-        n = snprintf(candidate, sizeof(candidate), "%s/%s%s", game_root,
-                     strchr(name, '/') ? "" : "bin/", name);
+        n = strchr(name, '/') ? snprintf(candidate, sizeof(candidate), "%s/%s", game_root, name) :
+            snprintf(candidate, sizeof(candidate), "%s/%s/%s", game_root, binary_directory, name);
     }
     if (n < 0 || (size_t)n >= sizeof(candidate)) return fail("library path is too long");
     if (!realpath(candidate, out)) {
-        /* portal2.sh prepends game_root/bin to DYLD_LIBRARY_PATH. Reproduce
-           that guest-only fallback, including Bink's @executable_path name. */
+        /* Match portal2.sh's guest-only DYLD_LIBRARY_PATH: newer Mac depots
+           moved libraries to bin/osx32. Keep the original install layout so
+           Source's own game-content searches still work. */
         const char *basename = strrchr(name, '/');
         basename = basename ? basename + 1 : name;
-        n = snprintf(candidate, sizeof(candidate), "%s/bin/%s", game_root, basename);
+        n = snprintf(candidate, sizeof(candidate), "%s/%s/%s", game_root, binary_directory, basename);
         if (n < 0 || (size_t)n >= sizeof(candidate)) return fail("library path is too long");
         if (!realpath(candidate, out)) return fail("%s: %s", candidate, strerror(errno));
     }
@@ -227,6 +230,10 @@ int guest_dyld32_initialize(const char *image_path)
         strcat(path, "/Portal2");
     }
     if (!realpath(path, game_root)) return fail("game directory: %s", strerror(errno));
+    char launcher[PATH_MAX];
+    int n = snprintf(launcher, sizeof(launcher), "%s/bin/osx32/launcher.dylib", game_root);
+    if (n < 0 || (size_t)n >= sizeof(launcher)) return fail("game path is too long");
+    binary_directory = access(launcher, R_OK) == 0 ? "bin/osx32" : "bin";
     pthread_once(&loader_once, create_lock);
     return 0;
 }
@@ -754,7 +761,10 @@ uint32_t guest_dyld32_open(const char *name, int flags)
                 result = HOST_HANDLE_BASE + i + 1;
             }
         }
-    } else result = open_locked(name, true);
+    } else {
+        result = steam_bridge32_open(name);
+        if (!result) result = open_locked(name, true);
+    }
     pthread_mutex_unlock(&loader_lock);
     return result;
 }
@@ -767,6 +777,9 @@ uint32_t guest_dyld32_symbol(uint32_t handle, const char *symbol)
     char name[1024];
     if (!symbol || snprintf(name, sizeof(name), "_%s", symbol) >= (int)sizeof(name)) {
         fail("invalid dlsym name");
+    } else if (handle == LP32_STEAM_CLIENT_HANDLE) {
+        result = steam_bridge32_symbol(symbol);
+        if (!result) fail("native Steam symbol %s is unavailable", symbol);
     } else if (handle == HANDLE_BASE || handle == (uint32_t)(uintptr_t)RTLD_DEFAULT) {
         result = global_symbol(name);
         if (!result && dlsym(RTLD_DEFAULT, symbol)) result = compat_runtime32_resolve_symbol(name, false);
@@ -790,6 +803,7 @@ uint32_t guest_dyld32_symbol(uint32_t handle, const char *symbol)
 
 int guest_dyld32_close(uint32_t handle)
 {
+    if (handle == LP32_STEAM_CLIENT_HANDLE) return 0;
     if (handle > HOST_HANDLE_BASE && handle - HOST_HANDLE_BASE <= host_module_count) return 0;
     if (handle < HANDLE_BASE || handle - HANDLE_BASE > module_count) return fail("invalid dlclose handle");
     return 0;
@@ -861,11 +875,11 @@ int guest_dyld32_self_test(void)
        checks relocations, binding, paths, reuse and lookup without saves/UI. */
     pthread_mutex_lock(&loader_lock);
     error_pending = false;
-    uint32_t launcher = open_locked("bin/launcher.dylib", false);
+    uint32_t launcher = open_locked("launcher.dylib", false);
     uint32_t main = launcher ? guest_dyld32_symbol(launcher, "LauncherMain") : 0;
     unsigned count = module_count;
     bool ok = launcher && main && guest_dyld32_contains(main, 1) &&
-              open_locked("bin/launcher.dylib", false) == launcher && module_count == count;
+              open_locked("launcher.dylib", false) == launcher && module_count == count;
     if (ok) {
         ok = !guest_dyld32_symbol(launcher, "__lp32_missing_symbol__") &&
              guest_dyld32_error() && !guest_dyld32_error() &&

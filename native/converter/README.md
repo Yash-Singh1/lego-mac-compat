@@ -8,7 +8,8 @@ There is no shell-interpolated command execution and no developer-tool
 dependency in the shipped app. Apple's supplied macOS tools perform copying,
 archive extraction and code signing; Swift handles SHA-256 and i386 thinning.
 
-`Conversion.swift` follows the existing `GAME=portal2 bundle` recipe and
+`Source.swift` shares app/Steam/depot discovery and copying with the Makefile
+helper in `tools/portal2_source.swift`. `Conversion.swift` follows the existing `GAME=portal2 bundle` recipe and
 `tools/prepare_portal2_runtime.py`. Keep the URL, archive/library digests and
 bundle layout in sync with those paths. It intentionally uses the stock
 loader and Rosetta configuration, including the existing performance fixes.
@@ -23,7 +24,7 @@ The built converter also exposes the same engine without opening any GUI:
 
 ```sh
 build/Portal2-Converter.app/Contents/MacOS/Portal2Converter \
-  --convert "/path/to/Portal 2.app" "/path/to/output folder"
+  --convert "/path/to/Portal 2.app or Steam game folder" "/path/to/output folder"
 ```
 
 An optional `--cache /path/to/cache` isolates integration tests from the
@@ -49,3 +50,23 @@ UI checks: window and Dock-icon drops, Choose Game, folder-picker dismissal,
 Cancel during download/copy, Quit during conversion, error recovery, Open
 Game and Show in Finder. A public release needs Developer ID signing and
 notarization separately from the local ad-hoc build target.
+
+For flat or split Steam depots, use the dedicated real-file integration test:
+
+```sh
+python3 tests/test_portal2_depots.py --source /path/to/portal2
+```
+
+It uses the prepared `build/guest-runtime` cache, verifies conversion and a
+Makefile rebuild with both depots, and preserves the source and existing apps.
+The source chooser accepts app bundles and folders; Dock drops declare both
+UTIs. For a Steam installation, choose the **Portal 2** game folder inside
+`steamapps/common`. The default Mac location is
+`~/Library/Application Support/Steam/steamapps/common/Portal 2`; an installation
+on another drive uses that drive's Steam library instead. The window and source
+picker explain this, and the picker starts in the default game folder when it
+contains `portal2_osx`. Selecting a Steam library or the parent of `depots/621` and `depots/623`
+is sufficient. Multiple ambiguous versions produce an actionable error.
+Steam copies require the installed Steam client to be running and signed in.
+The bundled loader bridges Steam's i386 interfaces to that native client; see
+`../PORTAL2.md` for tested behavior and remaining interface limitations.

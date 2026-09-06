@@ -648,6 +648,10 @@ int main(int argc, char **argv)
     }
     open_guest_diagnostic_log(argc > 0 ? argv[0] : NULL);
     if (lp32_profile()->title == LP32_TITLE_PORTAL2) {
+        // Finder launches need the same app identity Steam supplies when it
+        // starts Portal 2. Authentication/ownership remain Steam's decision.
+        setenv("SteamAppId", "620", 1);
+        setenv("SteamGameId", "620", 1);
         if (guest_dyld32_initialize(image_path) || chdir(guest_dyld32_game_root())) {
             fprintf(stderr, "game_loader: unable to select Portal 2 data directory\n");
             return EXIT_FAILURE;
@@ -800,9 +804,8 @@ int main(int argc, char **argv)
         if (portal2) {
             guest_argv[next_argument++] = compat_runtime32_copy_cstring("-game");
             guest_argv[next_argument++] = compat_runtime32_copy_cstring("portal2");
-            /* Bink's startup audio uses unbridged Carbon Sound Manager calls
-               (starting with NewSndCallBackUPP). Finder launches need the same
-               movie skip as diagnostic launches, before the engine starts. */
+            /* Keep the existing direct-to-menu launch behavior. In-game Bink
+               movies use the Sound Manager and Time Manager bridges. */
             guest_argv[next_argument++] = compat_runtime32_copy_cstring("-novid");
         }
         if (extra_argument) guest_argv[next_argument++] = extra_argument;

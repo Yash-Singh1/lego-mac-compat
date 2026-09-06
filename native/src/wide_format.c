@@ -2,6 +2,8 @@
 #include <errno.h>
 #include <limits.h>
 #include <stdbool.h>
+#include <stdio.h>
+#include <wctype.h>
 #include <string.h>
 
 _Static_assert(sizeof(wchar_t) == 4 && sizeof(long double) == 16, "Darwin wide formatting ABI");
@@ -102,4 +104,85 @@ int guest_vwformat(wchar_t *output, size_t capacity, const wchar_t *format,
     }
     if (length > INT_MAX) { errno = EOVERFLOW; return -1; }
     return (int)length;
+}
+
+/* Scan one conversion at a time so native long/pointer outputs cannot
+   overwrite adjacent i386 cells. wchar_t itself is 32 bits in both ABIs. */
+int guest_vwscan(const wchar_t *input, const wchar_t *format,
+                 const uint32_t *destinations)
+{
+    if (!input || !format || !destinations) { errno = EINVAL; return EOF; }
+    const wchar_t *start = input;
+    unsigned destination = 0;
+    int assigned = 0;
+    while (*format) {
+        if (iswspace(*format)) {
+            while (iswspace(*format)) ++format;
+            while (iswspace(*input)) ++input;
+            continue;
+        }
+        if (*format != '%' || format[1] == '%') {
+            if (*format == '%') ++format;
+            if (*input != *format) return !*input && !assigned ? EOF : assigned;
+            ++input; ++format; continue;
+        }
+        ++format;
+        bool suppress = *format == '*';
+        if (suppress) ++format;
+        wchar_t spec[256] = L"%";
+        size_t cursor = 1;
+        if (suppress) spec[cursor++] = '*';
+        while (*format >= '0' && *format <= '9') {
+            if (cursor >= 200) { errno = EINVAL; return EOF; }
+            spec[cursor++] = *format++;
+        }
+        enum { normal, hh, h, l, ll, size_word, long_float } length = normal;
+        if (*format == 'h') { ++format; length = *format == 'h' ? (++format, hh) : h; }
+        else if (*format == 'l') { ++format; length = *format == 'l' ? (++format, ll) : l; }
+        else if (*format == 'j' || *format == 'q') { ++format; length = ll; }
+        else if (*format == 'z' || *format == 't') { ++format; length = size_word; }
+        else if (*format == 'L') { ++format; length = long_float; }
+        wchar_t conversion = *format++;
+        bool integer = wcschr(L"diouxXn", conversion) != NULL;
+        bool floating = wcschr(L"aAeEfFgG", conversion) != NULL;
+        bool text = conversion == 's' || conversion == 'c' || conversion == '[';
+        if (!conversion || (!integer && !floating && !text && conversion != 'p') || length == long_float) {
+            errno = ENOTSUP; return EOF;
+        }
+        size_t output_size = length == hh ? 1 : length == h ? 2 : length == ll ? 8 : 4;
+        // Darwin i386 long, size_t and ptrdiff_t are 32 bits.
+        if (integer) {
+            if (length == hh || length == h) { spec[cursor++] = 'h'; if (length == hh) spec[cursor++] = 'h'; }
+            if (length == ll) { spec[cursor++] = 'l'; spec[cursor++] = 'l'; }
+        } else if (length == l) { spec[cursor++] = 'l'; }
+        if (floating) output_size = length == l ? 8 : 4;
+        spec[cursor++] = conversion;
+        if (conversion == '[') {
+            if (*format == '^') spec[cursor++] = *format++;
+            if (*format == ']') spec[cursor++] = *format++;
+            while (*format && *format != ']' && cursor < 250) spec[cursor++] = *format++;
+            if (*format != ']') { errno = EINVAL; return EOF; }
+            spec[cursor++] = *format++;
+        }
+        spec[cursor++] = '%'; spec[cursor++] = 'n'; spec[cursor] = 0;
+        void *output = suppress ? NULL : (void *)(uintptr_t)destinations[destination++];
+        if (conversion == 'n') {
+            uint64_t count = (uint64_t)(input - start);
+            if (output) memcpy(output, &count, output_size);
+            continue;
+        }
+        union { uint64_t integer; double floating; void *pointer; } temporary = {0};
+        int consumed = -1;
+        // Text output layouts already match, including %ls and %[...].
+        // Scalar outputs use staging storage to handle native %p safely.
+        int status = suppress ? swscanf(input, spec, &consumed) :
+            swscanf(input, spec, text ? output : &temporary, &consumed);
+        if (consumed < 0) return status == EOF && !assigned ? EOF : assigned;
+        if (!suppress) {
+            if (!text && output) memcpy(output, &temporary, output_size);
+            ++assigned;
+        }
+        input += consumed;
+    }
+    return assigned;
 }

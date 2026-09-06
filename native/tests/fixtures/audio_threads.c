@@ -1,5 +1,7 @@
 #include <AudioToolbox/AudioToolbox.h>
 #include <mach/mach.h>
+#include <CoreAudio/CoreAudio.h>
+extern int GetCurrentProcess(void *);
 #include <pthread.h>
 #include <stdint.h>
 #include <string.h>
@@ -28,6 +30,17 @@ static void state_changed(void *info, AudioQueueRef q, AudioQueuePropertyID prop
 
 int check_audio_threads(void)
 {
+    struct { uint32_t hi, lo, guard; } psn = {0, 0, 0x1234abcd};
+    if (GetCurrentProcess(&psn) || psn.guard != 0x1234abcd || (!psn.hi && !psn.lo)) return -220;
+    AudioObjectPropertyAddress address = {kAudioHardwarePropertyDefaultOutputDevice,
+        kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+    struct { AudioDeviceID id; uint32_t guard; } device = {0, 0x1234abcd};
+    UInt32 size = sizeof(device.id);
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &address, 0, NULL, &size, &device.id) ||
+        size != sizeof(device.id) || device.guard != 0x1234abcd) return -221;
+    address.mSelector = 0xffffffff;
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &address, 0, NULL, &size, &device.id) !=
+        kAudioHardwareUnknownPropertyError || device.guard != 0x1234abcd) return -222;
     worker_ran = returned_buffer = listener_ran = 0;
     struct { pthread_t thread; uint32_t guard; } t = {0, 0x12345678};
     if (pthread_create_suspended_np(&t.thread, NULL, worker, (void *)0x12345)) return -200;

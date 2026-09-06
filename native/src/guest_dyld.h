@@ -4,7 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Source's dlopen/dlsym run against guest i386 images, never host dlopen. */
+/* Source libraries load as i386 images. The installed Steam client is
+   accessed through explicit native interface proxies in steam_bridge.c. */
 int guest_dyld32_initialize(const char *image_path);
 const char *guest_dyld32_game_root(void);
 uint32_t guest_dyld32_open(const char *path, int flags);

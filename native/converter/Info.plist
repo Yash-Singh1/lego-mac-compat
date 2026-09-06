@@ -14,9 +14,9 @@
     <key>NSPrincipalClass</key><string>NSApplication</string>
     <key>NSHumanReadableCopyright</key><string>32bitgoofy. Requires your own Mac copy of Portal 2.</string>
     <key>CFBundleDocumentTypes</key><array><dict>
-        <key>CFBundleTypeName</key><string>Mac game application</string>
+        <key>CFBundleTypeName</key><string>Portal 2 app or game folder</string>
         <key>CFBundleTypeRole</key><string>Viewer</string>
         <key>LSHandlerRank</key><string>Alternate</string>
-        <key>LSItemContentTypes</key><array><string>com.apple.application-bundle</string></array>
+        <key>LSItemContentTypes</key><array><string>com.apple.application-bundle</string><string>public.folder</string></array>
     </dict></array>
 </dict></plist>

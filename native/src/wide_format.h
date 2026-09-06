@@ -5,4 +5,6 @@
 #include <wchar.h>
 int guest_vwformat(wchar_t *output, size_t capacity, const wchar_t *format,
                   const uint32_t *words);
+int guest_vwscan(const wchar_t *input, const wchar_t *format,
+                 const uint32_t *destinations);
 #endif

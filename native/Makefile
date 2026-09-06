@@ -23,6 +23,8 @@ ICON_NAME := LEGOStarWars3.icns
 else ifeq ($(GAME),portal2)
 BUNDLE := $(BUILD_DIR)/Portal2-Compat.app
 SOURCE_APP := /Volumes/Storage/games/mac/Portal 2.app
+# SOURCE_GAME accepts a Mac app, merged Steam installation, or depot download.
+SOURCE_GAME ?= $(SOURCE_APP)
 SOURCE_CONTENTS := $(SOURCE_APP)/Contents
 IMAGE_SOURCE := $(SOURCE_CONTENTS)/MacOS/portal2_osx
 IMAGE_PREREQ :=
@@ -87,7 +89,8 @@ portal2-runtime:
 # The converter ships compiled code and downloads its own private runtime.
 # Its users do not need Make, Python, Xcode, or a checkout of this repository.
 CONVERTER_APP := $(BUILD_DIR)/Portal2-Converter.app
-CONVERTER_SOURCES := converter/Conversion.swift converter/App.swift converter/main.swift
+CONVERTER_CORE := converter/Conversion.swift converter/Source.swift
+CONVERTER_SOURCES := $(CONVERTER_CORE) converter/App.swift converter/main.swift
 SWIFTC := $(shell xcrun --find swiftc)
 
 $(BUILD_DIR)/converter-arm64: $(CONVERTER_SOURCES) | $(BUILD_DIR)
@@ -106,7 +109,7 @@ portal2-converter: $(BUILD_DIR)/converter-arm64 $(BUILD_DIR)/converter-x86_64 $(
 	codesign --force --sign - "$(CONVERTER_APP)"
 	codesign --verify --deep --strict "$(CONVERTER_APP)"
 
-$(BUILD_DIR)/test_portal2_converter: converter/Conversion.swift tests/test_portal2_converter.swift | $(BUILD_DIR)
+$(BUILD_DIR)/test_portal2_converter: $(CONVERTER_CORE) tests/test_portal2_converter.swift | $(BUILD_DIR)
 	$(SWIFTC) -O -swift-version 5 -warnings-as-errors -target $(shell uname -m)-apple-macosx11.0 -sdk $(SDK) $^ -o $@
 
 test-portal2-converter: $(BUILD_DIR)/test_portal2_converter
@@ -124,9 +127,12 @@ test-guest-dyld: $(BUILD_DIR)/game_loader
 test-portal2-loader: $(BUILD_DIR)/game_loader
 	$(MAKE) GAME=portal2 test-portal2-loader-image
 
+$(BUILD_DIR)/portal2_source: $(CONVERTER_CORE) tools/portal2_source.swift | $(BUILD_DIR)
+	$(SWIFTC) -O -swift-version 5 -warnings-as-errors -target $(shell uname -m)-apple-macosx11.0 -sdk $(SDK) $^ -o $@
+
 .PHONY: test-portal2-loader-image
-test-portal2-loader-image: $(BUILD_DIR)/game_loader
-	env LP32_DYLD_SELFTEST=1 arch -x86_64 ./$(BUILD_DIR)/game_loader "$(SOURCE_APP)/Contents/MacOS/portal2_osx"
+test-portal2-loader-image: bundle
+	env LP32_DYLD_SELFTEST=1 arch -x86_64 "$(BUNDLE)/Contents/MacOS/$(LOADER_NAME)" "$(BUNDLE)/Contents/SharedSupport/$(IMAGE_NAME)"
 
 $(BUILD_DIR)/controller_probe: src/controller_probe.m | $(BUILD_DIR)
 	$(CLANG) $(CFLAGS) $^ -framework Foundation -framework GameController -o $@
@@ -148,8 +154,8 @@ $(BUILD_DIR)/mode32_probe: src/mode32_probe.c src/mode32_switch.S src/address_sp
 	$(CLANG) $(CFLAGS) $(LDFLAGS) $^ -o $@
 	codesign --force --sign - $@
 
-$(BUILD_DIR)/game_loader: src/game_loader.c src/game_profile.c src/macho_loader.c src/macho_file.c src/guest_dyld.c src/guest_memory.c src/network_bridge.c src/font_bridge.m src/gl_shader_bridge.c src/gl_misc_bridge.c src/compat_runtime.c src/wide_format.c src/audio_bridge.c src/audio_queue_bridge.c src/controller_bridge.m src/cursor_state.c src/objc_bridge.m src/arb_program_guard.c src/arb_sampler_usage.c src/mode32_switch.S src/import_gateway.S src/guest_context.S src/address_space_reserve.S | $(BUILD_DIR)
-	$(CLANG) $(CFLAGS) $(LDFLAGS) $^ -framework Cocoa -framework Carbon -framework OpenGL -framework ImageIO -framework CoreText -framework AudioToolbox -framework AudioUnit -framework CoreAudio -framework GameController -framework IOKit -liconv -o $@
+$(BUILD_DIR)/game_loader: src/game_loader.c src/game_profile.c src/macho_loader.c src/macho_file.c src/guest_dyld.c src/steam_bridge.c src/steam_bridge.h src/steam_abi.inc src/guest_memory.c src/network_bridge.c src/font_bridge.m src/gl_shader_bridge.c src/gl_misc_bridge.c src/compat_runtime.c src/wide_format.c src/audio_bridge.c src/audio_queue_bridge.c src/sound_manager_bridge.c src/sound_manager_bridge.h src/time_manager_bridge.c src/time_manager_bridge.h src/controller_bridge.m src/cursor_state.c src/objc_bridge.m src/arb_program_guard.c src/arb_sampler_usage.c src/mode32_switch.S src/import_gateway.S src/guest_context.S src/address_space_reserve.S | $(BUILD_DIR)
+	$(CLANG) $(CFLAGS) $(LDFLAGS) $(filter %.c %.m %.S,$^) -framework Cocoa -framework Carbon -framework OpenGL -framework ImageIO -framework CoreText -framework AudioToolbox -framework AudioUnit -framework CoreAudio -framework GameController -framework IOKit -liconv -lffi -o $@
 	codesign --force --sign - $@
 
 $(BUILD_DIR)/test_arb_sampler_usage: tests/test_arb_sampler_usage.c src/arb_sampler_usage.c src/arb_sampler_usage.h | $(BUILD_DIR)
@@ -183,9 +189,14 @@ mode-switch-stress: $(BUILD_DIR)/mode_switch_stress
 run: $(BUILD_DIR)/mode32_probe
 	arch -x86_64 ./$(BUILD_DIR)/mode32_probe
 
+ifeq ($(GAME),portal2)
+run-game: bundle
+	arch -x86_64 "./$(BUNDLE)/Contents/MacOS/$(LOADER_NAME)"
+else
 run-game: $(BUILD_DIR)/game_loader $(IMAGE_PREREQ)
 	test -f "$(IMAGE_SOURCE)" || { echo "missing $(IMAGE_SOURCE); pass SOURCE_APP=/path/to/the/game.app" >&2; exit 1; }
 	arch -x86_64 ./$(BUILD_DIR)/game_loader "$(IMAGE_SOURCE)"
+endif
 
 # Recover the plain Pirates Mach-O by emulating the packer stub (needs the
 # `unicorn` Python package, see the README).
@@ -197,29 +208,28 @@ $(BUILD_DIR)/LEGOPirates.unpacked.macbin: tools/unpack_securom.py $(UNPACK_PYTHO
 	test -f "$(PACKED_IMAGE)" || { echo "missing $(PACKED_IMAGE); pass SOURCE_APP=/path/to/LEGOPirates.app" >&2; exit 1; }
 	$(UNPACK_PYTHON) tools/unpack_securom.py "$(PACKED_IMAGE)" "$@"
 
+ifeq ($(GAME),portal2)
+bundle: $(BUILD_DIR)/game_loader $(BUILD_DIR)/portal2_source $(INFO_PLIST) portal2-runtime
+	./$(BUILD_DIR)/portal2_source --copy "$(SOURCE_GAME)" "$(BUNDLE)"
+	mkdir -p "$(BUNDLE)/Contents/MacOS"
+	cp $(BUILD_DIR)/game_loader "$(BUNDLE)/Contents/MacOS/$(LOADER_NAME)"
+	ditto --noextattr --noqtn "$(GUEST_RUNTIME_DIR)" "$(BUNDLE)/Contents/SharedSupport/Portal2/compat-runtime"
+	cp $(INFO_PLIST) "$(BUNDLE)/Contents/Info.plist"
+	codesign --force --sign - "$(BUNDLE)"
+	codesign --verify --deep --strict "$(BUNDLE)"
+else
 bundle: $(BUILD_DIR)/game_loader $(IMAGE_PREREQ) $(INFO_PLIST)
 	test -d "$(SOURCE_CONTENTS)" || { echo "missing $(SOURCE_APP); pass SOURCE_APP=/path/to/the/game.app" >&2; exit 1; }
 	test -f "$(IMAGE_SOURCE)" || { echo "missing $(IMAGE_SOURCE)" >&2; exit 1; }
-ifeq ($(GAME),portal2)
-	test -f "$(GUEST_RUNTIME_DIR)/libstdc++.6.dylib" -a -f "$(GUEST_RUNTIME_DIR)/libc++abi.dylib" || { echo "missing Portal 2 C++ runtime; run make portal2-runtime or set GUEST_RUNTIME_DIR" >&2; exit 1; }
-endif
 	mkdir -p $(BUNDLE)/Contents/MacOS $(BUNDLE)/Contents/Resources $(BUNDLE)/Contents/SharedSupport $(BUNDLE)/Contents/Library/Frameworks
 	cp $(BUILD_DIR)/game_loader $(BUNDLE)/Contents/MacOS/$(LOADER_NAME)
 	cp "$(IMAGE_SOURCE)" $(BUNDLE)/Contents/SharedSupport/$(IMAGE_NAME)
 	chmod 0644 $(BUNDLE)/Contents/SharedSupport/$(IMAGE_NAME)
-ifeq ($(GAME),portal2)
-	ditto --noextattr --noqtn "$(SOURCE_CONTENTS)/MacOS" $(BUNDLE)/Contents/SharedSupport/Portal2
-	ditto --noextattr --noqtn "$(GUEST_RUNTIME_DIR)" $(BUNDLE)/Contents/SharedSupport/Portal2/compat-runtime
-else
 	for data in $(GAME_DATA); do cp "$(SOURCE_CONTENTS)/MacOS/$$data" $(BUNDLE)/Contents/MacOS/$$data; done
 	ditto --noextattr --noqtn "$(SOURCE_CONTENTS)/Library/Frameworks/Cg.framework" $(BUNDLE)/Contents/Library/Frameworks/Cg.framework
-endif
 	cp $(INFO_PLIST) $(BUNDLE)/Contents/Info.plist
 	ditto --noextattr --noqtn "$(SOURCE_CONTENTS)/Resources" $(BUNDLE)/Contents/Resources
 	cp "$(ICON)" $(BUNDLE)/Contents/Resources/$(ICON_NAME)
-ifeq ($(GAME),portal2)
-	codesign --force --sign - $(BUNDLE)
-else
 	codesign --force --deep --sign - $(BUNDLE)
 endif
 

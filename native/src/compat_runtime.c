@@ -4,6 +4,8 @@
 #include "controller_bridge.h"
 #include "game_profile.h"
 #include "guest_dyld.h"
+#include "steam_bridge.h"
+#include "time_manager_bridge.h"
 #include "guest_memory.h"
 #include "network_bridge.h"
 #include "font_bridge.h"
@@ -24,6 +26,7 @@
 #include <locale.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <servers/bootstrap.h>
 #include <mach-o/dyld.h>
 #include <math.h>
 #include <pthread.h>
@@ -80,8 +83,10 @@ enum {
     kGatewayFarPointerOffset = 0x040,
     kImportThunksOffset = 0x1000,
     kImportThunkSize = 16,
-    kDynamicThunksOffset = 0x4000,
-    kDynamicThunkCapacity = 2048,
+    // Modern Source + CEF + native Steam interface methods exceed 2048
+    // imports. Keep their thunks on dedicated i386 pages beyond handle areas.
+    kDynamicThunksBase = 0x7f100000,
+    kDynamicThunkCapacity = 8192,
     kHost64PadsOffset = 0xd000,
     kReturn64Offset = kHost64PadsOffset + 0x000,
     kGateway64Offset = kHost64PadsOffset + 0x040,
@@ -392,7 +397,8 @@ static uint32_t guest_cond_capacity;
 static uint64_t guest_sync_released_count;
 static pthread_mutex_t guest_sync_table_lock = PTHREAD_MUTEX_INITIALIZER;
 static char dynamic_symbol_names[kDynamicThunkCapacity][512];
-static uint32_t dynamic_symbol_count;
+static _Atomic uint32_t dynamic_symbol_count;
+static pthread_mutex_t dynamic_symbol_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /*
  * Cg is still present in the game bundle as an x86_64 slice.  Cg 3.0 does not
@@ -1232,8 +1238,10 @@ static int build_transition_bridge(void)
         emit_u32(stub + 1, (uint32_t)(int32_t)displacement);
     }
 
+    memset((void *)(uintptr_t)kDynamicThunksBase, 0xcc,
+           kDynamicThunkCapacity * kImportThunkSize);
     for (uint32_t index = 0; index < kDynamicThunkCapacity; ++index) {
-        uint8_t *thunk = code + kDynamicThunksOffset + index * kImportThunkSize;
+        uint8_t *thunk = (uint8_t *)(uintptr_t)(kDynamicThunksBase + index * kImportThunkSize);
         thunk[0] = 0x68;
         emit_u32(thunk + 1, UINT32_C(0x80000000) | index);
         thunk[5] = 0xff;
@@ -1260,6 +1268,9 @@ static int build_transition_bridge(void)
         if (strcmp(current_image->imports[index].name, "_mach_task_self_") == 0) {
             data_cell[data_cells] = mach_task_self();
         }
+        if (strcmp(current_image->imports[index].name, "_bootstrap_port") == 0) {
+            data_cell[data_cells] = bootstrap_port;
+        }
         uint32_t objc_pointer =
             objc_bridge32_pointer_import(current_image->imports[index].name);
         if (objc_pointer) data_cell[data_cells] = objc_pointer;
@@ -1275,7 +1286,9 @@ static int build_transition_bridge(void)
     uint32_t helper = compat_runtime32_guest_callback("_lp32_context_signal_mask");
     emit_u32(code + 0xc000 + (lp32_context_save_helper - lp32_context_start), helper);
     emit_u32(code + 0xc000 + (lp32_context_restore_helper - lp32_context_start), helper);
-    if (mprotect(code, kBridgeCodeSize, PROT_READ | PROT_EXEC) != 0) {
+    if (mprotect((void *)(uintptr_t)kDynamicThunksBase,
+                 kDynamicThunkCapacity * kImportThunkSize, PROT_READ | PROT_EXEC) != 0 ||
+        mprotect(code, kBridgeCodeSize, PROT_READ | PROT_EXEC) != 0) {
         return runtime_error("mprotect transition bridge");
     }
     return 0;
@@ -1292,16 +1305,24 @@ static uint32_t guest_thunk_for_dynamic_symbol(const char *name)
         else if (!strcmp(name, "__longjmp")) entry = lp32_context_fast_longjmp;
         if (entry) return kBridgeCodeBase + 0xc000 + (uint32_t)(entry - lp32_context_start);
     }
+    pthread_mutex_lock(&dynamic_symbol_lock);
     for (uint32_t index = 0; index < dynamic_symbol_count; ++index) {
         if (strcmp(dynamic_symbol_names[index], name) == 0) {
-            return kBridgeCodeBase + kDynamicThunksOffset + index * kImportThunkSize;
+            pthread_mutex_unlock(&dynamic_symbol_lock);
+            return kDynamicThunksBase + index * kImportThunkSize;
         }
     }
     if (dynamic_symbol_count >= kDynamicThunkCapacity ||
-        strlen(name) >= sizeof(dynamic_symbol_names[0])) return 0;
-    uint32_t index = dynamic_symbol_count++;
+        strlen(name) >= sizeof(dynamic_symbol_names[0])) {
+        fprintf(stderr, "compat32: dynamic import capacity exceeded resolving %s (%u slots)\n", name, dynamic_symbol_count);
+        pthread_mutex_unlock(&dynamic_symbol_lock);
+        return 0;
+    }
+    uint32_t index = dynamic_symbol_count;
     strcpy(dynamic_symbol_names[index], name);
-    return kBridgeCodeBase + kDynamicThunksOffset + index * kImportThunkSize;
+    ++dynamic_symbol_count;
+    pthread_mutex_unlock(&dynamic_symbol_lock);
+    return kDynamicThunksBase + index * kImportThunkSize;
 }
 
 uint32_t compat_runtime32_guest_callback(const char *name)
@@ -1330,7 +1351,7 @@ uint32_t compat_runtime32_resolve_symbol(const char *name, int data_hint)
     uint32_t value = guest_standard_file_import(name);
     if (!value) value = objc_bridge32_pointer_import(name);
     bool data = value || !strcmp(name, "_errno") ||
-        !strcmp(name, "_mach_task_self_") || !strcmp(name, "_environ") ||
+        !strcmp(name, "_mach_task_self_") || !strcmp(name, "_bootstrap_port") || !strcmp(name, "_environ") ||
         !strcmp(name, "___stack_chk_guard") || !strcmp(name, "___mb_cur_max") || !strcmp(name, "___CFConstantStringClassReference") ||
         !strcmp(name, "_kCFAllocatorDefault") || !strcmp(name, "_kIOMasterPortDefault") ||
         !strncmp(name, "__ZTV", 5) || !strncmp(name, "__ZTI", 5) ||
@@ -1347,11 +1368,27 @@ uint32_t compat_runtime32_resolve_symbol(const char *name, int data_hint)
     if (!address || !copy) { free(copy); return 0; }
     cells[count++] = (struct data_symbol){copy, address};
     if (!strcmp(name, "_mach_task_self_")) value = mach_task_self();
+    if (!strcmp(name, "_bootstrap_port")) value = bootstrap_port;
     if (!strcmp(name, "___stack_chk_guard")) value = UINT32_C(0x6b71329a);
     if (!strcmp(name, "___mb_cur_max")) value = (uint32_t)MB_CUR_MAX;
     *(uint32_t *)(uintptr_t)address = value;
     if (!strcmp(name, "_errno")) guest_errno_address = address;
     return address;
+}
+
+static bool mach_message32_inline(const mach_msg_header_t *message, size_t capacity)
+{
+    if (capacity < sizeof(*message) || message->msgh_size < sizeof(*message) || message->msgh_size > capacity) return false;
+    if (!(message->msgh_bits & MACH_MSGH_BITS_COMPLEX)) return true;
+    if (message->msgh_size < sizeof(*message) + sizeof(mach_msg_body_t)) return false;
+    const mach_msg_body_t *body = (const void *)(message + 1);
+    size_t available = message->msgh_size - sizeof(*message) - sizeof(*body);
+    if (body->msgh_descriptor_count > available / sizeof(mach_msg_port_descriptor_t)) return false;
+    const mach_msg_port_descriptor_t *ports = (const void *)(body + 1);
+    for (uint32_t i = 0; i < body->msgh_descriptor_count; ++i) {
+        if (ports[i].type != MACH_MSG_PORT_DESCRIPTOR) return false;
+    }
+    return true;
 }
 
 static bool ensure_cg_library(void)
@@ -3214,7 +3251,10 @@ static uint64_t fast_OSAtomicCompareAndSwap32(const uint32_t *arguments,
 
 static uint64_t fast_memmove(const uint32_t *arguments, uint32_t return_address)
 {
-    (void)return_address;
+    if (arguments[2] && (!arguments[0] || !arguments[1])) {
+        fprintf(stderr, "compat32: invalid memory copy ra=0x%08x dst=0x%08x src=0x%08x bytes=%u\n",
+                return_address, arguments[0], arguments[1], arguments[2]);
+    }
     memmove((void *)(uintptr_t)arguments[0], (const void *)(uintptr_t)arguments[1],
             arguments[2]);
     return arguments[0];
@@ -3324,6 +3364,8 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
     dispatch_name_length = strlen(name);
     dispatch_name_matched = false;
     uint64_t network_result;
+    if (steam_bridge32_dispatch(name, arguments, &network_result)) return network_result;
+    if (time_manager_bridge32_dispatch(name, arguments, &network_result)) return network_result;
     if (network_bridge32_dispatch(name, arguments, &network_result)) return network_result;
     if (font_bridge32_dispatch(name, arguments, &network_result)) return network_result;
     if (import_is(name, "_NewPtr")) return guest_allocate(arguments[0], false);
@@ -3578,6 +3620,25 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
     if (import_is(name, "_wcscmp")) return (uint32_t)wcscmp((const wchar_t *)(uintptr_t)arguments[0], (const wchar_t *)(uintptr_t)arguments[1]);
     if (import_is(name, "_wcsncmp")) return (uint32_t)wcsncmp((const wchar_t *)(uintptr_t)arguments[0], (const wchar_t *)(uintptr_t)arguments[1], arguments[2]);
     if (import_is(name, "_wcschr")) return (uint32_t)(uintptr_t)wcschr((const wchar_t *)(uintptr_t)arguments[0], (wchar_t)arguments[1]);
+    if (import_is(name, "_wcsrchr")) return (uint32_t)(uintptr_t)wcsrchr((const wchar_t *)(uintptr_t)arguments[0], (wchar_t)arguments[1]);
+    if (import_is(name, "_wcsstr")) return (uint32_t)(uintptr_t)wcsstr((const wchar_t *)(uintptr_t)arguments[0], (const wchar_t *)(uintptr_t)arguments[1]);
+    if (import_is(name, "_wcsncat")) return (uint32_t)(uintptr_t)wcsncat((wchar_t *)(uintptr_t)arguments[0], (const wchar_t *)(uintptr_t)arguments[1], arguments[2]);
+    if (import_is(name, "_wcscoll")) return (uint32_t)wcscoll((const wchar_t *)(uintptr_t)arguments[0], (const wchar_t *)(uintptr_t)arguments[1]);
+    if (import_is(name, "_wcstod") || import_is(name, "_wcstof") || import_is(name, "_wcstol")) {
+        const wchar_t *input = (const void *)(uintptr_t)arguments[0];
+        wchar_t *end = NULL;
+        uint64_t result;
+        if (import_is(name, "_wcstol")) {
+            long value = wcstol(input, &end, (int)arguments[2]);
+            if (value > INT32_MAX) { value = INT32_MAX; errno = ERANGE; }
+            if (value < INT32_MIN) { value = INT32_MIN; errno = ERANGE; }
+            result = (uint32_t)value;
+        } else if (import_is(name, "_wcstof")) result = return_guest_float(wcstof(input, &end));
+        else result = return_guest_double(wcstod(input, &end));
+        if (arguments[1]) *(uint32_t *)(uintptr_t)arguments[1] = (uint32_t)(uintptr_t)end;
+        return result;
+    }
+
     if (import_is(name, "_wmemcpy") || import_is(name, "_wmemmove") || import_is(name, "_wmemset")) {
         wchar_t *out = (void *)(uintptr_t)arguments[0];
         if (import_is(name, "_wmemcpy")) wmemcpy(out, (const wchar_t *)(uintptr_t)arguments[1], arguments[2]);
@@ -3655,6 +3716,7 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         }
         return (uint32_t)status;
     }
+    if (import_is(name, "_kill")) return (uint32_t)kill((pid_t)arguments[0], (int)arguments[1]);
     if (import_is(name, "_getpid")) return (uint32_t)getpid();
     if (import_is(name, "_getuid")) return (uint32_t)getuid();
     if (import_is(name, "_geteuid")) return (uint32_t)geteuid();
@@ -3739,6 +3801,14 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         uint32_t result = import_is(name, "_strtol") ?
             (uint32_t)strtol((const char *)(uintptr_t)arguments[0], &end, (int)arguments[2]) :
             (uint32_t)strtoul((const char *)(uintptr_t)arguments[0], &end, (int)arguments[2]);
+        if (arguments[1]) *(uint32_t *)(uintptr_t)arguments[1] = (uint32_t)(uintptr_t)end;
+        return result;
+    }
+    if (import_is(name, "_strtoll") || import_is(name, "_strtoull")) {
+        char *end = NULL;
+        uint64_t result = import_is(name, "_strtoll") ?
+            (uint64_t)strtoll((const char *)(uintptr_t)arguments[0], &end, (int)arguments[2]) :
+            strtoull((const char *)(uintptr_t)arguments[0], &end, (int)arguments[2]);
         if (arguments[1]) *(uint32_t *)(uintptr_t)arguments[1] = (uint32_t)(uintptr_t)end;
         return result;
     }
@@ -4172,11 +4242,11 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
                (const char *)(uintptr_t)arguments[1]);
         return arguments[0];
     }
-    if (import_is(name, "_strchr")) {
+    if (import_is(name, "_strchr") || import_is(name, "_index")) {
         return (uint32_t)(uintptr_t)strchr((const char *)(uintptr_t)arguments[0],
                                            (int)arguments[1]);
     }
-    if (import_is(name, "_strrchr")) {
+    if (import_is(name, "_strrchr") || import_is(name, "_rindex")) {
         return (uint32_t)(uintptr_t)strrchr((const char *)(uintptr_t)arguments[0],
                                             (int)arguments[1]);
     }
@@ -4381,6 +4451,10 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         if (temporary && formatted >= 0) fputs(scratch, stdout);
         if (scratch != destination) free(scratch);
         return (uint32_t)formatted;
+    }
+    if (import_is(name, "_swscanf")) {
+        return (uint32_t)guest_vwscan((const wchar_t *)(uintptr_t)arguments[0],
+            (const wchar_t *)(uintptr_t)arguments[1], arguments + 2);
     }
     if (import_is(name, "_sscanf")) {
         const char *input = (const void *)(uintptr_t)arguments[0];
@@ -4622,6 +4696,52 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
             (uint64_t)((__uint128_t)value * timebase.numer / timebase.denom) :
             (uint64_t)((__uint128_t)value * timebase.denom / timebase.numer);
     }
+    if (import_is(name, "_mach_port_allocate")) {
+        return (uint32_t)mach_port_allocate(arguments[0], arguments[1], (mach_port_t *)(uintptr_t)arguments[2]);
+    }
+    if (import_is(name, "_mach_port_deallocate")) return (uint32_t)mach_port_deallocate(arguments[0], arguments[1]);
+    if (import_is(name, "_mach_port_mod_refs")) return (uint32_t)mach_port_mod_refs(arguments[0], arguments[1], arguments[2], (int32_t)arguments[3]);
+    if (import_is(name, "_mach_port_insert_right")) return (uint32_t)mach_port_insert_right(arguments[0], arguments[1], arguments[2], arguments[3]);
+    if (import_is(name, "_mach_port_type")) return (uint32_t)mach_port_type(arguments[0], arguments[1], (mach_port_type_t *)(uintptr_t)arguments[2]);
+    if (import_is(name, "_mach_msg")) {
+        // Steam's bootstrap IPC uses inline messages. Headers and port
+        // descriptors have identical layouts; OOL descriptors contain native
+        // pointers and require a separate conversion before they can be used.
+        mach_msg_header_t *guest = (void *)(uintptr_t)arguments[0];
+        mach_msg_option_t options = arguments[1];
+        mach_msg_size_t send_size = arguments[2], receive_size = arguments[3];
+        if ((options & MACH_SEND_MSG) && !mach_message32_inline(guest, send_size)) return MACH_SEND_INVALID_TYPE;
+        size_t capacity = send_size > receive_size ? send_size : receive_size;
+        if (capacity < sizeof(*guest) || capacity > 16 * 1024 * 1024) return MACH_SEND_INVALID_DATA;
+        mach_msg_header_t *host = calloc(1, capacity + MAX_TRAILER_SIZE);
+        if (!host) return MACH_SEND_NO_BUFFER;
+        if (options & MACH_SEND_MSG) memcpy(host, guest, send_size);
+        mach_msg_return_t status = mach_msg(host, options, send_size, receive_size,
+                                           arguments[4], arguments[5], arguments[6]);
+        if (status == MACH_MSG_SUCCESS && (options & MACH_RCV_MSG)) {
+            if (!mach_message32_inline(host, receive_size)) {
+                fprintf(stderr, "compat32: unsupported out-of-line Mach message in guest IPC\n");
+                mach_msg_destroy(host);
+                status = MACH_RCV_INVALID_DATA;
+            } else {
+                size_t bytes = host->msgh_size + sizeof(mach_msg_trailer_t);
+                memcpy(guest, host, bytes < receive_size ? bytes : receive_size);
+            }
+        } else if (status == MACH_RCV_TOO_LARGE && receive_size >= sizeof(*guest)) {
+            memcpy(guest, host, sizeof(*guest));
+        }
+        free(host);
+        return (uint32_t)status;
+    }
+    if (import_is(name, "_bootstrap_look_up")) {
+        // Mach port names are 32 bits in both ABIs. Steam probes its local
+        // service here; preserve the real lookup status when it is absent.
+        mach_port_t service = MACH_PORT_NULL;
+        kern_return_t status = bootstrap_look_up(arguments[0],
+            (char *)(uintptr_t)arguments[1], &service);
+        if (arguments[2]) *(uint32_t *)(uintptr_t)arguments[2] = service;
+        return (uint32_t)status;
+    }
     if (import_is(name, "_mach_absolute_time")) {
         uint64_t value = mach_absolute_time();
         static uint32_t traced_clocks;
@@ -4661,7 +4781,7 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         }
         return (uint32_t)usleep(arguments[0]);
     }
-    if (import_is(name, "_OSAtomicAdd32") ||
+    if (import_is(name, "_OTAtomicAdd32") || import_is(name, "_OSAtomicAdd32") ||
         import_is(name, "_OSAtomicAdd32Barrier")) {
         return fast_OSAtomicAdd32(arguments, return_address);
     }
