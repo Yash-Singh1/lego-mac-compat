@@ -85,6 +85,7 @@ struct proxy_entry {
 };
 
 static _Thread_local bool creating_cf_object;
+static _Thread_local const char *proxy_origin;
 static struct proxy_entry proxies[kProxyCapacity];
 static uint32_t proxy_count;
 static pthread_mutex_t proxy_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -590,9 +591,10 @@ static uint32_t proxy_for_object(id object)
         if (!logged_proxy_exhaustion) {
             fprintf(stderr,
                     "compat32: persistent Objective-C proxy pool exhausted "
-                    "at swap %llu for %s\n",
+                    "at swap %llu for %s (capacity=%u origin=%s)\n",
                     (unsigned long long)objc_bridge_swap_count,
-                    class_getName(object_getClass(object)));
+                    class_getName(object_getClass(object)),kProxyCapacity,
+                    proxy_origin?proxy_origin:"bridge");
             logged_proxy_exhaustion = true;
         }
         pthread_mutex_unlock(&proxy_mutex);
@@ -603,6 +605,12 @@ static uint32_t proxy_for_object(id object)
     proxies[slot] = (struct proxy_entry){handle, object,
                                        creating_cf_object ? 1u : 0u,
                                        !creating_cf_object};
+    static int trace_allocations=-1;
+    if(trace_allocations<0)trace_allocations=getenv("LP32_TRACE_PROXY_ALLOC")!=NULL;
+    if(trace_allocations)fprintf(stderr,
+        "compat32: proxy allocation swap=%llu slot=%u class=%s origin=%s owned=%d\n",
+        (unsigned long long)objc_bridge_swap_count,slot,class_getName(object_getClass(object)),
+        proxy_origin?proxy_origin:"bridge",creating_cf_object);
     if (proxy_object_is_retained(object)) [object retain];
     if (slot == proxy_count) ++proxy_count;
     pthread_mutex_unlock(&proxy_mutex);
@@ -650,9 +658,55 @@ static bool proxy_uses_guest_ownership(uint32_t token)
     bool managed=false;
     pthread_mutex_lock(&proxy_mutex);
     for(uint32_t i=0;i<proxy_count;++i)if(proxies[i].handle==token){
-        managed=proxies[i].object && !proxies[i].pinned;break;
+        managed=proxies[i].object && (!proxies[i].pinned || proxies[i].cf_owners);break;
     }
     pthread_mutex_unlock(&proxy_mutex);return managed;
+}
+
+/* Cocoa method families carry ownership independently of their concrete
+ * NSString class (tagged strings and heap strings must behave identically).
+ * Keep a bridge reference, transfer native +1 results into guest ownership,
+ * and schedule +0 string results on the guest's autorelease scope. */
+static bool objc_method_family(const char *selector,const char *family)
+{
+    while(*selector=='_')++selector;
+    size_t n=strlen(family);
+    return !strncmp(selector,family,n) && !(selector[n]>='a' && selector[n]<='z');
+}
+static uint32_t proxy_for_owned_object(id object)
+{
+    bool previous=creating_cf_object;creating_cf_object=true;
+    uint32_t token=proxy_for_object(object);creating_cf_object=previous;
+    return token;
+}
+static bool managed_string_init(id receiver,uint32_t token,const char *selector)
+{
+    return objc_method_family(selector,"init") &&
+        [receiver isKindOfClass:[NSString class]] && proxy_uses_guest_ownership(token);
+}
+static uint32_t proxy_for_string_result(id receiver,uint32_t receiver_token,
+                                        const char *selector,id value,bool initialized)
+{
+    if(initialized) {
+        /* init may replace a class-cluster placeholder and consume its +1.
+         * The invocation receives a separate retain, leaving our mapping safe
+         * until we transfer the guest's ownership to the initialized object. */
+        if(value==receiver) { [value release];return receiver_token; }
+        uint32_t token=proxy_for_owned_object(value);
+        [value release];
+        uint64_t ignored;objc_bridge32_dispatch("_CFRelease",&receiver_token,&ignored);
+        return token;
+    }
+    if(objc_method_family(selector,"alloc") || objc_method_family(selector,"new") ||
+       objc_method_family(selector,"copy") || objc_method_family(selector,"mutableCopy")) {
+        uint32_t token=proxy_for_owned_object(value);
+        [value release];
+        return token;
+    }
+    if(objc_method_family(selector,"init"))return proxy_for_object(value);
+    /* A self-returning getter does not make a managed value immortal. */
+    if(value==receiver && proxy_uses_guest_ownership(receiver_token))return receiver_token;
+    return proxy_for_autoreleased_object(value);
 }
 
 static bool enumerate_guest(id collection,const uint32_t *args,uint64_t *result)
@@ -879,6 +933,70 @@ int objc_bridge32_run_proxy_self_test(void)
         if([(NSDate *)object_for_receiver(deadline) timeIntervalSince1970]!=12345 ||
            proxy_count>before_cf_count+2)return -1;
         objc_bridge32_dispatch("_CFRelease",&deadline,&ignored);
+        /* Exercise actual Cocoa selectors with long, heap-backed strings;
+         * short tagged strings can conceal leaks by reusing their identity. */
+        uint32_t string_class=proxy_for_object((id)[NSString class]);
+        const char *string_methods[]={"alloc","initWithUTF8String:","release",
+            "stringWithUTF8String:","retain","copy","mutableCopy","appendString:","description","autorelease",
+            "initWithFormat:","stringWithFormat:"};
+        uint32_t string_selectors[12];
+        for(unsigned i=0;i<12;++i)string_selectors[i]=compat_runtime32_copy_cstring(string_methods[i]);
+        uint32_t string_format=proxy_for_object(@"%s");
+        uint32_t string_bytes=compat_runtime32_allocate(128,1);
+        uint32_t string_slots=proxy_count;
+        /* Copying an already pinned, borrowed string still returns guest +1. */
+        uint32_t pinned_copy_args[]={persistent_handle,string_selectors[5]};uint64_t pinned_copy;
+        if(!objc_bridge32_dispatch("_objc_msgSend",pinned_copy_args,&pinned_copy) || !pinned_copy)return -1;
+        pinned_copy_args[0]=(uint32_t)pinned_copy;pinned_copy_args[1]=string_selectors[2];
+        objc_bridge32_dispatch("_objc_msgSend",pinned_copy_args,&ignored);
+        if(proxy_uses_guest_ownership(persistent_handle) || object_for_receiver(persistent_handle)!=persistent)return -1;
+        /* A failing class-cluster initializer consumes the allocated object. */
+        uint32_t failed_init[]={string_class,string_selectors[0],string_bytes};uint64_t failed_result;
+        objc_bridge32_dispatch("_objc_msgSend",failed_init,&failed_result);
+        failed_init[0]=(uint32_t)failed_result;failed_init[1]=string_selectors[1];
+        memcpy((void *)(uintptr_t)string_bytes,"\xff",2);
+        if(!objc_bridge32_dispatch("_objc_msgSend",failed_init,&failed_result) || failed_result)return -1;
+        for(unsigned i=0;i<100000;++i) {
+            @autoreleasepool {
+                snprintf((char *)(uintptr_t)string_bytes,128,"heap-backed temporary string with unique contents %u",i);
+                uint32_t a[4]={string_class,string_selectors[0],0,0};uint64_t result;
+                if(!objc_bridge32_dispatch("_objc_msgSend",a,&result) || !result)return -1;
+                a[0]=(uint32_t)result;a[1]=string_selectors[1];a[2]=string_bytes;
+                if(i%2){a[1]=string_selectors[10];a[2]=string_format;a[3]=string_bytes;}
+                if(!objc_bridge32_dispatch("_objc_msgSend",a,&result) || !result)return -1;
+                uint32_t owned=(uint32_t)result;
+                a[0]=owned;a[1]=string_selectors[2];
+                objc_bridge32_dispatch("_objc_msgSend",a,&result);
+                guest_autorelease_push();
+                a[0]=string_class;a[1]=string_selectors[3];a[2]=string_bytes;
+                if(i%2){a[1]=string_selectors[11];a[2]=string_format;a[3]=string_bytes;}
+                if(!objc_bridge32_dispatch("_objc_msgSend",a,&result) || !result)return -1;
+                uint32_t temporary=(uint32_t)result;
+                a[0]=temporary;a[1]=string_selectors[4];objc_bridge32_dispatch("_objc_msgSend",a,&result);
+                a[1]=string_selectors[5];objc_bridge32_dispatch("_objc_msgSend",a,&result);
+                uint32_t copy=(uint32_t)result;
+                a[1]=string_selectors[6];objc_bridge32_dispatch("_objc_msgSend",a,&result);
+                uint32_t mutable=(uint32_t)result;
+                a[0]=mutable;a[1]=string_selectors[7];a[2]=temporary;objc_bridge32_dispatch("_objc_msgSend",a,&result);
+                a[0]=temporary;a[1]=string_selectors[8];objc_bridge32_dispatch("_objc_msgSend",a,&result);
+                if(result!=temporary)return -1;
+                guest_autorelease_pop();
+                NSString *value=object_for_receiver(temporary);
+                if(![value isEqualToString:[NSString stringWithUTF8String:(char *)(uintptr_t)string_bytes]] ||
+                   [(NSString *)object_for_receiver(mutable) length]!=value.length*2)return -1;
+                a[0]=copy;a[1]=string_selectors[2];objc_bridge32_dispatch("_objc_msgSend",a,&result);
+                a[0]=mutable;objc_bridge32_dispatch("_objc_msgSend",a,&result);
+                guest_autorelease_push();
+                a[0]=temporary;a[1]=string_selectors[9];objc_bridge32_dispatch("_objc_msgSend",a,&result);
+                guest_autorelease_pop();
+                if(proxy_count>string_slots+4) {
+                    fprintf(stderr,"compat32: string proxy lifetime regression at iteration %u: slots=%u baseline=%u\n",i,proxy_count,string_slots);
+                    return -1;
+                }
+            }
+        }
+        compat_runtime32_deallocate(string_bytes);
+        for(unsigned i=0;i<12;++i)compat_runtime32_deallocate(string_selectors[i]);
         uint32_t word = compat_runtime32_copy_cstring("world");
         uint32_t format_args[] = {persistent_handle, word, (uint32_t)-123, 0x89abcdef, 0x12345678, 0, 0x40040000};
         CFStringRef formatted = format_cf_string32(CFSTR("%@ %s %ld %llx %.2f"), format_args);
@@ -1031,7 +1149,7 @@ int objc_bridge32_run_proxy_self_test(void)
            [(NSEvent *)object_for_receiver((uint32_t)(uintptr_t)other) data1]!=456)return -1;
         reset_event_proxies();
         printf("Objective-C proxy self-test: PASS "
-               "(10000 CF ownership cycles; 100000 scoped dates; mixed CF varargs; 10000 messages, +%zu bytes; stable CFData; 10000 events, persistent=%u, "
+               "(10000 CF ownership cycles; 100000 scoped dates; 100000 owned/autoreleased string cycles; mixed CF varargs; 10000 messages, +%zu bytes; stable CFData; 10000 events, persistent=%u, "
                "event=%u)\n", invocation_growth, proxy_count,
                event_proxy_count);
         return 0;
@@ -1301,6 +1419,8 @@ static bool invoke_simple_message(id receiver, const char *selector_name,
                 2 : guest_words_for_type(type);
     }
 
+    bool string_init=managed_string_init(receiver,guest_arguments[0],selector_name);
+    if(string_init)[receiver retain];
     @try {
         if (super_method) {
             if (!invoke_using_imp(invocation, method_getImplementation(super_method))) return false;
@@ -1317,6 +1437,12 @@ static bool invoke_simple_message(id receiver, const char *selector_name,
         case '@': case '#': {
             id value = nil;
             [invocation getReturnValue:&value];
+            if(string_init || ([value isKindOfClass:[NSString class]] &&
+                ([receiver isKindOfClass:[NSString class]] ||
+                 (class_isMetaClass(object_getClass(receiver)) && [(Class)receiver isSubclassOfClass:[NSString class]])))) {
+                *guest_result=proxy_for_string_result(receiver,guest_arguments[0],selector_name,value,string_init);
+                return true;
+            }
             bool temporary = ([value isKindOfClass:[NSDate class]] &&
                 (!strncmp(selector_name,"date",4) || !strcmp(selector_name,"distantPast") || !strcmp(selector_name,"distantFuture"))) ||
                 (!strcmp(selector_name,"deviceDescription") && [receiver isKindOfClass:[NSScreen class]]);
@@ -5054,6 +5180,20 @@ static uint32_t guest_gl_string(GLenum name)
 {
     const GLubyte *raw_value = glGetString(name);
     if (!raw_value) return 0;
+    static bool logged_host_graphics;
+    if (!__atomic_exchange_n(&logged_host_graphics, true, __ATOMIC_RELAXED)) {
+        const GLubyte *vendor = glGetString(GL_VENDOR);
+        const GLubyte *renderer = glGetString(GL_RENDERER);
+        const GLubyte *version = glGetString(GL_VERSION);
+        NSProcessInfo *process = [NSProcessInfo processInfo];
+        fprintf(stderr, "compat32: host GL vendor=%s renderer=%s version=%s thermal_state=%ld",
+                vendor ? (const char *)vendor : "unknown",
+                renderer ? (const char *)renderer : "unknown",
+                version ? (const char *)version : "unknown", (long)[process thermalState]);
+        if (@available(macOS 12.0, *))
+            fprintf(stderr, " low_power=%d", [process isLowPowerModeEnabled]);
+        fputc('\n', stderr);
+    }
     const char *value = (const char *)raw_value;
     const char *buffer_mode = getenv("LP32_GL_BUFFER_MODE");
     bool prefer_subdata = getenv("LP32_PREFER_BUFFER_SUBDATA") != NULL ||
@@ -5478,8 +5618,13 @@ lp32_fast_import_fn objc_bridge32_fast_import(const char *import_name)
         {"_glGetIntegerv", fast_glGetIntegerv},
         {"_glGetFloatv", fast_glGetFloatv},
     };
+    /* Mach-O imports and dlsym expose the same functions with different
+       leading-underscore conventions. Both must populate the fast cache. */
+    if (import_name[0] == '_') ++import_name;
     for (size_t index = 0; index < sizeof(table) / sizeof(table[0]); ++index) {
-        if (strcmp(import_name, table[index].name) == 0) {
+        const char *name = table[index].name;
+        if (name[0] == '_') ++name;
+        if (strcmp(import_name, name) == 0) {
             return table[index].handler;
         }
     }
@@ -5611,6 +5756,9 @@ int objc_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
         /* CF Create/Copy results carry a guest ownership count. Borrowed
          * Cocoa/CF results keep their existing persistent lifetime. */
         bool previous = creating_cf_object;
+        const char *previous_origin=proxy_origin;
+        proxy_origin=(!strcmp(import_name,"_objc_msgSend") || !strcmp(import_name,"_objc_msgSend_fpret")) ?
+            (const char *)(uintptr_t)arguments[1] : import_name;
         creating_cf_object = (strncmp(import_name, "_CT", 3) == 0 || strncmp(import_name, "_CF", 3) == 0 || strncmp(import_name, "_CG", 3) == 0 || strncmp(import_name, "_IOHID", 6) == 0 || strncmp(import_name, "_TIS", 4) == 0) &&
             (strstr(import_name, "Create") || strstr(import_name, "Copy"));
         if (strncmp(import_name, "_dispatch_", 10) == 0 && strstr(import_name, "_create"))
@@ -5618,6 +5766,7 @@ int objc_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
         int handled = objc_bridge32_dispatch_body(import_name, import_length,
                                                    arguments, result);
         creating_cf_object = previous;
+        proxy_origin=previous_origin;
         refresh_enumeration_mutations();
         return handled;
     }
@@ -8485,8 +8634,11 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             (receiver == (id)[NSString class] || [receiver isKindOfClass:[NSString class]])) {
             CFStringRef formatted = format_cf_string32((CFStringRef)object_for_argument(arguments[2]), arguments + 3);
             if (!formatted) return 0;
+            bool string_init=managed_string_init(receiver,arguments[0],selector_name);
+            if(string_init)[receiver retain];
             id value = !strncmp(selector_name, "init", 4) ? [(NSString *)receiver initWithString:(id)formatted] : (id)formatted;
-            *result = proxy_for_object(value); CFRelease(formatted); return 1;
+            *result = proxy_for_string_result(receiver,arguments[0],selector_name,value,string_init);
+            CFRelease(formatted); return 1;
         }
         if (strcmp(selector_name, "CGLContextObj") == 0) {
             CGLContextObj context = [(NSOpenGLContext *)receiver CGLContextObj];
@@ -8878,6 +9030,38 @@ int objc_bridge32_run_gl_buffer_self_test(void)
     glGenBuffers(2, buffers);
     uint64_t dispatch_result = 0;
     int status = 0;
+
+    /* Both symbol spellings must use identical handlers, including names
+       reached through dlsym and through a Mach-O import stub. */
+    const char *fast_names[] = {"glBindBuffer", "glBindBufferARB", "glDrawArrays",
+        "glDrawRangeElements", "glVertexAttribPointer", "glBindTexture",
+        "glProgramEnvParameters4fvEXT", "glDepthFunc"};
+    for (unsigned i = 0; i < sizeof(fast_names) / sizeof(fast_names[0]); ++i) {
+        char decorated[128]; snprintf(decorated, sizeof(decorated), "_%s", fast_names[i]);
+        lp32_fast_import_fn plain = objc_bridge32_fast_import(fast_names[i]);
+        if (!plain || plain != objc_bridge32_fast_import(decorated)) {
+            fprintf(stderr, "gl-buffer-selftest: missing fast alias %s\n", decorated);
+            status = -1; goto cleanup;
+        }
+    }
+    const uint32_t bind_args[] = {GL_ARRAY_BUFFER, buffers[0]};
+    lp32_fast_import_fn bind = objc_bridge32_fast_import("_glBindBuffer");
+    bind(bind_args, 0);
+    GLint bound = 0; glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &bound);
+    if ((GLuint)bound != buffers[0] || glGetError() != GL_NO_ERROR) {
+        fputs("gl-buffer-selftest: fast binding did not reach GL\n", stderr);
+        status = -1; goto cleanup;
+    }
+    /* Controlled dispatch benchmark; no game, presentation, or audio. */
+    uint64_t before = hitch_now();
+    for (unsigned i = 0; i < 100000; ++i)
+        objc_bridge32_dispatch("_glBindBuffer", bind_args, &dispatch_result);
+    double chained_ns = (hitch_now() - before) / 100000.0;
+    before = hitch_now();
+    for (unsigned i = 0; i < 100000; ++i) bind(bind_args, 0);
+    double fast_ns = (hitch_now() - before) / 100000.0;
+    fprintf(stderr, "gl-buffer-selftest: bind dispatch chained=%.0f ns fast=%.0f ns\n",
+            chained_ns, fast_ns);
 
     uint32_t extensions = guest_gl_string(GL_EXTENSIONS);
     if (!extensions) {

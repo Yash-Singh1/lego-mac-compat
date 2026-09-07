@@ -81,6 +81,19 @@ for Marvel's shader constants. On the first launch after this fix, it backs up
 Marvel's `CachedShadersGL` folder alongside the original and rebuilds the cache;
 this corrects black intro logos and missing brick meshes. Saves are unaffected.
 
+The shared Cocoa bridge tracks owned and autoreleased string lifetimes instead
+of keeping every returned string permanently. This fixes a handle-table leak
+that can end in `persistent Objective-C proxy pool exhausted` followed by a
+crash. `make -C native test-objc-proxy` checks 100,000 string lifetime cycles,
+including retained values surviving pool drains, without launching a game.
+
+The shared dispatcher also avoids searching Carbon's libraries for unrelated
+imports, caches native Carbon exports, and uses the fast path for both GL
+symbol spellings and the existing atomic-operation aliases. This removes
+dispatch overhead introduced while expanding Complete Saga support, without
+disabling that port. `make -C native GAME=marvel test-carbon-dispatch` checks
+foreign-call rejection, native export caching, and real guest atomic calls.
+
 The storage repair is selected by the SDK library's UUID and a SHA-256 match
 of the entire defective routine, independently of the game profile. It keeps
 the parent directory path intact during recursion; it does not invent slot
@@ -105,16 +118,24 @@ Xbox glyphs otherwise; `LP32_BUTTON_GLYPHS=playstation|xbox` forces one.
 Marvel currently uses its shipped Xbox controller mapping and prompts.
 
 For silent testing, launch the bundle's executable with `LP32_MUTE_AUDIO=1`.
+This mutes only that process and does not change game settings or system volume.
 
 Marvel automatically records occasional frame hitches during normal play in
 `~/Library/Logs/LEGOMarvelCompat/hitches-<pid>-<timestamp>.log`. Relaunch after
 updating the loader to enable it. Each report contains 32 preceding frames,
 the slow frame, and 8 following frames, with draw counts, CPU time in draws,
-resource uploads, shader compilation, file I/O, waits and audio calls. It also
+resource uploads, shader compilation, file I/O, waits, audio, GL state changes,
+Objective-C calls and other runtime imports. Nested imports count only toward
+their own categories; calls spanning presentation are omitted. It also
 records the three slowest measured calls per frame (guest caller address,
 vertex/fragment program IDs and draw count), plus recent slow worker calls.
 Presentation time is split into work, drawable flush, and deliberate pacing.
 These are CPU wall timings; they do not measure GPU execution or replay draws.
+Log headers include the Mac model, chip, RAM, macOS version, Rosetta status,
+loader build time and dispatch overrides. The session log also records the
+native GL renderer and initial power/thermal state. Native crashes include a
+bounded raw stack trace by default, with the loader UUID and load address in
+the session header for matching a report to its build.
 Steam storage calls are included in I/O attribution. Save requests, filenames,
 byte counts, enumeration results and SDK return values also appear as
 `compat32: save ...` lines in `last-run.log` for normal Finder/Dock launches
@@ -130,4 +151,3 @@ report. `LP32_HITCH_MS=35` changes the threshold; `LP32_HITCH_LOG=0` disables it
 or set `LP32_HITCH_LOG` to an unused absolute file path to redirect it. Other
 titles leave it disabled unless explicitly enabled.
 `make -C native test-hitch-recorder` runs synthetic timing tests without launching a game.
-This mutes only that process and does not change game settings or system volume.

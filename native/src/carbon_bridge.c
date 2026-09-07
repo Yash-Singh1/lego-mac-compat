@@ -4,6 +4,7 @@
 #include "compat_runtime.h"
 #include "objc_bridge.h"
 #include "resource_bridge.h"
+#include "hitch_recorder.h"
 #include <Carbon/Carbon.h>
 #include <dlfcn.h>
 #include <errno.h>
@@ -108,11 +109,33 @@ static void initialize_displays(void) {
   }
 }
 static void *library;
+static pthread_once_t library_once = PTHREAD_ONCE_INIT;
+static _Thread_local unsigned symbol_lookups;
+static void open_carbon_library(void) {
+  library = dlopen("/System/Library/Frameworks/Carbon.framework/Carbon",
+                   RTLD_LOCAL | RTLD_NOW);
+}
 static void *symbol(const char *name) {
-  if (!library)
-    library = dlopen("/System/Library/Frameworks/Carbon.framework/Carbon",
-                     RTLD_LOCAL | RTLD_NOW);
-  return library ? dlsym(library, name + 1) : NULL;
+  /* The system framework stays loaded. Cache successful and absent exports,
+     including aliases, without a shared lock in event/input polling. */
+  static _Thread_local struct {
+    char name[128];
+    void *function;
+  } cache[128];
+  uint32_t hash = 2166136261u;
+  size_t length = 0;
+  for (; name[length]; ++length) hash = (hash ^ (unsigned char)name[length]) * 16777619u;
+  unsigned slot = hash % 128;
+  if (length < sizeof(cache[slot].name) && !strcmp(cache[slot].name, name))
+    return cache[slot].function;
+  pthread_once(&library_once, open_carbon_library);
+  ++symbol_lookups;
+  void *function = library ? dlsym(library, name + 1) : NULL;
+  if (length < sizeof(cache[slot].name)) {
+    memcpy(cache[slot].name, name, length + 1);
+    cache[slot].function = function;
+  }
+  return function;
 }
 /* FSSpec disappeared from the 64-bit entry points. Preserve its packed
  * 70-byte ABI and resolve parent IDs via FSRefs obtained from File Manager. */
@@ -1378,9 +1401,19 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
     *out = (uint32_t)status;
     return 1;
   }
-  void *function = symbol(native_name);
-  if (!function)
-    return 0;
+  void *function = NULL;
+  /* Resolve only after matching an implemented native operation, before its
+     arguments/temporary allocations have side effects. Foreign imports must
+     never search Carbon's dependency tree just to return unhandled. Keep the
+     original missing-export fallback for every matched operation. */
+#undef IS
+#define IS(s) ({ \
+    bool matches = !strcmp(name, s); \
+    if (matches && !function) { \
+      function = symbol(native_name); if (!function) return 0; \
+    } \
+    matches; \
+  })
   if (IS("_HIGetMousePosition")) {
     HIPoint point;
     void *object = unwrap(a[1]);
@@ -2741,6 +2774,41 @@ int carbon_bridge32_has_symbol(const char *name) {
     ++name;
   return !strcmp(name, "CreateRoundButtonControl") ||
          !strcmp(name, "CreateEditUnicodeTextControl");
+}
+
+int carbon_bridge32_run_dispatch_self_test(void) {
+  uint32_t args[4] = {0};
+  uint64_t result = 0x1234;
+  const char *foreign[] = {"_OSAtomicAdd32Barrier", "_CFAbsoluteTimeGetCurrent",
+                           "_CGEventSourceKeyState", "_glBindBuffer"};
+  unsigned before = symbol_lookups;
+  uint64_t start = hitch_now();
+  for (unsigned i = 0; i < 100000; ++i)
+    if (carbon_bridge32_dispatch(foreign[i % 4], args, &result) || result != 0x1234)
+      return -1;
+  fprintf(stderr, "carbon-dispatch-selftest: foreign calls=100000 ns/call=%.0f lookups=%u\n",
+          (hitch_now() - start) / 100000.0, symbol_lookups - before);
+  if (symbol_lookups != before) return -1;
+  /* Real native export, dynamic spelling, and repeated calls remain valid. */
+  if (!carbon_bridge32_dispatch("GetCurrentEventTime", args, &result)) return -1;
+  before = symbol_lookups;
+  for (unsigned i = 0; i < 10000; ++i)
+    if (!carbon_bridge32_dispatch("_GetCurrentEventTime", args, &result)) return -1;
+  if (symbol_lookups != before) return -1;
+  /* The hot atomic import used by Marvel must keep its 32-bit ABI and memory
+     ordering when resolved through the runtime's cached callback route. */
+  uint32_t cell = compat_runtime32_allocate(4, 1);
+  uint32_t thunk = compat_runtime32_guest_callback("_OSAtomicAdd32Barrier");
+  if (!cell || !thunk) return -1;
+  args[0] = 1; args[1] = cell;
+  start = hitch_now();
+  for (unsigned i = 0; i < 100000; ++i)
+    if (compat_runtime32_call(thunk, args, 2) != i + 1) return -1;
+  fprintf(stderr, "carbon-dispatch-selftest: guest atomic ns/call=%.0f\n",
+          (hitch_now() - start) / 100000.0);
+  compat_runtime32_deallocate(cell);
+  puts("carbon-dispatch-selftest: PASS (foreign imports, native cache, dynamic spelling, guest atomic callback)");
+  return 0;
 }
 
 /* Uses hidden native windows to verify the guest coordinate contract. */

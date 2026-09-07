@@ -151,6 +151,10 @@ $(BUILD_DIR)/test_macho_entry: tests/test_macho_entry.c src/macho_loader.c src/m
 test-macho-entry: $(BUILD_DIR)/test_macho_entry
 	./$(BUILD_DIR)/test_macho_entry
 
+.PHONY: test-objc-proxy
+test-objc-proxy: $(BUILD_DIR)/game_loader
+	env LP32_OBJC_PROXY_SELFTEST=1 LP32_NO_DIAGNOSTIC_LOG=1 arch -x86_64 ./$(BUILD_DIR)/game_loader
+
 $(BUILD_DIR)/test_arb_sampler_usage: tests/test_arb_sampler_usage.c src/arb_sampler_usage.c src/arb_sampler_usage.h | $(BUILD_DIR)
 	$(CLANG) $(CFLAGS) -Isrc tests/test_arb_sampler_usage.c src/arb_sampler_usage.c -o $@
 
@@ -239,7 +243,7 @@ clean:
 	rm -f $(BUILD_DIR)/mode32_probe $(BUILD_DIR)/game_loader $(BUILD_DIR)/controller_probe $(BUILD_DIR)/mkicon
 
 .PHONY: test-hitch-recorder
-$(BUILD_DIR)/test_hitch_recorder: tests/test_hitch_recorder.c src/hitch_recorder.c src/hitch_recorder.h | $(BUILD_DIR)
+$(BUILD_DIR)/test_hitch_recorder: tests/test_hitch_recorder.c src/hitch_recorder.c src/hitch_recorder.h src/host_diagnostics.h | $(BUILD_DIR)
 	$(CLANG) $(CFLAGS) tests/test_hitch_recorder.c src/hitch_recorder.c -o $@
 	codesign --force --sign - $@
 
@@ -278,6 +282,10 @@ test-rtti-bridge: $(BUILD_DIR)/test_rtti_bridge
 	arch -x86_64 ./$(BUILD_DIR)/test_rtti_bridge
 
 .PHONY: test-carbon-geometry
+.PHONY: test-carbon-dispatch
+test-carbon-dispatch: $(BUILD_DIR)/game_loader
+	env LP32_CARBON_DISPATCH_SELFTEST=1 LP32_MUTE_AUDIO=1 LP32_BACKGROUND_TEST=1 LP32_NO_DIAGNOSTIC_LOG=1 arch -x86_64 ./$(BUILD_DIR)/game_loader "$(BUNDLE)/Contents/SharedSupport/$(IMAGE_NAME)"
+
 test-carbon-geometry: $(BUILD_DIR)/game_loader
 	env LP32_CARBON_GEOMETRY_SELFTEST=1 LP32_MUTE_AUDIO=1 LP32_BACKGROUND_TEST=1 LP32_NO_DIAGNOSTIC_LOG=1 arch -x86_64 ./$(BUILD_DIR)/game_loader "$(BUNDLE)/Contents/SharedSupport/$(IMAGE_NAME)"
 

@@ -6,6 +6,7 @@
 #include "macho_loader.h"
 #include "objc_bridge.h"
 #include "hitch_recorder.h"
+#include "host_diagnostics.h"
 #include "steam_bridge.h"
 
 #include <errno.h>
@@ -496,15 +497,21 @@ static void guest_crash_diagnostic(int signal_number, siginfo_t *info,
             "compat32: signal %d code=%d address=%p "
             "rip=0x%016llx rsp=0x%016llx\n",
             signal_number, info->si_code, info->si_addr, rip, rsp);
-    if (getenv("LP32_TRACE_NATIVE_CRASH") && rip > UINT32_MAX) {
+    if (rip > UINT32_MAX) {
         uintptr_t address = rip, frame = context->uc_mcontext->__ss.__rbp;
         for (unsigned i = 0; i < 16; ++i) {
+            GUEST_DIAGNOSTIC("compat32: native return[%u]=0x%016llx\n",
+                            i, (unsigned long long)address);
+            /* Symbol lookup can acquire dyld locks. Keep it opt-in; the
+               bounded raw frame walk is sufficient for offline symbolication. */
+            if (getenv("LP32_TRACE_NATIVE_CRASH")) {
             Dl_info symbol = {0};
             dladdr((void *)address, &symbol);
             GUEST_DIAGNOSTIC("compat32: native frame %u %p %s + %llu (%s)\n", i,
                 (void *)address, symbol.dli_sname ? symbol.dli_sname : "?",
                 (unsigned long long)(address - (uintptr_t)symbol.dli_saddr),
                 symbol.dli_fname ? symbol.dli_fname : "?");
+            }
             uint64_t words[2]; mach_vm_size_t count = 0;
             if (frame < rsp || frame - rsp > 0x100000 ||
                 mach_vm_read_overwrite(mach_task_self(), frame, sizeof(words),
@@ -673,6 +680,24 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
     open_guest_diagnostic_log(argc > 0 ? argv[0] : NULL);
+    char host[768];
+    lp32_host_description(host, sizeof(host));
+    GUEST_DIAGNOSTIC("compat32: %s\n", host);
+    const struct mach_header_64 *loader_header =
+        (const struct mach_header_64 *)_dyld_get_image_header(0);
+    if (loader_header && loader_header->magic == MH_MAGIC_64) {
+        const struct load_command *command = (const void *)(loader_header + 1);
+        for (uint32_t i = 0; i < loader_header->ncmds; ++i) {
+            if (command->cmd == LC_UUID) {
+                const struct uuid_command *uuid = (const void *)command;
+                GUEST_DIAGNOSTIC("compat32: loader base=%p uuid=", (const void *)loader_header);
+                for (unsigned j = 0; j < 16; ++j) GUEST_DIAGNOSTIC("%02x", uuid->uuid[j]);
+                GUEST_DIAGNOSTIC("\n");
+                break;
+            }
+            command = (const void *)((const char *)command + command->cmdsize);
+        }
+    }
 
     if (configure_guest_breakpoint(&image) != 0) {
         macho_image32_unload(&image);
@@ -738,6 +763,11 @@ int main(int argc, char **argv)
     }
     if (getenv("LP32_GL_PARAMETER_SELFTEST")) {
         int result = objc_bridge32_run_gl_parameter_self_test();
+        macho_image32_unload(&image);
+        return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (getenv("LP32_CARBON_DISPATCH_SELFTEST")) {
+        int result = carbon_bridge32_run_dispatch_self_test();
         macho_image32_unload(&image);
         return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }

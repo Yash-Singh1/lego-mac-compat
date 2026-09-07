@@ -3090,7 +3090,7 @@ static uint8_t hitch_dynamic_kinds[kDynamicThunkCapacity];
 
 static void record_hitch_import(unsigned kind, const char *name,
                                 const uint32_t *args, uint32_t caller,
-                                uint64_t start, uint64_t end)
+                                struct hitch_scope *scope, uint64_t end)
 {
     uint32_t count = 0;
     if (kind == HITCH_DRAW) {
@@ -3098,7 +3098,7 @@ static void record_hitch_import(unsigned kind, const char *name,
         count = strstr(draw, "RangeElements") ? args[3] :
                 strstr(draw, "Arrays") ? args[2] : args[1];
     }
-    hitch_note(kind, name, caller, start, end, count);
+    hitch_scope_end(scope, kind, name, caller, end, count);
 }
 
 extern int libcpp_stream_bridge32_dispatch(const char *, const uint32_t *, uint64_t *);
@@ -3110,7 +3110,7 @@ uint64_t lp32_dispatch_import(uint32_t import_id, const uint32_t *arguments,
     lp32_fast_import_fn fast = fast_slot ? *fast_slot : NULL;
     unsigned hitch_kind = HITCH_NONE;
     const char *hitch_name = NULL;
-    uint64_t hitch_start_ns = 0;
+    struct hitch_scope hitch_scope;
     if (hitch_recorder_enabled) {
         uint32_t slot = import_id & UINT32_C(0x7fffffff);
         uint8_t *kind = (import_id & UINT32_C(0x80000000)) ?
@@ -3125,15 +3125,15 @@ uint64_t lp32_dispatch_import(uint32_t import_id, const uint32_t *arguments,
         }
         if (hitch_kind >= HITCH_DRAW) {
             hitch_name = import_name_for_id(import_id);
-            hitch_start_ns = hitch_now();
+            hitch_scope_begin(&hitch_scope, hitch_now());
         }
     }
     if (!compat_runtime32_frame_profile_enabled) {
         uint64_t result = (uintptr_t)fast > 1 ? fast(arguments, return_address) :
             dispatch_import_chained(import_id, import_name_for_id(import_id),
                                        arguments, return_address, fast_slot);
-        if (hitch_start_ns) record_hitch_import(hitch_kind, hitch_name, arguments,
-                                               return_address, hitch_start_ns, hitch_now());
+        if (hitch_name) record_hitch_import(hitch_kind, hitch_name, arguments,
+                                          return_address, &hitch_scope, hitch_now());
         return result;
     }
     const char *name = import_name_for_id(import_id);
@@ -3152,8 +3152,8 @@ uint64_t lp32_dispatch_import(uint32_t import_id, const uint32_t *arguments,
         dispatch_import_chained(import_id, name, arguments, return_address,
                                 fast_slot);
     uint64_t elapsed = profile_now() - start;
-    if (hitch_start_ns) record_hitch_import(hitch_kind, hitch_name, arguments,
-                                           return_address, hitch_start_ns, hitch_now());
+    if (hitch_name) record_hitch_import(hitch_kind, hitch_name, arguments,
+                                      return_address, &hitch_scope, hitch_now());
     frame_profile.dispatch_ns += elapsed;
     ++frame_profile.calls;
     struct import_profile_entry *entry = import_profile_slot(import_id);
@@ -3367,7 +3367,11 @@ static lp32_fast_import_fn runtime_fast_import(const char *name)
         lp32_fast_import_fn handler;
     } table[] = {
         {"_OSAtomicAdd32", fast_OSAtomicAdd32},
+        {"_OSAtomicAdd32Barrier", fast_OSAtomicAdd32},
         {"_OSAtomicCompareAndSwap32", fast_OSAtomicCompareAndSwap32},
+        {"_OSAtomicCompareAndSwapInt", fast_OSAtomicCompareAndSwap32},
+        {"_OSAtomicCompareAndSwap32Barrier", fast_OSAtomicCompareAndSwap32},
+        {"_OSAtomicCompareAndSwapPtrBarrier", fast_OSAtomicCompareAndSwap32},
         {"_memcpy", fast_memmove},
         {"_memmove", fast_memmove},
         {"___memcpy_chk", fast_memmove},

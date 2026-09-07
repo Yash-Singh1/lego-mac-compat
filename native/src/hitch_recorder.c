@@ -1,4 +1,5 @@
 #include "hitch_recorder.h"
+#include "host_diagnostics.h"
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
@@ -42,6 +43,8 @@ static unsigned history_count, history_next, worker_next, worker_count;
 static unsigned following, reports, skipped;
 static uint64_t previous_end, last_trigger, threshold_ns;
 static _Thread_local uint32_t vertex_program, fragment_program;
+static _Thread_local struct hitch_scope *active_scope;
+static _Thread_local uint64_t frame_generation;
 
 uint64_t hitch_now(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
 
@@ -72,7 +75,9 @@ unsigned hitch_classify(const char *name)
         strstr(name, "WaitSync")) return HITCH_WAIT;
     if (!strncmp(name, "AudioUnit", 9) || !strncmp(name, "AudioConverter", 14) ||
         !strncmp(name, "AudioFile", 9) || !strncmp(name, "ExtAudioFile", 12)) return HITCH_AUDIO;
-    return HITCH_NONE;
+    if (!strncmp(name, "gl", 2) || !strncmp(name, "CGL", 3)) return HITCH_GL_STATE;
+    if (!strncmp(name, "objc_", 5)) return HITCH_OBJC;
+    return HITCH_RUNTIME;
 }
 
 static void write_event(const char *label, const struct event *e)
@@ -89,7 +94,7 @@ static void write_report(const struct report *r)
         fprintf(output, " frame=%llu end=%.3f active=%d present=%.3f work=%.3f flush=%.3f pace=%.3f",
                 (unsigned long long)f->swap, f->end / 1e9, f->active,
                 f->present / 1e6, f->work / 1e6, f->flush / 1e6, f->pace / 1e6);
-        static const char *names[] = {"unknown", "none", "draw", "upload", "shader", "io", "wait", "audio"};
+        static const char *names[] = {"unknown", "none", "draw", "upload", "shader", "io", "wait", "audio", "glstate", "objc", "runtime"};
         for (unsigned k = HITCH_DRAW; k < HITCH_KIND_COUNT; ++k)
             fprintf(output, " %s=%llu/%.3f", names[k], (unsigned long long)f->count[k], f->ns[k] / 1e6);
         fputc('\n', output);
@@ -143,11 +148,14 @@ int hitch_start(const char *path, double threshold_ms)
     threshold_ns = (threshold_ms >= 1 && threshold_ms <= 10000) ?
         (uint64_t)(threshold_ms * 1e6) : 25000000;
     render_thread = pthread_self();
-    fprintf(output, "hitch-recorder v1 pid=%ld wall=%lld monotonic=%.3f threshold_ms=%.3f history=%d after=%d limit=%d\n"
+    fprintf(output, "hitch-recorder v2 pid=%ld wall=%lld monotonic=%.3f threshold_ms=%.3f history=%d after=%d limit=%d\n"
         "CPU wall timings only; draw time can include driver compilation or waiting, not GPU execution time.\n"
-        "Category values are call-count/total-ms. Work includes untimed guest work; flush excludes pacing.\n",
+        "Category values are call-count/exclusive-ms. Work includes untimed guest work and gateway overhead; flush excludes pacing.\n"
+        "Nested imports are excluded from parent timings; calls spanning presentation are omitted.\n",
         (long)getpid(), (long long)time(NULL), hitch_now() / 1e9, threshold_ns / 1e6,
         HISTORY, AFTER, REPORT_LIMIT);
+    char host[768]; lp32_host_description(host, sizeof(host));
+    fprintf(output, "%s\n", host);
     fflush(output);
     int error = pthread_create(&writer, NULL, write_loop, NULL);
     if (error) { fclose(output); output = NULL; errno = error; return -1; }
@@ -172,6 +180,21 @@ void hitch_program(uint32_t target, uint32_t program)
 {
     if (target == 0x8620) vertex_program = program;
     if (target == 0x8804) fragment_program = program;
+}
+void hitch_scope_begin(struct hitch_scope *scope, uint64_t now)
+{
+    *scope = (struct hitch_scope){now, 0, frame_generation, active_scope};
+    active_scope = scope;
+}
+void hitch_scope_end(struct hitch_scope *scope, unsigned kind, const char *name,
+                     uint32_t caller, uint64_t now, uint32_t count)
+{
+    uint64_t elapsed = now - scope->start;
+    active_scope = scope->parent;
+    if (active_scope) active_scope->children += elapsed;
+    if (scope->generation != frame_generation) return;
+    uint64_t exclusive = elapsed > scope->children ? elapsed - scope->children : 0;
+    hitch_note(kind, name, caller, scope->start, scope->start + exclusive, count);
 }
 void hitch_note(unsigned kind, const char *name, uint32_t caller,
                 uint64_t start, uint64_t end, uint32_t draw_count)
@@ -199,6 +222,7 @@ void hitch_frame(uint64_t swap, uint64_t work_end, uint64_t flush_end,
                  uint64_t present_end, uint64_t target_ns, bool active)
 {
     if (!hitch_recorder_enabled) return;
+    ++frame_generation;
     current.swap = swap; current.end = present_end; current.active = active;
     current.present = previous_end ? present_end - previous_end : 0;
     current.work = previous_end ? work_end - previous_end : 0;
