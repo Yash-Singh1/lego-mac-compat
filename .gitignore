@@ -7,6 +7,8 @@
 /.research-tools/
 # Build output, including the assembled game bundles (they contain the games)
 native/build/
+# Personal build preferences; repository defaults remain unchanged.
+native/local.mk
 
 .DS_Store
 *.dSYM/

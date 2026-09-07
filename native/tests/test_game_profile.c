@@ -26,6 +26,8 @@ int main(void)
         assert(lp32_profile_select(&image) == -1);
         assert(profile->thread_argument_is_direct == (i >= 2));
         assert(profile->callee_pops_struct_return == (i == 2 || i == 5));
+        assert((profile->steam_achievement_guard != NULL) == (i == 2));
+        assert(profile->steam_app_id == (i == 2 ? 249130u : 0u));
         if (profile->title != LP32_TITLE_COMPLETE_SAGA)
             assert(profile->controller && profile->display);
     }

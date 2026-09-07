@@ -1,6 +1,7 @@
 #import <CoreText/CoreText.h>
 #import <Security/Security.h>
 #include "objc_bridge.h"
+#include "focus_policy.h"
 #include "gl_core_bridge.h"
 #include "hid_bridge.h"
 #include "dispatch_bridge.h"
@@ -2190,14 +2191,15 @@ static void simulate_test_window_activation(NSWindow *window)
 
 static bool handle_test_activation(id receiver, const char *selector, uint64_t *result)
 {
-        if (background_test_mode() && selector) {
-            if (!getenv("LP32_TEST_FOCUS_LOSS") &&
+        if (selector) {
+            if (lp32_ignore_guest_focus_loss() &&
                 ((!strcmp(selector, "isActive") && [receiver isKindOfClass:[NSApplication class]]) ||
                  ((!strcmp(selector, "isKeyWindow") || !strcmp(selector, "isMainWindow")) &&
                   [receiver isKindOfClass:[NSWindow class]]))) {
                 *result = 1;
                 return true;
             }
+            if (!background_test_mode()) return false;
             if (strcmp(selector, "activateIgnoringOtherApps:") == 0 ||
                 strcmp(selector, "makeKeyWindow") == 0 ||
                 strcmp(selector, "makeMainWindow") == 0) {
@@ -3142,16 +3144,10 @@ static NSOpenGLPixelFormat *legacy_pixel_format(void)
 {
     /*
      * The game pauses its simulation and movie player whenever its window
-     * stops being key, exactly like the shipped build.  Unattended test runs
-     * set LP32_CONTINUE_WHEN_INACTIVE=1 so the game keeps running while the
-     * operator works in another app.
+     * stops being key, exactly like the shipped build. Continuing is opt-in
+     * via the environment or bundle setting, separate from test automation.
      */
-    static int keep_running = -1;
-    if (keep_running < 0) {
-        keep_running = getenv("LP32_CONTINUE_WHEN_INACTIVE") != NULL ||
-            (background_test_mode() && !getenv("LP32_TEST_FOCUS_LOSS"));
-    }
-    if (keep_running) return YES;
+    if (lp32_ignore_guest_focus_loss()) return YES;
     /* Under exclusive fullscreen the game's window was key whenever the
        application was active.  Modern activation is asynchronous and the
        borderless window is not always picked as key, so treat an active
@@ -3226,6 +3222,23 @@ static NSOpenGLPixelFormat *legacy_pixel_format(void)
     [super dealloc];
 }
 @end
+
+int objc_bridge32_run_focus_self_test(int expected)
+{
+    @autoreleasepool {
+        /* Run before AppKit activation: a nil native application/window is
+           definitely unfocused. Exercise the real GameWindow pause query. */
+        if (NSApp) return -1;
+        GameWindow *window = [[GameWindow alloc] initWithWindowedView:nil openGLView:nil];
+        int actual = [window hasFocus];
+        [window release];
+        if (actual != expected || lp32_continue_when_inactive() != expected ||
+            lp32_suppress_background_input() != expected) return -1;
+        fprintf(stderr, "focus selftest PASS (unfocused GameWindow hasFocus=%d, input suppressed=%d)\n",
+                actual, lp32_suppress_background_input());
+        return 0;
+    }
+}
 
 /* Modern host counterpart for Marvel's application delegate. Dispatch its
    two state changes back into the selected image; never terminate over an
@@ -7584,15 +7597,16 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         *result = 0; return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CGAssociateMouseAndMouseCursorPosition")) {
-        *result = getenv("LP32_BACKGROUND_TEST") ? 0 : CGAssociateMouseAndMouseCursorPosition(arguments[0] != 0); return 1;
+        *result = (background_test_mode() || (lp32_suppress_background_input() && !arguments[0])) ? 0 : CGAssociateMouseAndMouseCursorPosition(arguments[0] != 0); return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CGEventSourceKeyState")) {
-        *result = background_test_mode() ? objc_bridge32_test_key_down(arguments[1]) : CGEventSourceKeyState((CGEventSourceStateID)arguments[0], (CGKeyCode)arguments[1]);
+        *result = background_test_mode() ? objc_bridge32_test_key_down(arguments[1]) :
+            lp32_suppress_background_input() ? false : CGEventSourceKeyState((CGEventSourceStateID)arguments[0], (CGKeyCode)arguments[1]);
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CGWarpMouseCursorPosition")) {
         const float *xy = (const void *)arguments;
-        *result = background_test_mode() ? kCGErrorSuccess : CGWarpMouseCursorPosition(CGPointMake(xy[0], xy[1]));
+        *result = (background_test_mode() || lp32_suppress_background_input()) ? kCGErrorSuccess : CGWarpMouseCursorPosition(CGPointMake(xy[0], xy[1]));
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_NSPointInRect")) {

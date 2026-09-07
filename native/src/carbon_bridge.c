@@ -1,4 +1,5 @@
 #include "carbon_bridge.h"
+#include "focus_policy.h"
 #include "carbon_text.h"
 #include "carbon_ui.h"
 #include "compat_runtime.h"
@@ -2259,7 +2260,7 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
   }
   if (IS("_GetCurrentKeyModifiers") || IS("_GetDblTime") ||
       IS("_GetCaretTime")) {
-    *out = (IS("_GetCurrentKeyModifiers") && getenv("LP32_BACKGROUND_TEST"))
+    *out = (IS("_GetCurrentKeyModifiers") && (getenv("LP32_BACKGROUND_TEST") || lp32_suppress_background_input()))
                ? 0
                : F(uint32_t, void)();
     return 1;
@@ -2269,6 +2270,8 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
       memset(P(0), 0, 16);
       for(unsigned key=0;key<128;++key)
         if(objc_bridge32_test_key_down(key))((unsigned char *)P(0))[key/8]|=1u<<(key%8);
+    } else if (lp32_suppress_background_input()) {
+      memset(P(0), 0, 16);
     } else
       F(void, void *)(P(0));
     *out = 0;

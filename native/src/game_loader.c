@@ -380,6 +380,55 @@ static int install_texture_bind_guard(void)
     return 0;
 }
 
+/* Keep the original disabled-achievements return (eax = 0) when Steam's
+   stats object is NULL. Do not invent an interface, claim an unlock, or
+   alter Steam's initialization/relaunch result. All non-NULL calls retain
+   the original SetAchievement/StoreStats path and failure handling. */
+static int install_steam_achievement_guard(void)
+{
+    const struct lp32_steam_achievement_guard *guard =
+        lp32_profile()->steam_achievement_guard;
+    if (!guard) return 0;
+    enum { kStubAddress = 0x7f00f400 };
+    const struct lp32_code_signature *check = &guard->enabled_check;
+    const struct lp32_code_signature *load = &guard->stats_load;
+    const struct lp32_code_signature *skip = &guard->skip_return;
+    const unsigned char *branch = (void *)(uintptr_t)(check->address + 7);
+    const unsigned char zero_eax[] = {0x31, 0xc0};
+    if (check->length != 7 || load->length != 8 || skip->length != 6 ||
+        memcmp((void *)(uintptr_t)check->address, check->expected, 7) ||
+        memcmp((void *)(uintptr_t)load->address, load->expected, 8) ||
+        memcmp((void *)(uintptr_t)skip->address, skip->expected, 6) ||
+        memcmp((void *)(uintptr_t)(check->address - 2), zero_eax, 2) ||
+        branch[0] != 0x74 ||
+        check->address + 9 + (int8_t)branch[1] != skip->address) {
+        fprintf(stderr, "compat32: Steam achievement guard signature mismatch\n");
+        return -1;
+    }
+    unsigned char code[32];
+    size_t offset = 0;
+    emit_u8(code, &offset, 0x83); emit_u8(code, &offset, 0x3d);
+    emit_u32(code, &offset, guard->stats_pointer);
+    emit_u8(code, &offset, 0); /* cmp dword ptr [stats], 0 */
+    emit_u8(code, &offset, 0x0f); emit_u8(code, &offset, 0x84);
+    emit_rel32(code, &offset, kStubAddress, skip->address); /* je return */
+    memcpy(code + offset, check->expected, check->length);
+    offset += check->length;
+    emit_u8(code, &offset, 0xe9);
+    emit_rel32(code, &offset, kStubAddress, check->address + check->length);
+    if (write_guest_code(kStubAddress, code, offset, "Steam achievement stub"))
+        return -1;
+    unsigned char hook[7] = {0xe9, 0, 0, 0, 0, 0x90, 0x90};
+    int32_t relative = (int32_t)(kStubAddress - (check->address + 5));
+    memcpy(hook + 1, &relative, sizeof(relative));
+    if (write_guest_code(check->address, hook, sizeof(hook), "Steam achievement hook"))
+        return -1;
+    fprintf(stderr, "compat32: installed unavailable Steam stats achievement guard\n");
+    return 0;
+}
+
+#include "steam_achievement_selftest.h"
+
 static void flush_guest_instruction(uintptr_t address)
 {
     __builtin___clear_cache((char *)address, (char *)(address + 1));
@@ -653,6 +702,10 @@ int main(int argc, char **argv)
 {
     install_guest_crash_diagnostics();
     compat_runtime32_set_diagnostic_sink(runtime_diagnostic_line);
+    if (getenv("LP32_FOCUS_SELFTEST")) {
+        int expected = atoi(getenv("LP32_FOCUS_SELFTEST"));
+        return objc_bridge32_run_focus_self_test(expected) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
     if (getenv("LP32_CRASH_DIAGNOSTIC_SELFTEST")) {
         raise(SIGSEGV);
         return EXIT_FAILURE;
@@ -788,6 +841,16 @@ int main(int argc, char **argv)
         int result = objc_bridge32_run_gl_texture_self_test();
         macho_image32_unload(&image);
         return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (getenv("LP32_STEAM_ACHIEVEMENT_SELFTEST")) {
+        int result = steam_achievement_selftest();
+        macho_image32_unload(&image);
+        return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (steam_bridge32_prepare_environment(lp32_profile()->steam_app_id) != 0 ||
+        install_steam_achievement_guard() != 0) {
+        macho_image32_unload(&image);
+        return EXIT_FAILURE;
     }
     if (controller_bridge32_install() != 0) {
         macho_image32_unload(&image);

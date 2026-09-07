@@ -12,8 +12,9 @@
 #include <time.h>
 
 /* CCallbackBase has three virtual methods, then flags and the callback ID.
-   Keep host pointers entirely outside guest memory. The shipped Steam API
-   owns initialization, entitlement checks and callback delivery. */
+   Keep host pointers entirely outside guest memory. The loaded library
+   supplies initialization and callback delivery; a successful Init alone
+   does not establish its authenticity or a connection to Valve's servers. */
 struct steam_callback {
     const void **vtable;
     uint8_t flags;
@@ -24,6 +25,29 @@ struct steam_callback {
 };
 static void *steam_library;
 static struct steam_callback *callbacks;
+
+int steam_bridge32_prepare_environment(uint32_t app_id)
+{
+    if (!app_id) return 0;
+    char expected[16];
+    snprintf(expected, sizeof(expected), "%u", app_id);
+    const char *existing = getenv("SteamAppId");
+    if (existing && existing[0]) {
+        if (!strcmp(existing, expected)) return 0;
+        fprintf(stderr, "compat32: conflicting SteamAppId; expected %s for this title\n", expected);
+        return -1;
+    }
+    /* Feral chdirs into Resources before Steam startup; the SDK looks for
+       steam_appid.txt in the CWD, not beside our relocated executable.
+       The official bundled SDK also accepts SteamAppId. Supply identity
+       before any guest code runs, without changing CWD or faking Init. */
+    if (setenv("SteamAppId", expected, 1)) {
+        perror("compat32: set SteamAppId");
+        return -1;
+    }
+    fprintf(stderr, "compat32: SteamAppId=%s for relocated bundle\n", expected);
+    return 0;
+}
 
 static void *steam_symbol(const char *name)
 {
@@ -59,6 +83,16 @@ static void *steam_symbol(const char *name)
 static void deliver_callback(struct steam_callback *callback, void *data,
                              bool failure, uint64_t call, unsigned method)
 {
+    if (data && callback->size >= 12 &&
+        (callback->id == 1101 || callback->id == 1102)) {
+        uint64_t game_id;
+        int32_t status;
+        memcpy(&game_id, data, sizeof(game_id));
+        memcpy(&status, (const char *)data + 8, sizeof(status));
+        fprintf(stderr, "compat32: Steam %s game=%llu result=%d%s\n",
+                callback->id == 1101 ? "UserStatsReceived" : "UserStatsStored",
+                (unsigned long long)game_id, status, failure ? " I/O failure" : "");
+    }
     uint32_t payload = compat_runtime32_allocate((size_t)callback->size, 1);
     if (!payload) return;
     if (data) {
@@ -148,7 +182,12 @@ static int interface_call(unsigned which, unsigned slot, const uint32_t *a, uint
         if (slot == 9) { *result = CALL0(uint32_t); return 1; } /* GetAppID */
     } else if (which == STEAM_STATS) {
         switch (slot) {
-        case 0: case 10: *result = CALL0(bool); return 1;
+        case 0: case 10:
+            *result = CALL0(bool);
+            fprintf(stderr, "compat32: Steam %s %s\n",
+                    slot == 0 ? "RequestCurrentStats" : "StoreStats",
+                    *result ? "accepted" : "failed");
+            return 1;
         case 1: case 2: case 6:
             *result = CALL2(bool, const char *, PTR(1), void *, PTR(2)); return 1;
         case 3: *result = CALL2(bool, const char *, PTR(1), int32_t, (int32_t)a[2]); return 1;
@@ -156,7 +195,13 @@ static int interface_call(unsigned which, unsigned slot, const uint32_t *a, uint
             float value; memcpy(&value, &a[2], sizeof(value));
             *result = CALL2(bool, const char *, PTR(1), float, value); return 1;
         }
-        case 7: case 8: *result = CALL1(bool, const char *, PTR(1)); return 1;
+        case 7: case 8:
+            *result = CALL1(bool, const char *, PTR(1));
+            fprintf(stderr, "compat32: Steam %s(%s) %s\n",
+                    slot == 7 ? "SetAchievement" : "ClearAchievement",
+                    a[1] ? (const char *)PTR(1) : "(null)",
+                    *result ? "accepted" : "failed");
+            return 1;
         case 9: *result = CALL3(bool, const char *, PTR(1), bool *, PTR(2), uint32_t *, PTR(3)); return 1;
         case 11: *result = (uint32_t)CALL1(int, const char *, PTR(1)); return 1;
         case 12: *result = compat_runtime32_copy_cstring(CALL2(const char *, const char *, PTR(1), const char *, PTR(2))); return 1;
@@ -262,7 +307,15 @@ int steam_bridge32_dispatch(const char *name, const uint32_t *args, uint64_t *re
         if (!interfaces[i].guest) {
             void *(*function)(void) = steam_symbol(name + 1);
             interfaces[i].host = function ? function() : NULL;
-            if (!interfaces[i].host) { *result = 0; return 1; }
+            if (!interfaces[i].host) {
+                static bool warned[sizeof(interfaces) / sizeof(interfaces[0])];
+                if (!warned[i]) {
+                    fprintf(stderr, "compat32: %s unavailable; Steam initialization is required\n", name + 1);
+                    warned[i] = true;
+                }
+                *result = 0;
+                return 1;
+            }
             uint32_t allocation = compat_runtime32_allocate(65 * sizeof(uint32_t), 1);
             if (!allocation) return 0;
             uint32_t *words = (void *)(uintptr_t)allocation;
@@ -328,6 +381,8 @@ int steam_bridge32_dispatch(const char *name, const uint32_t *args, uint64_t *re
         bool (*function)(uint32_t) = steam_symbol(name + 1);
         if (!function) return 0;
         *result = function(args[0]);
+        if (*result)
+            fprintf(stderr, "compat32: Steam requested relaunch for app %u; the guest may skip SteamAPI_Init\n", args[0]);
         return 1;
     }
     if (strcmp(name, "_SteamAPI_RunCallbacks") == 0 || strcmp(name, "_SteamAPI_Shutdown") == 0) {

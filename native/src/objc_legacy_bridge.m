@@ -1,5 +1,6 @@
 #include "objc_legacy_bridge.h"
 #include "objc_bridge.h"
+#include "focus_policy.h"
 #include "compat_runtime.h"
 #import <AppKit/AppKit.h>
 #import <objc/runtime.h>
@@ -128,9 +129,10 @@ static void forward(id self,SEL command,NSInvocation *inv){
     bool meta=class_isMetaClass(object_getClass(self));
     const char *selector=sel_getName(inv.selector);struct method32 *m=method(meta?(Class)self:object_getClass(self),meta,selector);
     if(!m){[self doesNotRecognizeSelector:inv.selector];return;}
-    if (getenv("LP32_BACKGROUND_TEST") && !getenv("LP32_TEST_FOCUS_LOSS") &&
+    if (lp32_ignore_guest_focus_loss() &&
         (!strcmp(selector, "windowDidResignKey:") ||
          !strcmp(selector, "windowDidResignMain:") ||
+         !strcmp(selector, "applicationWillResignActive:") ||
          !strcmp(selector, "applicationDidResignActive:"))) return;
     if(getenv("LP32_TRACE_OBJC_SELECTORS"))fprintf(stderr,"compat32: native callback %s on %s\n",selector,class_getName(object_getClass(self)));
     uint32_t a[128]={objc_bridge32_guest_object(self),m->name};unsigned n=2;

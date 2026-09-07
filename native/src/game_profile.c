@@ -280,6 +280,14 @@ static const struct lp32_display_layout marvel_display = {
     .refresh_rate = 0x016b9ce4,
 };
 
+static const struct lp32_steam_achievement_guard marvel_steam_achievement_guard = {
+    .entry = 0x00249350,
+    .stats_pointer = 0x0160b554,
+    .enabled_check = {0x0024935f, {0x80,0xbe,0x66,0xbe,0x1e,0x01,0x00}, 7},
+    .stats_load = {0x0024936e, {0x8b,0x8e,0xf8,0x21,0x3c,0x01,0x8b,0x11}, 8},
+    .skip_return = {0x002493a7, {0x83,0xc4,0x14,0x5e,0x5d,0xc3}, 6},
+};
+
 /* This crt calls main directly from start. */
 static const struct lp32_game_profile marvel_profile = {
     .title = LP32_TITLE_MARVEL,
@@ -290,9 +298,11 @@ static const struct lp32_game_profile marvel_profile = {
     .entry_eip = 0x00002720,
     .image_end = 0x01753000,
     .main_address = 0x0025bc00,
+    .steam_app_id = 249130,
     .callee_pops_struct_return = 1,
     .thread_argument_is_direct = 1,
     .controller = &marvel_controller,
+    .steam_achievement_guard = &marvel_steam_achievement_guard,
     .display = &marvel_display,
     .application_should_terminate = 0x0043d1a0,
     .application_will_unhide = 0x0043d220,

@@ -120,6 +120,16 @@ struct lp32_texture_bind_guard {
     uint32_t resume;                 /* the jnz that follows the test */
 };
 
+/* Marvel can keep running after Steam startup requested a relaunch. Its
+   achievement submitter, unlike its stats polling code, assumes stats exist. */
+struct lp32_steam_achievement_guard {
+    uint32_t entry;
+    uint32_t stats_pointer;
+    struct lp32_code_signature enabled_check;
+    struct lp32_code_signature stats_load;
+    struct lp32_code_signature skip_return;
+};
+
 /* Display/frontend globals consulted by objc_bridge.m. */
 struct lp32_display_layout {
     uint32_t screen_width;
@@ -165,11 +175,13 @@ struct lp32_game_profile {
     uint8_t thread_argument_is_direct; /* persistent task object, not a stack-local pointer */
     uint8_t callee_pops_struct_return; /* Clang i386 sret ABI (Marvel) */
     uint32_t main_address;          /* 0 = derive from the crt start stub */
+    uint32_t steam_app_id;          /* relocated Steam bundle identity, 0 = none */
     const struct lp32_startup_latch_patch *startup_latch;
     const struct lp32_controller_layout *controller;
     const struct lp32_button_font_layout *button_font; /* NULL = Xbox glyphs only */
     const struct lp32_save_worker_patch *save_worker;  /* NULL = single init */
     const struct lp32_texture_bind_guard *texture_bind_guard; /* NULL = none */
+    const struct lp32_steam_achievement_guard *steam_achievement_guard;
     const struct lp32_display_layout *display;
     const struct lp32_render_pool *render_pool;
     const struct lp32_activator_layout *activator;

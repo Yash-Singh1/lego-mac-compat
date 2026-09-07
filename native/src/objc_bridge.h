@@ -17,6 +17,7 @@ lp32_fast_import_fn objc_bridge32_fast_import(const char *import_name);
 uint32_t objc_bridge32_pointer_import(const char *import_name);
 int objc_bridge32_run_proxy_self_test(void);
 int objc_bridge32_run_pointer_self_test(void);
+int objc_bridge32_run_focus_self_test(int expected);
 int objc_bridge32_prepare_shader_cache(void);
 int objc_bridge32_run_gl_parameter_self_test(void);
 int objc_bridge32_run_gl_buffer_self_test(void);

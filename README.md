@@ -57,6 +57,18 @@ This compiles the loader and assembles a self-contained app in
 the game's data, resources and Cg framework copied in. The original app is
 only read. Open the built app from Finder or the Dock.
 
+To keep cutscenes and gameplay running when you switch to another app, build
+with `CONTINUE_WHEN_INACTIVE=1` (works with `bundle` and `promote-loader`).
+This setting is **off by default** and stored in the generated app, so Finder
+launches respect it. For personal builds, put `CONTINUE_WHEN_INACTIVE = 1`
+in the git-ignored `native/local.mk`; use `CONTINUE_WHEN_INACTIVE=0` on a make
+command to override that preference. A process environment override,
+`LP32_CONTINUE_WHEN_INACTIVE=0` or `1`, takes priority over the bundle setting.
+This does not enable unattended test mode or mute audio. Global keyboard
+polls and cursor warps are suppressed while the real app is inactive.
+Gameplay continues too, so pause manually before leaving an active level.
+Test with `make -C native test-focus-policy test-focus-bridge`.
+
 Pirates ships with a SecuROM-packed executable. The build recovers the plain
 Mach-O from it automatically: `native/tools/unpack_securom.py` emulates the
 packer's stub with Unicorn and writes `native/build/LEGOPirates.unpacked.macbin`
@@ -66,8 +78,18 @@ creates a Python virtual environment in `native/build/venv` and installs
 `PYTHON=/path/to/python3`. Clone Wars and Marvel use their shipped binaries directly.
 
 Marvel supports the Feral 1.0.1 i386 build (`LEGOMarvel.macbin`). Its bundle
-includes the original x86_64 Steam API and uses normal Steam initialization;
-keep Steam running with access to the game. The same loader detects each
+copies the source app's x86_64 Steam API and forwards Steam initialization.
+Real Steam achievements require a genuine Steam library and Steam account
+access to Marvel (app 249130). A replacement library can return successful
+initialization without connecting to Steam: the earlier locally tested library
+contains the identifying string `Steam Emulator Version`. Those earlier save
+tests do **not** verify Steam Cloud. The genuine Steam build has now been
+tested separately: initialization succeeds, its success callback reaches the
+guest, and the game reads all 48 achievement entries. Uploading a newly earned
+achievement and Steam Cloud save/reload remain unverified.
+See [native/MARVEL-STEAM.md](native/MARVEL-STEAM.md) for the separate build
+command, the startup fix, and verification details.
+The same loader detects each
 title, with Marvel's thread and structure-return conventions kept in its
 own profile. Building Marvel leaves the other compatibility apps in place.
 Verified so far: menus, the opening sequence, and keyboard movement and
@@ -76,6 +98,13 @@ persist on disk; a bundled storage-library enumeration defect hid later slots
 after relaunch. The shared loader now repairs that directory walker, and fresh
 processes discover and fully read the existing saves. In-game resume and the
 full campaign remain unverified.
+Marvel's achievement submitter now skips a missing Steam stats interface
+instead of dereferencing NULL at `0x249374`. This is a crash guard, not Steam
+integration or an achievement retry queue. An unlock attempted while Steam
+is unavailable is not guaranteed to be uploaded later. Run
+`make -C native test-steam-achievement-guard` to exercise the mapped guest
+routine with NULL, disabled, successful, and failed mock interfaces without
+unlocking achievements or loading saves.
 The loader supplies the i386 character tables and Cg metadata queries needed
 for Marvel's shader constants. On the first launch after this fix, it backs up
 Marvel's `CachedShadersGL` folder alongside the original and rebuilds the cache;

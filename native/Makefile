@@ -1,4 +1,6 @@
 BUILD_DIR := build
+-include local.mk
+CONTINUE_WHEN_INACTIVE ?= 0
 
 # One loader serves every supported title; the bundle targets pick the title
 # with GAME=pirates (default), GAME=clonewars, GAME=marvel or GAME=saga.
@@ -138,11 +140,29 @@ $(BUILD_DIR)/game_loader: src/game_loader.c src/hitch_recorder.c src/game_profil
 	$(CLANG) $(CFLAGS) $(LDFLAGS) $(filter %.c %.m %.cpp %.S,$^) -lc++ -lffi -lcurl -lz -framework CoreText -framework Security -framework ForceFeedback -framework OpenAL -framework CFNetwork -framework SystemConfiguration -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework Cocoa -framework Carbon -framework OpenGL -framework AudioToolbox -framework AudioUnit -framework CoreAudio -framework GameController -framework IOKit -o $@
 	codesign --force --sign - $@
 
+$(BUILD_DIR)/game_loader: src/focus_policy.m
+
 $(BUILD_DIR)/test_game_profile: tests/test_game_profile.c src/game_profile.c src/game_profile.h src/macho_loader.h | $(BUILD_DIR)
 	$(CLANG) $(CFLAGS) -Isrc tests/test_game_profile.c src/game_profile.c -o $@
 
 test-game-profile: $(BUILD_DIR)/test_game_profile
 	./$(BUILD_DIR)/test_game_profile
+
+.PHONY: test-focus-policy
+$(BUILD_DIR)/test_focus_policy: tests/test_focus_policy.m src/focus_policy.m src/focus_policy.h | $(BUILD_DIR)
+	$(CLANG) $(CFLAGS) -Isrc tests/test_focus_policy.m src/focus_policy.m -framework Cocoa -o $@
+
+test-focus-policy: $(BUILD_DIR)/test_focus_policy
+	env -u LP32_CONTINUE_WHEN_INACTIVE -u LP32_BACKGROUND_TEST -u LP32_TEST_FOCUS_LOSS ./$(BUILD_DIR)/test_focus_policy 0
+	env -u LP32_BACKGROUND_TEST -u LP32_TEST_FOCUS_LOSS LP32_CONTINUE_WHEN_INACTIVE=1 ./$(BUILD_DIR)/test_focus_policy 1
+	env -u LP32_BACKGROUND_TEST -u LP32_TEST_FOCUS_LOSS LP32_CONTINUE_WHEN_INACTIVE=0 ./$(BUILD_DIR)/test_focus_policy 0
+	python3 tests/test_configure_bundle.py
+
+.PHONY: test-focus-bridge
+test-focus-bridge: $(BUILD_DIR)/game_loader
+	env -u LP32_CONTINUE_WHEN_INACTIVE -u LP32_BACKGROUND_TEST -u LP32_TEST_FOCUS_LOSS LP32_FOCUS_SELFTEST=0 ./$(BUILD_DIR)/game_loader
+	env -u LP32_BACKGROUND_TEST -u LP32_TEST_FOCUS_LOSS LP32_CONTINUE_WHEN_INACTIVE=1 LP32_FOCUS_SELFTEST=1 ./$(BUILD_DIR)/game_loader
+	env -u LP32_BACKGROUND_TEST -u LP32_TEST_FOCUS_LOSS LP32_CONTINUE_WHEN_INACTIVE=0 LP32_FOCUS_SELFTEST=0 ./$(BUILD_DIR)/game_loader
 
 $(BUILD_DIR)/test_macho_entry: tests/test_macho_entry.c src/macho_loader.c src/macho_loader.h | $(BUILD_DIR)
 	$(CLANG) $(CFLAGS) -Wl,-pagezero_size,0x1000 tests/test_macho_entry.c -o $@
@@ -202,6 +222,8 @@ saga-update:
 ifeq ($(GAME):$(SAGA_EDITION),saga:steam)
 bundle: $(BUILD_DIR)/game_loader $(INFO_PLIST) tools/bundle_saga_steam.py
 	python3 tools/bundle_saga_steam.py "$(SOURCE_APP)" "$(SAGA_DATA_SOURCE)" "$(BUILD_DIR)/game_loader" "$(BUNDLE)" "$(INFO_PLIST)"
+	python3 tools/configure_bundle.py "$(BUNDLE)" --continue-when-inactive "$(CONTINUE_WHEN_INACTIVE)"
+	codesign --force --deep --sign - "$(BUNDLE)"
 else
 bundle: $(BUILD_DIR)/game_loader $(IMAGE_PREREQ) $(INFO_PLIST)
 	if test "$(GAME)" = saga; then python3 tools/stage_saga_data.py "$(SAGA_DATA_SOURCE)" "$(BUILD_DIR)/Data"; fi
@@ -217,6 +239,7 @@ bundle: $(BUILD_DIR)/game_loader $(IMAGE_PREREQ) $(INFO_PLIST)
 	ditto --noextattr --noqtn "$(SOURCE_CONTENTS)/Resources" $(BUNDLE)/Contents/Resources
 	cp "$(ICON)" $(BUNDLE)/Contents/Resources/$(ICON_NAME)
 	if test "$(RESOURCE_FORKS)" = 1; then python3 tools/flatten_resource_forks.py $(BUNDLE); fi
+	python3 tools/configure_bundle.py "$(BUNDLE)" --continue-when-inactive "$(CONTINUE_WHEN_INACTIVE)"
 	codesign --force --deep --sign - $(BUNDLE)
 endif
 
@@ -227,6 +250,7 @@ promote-loader: $(BUILD_DIR)/game_loader
 	cp $(BUILD_DIR)/game_loader $(BUNDLE)/Contents/MacOS/$(LOADER_NAME).new
 	mv $(BUNDLE)/Contents/MacOS/$(LOADER_NAME).new $(BUNDLE)/Contents/MacOS/$(LOADER_NAME)
 	if test -f "$(ICON)"; then cp "$(ICON)" $(BUNDLE)/Contents/Resources/$(ICON_NAME); fi
+	python3 tools/configure_bundle.py "$(BUNDLE)" --continue-when-inactive "$(CONTINUE_WHEN_INACTIVE)"
 	codesign --force --deep --sign - $(BUNDLE)
 	codesign --verify --deep --strict $(BUNDLE)
 
@@ -349,6 +373,11 @@ $(BUILD_DIR)/test_steam_bridge: tests/test_steam_bridge.c src/steam_bridge.c src
 
 test-steam-bridge: $(BUILD_DIR)/test_steam_bridge
 	arch -x86_64 ./$(BUILD_DIR)/test_steam_bridge
+
+.PHONY: test-steam-achievement-guard
+MARVEL_TEST_IMAGE ?= $(BUILD_DIR)/LEGOMarvel-Compat.app/Contents/SharedSupport/LEGOMarvel.image
+test-steam-achievement-guard: $(BUILD_DIR)/game_loader
+	env LP32_STEAM_ACHIEVEMENT_SELFTEST=1 LP32_NO_DIAGNOSTIC_LOG=1 arch -x86_64 ./$(BUILD_DIR)/game_loader "$(MARVEL_TEST_IMAGE)"
 
 .PHONY: test-dlfcn-bridge
 $(BUILD_DIR)/test_dlfcn_bridge: tests/test_dlfcn_bridge.c src/dlfcn_bridge.c src/dlfcn_bridge.h | $(BUILD_DIR)
