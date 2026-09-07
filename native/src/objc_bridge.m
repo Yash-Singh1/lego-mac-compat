@@ -1,4 +1,12 @@
+#import <CoreText/CoreText.h>
+#import <Security/Security.h>
 #include "objc_bridge.h"
+#include "gl_core_bridge.h"
+#include "hid_bridge.h"
+#include "dispatch_bridge.h"
+#include "objc_legacy_bridge.h"
+#include "carbon_bridge.h"
+#include "cfnetwork_bridge.h"
 #include "hitch_recorder.h"
 #include "arb_program_guard.h"
 #include "audio_bridge.h"
@@ -15,7 +23,10 @@
 #import <OpenGL/OpenGL.h>
 #import <OpenGL/gl.h>
 #import <objc/runtime.h>
+#import <objc/objc-sync.h>
 #import <malloc/malloc.h>
+#import <dispatch/dispatch.h>
+#include <ffi/ffi.h>
 
 #include <dlfcn.h>
 #include <stdbool.h>
@@ -47,14 +58,20 @@ enum {
     kProxyBase = 0x7f018000,
     kProxyLimit = 0x7f020000,
     kProxyStride = 16,
-    kProxyCapacity = (kProxyLimit - kProxyBase) / kProxyStride,
+    kInlineProxyCapacity = (kProxyLimit - kProxyBase) / kProxyStride,
+    /* Newer Cocoa launchers legitimately keep thousands of resource strings
+       alive. Preserve the original token range and use a disjoint overflow
+       range, rather than colliding with the import thunks above it. */
+    kOverflowProxyBase = 0x71100000,
+    kProxyCapacity = 65536,
     /*
      * NSEvent and values derived from an event (most notably -characters)
      * have event-loop lifetime.  Giving every one a permanent bridge proxy
      * exhausted kProxyCapacity after a few thousand key-repeat events.  Keep
-     * those short-lived objects in a separate pool which is replaced when
-     * AppKit delivers the next event.  This address range is an opaque token
-     * range in the gap between the guest heap and its thread stacks.
+     * them in bounded per-thread rings. In-flight callbacks pin their handles:
+     * a nested resize event or another producer must not replace the message
+     * whose data fields the game is still reading. This opaque token range
+     * lies between the guest heap and its thread stacks.
      */
     kEventProxyBase = 0x71000000,
     kEventProxyCapacity = 64,
@@ -63,15 +80,70 @@ enum {
 struct proxy_entry {
     uint32_t handle;
     id object;
+    uint32_t cf_owners;
+    bool pinned;
 };
 
+static _Thread_local bool creating_cf_object;
 static struct proxy_entry proxies[kProxyCapacity];
 static uint32_t proxy_count;
-static struct proxy_entry event_proxies[kEventProxyCapacity];
-static uint32_t event_proxy_count;
-static NSEvent *current_proxy_event;
+static pthread_mutex_t proxy_mutex = PTHREAD_MUTEX_INITIALIZER;
+struct guest_autorelease_entry { uint32_t token; struct guest_autorelease_entry *next; };
+struct guest_autorelease_scope {
+    struct guest_autorelease_entry *objects;
+    struct guest_autorelease_scope *parent;
+};
+static _Thread_local struct guest_autorelease_scope *guest_autorelease_scope;
+struct event_pool {
+    struct proxy_entry entries[kEventProxyCapacity];
+    uint32_t count, cursor;
+    NSEvent *current;
+};
+static struct event_pool event_pools[1024];
+static uint32_t next_event_pool;
+static _Thread_local uint32_t event_pool_index=UINT32_MAX;
+static struct event_pool *event_pool(void) {
+    if(event_pool_index==UINT32_MAX)event_pool_index=__atomic_fetch_add(&next_event_pool,1,__ATOMIC_RELAXED);
+    if(event_pool_index>=1024)abort();
+    return &event_pools[event_pool_index];
+}
+#define event_proxies (event_pool()->entries)
+#define event_proxy_count (event_pool()->count)
+#define current_proxy_event (event_pool()->current)
 static bool logged_proxy_exhaustion;
 static uint64_t objc_bridge_swap_count;
+static NSScreen *preferred_game_screen(void);
+static void place_test_window(NSWindow *window)
+{
+    if (!getenv("LP32_TEST_DISPLAY") || window.sheetParent) return;
+    NSRect frame=window.frame, screen=preferred_game_screen().visibleFrame;
+    if(frame.size.width<=0 || frame.size.height<=0 || NSContainsRect(screen,frame))return;
+    frame.size.width=MIN(frame.size.width,screen.size.width);
+    frame.size.height=MIN(frame.size.height,screen.size.height);
+    frame.origin=NSMakePoint(screen.origin.x+(screen.size.width-frame.size.width)/2,
+                             screen.origin.y+(screen.size.height-frame.size.height)/2);
+    [window setFrame:frame display:NO];
+}
+
+/* NSFastEnumerationState contains native pointers and NSUInteger fields;
+ * never allow AppKit to write that 64-byte host record into a 32-byte guest
+ * stack record. Keep host iteration state until the enumeration finishes. */
+struct enumeration_context {
+    uint32_t address, mutation;
+    id collection;
+    NSFastEnumerationState state;
+};
+static struct enumeration_context enumerations[128];
+static void refresh_enumeration_mutations(void)
+{
+    for (unsigned i=0;i<128;++i) {
+        struct enumeration_context *e=&enumerations[i];
+        if(e->collection && e->mutation && e->state.mutationsPtr)
+            *(uint32_t *)(uintptr_t)e->mutation=(uint32_t)*e->state.mutationsPtr;
+    }
+}
+static bool enumerate_guest(id collection,const uint32_t *args,uint64_t *result);
+
 
 /* Section ranges of the loaded guest image (class-name refs, CF constants). */
 #define bridge_image (compat_runtime32_image())
@@ -460,7 +532,6 @@ static uint32_t event_proxy_for_object(id object)
 {
     if (!object) return 0;
     if ([object isKindOfClass:[NSEvent class]] && object != current_proxy_event) {
-        reset_event_proxies();
         current_proxy_event = (NSEvent *)object;
     }
     for (uint32_t index = 0; index < event_proxy_count; ++index) {
@@ -468,32 +539,54 @@ static uint32_t event_proxy_for_object(id object)
             return event_proxies[index].handle;
         }
     }
-    if (event_proxy_count >= kEventProxyCapacity) {
-        fprintf(stderr,
-                "compat32: event-scoped Objective-C proxy pool exhausted "
-                "at swap %llu for %s\n",
-                (unsigned long long)objc_bridge_swap_count,
-                class_getName(object_getClass(object)));
-        return 0;
-    }
-    uint32_t handle = kEventProxyBase + event_proxy_count * kProxyStride;
-    event_proxies[event_proxy_count].handle = handle;
-    event_proxies[event_proxy_count].object = object;
-    if (proxy_object_is_retained(object)) [object retain];
-    ++event_proxy_count;
+    struct event_pool *pool=event_pool();
+    uint32_t slot=pool->count;
+    if(slot==kEventProxyCapacity) {
+        bool found=false;
+        for(uint32_t i=0;i<kEventProxyCapacity;++i) {
+            slot=(pool->cursor+i)%kEventProxyCapacity;
+            if(!pool->entries[slot].cf_owners){found=true;break;}
+        }
+        if(!found){fprintf(stderr,"compat32: all event proxies are in use\n");return 0;}
+    } else ++pool->count;
+    id previous=pool->entries[slot].object;
+    uint32_t handle=kEventProxyBase+(event_pool_index*kEventProxyCapacity+slot)*kProxyStride;
+    pool->entries[slot]=(struct proxy_entry){handle,object,0,false};
+    pool->cursor=(slot+1)%kEventProxyCapacity;
+    if(proxy_object_is_retained(object))[object retain];
+    if(proxy_object_is_retained(previous))[previous release];
     return handle;
+}
+
+void objc_bridge32_pin_event(uint32_t token, int pin) {
+    if(token<kEventProxyBase || token>=kOverflowProxyBase || (token-kEventProxyBase)%kProxyStride)return;
+    uint32_t index=(token-kEventProxyBase)/kProxyStride;
+    struct proxy_entry *entry=&event_pools[index/kEventProxyCapacity].entries[index%kEventProxyCapacity];
+    if(entry->handle!=token || !entry->object)return;
+    if(pin)++entry->cf_owners;else if(entry->cf_owners)--entry->cf_owners;
 }
 
 static uint32_t proxy_for_object(id object)
 {
     if (!object) return 0;
+    uint32_t legacy = objc_legacy32_token(object);
+    if (legacy) return legacy;
     if ([object isKindOfClass:[NSEvent class]]) {
         return event_proxy_for_object(object);
     }
+    pthread_mutex_lock(&proxy_mutex);
     for (uint32_t index = 0; index < proxy_count; ++index) {
-        if (proxies[index].object == object) return proxies[index].handle;
+        if (proxies[index].object == object) {
+            if (creating_cf_object) ++proxies[index].cf_owners;
+            else proxies[index].pinned = true;
+            uint32_t handle = proxies[index].handle;
+            pthread_mutex_unlock(&proxy_mutex);
+            return handle;
+        }
     }
-    if (proxy_count >= kProxyCapacity) {
+    uint32_t slot = 0;
+    while (slot < proxy_count && proxies[slot].object) ++slot;
+    if (slot >= kProxyCapacity) {
         if (!logged_proxy_exhaustion) {
             fprintf(stderr,
                     "compat32: persistent Objective-C proxy pool exhausted "
@@ -502,14 +595,139 @@ static uint32_t proxy_for_object(id object)
                     class_getName(object_getClass(object)));
             logged_proxy_exhaustion = true;
         }
+        pthread_mutex_unlock(&proxy_mutex);
         return 0;
     }
-    uint32_t handle = kProxyBase + proxy_count * kProxyStride;
-    proxies[proxy_count].handle = handle;
-    proxies[proxy_count].object = object;
+    uint32_t handle = slot < kInlineProxyCapacity ? kProxyBase + slot * kProxyStride :
+        kOverflowProxyBase + (slot - kInlineProxyCapacity) * kProxyStride;
+    proxies[slot] = (struct proxy_entry){handle, object,
+                                       creating_cf_object ? 1u : 0u,
+                                       !creating_cf_object};
     if (proxy_object_is_retained(object)) [object retain];
-    ++proxy_count;
+    if (slot == proxy_count) ++proxy_count;
+    pthread_mutex_unlock(&proxy_mutex);
     return handle;
+}
+
+/* Native per-import pools are shorter lived than guest pools. Hold fresh
+ * autoreleased values until the guest drains its corresponding scope. */
+static void guest_autorelease_push(void)
+{
+    struct guest_autorelease_scope *scope=calloc(1,sizeof(*scope));
+    if(!scope)abort();
+    scope->parent=guest_autorelease_scope;guest_autorelease_scope=scope;
+}
+static void guest_autorelease_add(uint32_t token)
+{
+    if(!guest_autorelease_scope || !token)return;
+    struct guest_autorelease_entry *entry=malloc(sizeof(*entry));
+    if(!entry)abort();
+    *entry=(struct guest_autorelease_entry){token,guest_autorelease_scope->objects};
+    guest_autorelease_scope->objects=entry;
+}
+static void guest_autorelease_pop(void)
+{
+    struct guest_autorelease_scope *scope=guest_autorelease_scope;
+    if(!scope)return;
+    guest_autorelease_scope=scope->parent;
+    while(scope->objects){
+        struct guest_autorelease_entry *entry=scope->objects;
+        scope->objects=entry->next;
+        uint64_t ignored;objc_bridge32_dispatch("_CFRelease",&entry->token,&ignored);
+        free(entry);
+    }
+    free(scope);
+}
+static uint32_t proxy_for_autoreleased_object(id object)
+{
+    if(!guest_autorelease_scope)return proxy_for_object(object);
+    bool previous=creating_cf_object;creating_cf_object=true;
+    uint32_t token=proxy_for_object(object);creating_cf_object=previous;
+    guest_autorelease_add(token);return token;
+}
+static bool proxy_uses_guest_ownership(uint32_t token)
+{
+    bool managed=false;
+    pthread_mutex_lock(&proxy_mutex);
+    for(uint32_t i=0;i<proxy_count;++i)if(proxies[i].handle==token){
+        managed=proxies[i].object && !proxies[i].pinned;break;
+    }
+    pthread_mutex_unlock(&proxy_mutex);return managed;
+}
+
+static bool enumerate_guest(id collection,const uint32_t *args,uint64_t *result)
+{
+    uint32_t *guest=(void *)(uintptr_t)args[2];
+    uint32_t *buffer=(void *)(uintptr_t)args[3];
+    NSUInteger capacity=args[4];
+    if(!guest || !buffer || capacity>4096)return false;
+    struct enumeration_context *e=NULL;
+    for(unsigned i=0;i<128;++i)if(enumerations[i].address==args[2]){e=&enumerations[i];break;}
+    if(!e)for(unsigned i=0;i<128;++i)if(!enumerations[i].collection){e=&enumerations[i];break;}
+    if(!e)return false;
+    if(!guest[0] || e->collection!=collection){
+        [e->collection release];if(e->mutation)compat_runtime32_deallocate(e->mutation);
+        memset(e,0,sizeof(*e));e->address=args[2];e->collection=[collection retain];
+        e->mutation=compat_runtime32_allocate(4,1);
+    }
+    id *objects=calloc(capacity?capacity:1,sizeof(id));if(!objects)return false;
+    NSUInteger count=[collection countByEnumeratingWithState:&e->state objects:objects count:capacity];
+    if(count>capacity){free(objects);return false;}
+    for(NSUInteger i=0;i<count;++i)buffer[i]=proxy_for_object(e->state.itemsPtr[i]);
+    guest[0]=count?1:0;guest[1]=args[3];guest[2]=e->mutation;
+    refresh_enumeration_mutations();free(objects);*result=count;
+    if(!count){[e->collection release];compat_runtime32_deallocate(e->mutation);memset(e,0,sizeof(*e));}
+    return true;
+}
+
+static id object_for_argument(uint32_t value);
+
+/* CFAllocatorContext uses nine 32-bit words in the guest. Host CF calls
+ * receive widened sizes and bridge each supplied callback back to i386. */
+struct allocator_context32 { uint32_t version, info, retain, release, describe,
+    allocate, reallocate, deallocate, preferred; };
+static const void *allocator_retain32(const void *raw) {
+    struct allocator_context32 *c = malloc(sizeof(*c));
+    if (!c) return NULL;
+    memcpy(c, raw, sizeof(*c));
+    if (c->retain) c->info = compat_runtime32_call(c->retain, &c->info, 1);
+    return c;
+}
+static void allocator_release32(const void *raw) {
+    const struct allocator_context32 *c = raw;
+    if (c->release) compat_runtime32_call(c->release, &c->info, 1);
+    free((void *)c);
+}
+static CFStringRef allocator_describe32(const void *raw) {
+    const struct allocator_context32 *c = raw;
+    if (!c->describe) return NULL;
+    id description = object_for_argument(compat_runtime32_call(c->describe, &c->info, 1));
+    return description ? CFRetain((CFStringRef)description) : NULL;
+}
+static void *allocator_allocate32(CFIndex size, CFOptionFlags flags, void *raw) {
+    struct allocator_context32 *c = raw;
+    if (!c->allocate || size < 0 || size > INT32_MAX) return NULL;
+    uint32_t a[] = {(uint32_t)size, (uint32_t)flags, c->info};
+    return (void *)(uintptr_t)compat_runtime32_call(c->allocate, a, 3);
+}
+static void *allocator_reallocate32(void *pointer, CFIndex size, CFOptionFlags flags, void *raw) {
+    struct allocator_context32 *c = raw;
+    if (!c->reallocate || (uintptr_t)pointer > UINT32_MAX || size < 0 || size > INT32_MAX) return NULL;
+    uint32_t a[] = {(uint32_t)(uintptr_t)pointer, (uint32_t)size, (uint32_t)flags, c->info};
+    return (void *)(uintptr_t)compat_runtime32_call(c->reallocate, a, 4);
+}
+static void allocator_deallocate32(void *pointer, void *raw) {
+    struct allocator_context32 *c = raw;
+    if (c->deallocate && (uintptr_t)pointer <= UINT32_MAX) {
+        uint32_t a[] = {(uint32_t)(uintptr_t)pointer, c->info};
+        compat_runtime32_call(c->deallocate, a, 2);
+    }
+}
+static CFIndex allocator_preferred32(CFIndex size, CFOptionFlags flags, void *raw) {
+    struct allocator_context32 *c = raw;
+    if (!c->preferred || size < 0 || size > INT32_MAX) return size;
+    uint32_t a[] = {(uint32_t)size, (uint32_t)flags, c->info};
+    return (int32_t)compat_runtime32_call(c->preferred, a, 3);
 }
 
 static uint32_t proxy_for_returned_object(id receiver, id object)
@@ -559,6 +777,61 @@ static uint32_t guest_bytes_for_data(NSData *data)
     }
 }
 
+/* On the x86_64 host, exhausted register banks make va_arg consume this
+ * widened overflow area. i386 arguments always arrive as stack words. */
+static CFStringRef format_cf_string32(CFStringRef format, const uint32_t *guest) {
+    const char *text = [(NSString *)format UTF8String];
+    if (!text) return NULL;
+    uint64_t values[128]; size_t count = 0;
+    for (const char *p = text; *p; ++p) {
+        if (*p != '%') continue;
+        if (*++p == '%') continue;
+        while (*p && strchr("-+ #0'", *p)) ++p;
+        for (unsigned field = 0; field < 2; ++field) {
+            if (*p == '*') {
+                if (count == 128) return NULL;
+                values[count++] = (int32_t)*guest++; ++p;
+            } else while (*p >= '0' && *p <= '9') ++p;
+            if (*p == '$') return NULL; /* Positional formats need an index map. */
+            if (*p != '.') break;
+            ++p;
+        }
+        unsigned longs = 0;
+        if (*p == 'l') { ++longs; ++p; if (*p == 'l') { ++longs; ++p; } }
+        else if (*p == 'h') { ++p; if (*p == 'h') ++p; }
+        else if (*p == 'q' || *p == 'j') { longs = 2; ++p; }
+        else if (*p == 'z' || *p == 't') { longs = 1; ++p; }
+        if (!*p || count == 128 || *p == 'n' || *p == 'L') return NULL;
+        uint64_t value;
+        if (strchr("aAeEfFgG", *p) || longs == 2) { memcpy(&value, guest, 8); guest += 2; }
+        else if (*p == '@') value = (uintptr_t)object_for_argument(*guest++);
+        else if (strchr("diD", *p)) value = (int64_t)(int32_t)*guest++;
+        else value = *guest++;
+        values[count++] = value;
+    }
+    struct { unsigned gp_offset, fp_offset; void *overflow, *registers; } state = {48, 304, values, NULL};
+    va_list args;
+    _Static_assert(sizeof(args) == sizeof(state), "x86_64 va_list layout");
+    memcpy(args, &state, sizeof(state));
+    return CFStringCreateWithFormatAndArguments(NULL, NULL, format, args);
+}
+
+void *objc_bridge32_host_object(uint32_t token) { return object_for_argument(token); }
+uint32_t objc_bridge32_guest_pointer(void *pointer) {
+    return pointer ? proxy_for_object([NSValue valueWithPointer:pointer]) : 0;
+}
+uint32_t objc_bridge32_guest_object(void *object) { return proxy_for_object((id)object); }
+
+static void *event_proxy_test_worker(void *unused) {
+    (void)unused;
+    @autoreleasepool {
+        NSEvent *event=[NSEvent otherEventWithType:NSEventTypeApplicationDefined
+            location:NSZeroPoint modifierFlags:0 timestamp:0 windowNumber:0
+            context:nil subtype:2 data1:456 data2:789];
+        return (void *)(uintptr_t)event_proxy_for_object(event);
+    }
+}
+
 int objc_bridge32_run_proxy_self_test(void)
 {
     @autoreleasepool {
@@ -570,6 +843,49 @@ int objc_bridge32_run_proxy_self_test(void)
                   "persistent handle\n", stderr);
             return -1;
         }
+
+        uint32_t before_cf_count = proxy_count;
+        uint32_t text_buffer = compat_runtime32_allocate(96, 1);
+        if (!text_buffer) return -1;
+        for (unsigned i = 0; i < 10000; ++i) {
+            int length = snprintf((char *)(uintptr_t)text_buffer, 96, "temporary CF object %u", i);
+            uint32_t create[] = {0, text_buffer, (uint32_t)length, kCFStringEncodingUTF8, 0};
+            uint64_t value = 0;
+            if (!objc_bridge32_dispatch("_CFStringCreateWithBytes", create, &value) || !value) return -1;
+            uint32_t token = (uint32_t)value;
+            objc_bridge32_dispatch("_CFRetain", &token, &value);
+            objc_bridge32_dispatch("_CFRelease", &token, &value);
+            objc_bridge32_dispatch("_CFStringGetLength", &token, &value);
+            if (value != (uint32_t)length) return -1;
+            objc_bridge32_dispatch("_CFRelease", &token, &value);
+            for (uint32_t j = 0; j < proxy_count; ++j)
+                if (proxies[j].handle == token && proxies[j].object) return -1;
+        }
+        compat_runtime32_deallocate(text_buffer);
+        if (proxy_count > before_cf_count + 1) return -1;
+        guest_autorelease_push();
+        uint32_t deadline=proxy_for_autoreleased_object([NSDate dateWithTimeIntervalSince1970:12345]);
+        uint64_t ignored;
+        objc_bridge32_dispatch("_CFRetain",&deadline,&ignored);
+        for(unsigned i=0;i<100000;++i) {
+            @autoreleasepool {
+                guest_autorelease_push();
+                uint32_t date=proxy_for_autoreleased_object([NSDate dateWithTimeIntervalSince1970:20000+i]);
+                if(!date || !object_for_receiver(date))return -1;
+                guest_autorelease_pop();
+            }
+        }
+        guest_autorelease_pop();
+        if([(NSDate *)object_for_receiver(deadline) timeIntervalSince1970]!=12345 ||
+           proxy_count>before_cf_count+2)return -1;
+        objc_bridge32_dispatch("_CFRelease",&deadline,&ignored);
+        uint32_t word = compat_runtime32_copy_cstring("world");
+        uint32_t format_args[] = {persistent_handle, word, (uint32_t)-123, 0x89abcdef, 0x12345678, 0, 0x40040000};
+        CFStringRef formatted = format_cf_string32(CFSTR("%@ %s %ld %llx %.2f"), format_args);
+        BOOL format_ok = formatted && [(NSString *)formatted isEqualToString:@"persistent-proxy world -123 1234567889abcdef 2.50"];
+        if (formatted) CFRelease(formatted);
+        compat_runtime32_deallocate(word);
+        if (!format_ok) return -1;
 
         /* Exercise the real NSInvocation dispatch boundary.  Without the
            per-call autorelease pool this loop retains about 6 MiB of
@@ -684,9 +1000,38 @@ int objc_bridge32_run_proxy_self_test(void)
                     proxy_count, event_proxy_count);
             return -1;
         }
+        /* A Cocoa resource catalog may hold more objects than the original
+           inline range. Overflow handles must remain distinct and reversible. */
+        for (unsigned index = 0; index < 4096; ++index) {
+            NSNumber *number = [NSNumber numberWithUnsignedInt:index + 100000];
+            uint32_t handle = proxy_for_object(number);
+            if (!handle || object_for_receiver(handle) != number ||
+                !((handle >= kProxyBase && handle < kProxyLimit) ||
+                  (handle >= kOverflowProxyBase && handle < kOverflowProxyBase + (kProxyCapacity-kInlineProxyCapacity)*kProxyStride))) return -1;
+        }
+        if (object_for_receiver(persistent_handle) != persistent) return -1;
+        NSEvent *message=[NSEvent otherEventWithType:NSEventTypeApplicationDefined
+            location:NSZeroPoint modifierFlags:0 timestamp:0 windowNumber:0
+            context:nil subtype:1 data1:123 data2:321];
+        uint32_t message_token=event_proxy_for_object(message);
+        objc_bridge32_pin_event(message_token,1);
+        for(unsigned i=0;i<256;++i) {
+            NSEvent *nested=[NSEvent otherEventWithType:NSEventTypeApplicationDefined
+                location:NSZeroPoint modifierFlags:0 timestamp:0 windowNumber:0
+                context:nil subtype:2 data1:i data2:0];
+            if(!event_proxy_for_object(nested))return -1;
+        }
+        if([(NSEvent *)object_for_receiver(message_token) data2]!=321)return -1;
+        objc_bridge32_pin_event(message_token,0);
+        pthread_t producer;
+        if(pthread_create(&producer,NULL,event_proxy_test_worker,NULL))return -1;
+        void *other=NULL;
+        if(pthread_join(producer,&other) || (uintptr_t)other==message_token ||
+           [(NSEvent *)object_for_receiver(message_token) data1]!=123 ||
+           [(NSEvent *)object_for_receiver((uint32_t)(uintptr_t)other) data1]!=456)return -1;
         reset_event_proxies();
         printf("Objective-C proxy self-test: PASS "
-               "(10000 messages, +%zu bytes; stable CFData; 10000 events, persistent=%u, "
+               "(10000 CF ownership cycles; 100000 scoped dates; mixed CF varargs; 10000 messages, +%zu bytes; stable CFData; 10000 events, persistent=%u, "
                "event=%u)\n", invocation_growth, proxy_count,
                event_proxy_count);
         return 0;
@@ -696,10 +1041,13 @@ int objc_bridge32_run_proxy_self_test(void)
 static uint32_t register_proxy_with_handle(id object, uint32_t handle)
 {
     if (!object || !handle) return 0;
+    pthread_mutex_lock(&proxy_mutex);
     for (uint32_t index = 0; index < proxy_count; ++index) {
         if (proxies[index].object == object || proxies[index].handle == handle) {
             proxies[index].object = object;
             proxies[index].handle = handle;
+            proxies[index].pinned = true;
+            pthread_mutex_unlock(&proxy_mutex);
             return handle;
         }
     }
@@ -710,29 +1058,53 @@ static uint32_t register_proxy_with_handle(id object, uint32_t handle)
                     "while registering guest handle 0x%08x\n", handle);
             logged_proxy_exhaustion = true;
         }
+        pthread_mutex_unlock(&proxy_mutex);
         return 0;
     }
     proxies[proxy_count].handle = handle;
     proxies[proxy_count].object = object;
+    proxies[proxy_count].pinned = true;
     if (proxy_object_is_retained(object)) [object retain];
     ++proxy_count;
+    pthread_mutex_unlock(&proxy_mutex);
     return handle;
 }
 
 static id object_for_receiver(uint32_t receiver)
 {
     if (!receiver) return nil;
-    for (uint32_t index = 0; index < event_proxy_count; ++index) {
-        if (event_proxies[index].handle == receiver) {
-            return event_proxies[index].object;
-        }
+    id legacy = objc_legacy32_object(receiver);
+    if (legacy) return legacy;
+    if(receiver>=kEventProxyBase && receiver<kOverflowProxyBase) {
+        uint32_t offset=(receiver-kEventProxyBase)/kProxyStride;
+        struct proxy_entry *entry=&event_pools[offset/kEventProxyCapacity].entries[offset%kEventProxyCapacity];
+        return entry->handle==receiver?entry->object:nil;
+    }
+    pthread_mutex_lock(&proxy_mutex);
+    /* Ordinary proxy handles encode their slot. Avoid a linear search on
+     * every render-thread context lookup or semaphore operation. */
+    uint32_t slot = UINT32_MAX;
+    if (receiver >= kProxyBase && receiver < kProxyLimit &&
+        (receiver - kProxyBase) % kProxyStride == 0)
+        slot = (receiver - kProxyBase) / kProxyStride;
+    else if (receiver >= kOverflowProxyBase &&
+             receiver < kOverflowProxyBase + (kProxyCapacity-kInlineProxyCapacity)*kProxyStride &&
+             (receiver - kOverflowProxyBase) % kProxyStride == 0)
+        slot = kInlineProxyCapacity + (receiver - kOverflowProxyBase) / kProxyStride;
+    if (slot < proxy_count && proxies[slot].handle == receiver) {
+        id object = proxies[slot].object;
+        pthread_mutex_unlock(&proxy_mutex);
+        return object;
     }
     for (uint32_t index = 0; index < proxy_count; ++index) {
         if (proxies[index].handle == receiver) {
-            return proxies[index].object;
+            id object = proxies[index].object;
+            pthread_mutex_unlock(&proxy_mutex);
+            return object;
         }
     }
 
+    pthread_mutex_unlock(&proxy_mutex);
     /* Old 32-bit CF constant strings are four-word records in __DATA. */
     if (receiver >= bridge_image->cfstring_start &&
         receiver < bridge_image->cfstring_end) {
@@ -759,7 +1131,7 @@ static id object_for_receiver(uint32_t receiver)
     if (receiver >= bridge_image->cstring_start &&
         receiver < bridge_image->cstring_end) {
         const char *class_name = (const char *)(uintptr_t)receiver;
-        return (id)objc_getClass(class_name);
+        return (id)objc_legacy32_class(class_name);
     }
     return nil;
 }
@@ -806,13 +1178,56 @@ static size_t guest_words_for_type(const char *type)
     }
 }
 
+static ffi_type *ffi_objc_type(const char *type)
+{
+    type = skip_type_qualifiers(type);
+    static ffi_type *pair_fields[] = {&ffi_type_double, &ffi_type_double, NULL};
+    static ffi_type *rect_fields[] = {&ffi_type_double, &ffi_type_double, &ffi_type_double, &ffi_type_double, NULL};
+    static ffi_type pair = {0,0,FFI_TYPE_STRUCT,pair_fields};
+    static ffi_type rect = {0,0,FFI_TYPE_STRUCT,rect_fields};
+    switch (*type) {
+        case 'v': return &ffi_type_void;
+        case '@': case '#': case ':': case '*': case '^': return &ffi_type_pointer;
+        case 'c': return &ffi_type_sint8; case 'C': case 'B': return &ffi_type_uint8;
+        case 's': return &ffi_type_sint16; case 'S': return &ffi_type_uint16;
+        case 'i': return &ffi_type_sint32; case 'I': return &ffi_type_uint32;
+        case 'l': return &ffi_type_slong; case 'L': return &ffi_type_ulong;
+        case 'q': return &ffi_type_sint64; case 'Q': return &ffi_type_uint64;
+        case 'f': return &ffi_type_float; case 'd': return &ffi_type_double;
+        case '{':
+            if (strstr(type,"Rect=")) return &rect;
+            if (strstr(type,"Point=") || strstr(type,"Size=")) return &pair;
+    }
+    return NULL;
+}
+static bool invoke_using_imp(NSInvocation *invocation, IMP imp)
+{
+    NSMethodSignature *signature=invocation.methodSignature;
+    NSUInteger count=signature.numberOfArguments;
+    if(count>64 || signature.methodReturnLength>64)return false;
+    ffi_type *types[64], *ret=ffi_objc_type(signature.methodReturnType);
+    union {long double align;unsigned char bytes[64];} values[64], result;
+    void *args[64]; memset(values,0,sizeof(values));memset(&result,0,sizeof(result));
+    if(!ret)return false;
+    for(NSUInteger i=0;i<count;++i){
+        types[i]=ffi_objc_type([signature getArgumentTypeAtIndex:i]);if(!types[i])return false;
+        [invocation getArgument:values[i].bytes atIndex:i];args[i]=values[i].bytes;
+    }
+    ffi_cif cif;if(ffi_prep_cif(&cif,FFI_DEFAULT_ABI,(unsigned)count,ret,types)!=FFI_OK)return false;
+    ffi_call(&cif,FFI_FN(imp),result.bytes,args);
+    if(signature.methodReturnLength)[invocation setReturnValue:result.bytes];
+    return true;
+}
+
 static bool invoke_simple_message(id receiver, const char *selector_name,
                                   const uint32_t *guest_arguments,
-                                  uint64_t *guest_result)
+                                  uint64_t *guest_result, Method super_method, void *guest_struct_result)
 {
     SEL selector = sel_registerName(selector_name);
     if (![receiver respondsToSelector:selector]) return false;
-    NSMethodSignature *signature = [receiver methodSignatureForSelector:selector];
+    NSMethodSignature *signature = super_method ?
+        [NSMethodSignature signatureWithObjCTypes:method_getTypeEncoding(super_method)] :
+        [receiver methodSignatureForSelector:selector];
     if (!signature) return false;
 
     NSInvocation *invocation = [NSInvocation invocationWithMethodSignature:signature];
@@ -841,7 +1256,10 @@ static bool invoke_simple_message(id receiver, const char *selector_name,
                 break;
             }
             case '^': {
-                void *value = (void *)(uintptr_t)guest_arguments[word];
+                uint32_t token=guest_arguments[word];
+                id object=object_for_argument(token);
+                void *value=object ? ([object isKindOfClass:[NSValue class]] ?
+                    [(NSValue *)object pointerValue] : (void *)object) : (void *)(uintptr_t)token;
                 [invocation setArgument:&value atIndex:index];
                 break;
             }
@@ -884,7 +1302,9 @@ static bool invoke_simple_message(id receiver, const char *selector_name,
     }
 
     @try {
-        [invocation invoke];
+        if (super_method) {
+            if (!invoke_using_imp(invocation, method_getImplementation(super_method))) return false;
+        } else [invocation invoke];
     } @catch (NSException *exception) {
         fprintf(stderr, "compat32: host Objective-C message %s raised %s\n",
                 selector_name, [[exception reason] UTF8String]);
@@ -897,13 +1317,17 @@ static bool invoke_simple_message(id receiver, const char *selector_name,
         case '@': case '#': {
             id value = nil;
             [invocation getReturnValue:&value];
-            *guest_result = proxy_for_returned_object(receiver, value);
+            bool temporary = ([value isKindOfClass:[NSDate class]] &&
+                (!strncmp(selector_name,"date",4) || !strcmp(selector_name,"distantPast") || !strcmp(selector_name,"distantFuture"))) ||
+                (!strcmp(selector_name,"deviceDescription") && [receiver isKindOfClass:[NSScreen class]]);
+            *guest_result = temporary ? proxy_for_autoreleased_object(value) :
+                proxy_for_returned_object(receiver, value);
             return true;
         }
         case ':': {
             SEL value = (SEL)0;
             [invocation getReturnValue:&value];
-            *guest_result = value ? intern_guest_cstring(sel_getName(value)) : 0;
+            *guest_result = value ? objc_bridge32_guest_selector(sel_getName(value)) : 0;
             return true;
         }
         case '*': {
@@ -917,7 +1341,14 @@ static bool invoke_simple_message(id receiver, const char *selector_name,
             void *value = NULL;
             [invocation getReturnValue:&value];
             uintptr_t pointer = (uintptr_t)value;
-            if (pointer > UINT32_MAX) return false;
+            if (pointer > UINT32_MAX) {
+                if(strstr(return_type,"CGImage=") || strstr(return_type,"CGContext=") || strstr(return_type,"CGColorSpace="))
+                    *guest_result=proxy_for_object((id)value);
+                else if(strstr(return_type,"CGL") || !strcmp(return_type,"^v"))
+                    *guest_result=objc_bridge32_guest_pointer(value);
+                else return false;
+                return true;
+            }
             *guest_result = (uint32_t)pointer;
             return true;
         }
@@ -928,6 +1359,27 @@ static bool invoke_simple_message(id receiver, const char *selector_name,
         case 'i': case 'l': { int32_t value = 0; [invocation getReturnValue:&value]; *guest_result = (uint32_t)value; return true; }
         case 'I': case 'L': { uint32_t value = 0; [invocation getReturnValue:&value]; *guest_result = value; return true; }
         case 'q': case 'Q': { uint64_t value = 0; [invocation getReturnValue:&value]; *guest_result = value; return true; }
+        case '{': {
+            bool registers = guest_struct_result == NULL;
+            uint64_t pair_result = 0;
+            if (registers) guest_struct_result = &pair_result;
+            if (strstr(return_type, "Rect=")) {
+                if (registers) return false;
+                NSRect rect; [invocation getReturnValue:&rect];
+                float f[] = {rect.origin.x, rect.origin.y, rect.size.width, rect.size.height};
+                memcpy(guest_struct_result, f, sizeof(f));
+            } else if (strstr(return_type, "Point=") || strstr(return_type, "Size=")) {
+                NSSize pair; [invocation getReturnValue:&pair];
+                float f[] = {pair.width, pair.height}; memcpy(guest_struct_result, f, sizeof(f));
+            } else if (strstr(return_type, "Range=")) {
+                NSRange range; [invocation getReturnValue:&range];
+                uint32_t r[] = {(uint32_t)range.location, (uint32_t)range.length};
+                memcpy(guest_struct_result, r, sizeof(r));
+            } else return false;
+            *guest_result = registers ? pair_result : 0; return true;
+        }
+        case 'f': { float value = 0; [invocation getReturnValue:&value]; *guest_result = compat_runtime32_return_double(value); return true; }
+        case 'd': { double value = 0; [invocation getReturnValue:&value]; *guest_result = compat_runtime32_return_double(value); return true; }
         default: return false;
     }
 }
@@ -964,8 +1416,15 @@ static NSScreen *preferred_game_screen(void)
     NSArray *screens = [NSScreen screens];
     NSUInteger count = [screens count];
     CGDirectDisplayID primary_id = CGMainDisplayID();
+    const char *test_display = getenv("LP32_TEST_DISPLAY");
+    if (test_display && test_display[0]) {
+        CGDirectDisplayID requested=(CGDirectDisplayID)strtoul(test_display,NULL,0);
+        for(NSScreen *candidate in screens) {
+            if(display_id_for_screen(candidate)==requested){screen=[candidate retain];break;}
+        }
+    }
     const char *index_text = getenv("LP32_DISPLAY_INDEX");
-    if (index_text && index_text[0]) {
+    if (!screen && index_text && index_text[0]) {
         char *end = NULL;
         unsigned long index = strtoul(index_text, &end, 10);
         if (end && *end == '\0' && index < count) {
@@ -1208,10 +1667,15 @@ static NSString *characters_for_test_key(unsigned short key_code)
     return [NSString stringWithCharacters:&character length:1];
 }
 
+static unsigned char test_key_states[128];
+int objc_bridge32_test_key_down(unsigned key) {
+    return key<128 ? __atomic_load_n(&test_key_states[key],__ATOMIC_RELAXED) : 0;
+}
 static void post_test_key_event(NSWindow *window, unsigned short key_code,
                                 BOOL is_down)
 {
     if (!window) return;
+    if(key_code<128)__atomic_store_n(&test_key_states[key_code],is_down,__ATOMIC_RELAXED);
     NSString *characters = characters_for_test_key(key_code);
     NSTimeInterval timestamp = [[NSProcessInfo processInfo] systemUptime];
     NSEvent *event = [NSEvent
@@ -1225,7 +1689,36 @@ static void post_test_key_event(NSWindow *window, unsigned short key_code,
       charactersIgnoringModifiers:characters
                 isARepeat:NO
                   keyCode:key_code];
-    [NSApp postEvent:event atStart:NO];
+    if (getenv("LP32_BACKGROUND_TEST") && objc_legacy32_token(window))
+        [window sendEvent:event];
+    else [NSApp postEvent:event atStart:NO];
+}
+
+static void install_window_test_input(NSWindow *window)
+{
+    if (!window || !getenv("LP32_TEST_KEY_FIFO")) return;
+    static NSHashTable *installed;
+    if (!installed) installed=[[NSHashTable weakObjectsHashTable] retain];
+    if ([installed containsObject:window]) return;
+    [installed addObject:window];
+    __block int key=-1;
+    __block CFAbsoluteTime release_time=0;
+    NSTimer *timer=[NSTimer timerWithTimeInterval:0.02 repeats:YES block:^(NSTimer *timer) {
+        (void)timer;
+        CFAbsoluteTime now=CFAbsoluteTimeGetCurrent();
+        if(key>=0 && now>=release_time) {
+            post_test_key_event(window,(unsigned short)key,NO);key=-1;
+        }
+        if(key<0 && window.isVisible) {
+            double hold=0;int next=read_test_key_fifo(&hold);
+            if(next>=0) {
+                key=next;release_time=now+(hold>0?hold:0.15);
+                post_test_key_event(window,(unsigned short)key,YES);
+                fprintf(stderr,"compat32: scripted window key %d\n",key);
+            }
+        }
+    }];
+    [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
 }
 
 /*
@@ -1511,6 +2004,61 @@ static bool background_test_mode(void)
     static int enabled = -1;
     if (enabled < 0) enabled = getenv("LP32_BACKGROUND_TEST") != NULL;
     return enabled;
+}
+
+static void simulate_test_window_activation(NSWindow *window)
+{
+    if (getenv("LP32_TEST_FOCUS_LOSS")) return;
+    /* Games driven by activation notifications must see the same simulated
+     * focus as isActive/isKeyWindow, without making the real window key. */
+    dispatch_async(dispatch_get_main_queue(), ^{
+        /* Notify guest delegates only. Native AppKit observers require real
+         * key-window state and must not receive synthetic focus changes. */
+        id targets[] = {NSApp, NSApp.delegate, window.delegate};
+        const char *selectors[] = {"applicationDidBecomeActive:",
+                                   "applicationDidBecomeActive:", "windowDidBecomeKey:"};
+        for (unsigned i = 0; i < 3; ++i) {
+            if (!targets[i] || (i == 1 && targets[1] == targets[0]) ||
+                !objc_legacy32_token(targets[i])) continue;
+            SEL selector = sel_registerName(selectors[i]);
+            if (![targets[i] respondsToSelector:selector]) continue;
+            NSNotification *notification = [NSNotification notificationWithName:
+                i == 2 ? NSWindowDidBecomeKeyNotification : NSApplicationDidBecomeActiveNotification
+                object:i == 2 ? (id)window : (id)NSApp];
+            [targets[i] performSelector:selector withObject:notification];
+        }
+    });
+}
+
+
+static bool handle_test_activation(id receiver, const char *selector, uint64_t *result)
+{
+        if (background_test_mode() && selector) {
+            if (!getenv("LP32_TEST_FOCUS_LOSS") &&
+                ((!strcmp(selector, "isActive") && [receiver isKindOfClass:[NSApplication class]]) ||
+                 ((!strcmp(selector, "isKeyWindow") || !strcmp(selector, "isMainWindow")) &&
+                  [receiver isKindOfClass:[NSWindow class]]))) {
+                *result = 1;
+                return true;
+            }
+            if (strcmp(selector, "activateIgnoringOtherApps:") == 0 ||
+                strcmp(selector, "makeKeyWindow") == 0 ||
+                strcmp(selector, "makeMainWindow") == 0) {
+                if ([receiver isKindOfClass:[NSWindow class]])
+                    simulate_test_window_activation(receiver);
+                *result = 0;
+                return true;
+            }
+            if (strcmp(selector, "makeKeyAndOrderFront:") == 0 &&
+                [receiver isKindOfClass:[NSWindow class]]) {
+                place_test_window(receiver);
+                [(NSWindow *)receiver orderFront:nil];
+                simulate_test_window_activation(receiver);
+                *result = 0;
+                return true;
+            }
+        }
+    return false;
 }
 
 /*
@@ -2571,9 +3119,14 @@ static NSOpenGLPixelFormat *legacy_pixel_format(void)
 - (IBAction)activateOnline:(id)sender;
 @end
 
+uint32_t objc_bridge32_guest_selector(const char *name)
+{
+    uint32_t existing = objc_legacy32_selector(name);
+    return existing ? existing : intern_guest_cstring(name);
+}
 static uint32_t guest_selector(const char *name)
 {
-    return compat_runtime32_copy_cstring(name);
+    return objc_bridge32_guest_selector(name);
 }
 
 static uint32_t call_guest_method(uint32_t imp, uint32_t self_handle,
@@ -4981,9 +5534,46 @@ int objc_bridge32_prepare_shader_cache(void)
     return 0;
 }
 
+struct display_callback32 {uint32_t function,context;bool active;};
+static struct display_callback32 display_callbacks[64];
+static pthread_mutex_t display_callback_lock=PTHREAD_MUTEX_INITIALIZER;
+static void display_reconfigured(CGDirectDisplayID display,CGDisplayChangeSummaryFlags flags,void *raw){
+    struct display_callback32 *entry=raw;pthread_mutex_lock(&display_callback_lock);
+    uint32_t function=entry->active?entry->function:0,context=entry->context;pthread_mutex_unlock(&display_callback_lock);
+    if(function){uint32_t args[]={display,flags,context};compat_runtime32_call(function,args,3);}
+}
+static int display_callback_dispatch(const char *name,const uint32_t *args,uint64_t *result){
+    bool add=!strcmp(name,"_CGDisplayRegisterReconfigurationCallback");
+    if(!add&&strcmp(name,"_CGDisplayRemoveReconfigurationCallback"))return 0;
+    pthread_mutex_lock(&display_callback_lock);struct display_callback32 *entry=NULL;
+    for(unsigned i=0;i<64;++i)if(display_callbacks[i].function==args[0]&&display_callbacks[i].context==args[1]){entry=&display_callbacks[i];break;}
+    if(!entry&&add)for(unsigned i=0;i<64;++i)if(!display_callbacks[i].function){entry=&display_callbacks[i];entry->function=args[0];entry->context=args[1];break;}
+    pthread_mutex_unlock(&display_callback_lock);
+    if(!entry){*result=kCGErrorIllegalArgument;return 1;}
+    CGError error=add?CGDisplayRegisterReconfigurationCallback(display_reconfigured,entry):CGDisplayRemoveReconfigurationCallback(display_reconfigured,entry);
+    if(error==kCGErrorSuccess){pthread_mutex_lock(&display_callback_lock);entry->active=add;pthread_mutex_unlock(&display_callback_lock);}
+    *result=error;return 1;
+}
+
+struct lp32_provider_data {uint32_t info, data, size, release;};
+static void release_provider_data(void *raw,const void *data,size_t size) {
+    (void)data;(void)size;struct lp32_provider_data *p=raw;
+    if(p->release){uint32_t args[]={p->info,p->data,p->size};compat_runtime32_call(p->release,args,3);}free(p);
+}
 int objc_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
                            uint64_t *result)
 {
+    if (strncmp(import_name,"CG",2)==0) {
+        char normalized[128]; if(strlen(import_name)+2>sizeof(normalized))return 0;
+        normalized[0]='_';strcpy(normalized+1,import_name);
+        return objc_bridge32_dispatch(normalized,arguments,result);
+    }
+    if (!strcmp(import_name,"_CGDataProviderRelease") || !strcmp(import_name,"_CGImageRelease") ||
+        !strcmp(import_name,"_CGColorSpaceRelease") || !strcmp(import_name,"_CGContextRelease"))
+        return objc_bridge32_dispatch("_CFRelease",arguments,result);
+    if (!strcmp(import_name,"_CGDataProviderRetain") || !strcmp(import_name,"_CGImageRetain") ||
+        !strcmp(import_name,"_CGColorSpaceRetain") || !strcmp(import_name,"_CGContextRetain"))
+        return objc_bridge32_dispatch("_CFRetain",arguments,result);
     /*
      * The guest creates and drains its own NSAutoreleasePool objects, but
      * those pools cannot reliably describe the lifetime of temporary host
@@ -5008,12 +5598,28 @@ int objc_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
                  (import_name[0] == '_' && import_name[1] == 'g' &&
                   import_name[2] == 'l');
     if (is_gl) {
-        return objc_bridge32_dispatch_body(import_name, import_length,
-                                           arguments, result);
+        if (objc_bridge32_dispatch_body(import_name, import_length, arguments, result)) return 1;
+        /* Mach-O imports have a leading underscore; dlsym names do not. */
+        if (import_name[0] == '_' && objc_bridge32_dispatch_body(import_name+1, import_length-1, arguments, result)) return 1;
+        if (import_name[0] != '_' && import_length < 126) {
+            char prefixed[128];prefixed[0]='_';memcpy(prefixed+1,import_name,import_length+1);
+            if(objc_bridge32_dispatch_body(prefixed,import_length+1,arguments,result))return 1;
+        }
+        return gl_core_bridge32_dispatch(import_name, arguments, result);
     }
     @autoreleasepool {
-        return objc_bridge32_dispatch_body(import_name, import_length,
-                                           arguments, result);
+        /* CF Create/Copy results carry a guest ownership count. Borrowed
+         * Cocoa/CF results keep their existing persistent lifetime. */
+        bool previous = creating_cf_object;
+        creating_cf_object = (strncmp(import_name, "_CT", 3) == 0 || strncmp(import_name, "_CF", 3) == 0 || strncmp(import_name, "_CG", 3) == 0 || strncmp(import_name, "_IOHID", 6) == 0 || strncmp(import_name, "_TIS", 4) == 0) &&
+            (strstr(import_name, "Create") || strstr(import_name, "Copy"));
+        if (strncmp(import_name, "_dispatch_", 10) == 0 && strstr(import_name, "_create"))
+            creating_cf_object = true;
+        int handled = objc_bridge32_dispatch_body(import_name, import_length,
+                                                   arguments, result);
+        creating_cf_object = previous;
+        refresh_enumeration_mutations();
+        return handled;
     }
 }
 
@@ -5022,6 +5628,372 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                                        const uint32_t *arguments,
                                        uint64_t *result)
 {
+    if (LP32_NAME_IS(import_name, import_length, "_objc_msgSendSuper")) {
+        const uint32_t *super = (const void *)(uintptr_t)arguments[0];
+        id receiver = object_for_argument(super[0]);
+        Class parent = (Class)object_for_argument(super[1]);
+        const char *selector = (const void *)(uintptr_t)arguments[1];
+        Method method = parent ? class_getInstanceMethod(parent, sel_registerName(selector)) : NULL;
+        if (!receiver || !method) return 0;
+        NSMethodSignature *signature = [NSMethodSignature signatureWithObjCTypes:method_getTypeEncoding(method)];
+        unsigned count = 2;
+        for (NSUInteger i=2;i<signature.numberOfArguments;++i) {
+            const char *type = [signature getArgumentTypeAtIndex:i];
+            count += strstr(type,"Rect=") ? 4 :
+                (strstr(type,"Point=") || strstr(type,"Size=")) ? 2 : guest_words_for_type(type);
+        }
+        if (count > 128) return 0;
+        uint32_t args[128]; memcpy(args, arguments, count * 4); args[0] = super[0];
+        if(objc_legacy32_super_message(receiver,parent,args,result))return 1;
+        if (handle_test_activation(receiver, selector, result)) return 1;
+        if (getenv("LP32_TRACE_EVENTS") && !strcmp(selector,"sendEvent:")) {
+            NSEvent *event=object_for_argument(args[2]);
+            fprintf(stderr,"compat32: super sendEvent token=%08x native=%p type=%lu caller=%08x\n",
+                args[2],event,(unsigned long)event.type,arguments[-1]);
+        }
+        return invoke_simple_message(receiver, selector, args, result, method, NULL);
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_objc_sync_enter") ||
+        LP32_NAME_IS(import_name, import_length, "_objc_sync_exit")) {
+        id object = object_for_argument(arguments[0]);
+        *result = (uint32_t)(LP32_NAME_IS(import_name, import_length, "_objc_sync_enter") ?
+                            objc_sync_enter(object) : objc_sync_exit(object));
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFDictionaryApplyFunction")) {
+        CFDictionaryRef dictionary=(CFDictionaryRef)object_for_argument(arguments[0]);
+        CFIndex count=CFDictionaryGetCount(dictionary);
+        const void **entries=calloc((size_t)(count?count:1)*2,sizeof(void *));
+        if(!entries)return 0;
+        CFDictionaryGetKeysAndValues(dictionary,entries,entries+count);
+        for(CFIndex i=0;i<count;++i){
+            uint32_t args[]={proxy_for_object((id)entries[i]),proxy_for_object((id)entries[count+i]),arguments[2]};
+            compat_runtime32_call(arguments[1],args,3);
+            if(compat_runtime32_last_call_trapped())break;
+        }
+        free(entries);*result=0;return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFArrayApplyFunction")) {
+        CFArrayRef array=(CFArrayRef)object_for_argument(arguments[0]);
+        for(int32_t i=0;i<(int32_t)arguments[2];++i){
+            uint32_t args[]={proxy_for_object((id)CFArrayGetValueAtIndex(array,(int32_t)arguments[1]+i)),arguments[4]};
+            compat_runtime32_call(arguments[3],args,2);
+            if(compat_runtime32_last_call_trapped())break;
+        }
+        *result=0;return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFUUIDGetConstantUUIDWithBytes")) {
+        CFUUIDRef uuid=CFUUIDGetConstantUUIDWithBytes(NULL,
+            arguments[1],arguments[2],arguments[3],arguments[4],arguments[5],arguments[6],arguments[7],arguments[8],
+            arguments[9],arguments[10],arguments[11],arguments[12],arguments[13],arguments[14],arguments[15],arguments[16]);
+        *result=proxy_for_object((id)uuid);return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFUUIDGetUUIDBytes")) {
+        CFUUIDBytes bytes=CFUUIDGetUUIDBytes((CFUUIDRef)object_for_argument(arguments[1]));
+        memcpy((void *)(uintptr_t)arguments[0],&bytes,sizeof(bytes));*result=arguments[0];return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFNumberGetTypeID")) { *result=CFNumberGetTypeID();return 1; }
+    if (LP32_NAME_IS(import_name, import_length, "_CFBooleanGetTypeID")) { *result=CFBooleanGetTypeID();return 1; }
+    if (LP32_NAME_IS(import_name, import_length, "_CFBooleanGetValue")) { *result=CFBooleanGetValue((CFBooleanRef)object_for_argument(arguments[0]));return 1; }
+    if (LP32_NAME_IS(import_name, import_length, "_CFDateGetTypeID")) { *result=CFDateGetTypeID();return 1; }
+    if (LP32_NAME_IS(import_name, import_length, "_CFSetGetTypeID")) { *result=CFSetGetTypeID();return 1; }
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringGetTypeID")) { *result=CFStringGetTypeID();return 1; }
+    if (LP32_NAME_IS(import_name, import_length, "_CFURLGetTypeID")) { *result=CFURLGetTypeID();return 1; }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    if (LP32_NAME_IS(import_name, import_length, "_CFURLCreateStringByAddingPercentEscapes")) {
+        CFStringRef value=CFURLCreateStringByAddingPercentEscapes(NULL,
+            (CFStringRef)object_for_argument(arguments[1]),(CFStringRef)object_for_argument(arguments[2]),
+            (CFStringRef)object_for_argument(arguments[3]),arguments[4]);
+        *result=proxy_for_object((id)value);if(value)CFRelease(value);return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFURLCreateStringByReplacingPercentEscapes")) {
+        CFStringRef value=CFURLCreateStringByReplacingPercentEscapes(NULL,
+            (CFStringRef)object_for_argument(arguments[1]),(CFStringRef)object_for_argument(arguments[2]));
+        *result=proxy_for_object((id)value);if(value)CFRelease(value);return 1;
+    }
+#pragma clang diagnostic pop
+    if (LP32_NAME_IS(import_name, import_length, "_CFURLCreateWithBytes")) {
+        CFURLRef value=CFURLCreateWithBytes(NULL,(const UInt8 *)(uintptr_t)arguments[1],
+            (int32_t)arguments[2],arguments[3],(CFURLRef)object_for_argument(arguments[4]));
+        *result=proxy_for_object((id)value);if(value)CFRelease(value);return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFURLGetString")) {
+        *result=proxy_for_object((id)CFURLGetString((CFURLRef)object_for_argument(arguments[0])));return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFURLCopyScheme")) {
+        CFStringRef value=CFURLCopyScheme((CFURLRef)object_for_argument(arguments[0]));
+        *result=proxy_for_object((id)value);if(value)CFRelease(value);return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringCreateWithCString")) {
+        CFStringRef string=CFStringCreateWithCString(NULL,(const char *)(uintptr_t)arguments[1],arguments[2]);
+        *result=proxy_for_object((id)string);if(string)CFRelease(string);return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringCreateExternalRepresentation")) {
+        CFDataRef data=CFStringCreateExternalRepresentation(NULL,
+            (CFStringRef)object_for_argument(arguments[1]),arguments[2],(UInt8)arguments[3]);
+        *result=proxy_for_object((id)data);if(data)CFRelease(data);return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringCompareWithOptions")) {
+        CFRange range = CFRangeMake((int32_t)arguments[2], (int32_t)arguments[3]);
+        *result = (uint32_t)CFStringCompareWithOptions((CFStringRef)object_for_argument(arguments[0]),
+            (CFStringRef)object_for_argument(arguments[1]), range, arguments[4]);
+        return 1;
+    }
+    if (display_callback_dispatch(import_name,arguments,result)) return 1;
+    if (dispatch_bridge32_dispatch(import_name, arguments, result)) return 1;
+    if (hid_bridge32_dispatch(import_name,arguments,result)) return 1;
+    if (LP32_NAME_IS(import_name,import_length,"_CFSetGetCount")) {*result=(uint32_t)CFSetGetCount((CFSetRef)object_for_argument(arguments[0]));return 1;}
+    if (LP32_NAME_IS(import_name,import_length,"_CFSetGetValues") || LP32_NAME_IS(import_name,import_length,"_CFSetApplyFunction")) {
+        CFSetRef set=(CFSetRef)object_for_argument(arguments[0]);CFIndex count=CFSetGetCount(set);
+        const void **values=calloc(count?count:1,sizeof(*values));if(!values)return 0;CFSetGetValues(set,values);
+        for(CFIndex i=0;i<count;++i){uint32_t token=proxy_for_object((id)values[i]);
+            if(LP32_NAME_IS(import_name,import_length,"_CFSetGetValues"))((uint32_t *)(uintptr_t)arguments[1])[i]=token;
+            else{uint32_t a[]={token,arguments[2]};compat_runtime32_call(arguments[1],a,2);}}
+        free(values);*result=0;return 1;
+    }
+    if (objc_legacy32_property(import_name,arguments,result)) return 1;
+    if (LP32_NAME_IS(import_name, import_length, "_NSClassFromString")) {
+        NSString *name=object_for_argument(arguments[0]);
+        Class klass=name?objc_legacy32_class([name UTF8String]):Nil;
+        *result=proxy_for_object(klass);return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_NSStringFromClass")) {
+        *result=proxy_for_object(NSStringFromClass((Class)object_for_argument(arguments[0])));return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_NSSelectorFromString")) {
+        NSString *name=object_for_argument(arguments[0]);*result=objc_bridge32_guest_selector([name UTF8String]);return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_NSStringFromSelector")) {
+        const char *name=(void *)(uintptr_t)arguments[0];*result=proxy_for_object(name?[NSString stringWithUTF8String:name]:nil);return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFTimeZoneCopyDefault") ||
+        LP32_NAME_IS(import_name, import_length, "_CFTimeZoneCreateWithName")) {
+        CFTimeZoneRef zone=LP32_NAME_IS(import_name,import_length,"_CFTimeZoneCopyDefault") ?
+            CFTimeZoneCopyDefault() : CFTimeZoneCreateWithName(NULL,(CFStringRef)object_for_argument(arguments[1]),arguments[2]!=0);
+        *result=proxy_for_object((id)zone);if(zone)CFRelease(zone);return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFTimeZoneGetSecondsFromGMT")) {
+        double time;memcpy(&time,arguments+1,8);
+        *result=compat_runtime32_return_double(CFTimeZoneGetSecondsFromGMT((CFTimeZoneRef)object_for_argument(arguments[0]),time));return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFDateCreate")) {
+        double time;memcpy(&time,arguments+1,8);CFDateRef date=CFDateCreate(NULL,time);
+        *result=proxy_for_object((id)date);if(date)CFRelease(date);return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFDateGetAbsoluteTime")) {
+        *result=compat_runtime32_return_double(CFDateGetAbsoluteTime((CFDateRef)object_for_argument(arguments[0])));return 1;
+    }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    if (LP32_NAME_IS(import_name, import_length, "_CFAbsoluteTimeGetGregorianDate")) {
+        double time;memcpy(&time,arguments+1,8);
+        CFGregorianDate date=CFAbsoluteTimeGetGregorianDate(time,(CFTimeZoneRef)object_for_argument(arguments[3]));
+        _Static_assert(sizeof(CFGregorianDate)==16,"Gregorian date layout");
+        memcpy((void *)(uintptr_t)arguments[0],&date,16);*result=arguments[0];return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFGregorianDateGetAbsoluteTime")) {
+        CFGregorianDate date;memcpy(&date,arguments,16);
+        *result=compat_runtime32_return_double(CFGregorianDateGetAbsoluteTime(date,(CFTimeZoneRef)object_for_argument(arguments[4])));return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFAbsoluteTimeGetDayOfWeek")) {
+        double time;memcpy(&time,arguments,8);
+        *result=(uint32_t)CFAbsoluteTimeGetDayOfWeek(time,(CFTimeZoneRef)object_for_argument(arguments[2]));return 1;
+    }
+#pragma clang diagnostic pop
+    if (LP32_NAME_IS(import_name,import_length,"_CFStringFindAndReplace")) {
+        *result=(uint32_t)CFStringFindAndReplace((CFMutableStringRef)object_for_argument(arguments[0]),(CFStringRef)object_for_argument(arguments[1]),
+            (CFStringRef)object_for_argument(arguments[2]),CFRangeMake((int32_t)arguments[3],(int32_t)arguments[4]),arguments[5]);return 1;
+    }
+    if (LP32_NAME_IS(import_name,import_length,"_CFStringTransform")) {
+        int32_t *guest=(void *)(uintptr_t)arguments[1];CFRange range=guest?CFRangeMake(guest[0],guest[1]):CFRangeMake(0,0);
+        *result=CFStringTransform((CFMutableStringRef)object_for_argument(arguments[0]),guest?&range:NULL,(CFStringRef)object_for_argument(arguments[2]),arguments[3]!=0);
+        if(guest){guest[0]=(int32_t)range.location;guest[1]=(int32_t)range.length;}return 1;
+    }
+    if (LP32_NAME_IS(import_name,import_length,"_CFStringAppendFormat")) {
+        CFStringRef formatted=format_cf_string32((CFStringRef)object_for_argument(arguments[2]),arguments+3);
+        if(!formatted)return 0;CFStringAppend((CFMutableStringRef)object_for_argument(arguments[0]),formatted);CFRelease(formatted);*result=0;return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringCreateWithFileSystemRepresentation")) {
+        CFStringRef string = CFStringCreateWithFileSystemRepresentation(NULL, (void *)(uintptr_t)arguments[1]);
+        *result = proxy_for_object((id)string); if(string)CFRelease(string); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringGetFileSystemRepresentation")) {
+        *result = CFStringGetFileSystemRepresentation((CFStringRef)object_for_argument(arguments[0]), (void *)(uintptr_t)arguments[1], (int32_t)arguments[2]);return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringGetMaximumSizeOfFileSystemRepresentation")) {
+        *result = (uint32_t)CFStringGetMaximumSizeOfFileSystemRepresentation((CFStringRef)object_for_argument(arguments[0]));return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringConvertIANACharSetNameToEncoding")) {
+        *result = CFStringConvertIANACharSetNameToEncoding((CFStringRef)object_for_argument(arguments[0]));return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringCreateArrayBySeparatingStrings")) {
+        CFArrayRef array=CFStringCreateArrayBySeparatingStrings(NULL,(CFStringRef)object_for_argument(arguments[1]),(CFStringRef)object_for_argument(arguments[2]));
+        *result=proxy_for_object((id)array);if(array)CFRelease(array);return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringConvertWindowsCodepageToEncoding")) {*result=CFStringConvertWindowsCodepageToEncoding(arguments[0]);return 1;}
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringConvertEncodingToWindowsCodepage")) {*result=CFStringConvertEncodingToWindowsCodepage(arguments[0]);return 1;}
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringGetSystemEncoding")) {*result=CFStringGetSystemEncoding();return 1;}
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringConvertEncodingToNSStringEncoding")) {*result=(uint32_t)CFStringConvertEncodingToNSStringEncoding(arguments[0]);return 1;}
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringConvertNSStringEncodingToEncoding")) {*result=CFStringConvertNSStringEncodingToEncoding(arguments[0]);return 1;}
+    if (LP32_NAME_IS(import_name, import_length, "_dispatch_semaphore_create")) {
+        dispatch_semaphore_t semaphore = dispatch_semaphore_create((int32_t)arguments[0]);
+        *result = proxy_for_object((id)semaphore);
+        if (semaphore) dispatch_release(semaphore);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_dispatch_semaphore_signal")) {
+        *result = (uint32_t)dispatch_semaphore_signal((dispatch_semaphore_t)object_for_argument(arguments[0]));
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_dispatch_semaphore_wait")) {
+        uint64_t timeout; memcpy(&timeout, arguments + 1, 8);
+        *result = (uint32_t)dispatch_semaphore_wait((dispatch_semaphore_t)object_for_argument(arguments[0]), timeout);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_dispatch_time")) {
+        uint64_t when; int64_t delta;
+        memcpy(&when, arguments, 8); memcpy(&delta, arguments + 2, 8);
+        *result = dispatch_time(when, delta); return 1;
+    }
+    if ((strncmp(import_name,"_CF",3)==0 || strncmp(import_name,"_SC",3)==0) &&
+        cfnetwork_bridge32_dispatch(import_name, arguments, result)) return 1;
+    if (LP32_NAME_IS(import_name, import_length, "_ABGetSharedAddressBook") ||
+        LP32_NAME_IS(import_name, import_length, "_ABGetMe") ||
+        LP32_NAME_IS(import_name, import_length, "_ABRecordCopyValue") ||
+        LP32_NAME_IS(import_name, import_length, "_ABMultiValueCopyPrimaryIdentifier") ||
+        LP32_NAME_IS(import_name, import_length, "_ABMultiValueCopyValueAtIndex") ||
+        LP32_NAME_IS(import_name, import_length, "_ABMultiValueIndexForIdentifier")) {
+        static void *address_book;
+        if (!address_book) address_book = dlopen(
+            "/System/Library/Frameworks/AddressBook.framework/AddressBook", RTLD_NOW | RTLD_LOCAL);
+        void *function = address_book ? dlsym(address_book, import_name + 1) : NULL;
+        if (!function) return 0;
+        id value = nil;
+        if (LP32_NAME_IS(import_name, import_length, "_ABGetSharedAddressBook")) {
+            value = ((id (*)(void))function)();
+        } else {
+            id object = object_for_argument(arguments[0]);
+            if (LP32_NAME_IS(import_name, import_length, "_ABMultiValueIndexForIdentifier")) {
+                *result = object ? (uint32_t)((CFIndex (*)(id, id))function)(
+                    object, object_for_argument(arguments[1])) : UINT32_MAX;
+                return 1;
+            }
+            if (object) {
+                if (LP32_NAME_IS(import_name, import_length, "_ABRecordCopyValue"))
+                    value = ((id (*)(id, id))function)(object, object_for_argument(arguments[1]));
+                else if (LP32_NAME_IS(import_name, import_length, "_ABMultiValueCopyValueAtIndex"))
+                    value = ((id (*)(id, CFIndex))function)(object, (int32_t)arguments[1]);
+                else value = ((id (*)(id))function)(object);
+            }
+        }
+        *result = proxy_for_object(value);
+        if (value && strstr(import_name, "Copy")) CFRelease((CFTypeRef)value);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name,import_length,"_CGDataProviderCreateWithData")) {
+        struct lp32_provider_data *p=malloc(sizeof(*p));if(!p){*result=0;return 1;}
+        *p=(struct lp32_provider_data){arguments[0],arguments[1],arguments[2],arguments[3]};
+        CGDataProviderRef provider=CGDataProviderCreateWithData(p,(void *)(uintptr_t)p->data,p->size,release_provider_data);
+        if(!provider)free(p);*result=proxy_for_object((id)provider);if(provider)CGDataProviderRelease(provider);return 1;
+    }
+    if (LP32_NAME_IS(import_name,import_length,"_CTFontCreateUIFontForLanguage") || LP32_NAME_IS(import_name,import_length,"_CTFontCreateWithName")) {
+        float size;memcpy(&size,arguments+1,4);CTFontRef font;
+        if(LP32_NAME_IS(import_name,import_length,"_CTFontCreateUIFontForLanguage"))font=CTFontCreateUIFontForLanguage(arguments[0],size,(CFStringRef)object_for_argument(arguments[2]));
+        else {CGAffineTransform transform,*matrix=NULL;if(arguments[2]){const float *f=(void *)(uintptr_t)arguments[2];transform=CGAffineTransformMake(f[0],f[1],f[2],f[3],f[4],f[5]);matrix=&transform;}font=CTFontCreateWithName((CFStringRef)object_for_argument(arguments[0]),size,matrix);}
+        *result=proxy_for_object((id)font);if(font)CFRelease(font);return 1;
+    }
+    if (LP32_NAME_IS(import_name,import_length,"_CTFontCreateCopyWithSymbolicTraits")) {
+        float size;memcpy(&size,arguments+1,4);CGAffineTransform transform,*matrix=NULL;
+        if(arguments[2]){const float *f=(void *)(uintptr_t)arguments[2];transform=CGAffineTransformMake(f[0],f[1],f[2],f[3],f[4],f[5]);matrix=&transform;}
+        CTFontRef font=CTFontCreateCopyWithSymbolicTraits((CTFontRef)object_for_argument(arguments[0]),size,matrix,arguments[3],arguments[4]);
+        *result=proxy_for_object((id)font);if(font)CFRelease(font);return 1;
+    }
+    if (LP32_NAME_IS(import_name,import_length,"_CTFontCopyGraphicsFont")) {
+        CTFontDescriptorRef descriptor=NULL;CGFontRef font=CTFontCopyGraphicsFont((CTFontRef)object_for_argument(arguments[0]),arguments[1]?&descriptor:NULL);
+        if(arguments[1])*(uint32_t *)(uintptr_t)arguments[1]=proxy_for_object((id)descriptor);
+        if(descriptor)CFRelease(descriptor);*result=proxy_for_object((id)font);if(font)CGFontRelease(font);return 1;
+    }
+    if (LP32_NAME_IS(import_name,import_length,"_CTFontGetGlyphsForCharacters")) {
+        *result=CTFontGetGlyphsForCharacters((CTFontRef)object_for_argument(arguments[0]),(void *)(uintptr_t)arguments[1],(void *)(uintptr_t)arguments[2],(int32_t)arguments[3]);return 1;
+    }
+    if (LP32_NAME_IS(import_name,import_length,"_CTFontGetAdvancesForGlyphs")) {
+        uint32_t count=arguments[4];if(count>1048576)return 0;CGSize *sizes=arguments[3]?calloc(count?count:1,sizeof(*sizes)):NULL;
+        double advance=CTFontGetAdvancesForGlyphs((CTFontRef)object_for_argument(arguments[0]),arguments[1],(void *)(uintptr_t)arguments[2],sizes,count);
+        if(sizes){float *out=(void *)(uintptr_t)arguments[3];for(uint32_t i=0;i<count;++i){out[i*2]=sizes[i].width;out[i*2+1]=sizes[i].height;}free(sizes);}
+        *result=compat_runtime32_return_double(advance);return 1;
+    }
+    if (LP32_NAME_IS(import_name,import_length,"_CTFontGetBoundingBox") || LP32_NAME_IS(import_name,import_length,"_CTFontGetBoundingRectsForGlyphs") || LP32_NAME_IS(import_name,import_length,"_CTLineGetImageBounds")) {
+        CGRect rect;
+        if(LP32_NAME_IS(import_name,import_length,"_CTFontGetBoundingBox"))rect=CTFontGetBoundingBox((CTFontRef)object_for_argument(arguments[1]));
+        else if(LP32_NAME_IS(import_name,import_length,"_CTLineGetImageBounds"))rect=CTLineGetImageBounds((CTLineRef)object_for_argument(arguments[1]),(CGContextRef)object_for_argument(arguments[2]));
+        else {uint32_t count=arguments[5];if(count>1048576)return 0;CGRect *rects=arguments[4]?calloc(count?count:1,sizeof(*rects)):NULL;
+            rect=CTFontGetBoundingRectsForGlyphs((CTFontRef)object_for_argument(arguments[1]),arguments[2],(void *)(uintptr_t)arguments[3],rects,count);
+            if(rects){float *out=(void *)(uintptr_t)arguments[4];for(uint32_t i=0;i<count;++i){out[i*4]=rects[i].origin.x;out[i*4+1]=rects[i].origin.y;out[i*4+2]=rects[i].size.width;out[i*4+3]=rects[i].size.height;}free(rects);}}
+        float out[]={rect.origin.x,rect.origin.y,rect.size.width,rect.size.height};memcpy((void *)(uintptr_t)arguments[0],out,16);*result=arguments[0];return 1;
+    }
+    if (LP32_NAME_IS(import_name,import_length,"_CTLineCreateWithAttributedString")) {
+        CTLineRef line=CTLineCreateWithAttributedString((CFAttributedStringRef)object_for_argument(arguments[0]));*result=proxy_for_object((id)line);if(line)CFRelease(line);return 1;
+    }
+    if (LP32_NAME_IS(import_name,import_length,"_CTLineDraw")) {CTLineDraw((CTLineRef)object_for_argument(arguments[0]),(CGContextRef)object_for_argument(arguments[1]));*result=0;return 1;}
+    if (LP32_NAME_IS(import_name,import_length,"_CTFontGetAscent")) { *result=compat_runtime32_return_double(CTFontGetAscent((CTFontRef)object_for_argument(arguments[0])));return 1; }
+    if (LP32_NAME_IS(import_name,import_length,"_CTFontGetDescent")) { *result=compat_runtime32_return_double(CTFontGetDescent((CTFontRef)object_for_argument(arguments[0])));return 1; }
+    if (LP32_NAME_IS(import_name,import_length,"_CTFontGetLeading")) { *result=compat_runtime32_return_double(CTFontGetLeading((CTFontRef)object_for_argument(arguments[0])));return 1; }
+    if (LP32_NAME_IS(import_name,import_length,"_CTFontGetSize")) { *result=compat_runtime32_return_double(CTFontGetSize((CTFontRef)object_for_argument(arguments[0])));return 1; }
+    if (LP32_NAME_IS(import_name,import_length,"_CGBitmapContextCreate")) {
+        CGContextRef context=CGBitmapContextCreate((void *)(uintptr_t)arguments[0],arguments[1],arguments[2],arguments[3],arguments[4],(CGColorSpaceRef)object_for_argument(arguments[5]),arguments[6]);
+        *result=proxy_for_object((id)context);if(context)CGContextRelease(context);return 1;
+    }
+    if (LP32_NAME_IS(import_name,import_length,"_CGColorSpaceCreateDeviceGray")) {
+        CGColorSpaceRef color=CGColorSpaceCreateDeviceGray();*result=proxy_for_object((id)color);CGColorSpaceRelease(color);return 1;
+    }
+    if (LP32_NAME_IS(import_name,import_length,"_CGColorSpaceCreateDeviceRGB")) {
+        CGColorSpaceRef color=CGColorSpaceCreateDeviceRGB();*result=proxy_for_object((id)color);CGColorSpaceRelease(color);return 1;
+    }
+    if (LP32_NAME_IS(import_name,import_length,"_CGImageCreate")) {
+        CGColorSpaceRef color=(CGColorSpaceRef)object_for_argument(arguments[5]);
+        CGFloat decode[32];const CGFloat *values=NULL;
+        if(arguments[8]){size_t count=color?CGColorSpaceGetNumberOfComponents(color)*2:0;if(count>32)return 0;const float *guest=(void *)(uintptr_t)arguments[8];for(size_t i=0;i<count;++i)decode[i]=guest[i];values=decode;}
+        CGImageRef image=CGImageCreate(arguments[0],arguments[1],arguments[2],arguments[3],arguments[4],color,arguments[6],(CGDataProviderRef)object_for_argument(arguments[7]),values,arguments[9]!=0,arguments[10]);
+        *result=proxy_for_object((id)image);if(image)CGImageRelease(image);return 1;
+    }
+    if (LP32_NAME_IS(import_name,import_length,"_CGImageGetWidth") || LP32_NAME_IS(import_name,import_length,"_CGImageGetHeight")) {
+        CGImageRef image=(CGImageRef)object_for_argument(arguments[0]);*result=LP32_NAME_IS(import_name,import_length,"_CGImageGetWidth")?CGImageGetWidth(image):CGImageGetHeight(image);return 1;
+    }
+    if (LP32_NAME_IS(import_name,import_length,"_CGContextSaveGState") || LP32_NAME_IS(import_name,import_length,"_CGContextRestoreGState")) {
+        CGContextRef context=(CGContextRef)object_for_argument(arguments[0]);
+        if(LP32_NAME_IS(import_name,import_length,"_CGContextSaveGState"))CGContextSaveGState(context);else CGContextRestoreGState(context);*result=0;return 1;
+    }
+    if (LP32_NAME_IS(import_name,import_length,"_CGContextClearRect") || LP32_NAME_IS(import_name,import_length,"_CGContextAddRect") || LP32_NAME_IS(import_name,import_length,"_CGContextDrawImage") || LP32_NAME_IS(import_name,import_length,"_CGContextFillRect") || LP32_NAME_IS(import_name,import_length,"_CGContextStrokeRect") || LP32_NAME_IS(import_name,import_length,"_CGContextClipToRect")) {
+        CGContextRef context=(CGContextRef)object_for_argument(arguments[0]);float f[4];memcpy(f,arguments+1,sizeof(f));CGRect rect=CGRectMake(f[0],f[1],f[2],f[3]);
+        if(LP32_NAME_IS(import_name,import_length,"_CGContextDrawImage"))CGContextDrawImage(context,rect,(CGImageRef)object_for_argument(arguments[5]));
+        else if(LP32_NAME_IS(import_name,import_length,"_CGContextFillRect"))CGContextFillRect(context,rect);
+        else if(LP32_NAME_IS(import_name,import_length,"_CGContextStrokeRect"))CGContextStrokeRect(context,rect);
+        else if(LP32_NAME_IS(import_name,import_length,"_CGContextClearRect"))CGContextClearRect(context,rect);
+        else if(LP32_NAME_IS(import_name,import_length,"_CGContextAddRect"))CGContextAddRect(context,rect);
+        else CGContextClipToRect(context,rect);*result=0;return 1;
+    }
+    if (LP32_NAME_IS(import_name,import_length,"_CGContextSetRGBFillColor") || LP32_NAME_IS(import_name,import_length,"_CGContextSetRGBStrokeColor")) {
+        float f[4];memcpy(f,arguments+1,sizeof(f));CGContextRef context=(CGContextRef)object_for_argument(arguments[0]);
+        if(LP32_NAME_IS(import_name,import_length,"_CGContextSetRGBFillColor"))CGContextSetRGBFillColor(context,f[0],f[1],f[2],f[3]);else CGContextSetRGBStrokeColor(context,f[0],f[1],f[2],f[3]);*result=0;return 1;
+    }
+    if (LP32_NAME_IS(import_name,import_length,"_CGContextTranslateCTM") || LP32_NAME_IS(import_name,import_length,"_CGContextScaleCTM")) {
+        float f[2];memcpy(f,arguments+1,sizeof(f));CGContextRef context=(CGContextRef)object_for_argument(arguments[0]);
+        if(LP32_NAME_IS(import_name,import_length,"_CGContextTranslateCTM"))CGContextTranslateCTM(context,f[0],f[1]);else CGContextScaleCTM(context,f[0],f[1]);*result=0;return 1;
+    }
+    if (LP32_NAME_IS(import_name,import_length,"_CGContextFlush")) { CGContextFlush((CGContextRef)object_for_argument(arguments[0])); *result=0;return 1; }
+    if (LP32_NAME_IS(import_name,import_length,"_CGContextSynchronize")) { CGContextSynchronize((CGContextRef)object_for_argument(arguments[0])); *result=0;return 1; }
+    if (LP32_NAME_IS(import_name,import_length,"_CGContextClip")) { CGContextClip((CGContextRef)object_for_argument(arguments[0])); *result=0;return 1; }
+    if (LP32_NAME_IS(import_name,import_length,"_CGContextEOClip")) { CGContextEOClip((CGContextRef)object_for_argument(arguments[0])); *result=0;return 1; }
+    if (LP32_NAME_IS(import_name,import_length,"_CGContextFillPath")) { CGContextFillPath((CGContextRef)object_for_argument(arguments[0])); *result=0;return 1; }
+    if (LP32_NAME_IS(import_name,import_length,"_CGContextStrokePath")) { CGContextStrokePath((CGContextRef)object_for_argument(arguments[0])); *result=0;return 1; }
+    if (LP32_NAME_IS(import_name,import_length,"_CGContextSetBlendMode")) { CGContextSetBlendMode((CGContextRef)object_for_argument(arguments[0]),(CGBlendMode)arguments[1]); *result=0;return 1; }
+    if (LP32_NAME_IS(import_name,import_length,"_CGContextSetShouldAntialias")) { CGContextSetShouldAntialias((CGContextRef)object_for_argument(arguments[0]),(bool)arguments[1]); *result=0;return 1; }
+    if (LP32_NAME_IS(import_name,import_length,"_CGContextMoveToPoint")) { float f[2];memcpy(f,arguments+1,8);CGContextMoveToPoint((CGContextRef)object_for_argument(arguments[0]),f[0],f[1]); *result=0;return 1; }
+    if (LP32_NAME_IS(import_name,import_length,"_CGContextAddLineToPoint")) { float f[2];memcpy(f,arguments+1,8);CGContextAddLineToPoint((CGContextRef)object_for_argument(arguments[0]),f[0],f[1]); *result=0;return 1; }
+    if (LP32_NAME_IS(import_name,import_length,"_CGContextSetTextPosition")) { float f[2];memcpy(f,arguments+1,8);CGContextSetTextPosition((CGContextRef)object_for_argument(arguments[0]),f[0],f[1]); *result=0;return 1; }
+    if (LP32_NAME_IS(import_name,import_length,"_CGContextSetLineWidth")) { float f;memcpy(&f,arguments+1,4);CGContextSetLineWidth((CGContextRef)object_for_argument(arguments[0]),f); *result=0;return 1; }
+    if (LP32_NAME_IS(import_name,import_length,"_CGContextSetCharacterSpacing")) { float f;memcpy(&f,arguments+1,4);CGContextSetCharacterSpacing((CGContextRef)object_for_argument(arguments[0]),f); *result=0;return 1; }
     if (LP32_NAME_IS(import_name, import_length, "_IOPMAssertionCreateWithName")) {
         CFStringRef type = (CFStringRef)object_for_argument(arguments[0]);
         CFStringRef name = (CFStringRef)object_for_argument(arguments[2]);
@@ -5030,8 +6002,30 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         if (arguments[3]) *(uint32_t *)(uintptr_t)arguments[3] = assertion;
         return 1;
     }
+    if (LP32_NAME_IS(import_name, import_length, "_CGSetLocalEventsSuppressionInterval")) {
+        double interval;memcpy(&interval,arguments,8);
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        *result=background_test_mode()?kCGErrorSuccess:CGSetLocalEventsSuppressionInterval(interval);
+#pragma clang diagnostic pop
+        return 1;
+    }
     if (LP32_NAME_IS(import_name, import_length, "_CGMainDisplayID")) {
         *result = preferred_game_display_id();
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGDisplayBounds")) {
+        CGRect bounds = CGDisplayBounds(arguments[1]);
+        float rect[] = {bounds.origin.x, bounds.origin.y, bounds.size.width, bounds.size.height};
+        memcpy((void *)(uintptr_t)arguments[0], rect, sizeof(rect));
+        *result = 0;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGGetOnlineDisplayList") ||
+        LP32_NAME_IS(import_name, import_length, "_CGGetActiveDisplayList")) {
+        *result = strstr(import_name, "Online") ?
+            CGGetOnlineDisplayList(arguments[0], (void *)(uintptr_t)arguments[1], (void *)(uintptr_t)arguments[2]) :
+            CGGetActiveDisplayList(arguments[0], (void *)(uintptr_t)arguments[1], (void *)(uintptr_t)arguments[2]);
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CGDisplayIDToOpenGLDisplayMask")) {
@@ -5070,10 +6064,21 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         *result = [[mode objectForKey:key] unsignedIntValue];
         return 1;
     }
+    if (LP32_NAME_IS(import_name, import_length, "_CGDisplayModeGetIOFlags") ||
+        LP32_NAME_IS(import_name, import_length, "_CGDisplayModeGetIODisplayModeID")) {
+        NSDictionary *mode = object_for_argument(arguments[0]);
+        NSString *key = strstr(import_name, "IOFlags") ? @"IOFlags" : @"IODisplayModeID";
+        *result = [[mode objectForKey:key] unsignedIntValue];
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGDisplayMirrorsDisplay")) {
+        *result = CGDisplayMirrorsDisplay(arguments[0]);
+        return 1;
+    }
     if (LP32_NAME_IS(import_name, import_length, "_CGDisplayModeGetRefreshRate")) {
         NSDictionary *mode = object_for_argument(arguments[0]);
         double refresh = [[mode objectForKey:@"RefreshRate"] doubleValue];
-        memcpy(result, &refresh, sizeof(refresh));
+        *result = compat_runtime32_return_double(refresh);
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CGDisplayModeCopyPixelEncoding")) {
@@ -5343,6 +6348,51 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         NSValue *wrapper = object_for_argument(arguments[0]);
         CGLContextObj context = wrapper ? [wrapper pointerValue] : NULL;
         *result = context ? CGLFlushDrawable(context) : kCGLBadContext;
+        if (getenv("LP32_TRACE_GL_FRAMES")) {
+            static uint64_t frames;
+            if (++frames <= 3 || frames % 120 == 0) {
+                GLint viewport[4], framebuffer;
+                glGetIntegerv(GL_VIEWPORT, viewport);
+                glGetIntegerv(GL_FRAMEBUFFER_BINDING, &framebuffer);
+                fprintf(stderr, "compat32: CGL present=%llu context=%p current=%p status=%u viewport=%d,%d,%d,%d fbo=%d\n",
+                    (unsigned long long)frames, context, CGLGetCurrentContext(),
+                    (unsigned)*result, viewport[0], viewport[1], viewport[2], viewport[3], framebuffer);
+            }
+        }
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGLGetShareGroup") ||
+        LP32_NAME_IS(import_name, import_length, "_CGLGetPixelFormat")) {
+        NSValue *wrapper = object_for_argument(arguments[0]);
+        CGLContextObj context = wrapper ? [wrapper pointerValue] : NULL;
+        void *pointer = !context ? NULL :
+            LP32_NAME_IS(import_name, import_length, "_CGLGetShareGroup") ?
+            (void *)CGLGetShareGroup(context) : (void *)CGLGetPixelFormat(context);
+        *result = objc_bridge32_guest_pointer(pointer);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGLEnable") ||
+        LP32_NAME_IS(import_name, import_length, "_CGLDisable") ||
+        LP32_NAME_IS(import_name, import_length, "_CGLIsEnabled")) {
+        NSValue *wrapper = object_for_argument(arguments[0]);
+        CGLContextObj context = wrapper ? [wrapper pointerValue] : NULL;
+        CGLError error = kCGLBadContext;
+        if (context) {
+            CGLContextEnable capability = (CGLContextEnable)arguments[1];
+            if (LP32_NAME_IS(import_name, import_length, "_CGLEnable"))
+                error = CGLEnable(context, capability);
+            else if (LP32_NAME_IS(import_name, import_length, "_CGLDisable"))
+                error = CGLDisable(context, capability);
+            else
+                error = CGLIsEnabled(context, capability, (GLint *)(uintptr_t)arguments[2]);
+        }
+        *result = (uint32_t)error;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGLGetParameter")) {
+        NSValue *wrapper = object_for_argument(arguments[0]);
+        CGLContextObj context = wrapper ? [wrapper pointerValue] : NULL;
+        *result = context ? CGLGetParameter(context, arguments[1], (void *)(uintptr_t)arguments[2]) : kCGLBadContext;
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CGLGetCurrentContext")) {
@@ -6083,6 +7133,12 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     if (LP32_NAME_IS(import_name, import_length, "glIsProgramARB")) {
         *result = glIsProgramARB(arguments[0]); return 1;
     }
+    if (LP32_NAME_IS(import_name, import_length, "_glGetStringi")) {
+        extern const GLubyte *glGetStringi(GLenum, GLuint);
+        const GLubyte *value = glGetStringi(arguments[0], arguments[1]);
+        *result = value ? intern_guest_cstring((const char *)value) : 0;
+        return 1;
+    }
     if (LP32_NAME_IS(import_name, import_length, "_glGetString")) {
         *result = guest_gl_string(arguments[0]);
         return 1;
@@ -6330,8 +7386,262 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         return 1;
     }
 
+    /* The original updater would replace the compatibility executable with
+     * an unsupported i386 download. Keep automatic update checks disabled. */
+    if (LP32_NAME_IS(import_name, import_length, "_SUSparkleCallNSApplicationLoad")) {
+        *result = NSApplicationLoad(); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_SUSparkleWillCheckForUpdates") ||
+        LP32_NAME_IS(import_name, import_length, "_SUSparkleShouldCheckForUpdates") ||
+        LP32_NAME_IS(import_name, import_length, "_SUSparkleAppShouldQuit") ||
+        LP32_NAME_IS(import_name, import_length, "_SUSparkleInitializeForCarbon")) {
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGAssociateMouseAndMouseCursorPosition")) {
+        *result = getenv("LP32_BACKGROUND_TEST") ? 0 : CGAssociateMouseAndMouseCursorPosition(arguments[0] != 0); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGEventSourceKeyState")) {
+        *result = background_test_mode() ? objc_bridge32_test_key_down(arguments[1]) : CGEventSourceKeyState((CGEventSourceStateID)arguments[0], (CGKeyCode)arguments[1]);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGWarpMouseCursorPosition")) {
+        const float *xy = (const void *)arguments;
+        *result = background_test_mode() ? kCGErrorSuccess : CGWarpMouseCursorPosition(CGPointMake(xy[0], xy[1]));
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_NSPointInRect")) {
+        const float *f = (const void *)arguments;
+        *result = NSPointInRect(NSMakePoint(f[0], f[1]), NSMakeRect(f[2], f[3], f[4], f[5]));
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_NSDisableScreenUpdates") ||
+        LP32_NAME_IS(import_name, import_length, "_NSEnableScreenUpdates")) {
+        if (!background_test_mode()) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            if (strstr(import_name, "Disable")) NSDisableScreenUpdates();
+            else NSEnableScreenUpdates();
+#pragma clang diagnostic pop
+        }
+        *result = 0;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGDisplayRestoreColorSyncSettings")) {
+        if(!getenv("LP32_BACKGROUND_TEST"))CGDisplayRestoreColorSyncSettings();*result=0;return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGGetDisplayTransferByTable")) {
+        *result=(uint32_t)CGGetDisplayTransferByTable(arguments[0],arguments[1],(void *)(uintptr_t)arguments[2],(void *)(uintptr_t)arguments[3],(void *)(uintptr_t)arguments[4],(void *)(uintptr_t)arguments[5]);return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGGetDisplayTransferByFormula")) {
+        *result=(uint32_t)CGGetDisplayTransferByFormula(arguments[0],(void *)(uintptr_t)arguments[1],(void *)(uintptr_t)arguments[2],(void *)(uintptr_t)arguments[3],(void *)(uintptr_t)arguments[4],(void *)(uintptr_t)arguments[5],(void *)(uintptr_t)arguments[6],(void *)(uintptr_t)arguments[7],(void *)(uintptr_t)arguments[8],(void *)(uintptr_t)arguments[9]);return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGSetDisplayTransferByFormula")) {
+        float f[9];memcpy(f,arguments+1,sizeof(f));
+        *result=getenv("LP32_BACKGROUND_TEST")?0:(uint32_t)CGSetDisplayTransferByFormula(arguments[0],f[0],f[1],f[2],f[3],f[4],f[5],f[6],f[7],f[8]);return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGSetDisplayTransferByTable")) {
+        *result=getenv("LP32_BACKGROUND_TEST")?0:(uint32_t)CGSetDisplayTransferByTable(arguments[0],arguments[1],(void *)(uintptr_t)arguments[2],(void *)(uintptr_t)arguments[3],(void *)(uintptr_t)arguments[4]);return 1;
+    }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    if (LP32_NAME_IS(import_name, import_length, "_CFXMLTreeCreateFromData")) {
+        CFXMLTreeRef tree = CFXMLTreeCreateFromData(NULL, (CFDataRef)object_for_argument(arguments[1]),
+            (CFURLRef)object_for_argument(arguments[2]), arguments[3], (int32_t)arguments[4]);
+        *result = proxy_for_object((id)tree); if (tree) CFRelease(tree); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFXMLTreeGetNode")) {
+        *result = proxy_for_object((id)CFXMLTreeGetNode((CFXMLTreeRef)object_for_argument(arguments[0]))); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFXMLNodeGetTypeCode")) {
+        *result = CFXMLNodeGetTypeCode((CFXMLNodeRef)object_for_argument(arguments[0])); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFXMLNodeGetString")) {
+        *result = proxy_for_object((id)CFXMLNodeGetString((CFXMLNodeRef)object_for_argument(arguments[0]))); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFXMLNodeGetInfoPtr")) {
+        id object = object_for_argument(arguments[0]);
+        CFXMLNodeRef node = (CFXMLNodeRef)object;
+        const void *info = CFXMLNodeGetInfoPtr(node);
+        if (!info) { *result = 0; return 1; }
+        uint32_t words[5] = {0};
+        switch (CFXMLNodeGetTypeCode(node)) {
+            case kCFXMLNodeTypeElement: {
+                const CFXMLElementInfo *element = info;
+                words[0] = proxy_for_object((id)element->attributes);
+                words[1] = proxy_for_object((id)element->attributeOrder);
+                words[2] = element->isEmpty; break;
+            }
+            case kCFXMLNodeTypeDocument: {
+                const CFXMLDocumentInfo *document = info;
+                words[0] = proxy_for_object((id)document->sourceURL); words[1] = document->encoding; break;
+            }
+            case kCFXMLNodeTypeProcessingInstruction:
+                words[0] = proxy_for_object((id)((const CFXMLProcessingInstructionInfo *)info)->dataString); break;
+            case kCFXMLNodeTypeEntityReference:
+                words[0] = (uint32_t)((const CFXMLEntityReferenceInfo *)info)->entityType; break;
+            default: return 0;
+        }
+        static char info_key;
+        LP32DataBuffer *buffer = objc_getAssociatedObject(object, &info_key);
+        if (!buffer) {
+            buffer = [[[LP32DataBuffer alloc] init] autorelease]; buffer->guest = compat_runtime32_allocate(sizeof(words), 1);
+            objc_setAssociatedObject(object, &info_key, buffer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        if (buffer->guest) memcpy((void *)(uintptr_t)buffer->guest, words, sizeof(words));
+        *result = buffer->guest; return 1;
+    }
+#pragma clang diagnostic pop
+    if (LP32_NAME_IS(import_name, import_length, "_CFTreeGetChildCount")) {
+        *result = CFTreeGetChildCount((CFTreeRef)object_for_argument(arguments[0])); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFTreeGetChildAtIndex")) {
+        *result = proxy_for_object((id)CFTreeGetChildAtIndex((CFTreeRef)object_for_argument(arguments[0]), (int32_t)arguments[1])); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFTreeApplyFunctionToChildren")) {
+        CFTreeRef tree = (CFTreeRef)object_for_argument(arguments[0]);
+        CFIndex count = CFTreeGetChildCount(tree);
+        for (CFIndex i = 0; i < count; ++i) {
+            uint32_t args[] = {proxy_for_object((id)CFTreeGetChildAtIndex(tree, i)), arguments[2]};
+            compat_runtime32_call(arguments[1], args, 2);
+        }
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name,import_length,"_CFErrorCopyFailureReason") || LP32_NAME_IS(import_name,import_length,"_CFErrorCopyDescription") ||
+        LP32_NAME_IS(import_name,import_length,"_CFErrorCopyRecoverySuggestion") || LP32_NAME_IS(import_name,import_length,"_CFErrorCopyUserInfo")) {
+        CFErrorRef error=(CFErrorRef)object_for_argument(arguments[0]);CFTypeRef value;
+        if(LP32_NAME_IS(import_name,import_length,"_CFErrorCopyFailureReason"))value=CFErrorCopyFailureReason(error);
+        else if(LP32_NAME_IS(import_name,import_length,"_CFErrorCopyDescription"))value=CFErrorCopyDescription(error);
+        else if(LP32_NAME_IS(import_name,import_length,"_CFErrorCopyRecoverySuggestion"))value=CFErrorCopyRecoverySuggestion(error);
+        else value=CFErrorCopyUserInfo(error);
+        *result=proxy_for_object((id)value);if(value)CFRelease(value);return 1;
+    }
+    if (LP32_NAME_IS(import_name,import_length,"_CFErrorGetCode")) {*result=(uint32_t)CFErrorGetCode((CFErrorRef)object_for_argument(arguments[0]));return 1;}
+    if (LP32_NAME_IS(import_name,import_length,"_CFErrorGetDomain")) {*result=proxy_for_object((id)CFErrorGetDomain((CFErrorRef)object_for_argument(arguments[0])));return 1;}
+    if (LP32_NAME_IS(import_name,import_length,"_CFURLCreateBookmarkDataFromFile") || LP32_NAME_IS(import_name,import_length,"_CFURLCreateBookmarkData") ||
+        LP32_NAME_IS(import_name,import_length,"_CFURLCreateByResolvingBookmarkData") || LP32_NAME_IS(import_name,import_length,"_CFURLWriteBookmarkDataToFile")) {
+        CFErrorRef error=NULL;CFTypeRef value=NULL;uint32_t error_address;
+        bool writing=LP32_NAME_IS(import_name,import_length,"_CFURLWriteBookmarkDataToFile");
+        if(LP32_NAME_IS(import_name,import_length,"_CFURLCreateBookmarkDataFromFile")){
+            value=CFURLCreateBookmarkDataFromFile(NULL,(CFURLRef)object_for_argument(arguments[1]),&error);error_address=arguments[2];
+        } else if(LP32_NAME_IS(import_name,import_length,"_CFURLCreateBookmarkData")){
+            value=CFURLCreateBookmarkData(NULL,(CFURLRef)object_for_argument(arguments[1]),arguments[2],(CFArrayRef)object_for_argument(arguments[3]),(CFURLRef)object_for_argument(arguments[4]),&error);error_address=arguments[5];
+        } else if(writing){
+            *result=CFURLWriteBookmarkDataToFile((CFDataRef)object_for_argument(arguments[0]),(CFURLRef)object_for_argument(arguments[1]),arguments[2],&error);error_address=arguments[3];
+        } else {
+            value=CFURLCreateByResolvingBookmarkData(NULL,(CFDataRef)object_for_argument(arguments[1]),arguments[2],(CFURLRef)object_for_argument(arguments[3]),(CFArrayRef)object_for_argument(arguments[4]),(void *)(uintptr_t)arguments[5],&error);error_address=arguments[6];
+        }
+        if(!writing)*result=proxy_for_object((id)value);
+        if(error_address)*(uint32_t *)(uintptr_t)error_address=proxy_for_object((id)error);
+        if(error)CFRelease(error);if(value)CFRelease(value);return 1;
+    }
+    if (LP32_NAME_IS(import_name,import_length,"_CFURLCreateCopyAppendingPathExtension") || LP32_NAME_IS(import_name,import_length,"_CFURLCreateCopyDeletingPathExtension")) {
+        CFURLRef value=LP32_NAME_IS(import_name,import_length,"_CFURLCreateCopyAppendingPathExtension")?
+            CFURLCreateCopyAppendingPathExtension(NULL,(CFURLRef)object_for_argument(arguments[1]),(CFStringRef)object_for_argument(arguments[2])):
+            CFURLCreateCopyDeletingPathExtension(NULL,(CFURLRef)object_for_argument(arguments[1]));
+        *result=proxy_for_object((id)value);if(value)CFRelease(value);return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFPropertyListCreateFromXMLData")) {
+        CFStringRef error=NULL;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        CFPropertyListRef value=CFPropertyListCreateFromXMLData(NULL,(CFDataRef)object_for_argument(arguments[1]),arguments[2],&error);
+#pragma clang diagnostic pop
+        *result=proxy_for_object((id)value);
+        if(arguments[3])*(uint32_t *)(uintptr_t)arguments[3]=proxy_for_object((id)error);
+        if(error)CFRelease(error);if(value)CFRelease(value);return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFPreferencesCopyAppValue")) {
+        CFPropertyListRef value=CFPreferencesCopyAppValue((CFStringRef)object_for_argument(arguments[0]),(CFStringRef)object_for_argument(arguments[1]));
+        *result=proxy_for_object((id)value);if(value)CFRelease(value);return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFPreferencesGetAppBooleanValue")) {
+        *result=CFPreferencesGetAppBooleanValue((CFStringRef)object_for_argument(arguments[0]),(CFStringRef)object_for_argument(arguments[1]),(void *)(uintptr_t)arguments[2]);return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFPreferencesCopyValue")) {
+        CFPropertyListRef value = CFPreferencesCopyValue((CFStringRef)object_for_argument(arguments[0]),
+            (CFStringRef)object_for_argument(arguments[1]), (CFStringRef)object_for_argument(arguments[2]),
+            (CFStringRef)object_for_argument(arguments[3]));
+        *result = proxy_for_object((id)value); if (value) CFRelease(value); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFPreferencesSetAppValue")) {
+        CFPreferencesSetAppValue((CFStringRef)object_for_argument(arguments[0]),
+            (CFPropertyListRef)object_for_argument(arguments[1]),(CFStringRef)object_for_argument(arguments[2]));
+        *result=0;return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFPreferencesAppSynchronize")) {
+        *result=CFPreferencesAppSynchronize((CFStringRef)object_for_argument(arguments[0]));return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFPreferencesSynchronize")) {
+        *result=CFPreferencesSynchronize((CFStringRef)object_for_argument(arguments[0]),
+            (CFStringRef)object_for_argument(arguments[1]),(CFStringRef)object_for_argument(arguments[2]));return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFAllocatorCreate")) {
+        struct allocator_context32 *guest = (void *)(uintptr_t)arguments[1];
+        if (!guest || guest->version) { *result = 0; return 1; }
+        CFAllocatorContext context = {0, guest, allocator_retain32, allocator_release32,
+            allocator_describe32, allocator_allocate32, allocator_reallocate32,
+            allocator_deallocate32, allocator_preferred32};
+        CFAllocatorRef allocator = CFAllocatorCreate(NULL, &context);
+        *result = proxy_for_object((id)allocator);
+        if (allocator) CFRelease(allocator);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_SecRequirementCreateWithString") ||
+        LP32_NAME_IS(import_name, import_length, "_SecRequirementCreateWithData")) {
+        SecRequirementRef requirement = NULL;
+        OSStatus status = LP32_NAME_IS(import_name, import_length, "_SecRequirementCreateWithString") ?
+            SecRequirementCreateWithString((CFStringRef)object_for_argument(arguments[0]), arguments[1], &requirement) :
+            SecRequirementCreateWithData((CFDataRef)object_for_argument(arguments[0]), arguments[1], &requirement);
+        if (arguments[2]) *(uint32_t *)(uintptr_t)arguments[2] = proxy_for_object((id)requirement);
+        if (requirement) CFRelease(requirement);
+        *result = (uint32_t)status; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_SecCodeCopySelf")) {
+        SecCodeRef code = NULL;
+        OSStatus status = SecCodeCopySelf(arguments[0], &code);
+        if (arguments[1]) *(uint32_t *)(uintptr_t)arguments[1] = proxy_for_object((id)code);
+        if (code) CFRelease(code);
+        *result = (uint32_t)status; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_SecCodeCheckValidity")) {
+        *result = (uint32_t)SecCodeCheckValidity((SecCodeRef)object_for_argument(arguments[0]),
+            arguments[1], (SecRequirementRef)object_for_argument(arguments[2]));
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFAllocatorGetDefault")) {
+        *result = proxy_for_object((id)CFAllocatorGetDefault());
+        return 1;
+    }
+
     if (LP32_NAME_IS(import_name, import_length, "_CFBundleGetMainBundle")) {
         *result = proxy_for_object(legacy_game_bundle());
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFBundleGetInfoDictionary")) {
+        NSBundle *bundle=object_for_argument(arguments[0]);
+        *result=proxy_for_object([bundle infoDictionary]);return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFBundleCopyAuxiliaryExecutableURL")) {
+        NSBundle *bundle=object_for_argument(arguments[0]);
+        *result=proxy_for_object([bundle URLForAuxiliaryExecutable:object_for_argument(arguments[1])]);return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFBundleCopyBundleLocalizations")) {
+        NSBundle *bundle = object_for_argument(arguments[0]);
+        *result = proxy_for_object([bundle localizations]);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFBundleCopyResourceURLsOfType")) {
+        NSBundle *bundle=object_for_argument(arguments[0]);
+        *result=proxy_for_object([bundle URLsForResourcesWithExtension:object_for_argument(arguments[1]) subdirectory:object_for_argument(arguments[2])]);return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFBundleLoadExecutable")) {
+        NSBundle *bundle = object_for_argument(arguments[0]);
+        *result = [bundle load]; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFBundleCopyPreferredLocalizationsFromArray")) {
+        CFArrayRef preferred = CFBundleCopyPreferredLocalizationsFromArray((CFArrayRef)object_for_argument(arguments[0]));
+        *result = proxy_for_object((id)preferred);
+        if (preferred) CFRelease(preferred);
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFBundleCopyExecutableURL")) {
@@ -6369,21 +7679,22 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                no modern counterpart here; the game reads its configuration
                itself, so the bridge answers for the launcher. */
             thunk = compat_runtime32_guest_callback(kFeralMainEntryCallbackName);
-        } else if (symbol && dlsym(RTLD_DEFAULT, symbol)) {
+        } else if (symbol && (carbon_bridge32_has_symbol(symbol) || dlsym(RTLD_DEFAULT, symbol))) {
             thunk = compat_runtime32_guest_callback(symbol);
         }
-        if (!thunk && getenv("LP32_TRACE_DISPLAY")) {
-            fprintf(stderr, "compat32: CFBundleGetFunctionPointerForName %s -> none\n",
-                    symbol ? symbol : "(null)");
+        if (getenv("LP32_TRACE_DISPLAY")) {
+            fprintf(stderr, "compat32: CFBundleGetFunctionPointerForName %s -> %#x\n",
+                    symbol ? symbol : "(null)",thunk);
         }
         *result = thunk;
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFBundleCopyLocalizedString")) {
         NSBundle *bundle = object_for_argument(arguments[0]);
-        *result = proxy_for_object([bundle localizedStringForKey:object_for_argument(arguments[1])
-                                                           value:object_for_argument(arguments[2])
-                                                           table:object_for_argument(arguments[3])]);
+        NSString *key = object_for_argument(arguments[1]);
+        NSString *value = [bundle localizedStringForKey:key value:object_for_argument(arguments[2]) table:object_for_argument(arguments[3])];
+        if (getenv("LP32_TRACE_LOCALIZATION")) fprintf(stderr,"compat32: localized bundle=%s key=%s table=%s result=%s\n",bundle.bundlePath.UTF8String,key.UTF8String,[(NSString *)object_for_argument(arguments[3]) UTF8String],value.UTF8String);
+        *result = proxy_for_object(value);
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_NSHomeDirectory")) {
@@ -6391,6 +7702,65 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         *result = proxy_for_object(test_home && test_home[0] ?
             [NSString stringWithUTF8String:test_home] : NSHomeDirectory());
         return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFURLCreateFromFSRef")) {
+        UInt8 path[PATH_MAX];
+        int16_t (*makePath)(const void *,UInt8 *,uint32_t)=dlsym(RTLD_DEFAULT,"FSRefMakePath");
+        *result=makePath && !makePath((const void *)(uintptr_t)arguments[1],path,sizeof(path)) ?
+            proxy_for_object([NSURL fileURLWithPath:[NSString stringWithUTF8String:(const char *)path]]) : 0;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFURLGetFSRef")) {
+        const char *path=[[object_for_argument(arguments[0]) path] fileSystemRepresentation];
+        int16_t (*makeRef)(const UInt8 *,void *,void *)=dlsym(RTLD_DEFAULT,"FSPathMakeRef");
+        *result=path && makeRef && !makeRef((const UInt8 *)path,(void *)(uintptr_t)arguments[1],NULL);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFURLCreateWithFileSystemPath") ||
+        LP32_NAME_IS(import_name, import_length, "_CFURLCreateWithFileSystemPathRelativeToBase")) {
+        CFURLRef base=LP32_NAME_IS(import_name,import_length,"_CFURLCreateWithFileSystemPathRelativeToBase")?
+            (CFURLRef)object_for_argument(arguments[4]):NULL;
+        CFURLRef url=CFURLCreateWithFileSystemPathRelativeToBase(NULL,
+            (CFStringRef)object_for_argument(arguments[1]),arguments[2],arguments[3]!=0,base);
+        *result=proxy_for_object((id)url);if(url)CFRelease(url);return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFURLCreateFromFileSystemRepresentation")) {
+        CFURLRef url=CFURLCreateFromFileSystemRepresentation(NULL,(const UInt8 *)(uintptr_t)arguments[1],
+            (int32_t)arguments[2],arguments[3]!=0);*result=proxy_for_object((id)url);if(url)CFRelease(url);return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFURLCopyAbsoluteURL")) {
+        CFURLRef url=CFURLCopyAbsoluteURL((CFURLRef)object_for_argument(arguments[0]));
+        *result=proxy_for_object((id)url);if(url)CFRelease(url);return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFURLCreateWithString")) {
+        CFURLRef url=CFURLCreateWithString(NULL,(CFStringRef)object_for_argument(arguments[1]),
+            (CFURLRef)object_for_argument(arguments[2]));
+        *result=proxy_for_object((id)url);if(url)CFRelease(url);return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFURLCopyHostName")) {
+        CFStringRef host=CFURLCopyHostName((CFURLRef)object_for_argument(arguments[0]));
+        *result=proxy_for_object((id)host);if(host)CFRelease(host);return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFURLCopyLastPathComponent")) {
+        *result=proxy_for_object([object_for_argument(arguments[0]) lastPathComponent]);return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFURLCreateCopyAppendingPathComponent")) {
+        CFURLRef url=CFURLCreateCopyAppendingPathComponent(NULL,(CFURLRef)object_for_argument(arguments[1]),
+            (CFStringRef)object_for_argument(arguments[2]),arguments[3]!=0);
+        *result=proxy_for_object((id)url);if(url)CFRelease(url);return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFURLCreateCopyDeletingLastPathComponent")) {
+        CFURLRef url=CFURLCreateCopyDeletingLastPathComponent(NULL,(CFURLRef)object_for_argument(arguments[1]));
+        *result=proxy_for_object((id)url);if(url)CFRelease(url);return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFURLHasDirectoryPath")) {
+        *result=CFURLHasDirectoryPath((CFURLRef)object_for_argument(arguments[0]));return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFBundleCopyBundleURL")) {
+        *result=proxy_for_object([object_for_argument(arguments[0]) bundleURL]);return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFBundleGetValueForInfoDictionaryKey")) {
+        *result=proxy_for_object([object_for_argument(arguments[0]) objectForInfoDictionaryKey:object_for_argument(arguments[1])]);return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFURLCopyFileSystemPath")) {
         NSURL *url = object_for_argument(arguments[0]);
@@ -6427,17 +7797,139 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         }
         return 1;
     }
-    if (LP32_NAME_IS(import_name, import_length, "_CFRelease")) {
-        *result = 0;
-        return 1;
-    }
-    if (LP32_NAME_IS(import_name, import_length, "_CFRetain")) {
-        *result = arguments[0];
+    if (LP32_NAME_IS(import_name, import_length, "_CFRelease") ||
+        LP32_NAME_IS(import_name, import_length, "_CFRetain") ||
+        LP32_NAME_IS(import_name, import_length, "_dispatch_release") ||
+        LP32_NAME_IS(import_name, import_length, "_dispatch_retain")) {
+        bool retain = LP32_NAME_IS(import_name, import_length, "_CFRetain") ||
+                      LP32_NAME_IS(import_name, import_length, "_dispatch_retain");
+        id legacy = objc_legacy32_object(arguments[0]);
+        if (legacy) {
+            if (retain) [legacy retain]; else [legacy release];
+            *result = retain ? arguments[0] : 0;
+            return 1;
+        }
+        id released = nil;
+        pthread_mutex_lock(&proxy_mutex);
+        for (uint32_t i = 0; i < proxy_count; ++i) {
+            struct proxy_entry *entry = &proxies[i];
+            if (entry->handle != arguments[0] || !entry->object) continue;
+            if (retain) ++entry->cf_owners;
+            else if (entry->cf_owners && --entry->cf_owners == 0 && !entry->pinned) {
+                released = entry->object;
+                memset(entry, 0, sizeof(*entry));
+
+            }
+            break;
+        }
+        pthread_mutex_unlock(&proxy_mutex);
+        if (proxy_object_is_retained(released)) [released release];
+        *result = retain ? arguments[0] : 0;
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFGetTypeID")) {
         id object = object_for_argument(arguments[0]);
         *result = object ? CFGetTypeID((CFTypeRef)object) : 0;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringCreateMutableCopy")) {
+        CFMutableStringRef string = CFStringCreateMutableCopy(NULL, (int32_t)arguments[1],
+            (CFStringRef)object_for_argument(arguments[2]));
+        *result = proxy_for_object((id)string);
+        if (string) CFRelease(string);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringCreateCopy")) {
+        *result = proxy_for_object([[object_for_argument(arguments[1]) copy] autorelease]); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringCreateWithPascalString")) {
+        CFStringRef string = CFStringCreateWithPascalString(NULL,
+            (const UInt8 *)(uintptr_t)arguments[1], arguments[2]);
+        *result = proxy_for_object((id)string);
+        if (string) CFRelease(string);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringCreateWithCharacters")) {
+        CFStringRef string = CFStringCreateWithCharacters(NULL,
+            (const UniChar *)(uintptr_t)arguments[1], (int32_t)arguments[2]);
+        *result = proxy_for_object((id)string);
+        if (string) CFRelease(string);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringCreateWithSubstring")) {
+        CFStringRef string = CFStringCreateWithSubstring(NULL,
+            (CFStringRef)object_for_argument(arguments[1]),
+            CFRangeMake((int32_t)arguments[2], (int32_t)arguments[3]));
+        *result = proxy_for_object((id)string);
+        if (string) CFRelease(string);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringCreateWithFormat") ||
+        LP32_NAME_IS(import_name, import_length, "_CFStringCreateWithFormatAndArguments")) {
+        const uint32_t *args = LP32_NAME_IS(import_name, import_length, "_CFStringCreateWithFormat") ? arguments + 3 : (const void *)(uintptr_t)arguments[3];
+        CFStringRef string = format_cf_string32((CFStringRef)object_for_argument(arguments[2]), args);
+        if (!string) return 0;
+        *result = proxy_for_object((id)string); CFRelease(string); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringLowercase") ||
+        LP32_NAME_IS(import_name, import_length, "_CFStringUppercase")) {
+        CFMutableStringRef string = (CFMutableStringRef)object_for_argument(arguments[0]);
+        CFLocaleRef locale = (CFLocaleRef)object_for_argument(arguments[1]);
+        if (LP32_NAME_IS(import_name, import_length, "_CFStringLowercase")) CFStringLowercase(string, locale);
+        else CFStringUppercase(string, locale);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringGetIntValue")) {
+        *result = (uint32_t)CFStringGetIntValue((CFStringRef)object_for_argument(arguments[0])); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringGetDoubleValue")) {
+        *result = compat_runtime32_return_double(CFStringGetDoubleValue((CFStringRef)object_for_argument(arguments[0]))); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringAppend")) {
+        CFStringAppend((CFMutableStringRef)object_for_argument(arguments[0]),
+                       (CFStringRef)object_for_argument(arguments[1])); *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringInsert")) {
+        CFStringInsert((CFMutableStringRef)object_for_argument(arguments[0]),
+            (int32_t)arguments[1],(CFStringRef)object_for_argument(arguments[2]));
+        *result=0;return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringDelete")) {
+        CFStringDelete((CFMutableStringRef)object_for_argument(arguments[0]),
+                       CFRangeMake((int32_t)arguments[1], (int32_t)arguments[2])); *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringReplace")) {
+        CFStringReplace((CFMutableStringRef)object_for_argument(arguments[0]),
+                        CFRangeMake((int32_t)arguments[1], (int32_t)arguments[2]),
+                        (CFStringRef)object_for_argument(arguments[3])); *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringGetCharacters")) {
+        CFStringGetCharacters((CFStringRef)object_for_argument(arguments[0]),
+            CFRangeMake((int32_t)arguments[1], (int32_t)arguments[2]),
+            (UniChar *)(uintptr_t)arguments[3]); *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringGetPascalString")) {
+        *result = CFStringGetPascalString((CFStringRef)object_for_argument(arguments[0]),
+            (UInt8 *)(uintptr_t)arguments[1], (int32_t)arguments[2], arguments[3]); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFHash")) {
+        *result = (uint32_t)CFHash((CFTypeRef)object_for_argument(arguments[0])); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringGetBytes")) {
+        CFIndex used=0;
+        *result = (uint32_t)CFStringGetBytes((CFStringRef)object_for_argument(arguments[0]),
+            CFRangeMake((int32_t)arguments[1],(int32_t)arguments[2]), arguments[3],
+            (UInt8)arguments[4],arguments[5]!=0,(UInt8 *)(uintptr_t)arguments[6],
+            (int32_t)arguments[7],arguments[8]?&used:NULL);
+        if(arguments[8])*(int32_t *)(uintptr_t)arguments[8]=(int32_t)used;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringFindWithOptions")) {
+        CFRange range;
+        *result=CFStringFindWithOptions((CFStringRef)object_for_argument(arguments[0]),
+            (CFStringRef)object_for_argument(arguments[1]),
+            CFRangeMake((int32_t)arguments[2],(int32_t)arguments[3]),arguments[4],&range);
+        if(*result && arguments[5]){int32_t *p=(void *)(uintptr_t)arguments[5];p[0]=(int32_t)range.location;p[1]=(int32_t)range.length;}
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFStringGetLength")) {
@@ -6458,6 +7950,10 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFStringCompare")) {
+        if (!object_for_argument(arguments[0]) || !object_for_argument(arguments[1])) {
+            fprintf(stderr,"compat32: unresolved CFStringCompare arguments %#x %#x\n",arguments[0],arguments[1]);
+            return 0;
+        }
         NSString *left = object_for_argument(arguments[0]);
         NSString *right = object_for_argument(arguments[1]);
         *result = (uint32_t)CFStringCompare((CFStringRef)left,
@@ -6482,6 +7978,35 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         *result = proxy_for_object([(NSString *)string autorelease]);
         return 1;
     }
+    if (LP32_NAME_IS(import_name, import_length, "_CFArrayCreateMutable") || LP32_NAME_IS(import_name, import_length, "_CFArrayCreate")) {
+        bool mutable=LP32_NAME_IS(import_name,import_length,"_CFArrayCreateMutable");
+        if(!compat_runtime32_pointer_import_matches(arguments[mutable?2:3],"_kCFTypeArrayCallBacks"))return 0;
+        CFArrayRef array;
+        if(mutable)array=CFArrayCreateMutable(NULL,(int32_t)arguments[1],&kCFTypeArrayCallBacks);
+        else{
+            uint32_t count=arguments[2];const uint32_t *guest=(void *)(uintptr_t)arguments[1];
+            const void **values=calloc(count?count:1,sizeof(*values));if(!values)return 0;
+            for(uint32_t i=0;i<count;++i)values[i]=object_for_argument(guest[i]);
+            array=CFArrayCreate(NULL,values,count,&kCFTypeArrayCallBacks);free(values);
+        }
+        *result=proxy_for_object((id)array);if(array)CFRelease(array);return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFArrayCreateCopy") || LP32_NAME_IS(import_name, import_length, "_CFArrayCreateMutableCopy")) {
+        CFArrayRef array=LP32_NAME_IS(import_name,import_length,"_CFArrayCreateCopy")?
+            CFArrayCreateCopy(NULL,(CFArrayRef)object_for_argument(arguments[1])):
+            CFArrayCreateMutableCopy(NULL,(int32_t)arguments[1],(CFArrayRef)object_for_argument(arguments[2]));
+        *result=proxy_for_object((id)array);if(array)CFRelease(array);return 1;
+    }
+    if (LP32_NAME_IS(import_name,import_length,"_CFArrayAppendValue") || LP32_NAME_IS(import_name,import_length,"_CFArrayInsertValueAtIndex") ||
+        LP32_NAME_IS(import_name,import_length,"_CFArraySetValueAtIndex") || LP32_NAME_IS(import_name,import_length,"_CFArrayRemoveValueAtIndex") ||
+        LP32_NAME_IS(import_name,import_length,"_CFArrayRemoveAllValues")) {
+        CFMutableArrayRef array=(CFMutableArrayRef)object_for_argument(arguments[0]);
+        if(LP32_NAME_IS(import_name,import_length,"_CFArrayAppendValue"))CFArrayAppendValue(array,object_for_argument(arguments[1]));
+        else if(LP32_NAME_IS(import_name,import_length,"_CFArrayInsertValueAtIndex"))CFArrayInsertValueAtIndex(array,(int32_t)arguments[1],object_for_argument(arguments[2]));
+        else if(LP32_NAME_IS(import_name,import_length,"_CFArraySetValueAtIndex"))CFArraySetValueAtIndex(array,(int32_t)arguments[1],object_for_argument(arguments[2]));
+        else if(LP32_NAME_IS(import_name,import_length,"_CFArrayRemoveValueAtIndex"))CFArrayRemoveValueAtIndex(array,(int32_t)arguments[1]);
+        else CFArrayRemoveAllValues(array);*result=0;return 1;
+    }
     if (LP32_NAME_IS(import_name, import_length, "_CFArrayGetCount")) {
         NSArray *array = object_for_argument(arguments[0]);
         *result = (uint32_t)[array count];
@@ -6496,6 +8021,51 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         NSUInteger index = arguments[1];
         *result = index < [array count] ? proxy_for_object([array objectAtIndex:index]) : 0;
         return 1;
+    }
+    if (LP32_NAME_IS(import_name,import_length,"_CFDictionaryGetCount")) {
+        *result=(uint32_t)CFDictionaryGetCount((CFDictionaryRef)object_for_argument(arguments[0]));return 1;
+    }
+    if (LP32_NAME_IS(import_name,import_length,"_CFDictionaryGetKeysAndValues")) {
+        CFDictionaryRef dictionary=(CFDictionaryRef)object_for_argument(arguments[0]);CFIndex count=CFDictionaryGetCount(dictionary);
+        const void **values=calloc(count?count*2:1,sizeof(*values));if(!values)return 0;
+        CFDictionaryGetKeysAndValues(dictionary,values,values+count);
+        for(CFIndex i=0;i<count;++i){
+            if(arguments[1])((uint32_t *)(uintptr_t)arguments[1])[i]=proxy_for_object((id)values[i]);
+            if(arguments[2])((uint32_t *)(uintptr_t)arguments[2])[i]=proxy_for_object((id)values[i+count]);
+        }
+        free(values);*result=0;return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFDictionaryCreateMutable") ||
+        LP32_NAME_IS(import_name, import_length, "_CFDictionaryCreate")) {
+        bool mutable = LP32_NAME_IS(import_name, import_length, "_CFDictionaryCreateMutable");
+        unsigned key_index = mutable ? 2 : 4, value_index = mutable ? 3 : 5;
+        /* Custom/raw callbacks require their own value representation. Trap
+           unsupported tables instead of treating guest addresses as CF objects. */
+        if (!compat_runtime32_pointer_import_matches(arguments[key_index], "_kCFTypeDictionaryKeyCallBacks") ||
+            !compat_runtime32_pointer_import_matches(arguments[value_index], "_kCFTypeDictionaryValueCallBacks")) return 0;
+        CFMutableDictionaryRef dictionary = CFDictionaryCreateMutable(NULL, mutable ? (int32_t)arguments[1] : 0,
+            &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        if (!mutable && dictionary) {
+            const uint32_t *keys=(void *)(uintptr_t)arguments[1], *values=(void *)(uintptr_t)arguments[2];
+            for(uint32_t i=0;i<arguments[3];++i)CFDictionaryAddValue(dictionary,object_for_argument(keys[i]),object_for_argument(values[i]));
+            CFDictionaryRef immutable=CFDictionaryCreateCopy(NULL,dictionary);CFRelease(dictionary);
+            *result=proxy_for_object((id)immutable);if(immutable)CFRelease(immutable);return 1;
+        }
+        *result=proxy_for_object((id)dictionary);if(dictionary)CFRelease(dictionary);return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFDictionaryCreateCopy") ||
+        LP32_NAME_IS(import_name, import_length, "_CFDictionaryCreateMutableCopy")) {
+        bool mutable=LP32_NAME_IS(import_name, import_length, "_CFDictionaryCreateMutableCopy");
+        CFDictionaryRef dictionary=mutable ? CFDictionaryCreateMutableCopy(NULL,(int32_t)arguments[1],
+            (CFDictionaryRef)object_for_argument(arguments[2])) : CFDictionaryCreateCopy(NULL,(CFDictionaryRef)object_for_argument(arguments[1]));
+        *result=proxy_for_object((id)dictionary);if(dictionary)CFRelease(dictionary);return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFDictionaryAddValue")) {
+        CFDictionaryAddValue((CFMutableDictionaryRef)object_for_argument(arguments[0]),object_for_argument(arguments[1]),object_for_argument(arguments[2]));
+        *result=0;return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFDictionaryGetCountOfKey")) {
+        *result=(uint32_t)CFDictionaryGetCountOfKey((CFDictionaryRef)object_for_argument(arguments[0]),object_for_argument(arguments[1]));return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFDictionaryGetValue")) {
         NSDictionary *dictionary = object_for_argument(arguments[0]);
@@ -6531,13 +8101,43 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         *result = 0;
         return 1;
     }
+    if (LP32_NAME_IS(import_name, import_length, "_CFDataCreate")) {
+        CFDataRef data = CFDataCreate(NULL, (const UInt8 *)(uintptr_t)arguments[1], (int32_t)arguments[2]);
+        *result = proxy_for_object((id)data); if (data) CFRelease(data); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFDataCreateMutable")) {
+        CFMutableDataRef data = CFDataCreateMutable((CFAllocatorRef)object_for_argument(arguments[0]),
+                                                   (int32_t)arguments[1]);
+        *result = proxy_for_object((id)data);
+        if (data) CFRelease(data);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFDataSetLength")) {
+        CFDataSetLength((CFMutableDataRef)object_for_argument(arguments[0]), (int32_t)arguments[1]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFDataGetLength")) {
+        *result = CFDataGetLength((CFDataRef)object_for_argument(arguments[0])); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFDataGetBytes")) {
+        CFDataGetBytes((CFDataRef)object_for_argument(arguments[0]),
+            CFRangeMake((int32_t)arguments[1], (int32_t)arguments[2]),
+            (UInt8 *)(uintptr_t)arguments[3]);
+        *result=0;return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFDataGetMutableBytePtr")) {
+        UInt8 *bytes = CFDataGetMutableBytePtr((CFMutableDataRef)object_for_argument(arguments[0]));
+        if ((uintptr_t)bytes > UINT32_MAX) return 0; /* Never truncate writable host memory. */
+        *result = (uintptr_t)bytes; return 1;
+    }
     if (LP32_NAME_IS(import_name, import_length, "_CFDataGetTypeID")) {
         *result = CFDataGetTypeID();
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFDataGetBytePtr")) {
         NSData *data = object_for_argument(arguments[0]);
-        *result = guest_bytes_for_data(data);
+        *result = (uintptr_t)[data bytes] <= UINT32_MAX ?
+            (uintptr_t)[data bytes] : guest_bytes_for_data(data);
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFBooleanGetValue")) {
@@ -6634,21 +8234,25 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         memcpy(result, &value, sizeof(value));
         return 1;
     }
-    if (LP32_NAME_IS(import_name, import_length, "_CFRunLoopGetCurrent")) {
-        /* A host-thread token is sufficient because Add/Remove operate on
-           the current run loop for this title's IOKit notification path. */
-        *result = proxy_for_object([NSThread currentThread]);
-        return 1;
-    }
     if (LP32_NAME_IS(import_name, import_length, "_CFShow")) {
         id object = object_for_argument(arguments[0]);
         fprintf(stderr, "compat32: CFShow %s\n", [[object description] UTF8String]);
         *result = 0;
         return 1;
     }
+    if (LP32_NAME_IS(import_name, import_length, "_CFCopyDescription")) {
+        CFTypeRef object=(CFTypeRef)object_for_argument(arguments[0]);
+        CFStringRef description=object?CFCopyDescription(object):NULL;
+        *result=proxy_for_object((id)description);if(description)CFRelease(description);return 1;
+    }
 
-    if (LP32_NAME_IS(import_name, import_length, "_TISCopyCurrentKeyboardInputSource")) {
-        TISInputSourceRef source = TISCopyCurrentKeyboardInputSource();
+    if (LP32_NAME_IS(import_name, import_length, "_TISCopyCurrentKeyboardInputSource") ||
+        LP32_NAME_IS(import_name, import_length, "_TISCopyCurrentKeyboardLayoutInputSource") ||
+        LP32_NAME_IS(import_name, import_length, "_TISCopyCurrentASCIICapableKeyboardLayoutInputSource")) {
+        TISInputSourceRef source = strstr(import_name, "ASCIICapable") ?
+            TISCopyCurrentASCIICapableKeyboardLayoutInputSource() :
+            strstr(import_name, "Layout") ? TISCopyCurrentKeyboardLayoutInputSource() :
+            TISCopyCurrentKeyboardInputSource();
         *result = proxy_for_object((id)source);
         if (source) CFRelease(source);
         return 1;
@@ -6712,6 +8316,15 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     }
 
     if (LP32_NAME_IS(import_name, import_length, "_NSApplicationMain")) {
+        objc_legacy32_register_classes();
+        if(getenv("LP32_TEST_DISPLAY")) {
+            NSTimer *placement = [NSTimer timerWithTimeInterval:0.1 repeats:YES block:^(NSTimer *timer) {
+                (void)timer;
+                for(NSWindow *window in NSApp.windows) place_test_window(window);
+            }];
+            [[NSRunLoop mainRunLoop] addTimer:placement forMode:NSRunLoopCommonModes];
+            [[NSRunLoop mainRunLoop] addTimer:placement forMode:NSModalPanelRunLoopMode];
+        }
         int argc = (int)arguments[0];
         const uint32_t *guest_argv = (const void *)(uintptr_t)arguments[1];
         if (argc < 0 || argc > 64 || !guest_argv) return 0;
@@ -6725,7 +8338,9 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         return 1;
     }
 
-    if (LP32_NAME_IS(import_name, import_length, "_objc_msgSend")) {
+    if (LP32_NAME_IS(import_name, import_length, "_objc_msgSend") ||
+        LP32_NAME_IS(import_name, import_length, "_objc_msgSend_fpret")) {
+        if (objc_legacy32_message(arguments, result)) return 1;
         id receiver = object_for_receiver(arguments[0]);
         const char *selector_name = (const char *)(uintptr_t)arguments[1];
         static int trace_selectors = -1;
@@ -6737,39 +8352,64 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                     (unsigned long long)objc_bridge_swap_count, selector_name,
                     receiver ? class_getName(object_getClass(receiver)) : "(none)");
         }
-        /* Marvel drains pools across bridge calls. The dispatch pool has
+        /* Guest pools span bridge calls. The dispatch pool has
            already drained any nested host pool by then, so keep its guest
            pool token inert; host temporaries retain their per-call lifetime. */
-        if (lp32_profile()->title == LP32_TITLE_MARVEL && selector_name) {
+        if (selector_name) {
             static NSObject *pool_token;
             if (receiver == [NSAutoreleasePool class] &&
                 (strcmp(selector_name, "alloc") == 0 || strcmp(selector_name, "new") == 0)) {
                 if (!pool_token) pool_token = [[NSObject alloc] init];
+                guest_autorelease_push();
                 *result = proxy_for_object(pool_token);
                 return 1;
             }
             if (pool_token && receiver == pool_token) {
+                if(!strcmp(selector_name,"drain") || !strcmp(selector_name,"release"))guest_autorelease_pop();
                 *result = (strcmp(selector_name, "drain") == 0 ||
                            strcmp(selector_name, "release") == 0) ? 0 : arguments[0];
                 return 1;
             }
         }
+        if (selector_name &&
+            (!strcmp(selector_name,"retain") || !strcmp(selector_name,"release") || !strcmp(selector_name,"autorelease")) &&
+            proxy_uses_guest_ownership(arguments[0])) {
+            if(!strcmp(selector_name,"retain") || !strcmp(selector_name,"release")) {
+                bool retain=!strcmp(selector_name,"retain");
+                return objc_bridge32_dispatch(retain?"_CFRetain":"_CFRelease",arguments,result);
+            }
+            if(!strcmp(selector_name,"autorelease")) {
+                guest_autorelease_add(arguments[0]);*result=arguments[0];return 1;
+            }
+        }
+        if (selector_name && strcmp(selector_name,"runModal")==0 && [receiver isKindOfClass:[NSAlert class]]) {
+            NSAlert *alert=receiver;
+            fprintf(stderr,"compat32: launcher alert: %s | %s\n",alert.messageText.UTF8String,alert.informativeText.UTF8String);
+            for(NSButton *button in alert.buttons)fprintf(stderr,"compat32: alert button: %s\n",button.title.UTF8String);
+            [alert layout];place_test_window(alert.window);
+            const char *test_message=getenv("LP32_TEST_ALERT_MESSAGE"), *test_button=getenv("LP32_TEST_ALERT_BUTTON");
+            if(test_message && test_button && [alert.messageText isEqualToString:[NSString stringWithUTF8String:test_message]]) {
+                for(NSButton *button in alert.buttons)if([button.title isEqualToString:[NSString stringWithUTF8String:test_button]]) {
+                    NSTimer *click=[NSTimer timerWithTimeInterval:0.25 repeats:NO block:^(NSTimer *timer){(void)timer;[button performClick:nil];}];
+                    [[NSRunLoop currentRunLoop] addTimer:click forMode:NSModalPanelRunLoopMode];break;
+                }
+            }
+        }
         /* Unattended test runs must never take focus away from the user: the
            game activates itself and makes its window key at startup, so answer
            those without doing them (the window is still ordered in). */
-        if (background_test_mode() && selector_name) {
-            if (strcmp(selector_name, "activateIgnoringOtherApps:") == 0 ||
-                strcmp(selector_name, "makeKeyWindow") == 0 ||
-                strcmp(selector_name, "makeMainWindow") == 0) {
-                *result = 0;
-                return 1;
-            }
-            if (strcmp(selector_name, "makeKeyAndOrderFront:") == 0 &&
-                [receiver isKindOfClass:[NSWindow class]]) {
-                [(NSWindow *)receiver orderFront:nil];
-                *result = 0;
-                return 1;
-            }
+        if (handle_test_activation(receiver, selector_name, result)) return 1;
+        if (background_test_mode() && !strcmp(selector_name, "setView:") &&
+            [receiver isKindOfClass:[NSOpenGLContext class]]) {
+            NSView *view = object_for_argument(arguments[2]);
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            [(NSOpenGLContext *)receiver setView:view];
+#pragma clang diagnostic pop
+            if (view.window) simulate_test_window_activation(view.window);
+            if (view.window) install_window_test_input(view.window);
+            *result = 0;
+            return 1;
         }
         if (getenv("LP32_TRACE_INPUT") && selector_name &&
             (strstr(selector_name, "Event") || strstr(selector_name, "event") ||
@@ -6781,12 +8421,72 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                     selector_name,
                     receiver ? class_getName(object_getClass(receiver)) : "(none)");
         }
+        if (selector_name && !strcmp(selector_name,"countByEnumeratingWithState:objects:count:"))
+            return enumerate_guest(receiver,arguments,result);
         if (!arguments[0]) { *result = 0; return 1; }
         if (!receiver || !selector_name) {
             fprintf(stderr,
                     "compat32: Objective-C lookup failed receiver=0x%08x selector=%s\n",
                     arguments[0], selector_name ? selector_name : "(null)");
             return 0;
+        }
+        if (!strcmp(selector_name, "setMainFrameURL:") && getenv("LP32_TEST_WEB_CLICK_ID")) {
+            NSString *identifier = [NSString stringWithUTF8String:getenv("LP32_TEST_WEB_CLICK_ID")];
+            NSData *json = [NSJSONSerialization dataWithJSONObject:@[identifier] options:0 error:NULL];
+            NSString *encoded = [[[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding] autorelease];
+            NSString *script = [NSString stringWithFormat:
+                @"(function(){var b=document.getElementById((%@)[0]);if(!b||b.disabled||!b.offsetParent)return '';b.click();return 'clicked';})()", encoded];
+            NSDate *ready = [NSDate dateWithTimeIntervalSinceNow:12];
+            NSTimer *click = [NSTimer timerWithTimeInterval:1 repeats:YES block:^(NSTimer *timer) {
+                if ([ready timeIntervalSinceNow] > 0) return;
+                NSString *value = [receiver performSelector:NSSelectorFromString(@"stringByEvaluatingJavaScriptFromString:") withObject:script];
+                if ([value isEqualToString:@"clicked"]) {
+                    fprintf(stderr, "compat32: test clicked web control %s\n", identifier.UTF8String);
+                    [timer invalidate];
+                }
+            }];
+            [[NSRunLoop mainRunLoop] addTimer:click forMode:NSRunLoopCommonModes];
+        }
+        if (!strcmp(selector_name, "arrayWithObjects:") || !strcmp(selector_name, "initWithObjects:") ||
+            !strcmp(selector_name, "arrayWithObjects:count:") || !strcmp(selector_name, "initWithObjects:count:")) {
+            bool counted = strstr(selector_name, "count:") != NULL;
+            const uint32_t *values = counted ? (void *)(uintptr_t)arguments[2] : arguments + 2;
+            size_t count = counted ? arguments[3] : 0;
+            if (!counted) {while (count < 1024 && values[count]) ++count; if (count == 1024) return 0;}
+            if (count > 1048576 || (count && !values)) return 0;
+            id *objects = calloc(count ? count : 1, sizeof(id));
+            if (!objects) return 0;
+            for (size_t i = 0; i < count; ++i) {
+                objects[i] = object_for_argument(values[i]);
+                if (!objects[i]) { free(objects); return 0; }
+            }
+            id value = !strncmp(selector_name, "init", 4) ?
+                [(NSArray *)receiver initWithObjects:objects count:count] :
+                [(Class)receiver arrayWithObjects:objects count:count];
+            free(objects); *result = proxy_for_object(value); return 1;
+        }
+        if (!strcmp(selector_name, "dictionaryWithObjectsAndKeys:") || !strcmp(selector_name, "initWithObjectsAndKeys:")) {
+            size_t count = 0;
+            const uint32_t *values = arguments + 2;
+            while (count < 512 && values[count * 2]) ++count;
+            if (count == 512) return 0;
+            id objects[512], keys[512];
+            for (size_t i = 0; i < count; ++i) {
+                objects[i] = object_for_argument(values[i * 2]);
+                keys[i] = object_for_argument(values[i * 2 + 1]);
+                if (!objects[i] || !keys[i]) return 0;
+            }
+            id value = !strncmp(selector_name, "init", 4) ?
+                [(NSDictionary *)receiver initWithObjects:objects forKeys:keys count:count] :
+                [(Class)receiver dictionaryWithObjects:objects forKeys:keys count:count];
+            *result = proxy_for_object(value); return 1;
+        }
+        if ((!strcmp(selector_name, "stringWithFormat:") || !strcmp(selector_name, "initWithFormat:")) &&
+            (receiver == (id)[NSString class] || [receiver isKindOfClass:[NSString class]])) {
+            CFStringRef formatted = format_cf_string32((CFStringRef)object_for_argument(arguments[2]), arguments + 3);
+            if (!formatted) return 0;
+            id value = !strncmp(selector_name, "init", 4) ? [(NSString *)receiver initWithString:(id)formatted] : (id)formatted;
+            *result = proxy_for_object(value); CFRelease(formatted); return 1;
         }
         if (strcmp(selector_name, "CGLContextObj") == 0) {
             CGLContextObj context = [(NSOpenGLContext *)receiver CGLContextObj];
@@ -6942,8 +8642,12 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                 }
             }
         }
+        if(getenv("LP32_TRACE_EVENTS") && !strcmp(selector_name,"postEvent:atStart:")) {
+            NSEvent *e=object_for_argument(arguments[2]);
+            if(e.type==NSEventTypeApplicationDefined)fprintf(stderr,"POST tid=%u token=%08x data=%lx,%lx subtype=%d\n",pthread_mach_thread_np(pthread_self()),arguments[2],(long)e.data1,(long)e.data2,(int)e.subtype);
+        }
         bool invoked = invoke_simple_message(receiver, selector_name,
-                                             arguments, result);
+                                             arguments, result, NULL, NULL);
         if (!invoked) {
             fprintf(stderr,
                     "compat32: Objective-C bridge cannot invoke %s on %s\n",
@@ -6953,9 +8657,15 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     }
 
     if (LP32_NAME_IS(import_name, import_length, "_objc_msgSend_stret")) {
+        if (objc_legacy32_message_stret(arguments, result)) return 1;
         struct guest_rect *destination = (void *)(uintptr_t)arguments[0];
         id receiver = object_for_receiver(arguments[1]);
         const char *selector_name = (const char *)(uintptr_t)arguments[2];
+        if (selector_name && strcmp(selector_name,"operatingSystemVersion")==0 && destination) {
+            NSOperatingSystemVersion version=receiver?[(NSProcessInfo *)receiver operatingSystemVersion]:(NSOperatingSystemVersion){0,0,0};
+            int32_t guest[]={(int32_t)version.majorVersion,(int32_t)version.minorVersion,(int32_t)version.patchVersion};
+            memcpy(destination,guest,sizeof(guest));*result=0;return 1;
+        }
         if (!arguments[1] && destination) {
             memset(destination, 0, sizeof(*destination));
             *result = 0;
@@ -6986,7 +8696,8 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             rect = [NSWindow contentRectForFrameRect:input
                                            styleMask:arguments[7]];
         } else {
-            return 0;
+            return invoke_simple_message(receiver, selector_name, arguments + 1,
+                                          result, NULL, destination);
         }
         destination->x = (float)rect.origin.x;
         destination->y = (float)rect.origin.y;
@@ -7002,8 +8713,41 @@ static int objc_bridge32_dispatch_body(const char *import_name,
 uint32_t objc_bridge32_pointer_import(const char *import_name)
 {
     const size_t import_length = strlen(import_name);
+    if (LP32_NAME_IS(import_name, import_length, "_kCFAllocatorSystemDefault")) return proxy_for_object((id)kCFAllocatorSystemDefault);
+    if (LP32_NAME_IS(import_name, import_length, "_kCFAllocatorNull")) return proxy_for_object((id)kCFAllocatorNull);
+    uint32_t network_constant = cfnetwork_bridge32_pointer_import(import_name);
+    if (network_constant) return network_constant;
+    if (LP32_NAME_IS(import_name, import_length, "_kCFPreferencesAnyApplication")) return proxy_for_object((id)kCFPreferencesAnyApplication);
+    if (LP32_NAME_IS(import_name, import_length, "_kCFPreferencesAnyHost")) return proxy_for_object((id)kCFPreferencesAnyHost);
+    if (LP32_NAME_IS(import_name, import_length, "_kCFPreferencesAnyUser")) return proxy_for_object((id)kCFPreferencesAnyUser);
+    if (LP32_NAME_IS(import_name, import_length, "_kCFPreferencesCurrentHost")) return proxy_for_object((id)kCFPreferencesCurrentHost);
+    if (LP32_NAME_IS(import_name, import_length, "_kCFPreferencesCurrentUser")) return proxy_for_object((id)kCFPreferencesCurrentUser);
+    if (LP32_NAME_IS(import_name, import_length, "_kCFPreferencesCurrentApplication")) return proxy_for_object((id)kCFPreferencesCurrentApplication);
+    if (LP32_NAME_IS(import_name, import_length, "_kCFBooleanTrue")) return proxy_for_object((id)kCFBooleanTrue);
+    if (LP32_NAME_IS(import_name, import_length, "_kCFBooleanFalse")) return proxy_for_object((id)kCFBooleanFalse);
+    if (LP32_NAME_IS(import_name, import_length, "_NSFilePosixPermissions")) return proxy_for_object((id)NSFilePosixPermissions);
+    if (LP32_NAME_IS(import_name, import_length, "_NSLocaleCountryCode")) return proxy_for_object((id)NSLocaleCountryCode);
+    if (LP32_NAME_IS(import_name, import_length, "_NSLocalizedDescriptionKey")) return proxy_for_object((id)NSLocalizedDescriptionKey);
+    if (LP32_NAME_IS(import_name, import_length, "_NSPOSIXErrorDomain")) return proxy_for_object((id)NSPOSIXErrorDomain);
+    if (LP32_NAME_IS(import_name, import_length, "_NSPasteboardTypeString")) return proxy_for_object((id)NSPasteboardTypeString);
+    if (LP32_NAME_IS(import_name, import_length, "_kCTForegroundColorFromContextAttributeName")) return proxy_for_object((id)kCTForegroundColorFromContextAttributeName);
+    if (LP32_NAME_IS(import_name, import_length, "_NSRunLoopCommonModes")) return proxy_for_object((id)NSRunLoopCommonModes);
+    if (LP32_NAME_IS(import_name, import_length, "_NSUnderlyingErrorKey")) return proxy_for_object((id)NSUnderlyingErrorKey);
+    if (LP32_NAME_IS(import_name, import_length, "_NSWindowDidBecomeMainNotification")) return proxy_for_object((id)NSWindowDidBecomeMainNotification);
+    if (LP32_NAME_IS(import_name, import_length, "_NSWindowDidDeminiaturizeNotification")) return proxy_for_object((id)NSWindowDidDeminiaturizeNotification);
+    if (LP32_NAME_IS(import_name, import_length, "_NSWindowDidEnterFullScreenNotification")) return proxy_for_object((id)NSWindowDidEnterFullScreenNotification);
+    if (LP32_NAME_IS(import_name, import_length, "_NSWindowDidExitFullScreenNotification")) return proxy_for_object((id)NSWindowDidExitFullScreenNotification);
+    if (LP32_NAME_IS(import_name, import_length, "_NSWindowDidMiniaturizeNotification")) return proxy_for_object((id)NSWindowDidMiniaturizeNotification);
+    if (LP32_NAME_IS(import_name, import_length, "_NSWindowDidResignMainNotification")) return proxy_for_object((id)NSWindowDidResignMainNotification);
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    if (LP32_NAME_IS(import_name, import_length, "_NSWorkspaceLaunchConfigurationArguments")) return proxy_for_object((id)NSWorkspaceLaunchConfigurationArguments);
+#pragma clang diagnostic pop
+    if (LP32_NAME_IS(import_name, import_length, "_kTISNotifySelectedKeyboardInputSourceChanged")) return proxy_for_object((id)kTISNotifySelectedKeyboardInputSourceChanged);
+    if (LP32_NAME_IS(import_name, import_length, "_kTISPropertyInputSourceID")) return proxy_for_object((id)kTISPropertyInputSourceID);
     if (LP32_NAME_IS(import_name, import_length, "_NSApp")) {
-        return proxy_for_object([NSApplication sharedApplication]);
+        Class application = objc_legacy32_application_class();
+        return proxy_for_object([application sharedApplication]);
     }
     if (LP32_NAME_IS(import_name, import_length, "_kCFLocaleCountryCode")) {
         return proxy_for_object((NSString *)kCFLocaleCountryCode);
@@ -7011,6 +8755,7 @@ uint32_t objc_bridge32_pointer_import(const char *import_name)
     if (LP32_NAME_IS(import_name, import_length, "_kCFLocaleLanguageCode")) {
         return proxy_for_object((NSString *)kCFLocaleLanguageCode);
     }
+    if (LP32_NAME_IS(import_name, import_length, "_kCFRunLoopCommonModes")) return proxy_for_object((id)kCFRunLoopCommonModes);
     if (LP32_NAME_IS(import_name, import_length, "_kCFRunLoopDefaultMode")) {
         return proxy_for_object((NSString *)kCFRunLoopDefaultMode);
     }

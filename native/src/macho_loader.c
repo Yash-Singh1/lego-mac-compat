@@ -28,12 +28,12 @@ struct source_file {
  * The __LEGACY zerofill in address_space_reserve.S pins the whole low 2 GiB.
  * Only the pages the image actually occupies are released here; everything
  * else in the reservation is carved with MAP_FIXED by the runtime (guest heap
- * at 0x02000000, stacks and bridge pages at 0x7c000000+), so the image must
+ * above max(0x02000000, image end), stacks and bridge pages at 0x7c000000+), so the image must
  * end below the heap base.
  */
 enum {
     kLegacyReservationStart = 0x00001000,
-    kLegacyReservationEnd = 0x02000000,
+    kLegacyReservationEnd = 0x10000000,
     kLegacyPageSize = 0x1000,
 };
 
@@ -159,6 +159,8 @@ static int inspect_commands(const struct source_file *source,
     uint32_t initializer_count = 0;
     uint32_t initializer_address = 0;
     uint32_t entry_eip = 0;
+    const struct entry_point_command *main_entry = NULL;
+    const struct segment_command *text_segment = NULL;
     const uint8_t *cursor = source->bytes + sizeof(*header);
     const uint8_t *commands_end = cursor + header->sizeofcmds;
 
@@ -177,6 +179,7 @@ static int inspect_commands(const struct source_file *source,
                 return fail_message("LC_SEGMENT is truncated");
             }
             const struct segment_command *segment = (const void *)cursor;
+            if (strncmp(segment->segname, SEG_TEXT, 16) == 0) text_segment = segment;
             size_t sections_size = (size_t)segment->nsects * sizeof(struct section);
             if (sections_size > command->cmdsize - sizeof(*segment)) {
                 return fail_message("LC_SEGMENT section array is truncated");
@@ -218,6 +221,11 @@ static int inspect_commands(const struct source_file *source,
                                           section[section_index].size;
                 }
             }
+        } else if (command->cmd == LC_MAIN) {
+            if (command->cmdsize < sizeof(struct entry_point_command) || main_entry) {
+                return fail_message("LC_MAIN is truncated or duplicated");
+            }
+            main_entry = (const void *)cursor;
         } else if (command->cmd == LC_UNIXTHREAD) {
             const uint32_t *words = (const void *)(cursor + sizeof(*command));
             size_t word_count = (command->cmdsize - sizeof(*command)) / sizeof(uint32_t);
@@ -231,6 +239,19 @@ static int inspect_commands(const struct source_file *source,
         cursor += command->cmdsize;
     }
 
+    if (main_entry) {
+        /* entryoff is a file offset in __TEXT, not a virtual address or a
+           crt startup stub. Validate it before mapping or executing anything. */
+        if (entry_eip || !text_segment ||
+            !(text_segment->initprot & VM_PROT_EXECUTE) ||
+            main_entry->entryoff < text_segment->fileoff ||
+            main_entry->entryoff - text_segment->fileoff >= text_segment->filesize) {
+            return fail_message("LC_MAIN has an invalid executable entry point");
+        }
+        entry_eip = text_segment->vmaddr +
+                    (uint32_t)(main_entry->entryoff - text_segment->fileoff);
+        image->main_address = entry_eip;
+    }
     if (cursor != commands_end || min_address == UINT32_MAX || !entry_eip) {
         return fail_message("Mach-O has incomplete segment or entry-point metadata");
     }
@@ -317,10 +338,35 @@ static int collect_imports(struct macho_image32 *image)
                     import->name = name;
                     import->address = sections[section_index].addr + item * stride;
                     import->kind = kind;
+                    /* Modern linkers retain indirect slots for coalesced and
+                       private-external definitions. Resolve these to the guest
+                       implementation, rather than asking the host bridge to
+                       implement the game's own C++ template instantiations. */
+                    if ((symbols[symbol_index].n_type & N_TYPE) == N_SECT) {
+                        uint32_t target = symbols[symbol_index].n_value;
+                        if (target < image->min_address || target >= image->max_address)
+                            return fail_message("Mach-O defined indirect symbol is outside image");
+                        import->target = target;
+                    }
                 }
             }
         }
         cursor += command->cmdsize;
+    }
+    /* Non-lazy symbol pointers also hold addresses of functions. Taking &fopen,
+     * for example, must resolve to executable bridge code, not a data cell.
+     * A matching stub/lazy entry provides the symbol's callable classification
+     * without guessing from its spelling (undefined nlist entries lack types). */
+    for (size_t i = 0; i < image->import_count; ++i) {
+        struct macho_import32 *import = &image->imports[i];
+        if (import->kind != MACHO_IMPORT32_POINTER) continue;
+        for (size_t j = 0; j < image->import_count; ++j) {
+            if (image->imports[j].kind != MACHO_IMPORT32_POINTER &&
+                strcmp(import->name, image->imports[j].name) == 0) {
+                import->kind = MACHO_IMPORT32_FUNCTION_POINTER;
+                break;
+            }
+        }
     }
     return 0;
 }

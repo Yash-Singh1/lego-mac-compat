@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define MACHO_IMAGE32_MAX_IMPORTS 1024
+#define MACHO_IMAGE32_MAX_IMPORTS 16384
 
 enum macho_import32_kind {
     MACHO_IMPORT32_POINTER,
@@ -16,12 +16,14 @@ enum macho_import32_kind {
 struct macho_import32 {
     const char *name;
     uint32_t address;
+    uint32_t target; /* Nonzero for a symbol defined in this image, not a host import. */
     enum macho_import32_kind kind;
 };
 
 struct macho_image32 {
     const struct mach_header *header;
     uint32_t entry_eip;
+    uint32_t main_address; /* LC_MAIN supplies main directly; LC_UNIXTHREAD does not. */
     uint32_t min_address;
     uint32_t max_address;
     uint32_t initializer_count;

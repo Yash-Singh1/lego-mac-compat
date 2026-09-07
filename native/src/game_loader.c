@@ -1,4 +1,6 @@
+#include "objc_legacy_bridge.h"
 #include "compat_runtime.h"
+#include "carbon_bridge.h"
 #include "controller_bridge.h"
 #include "game_profile.h"
 #include "macho_loader.h"
@@ -7,6 +9,9 @@
 #include "steam_bridge.h"
 
 #include <errno.h>
+#include <dlfcn.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
@@ -42,7 +47,7 @@ static void flush_guest_instruction(uintptr_t address);
 static void open_guest_diagnostic_log(const char *executable_path)
 {
     /* A read-only storage probe must not truncate a player's session log. */
-    if (getenv("LP32_STEAM_STORAGE_PROBE")) return;
+    if (getenv("LP32_STEAM_STORAGE_PROBE") || getenv("LP32_NO_DIAGNOSTIC_LOG")) return;
     const char *home = getenv("HOME");
     if (!home || !home[0]) return;
 
@@ -491,6 +496,23 @@ static void guest_crash_diagnostic(int signal_number, siginfo_t *info,
             "compat32: signal %d code=%d address=%p "
             "rip=0x%016llx rsp=0x%016llx\n",
             signal_number, info->si_code, info->si_addr, rip, rsp);
+    if (getenv("LP32_TRACE_NATIVE_CRASH") && rip > UINT32_MAX) {
+        uintptr_t address = rip, frame = context->uc_mcontext->__ss.__rbp;
+        for (unsigned i = 0; i < 16; ++i) {
+            Dl_info symbol = {0};
+            dladdr((void *)address, &symbol);
+            GUEST_DIAGNOSTIC("compat32: native frame %u %p %s + %llu (%s)\n", i,
+                (void *)address, symbol.dli_sname ? symbol.dli_sname : "?",
+                (unsigned long long)(address - (uintptr_t)symbol.dli_saddr),
+                symbol.dli_fname ? symbol.dli_fname : "?");
+            uint64_t words[2]; mach_vm_size_t count = 0;
+            if (frame < rsp || frame - rsp > 0x100000 ||
+                mach_vm_read_overwrite(mach_task_self(), frame, sizeof(words),
+                    (mach_vm_address_t)words, &count) || count != sizeof(words)) break;
+            if (words[0] <= frame) break;
+            frame = words[0]; address = words[1];
+        }
+    }
     uint32_t mode_to64 = 0, mode_to32 = 0;
     compat_runtime32_mode_guard_counts(&mode_to64, &mode_to32);
     GUEST_DIAGNOSTIC(
@@ -546,6 +568,7 @@ static void install_guest_crash_diagnostics(void)
     sigemptyset(&action.sa_mask);
     sigaction(SIGSEGV, &action, NULL);
     sigaction(SIGBUS, &action, NULL);
+    sigaction(SIGILL, &action, NULL);
     action.sa_flags = SA_SIGINFO;
     sigaction(SIGTRAP, &action, NULL);
 }
@@ -601,7 +624,7 @@ static void runtime_diagnostic_line(const char *line)
 static const char *default_image_path(const char *argv0, char *buffer,
                                       size_t size)
 {
-    static const char *const candidates[] = {"LEGOPirates", "LEGOCloneWars", "LEGOMarvel"};
+    static const char *const candidates[] = {"LEGOPirates", "LEGOCloneWars", "LEGOMarvel", "LEGOCompleteSaga"};
     const char *slash = strrchr(argv0, '/');
     size_t directory_length = slash ? (size_t)(slash - argv0) : 0;
     for (size_t index = 0; index < sizeof(candidates) / sizeof(candidates[0]); ++index) {
@@ -673,8 +696,18 @@ int main(int argc, char **argv)
         macho_image32_unload(&image);
         return EXIT_FAILURE;
     }
+    if (getenv("LP32_OBJC_LIFETIME_SELFTEST")) {
+        int result=objc_legacy32_run_lifetime_self_test();
+        macho_image32_unload(&image);
+        return result==0?EXIT_SUCCESS:EXIT_FAILURE;
+    }
     if (getenv("LP32_HEAP_SELFTEST")) {
         int result = compat_runtime32_run_heap_self_test();
+        macho_image32_unload(&image);
+        return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (getenv("LP32_CARBON_GEOMETRY_SELFTEST")) {
+        int result = carbon_bridge32_run_geometry_self_test();
         macho_image32_unload(&image);
         return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }

@@ -13,12 +13,15 @@ Support for the original 32-bit Mac releases:
 | --- | --- | --- |
 | LEGO Star Wars II: The Original Trilogy | Aspyr, 2006 | - |
 | LEGO Batman: The Videogame | Feral, 2009 | - |
+| LEGO Star Wars: The Complete Saga | Feral, Steam 1.2.1 | WIP; launcher, menus and new-game cantina verified |
 | LEGO Indiana Jones 2: The Adventure Continues | Feral, 2009 | - |
 | LEGO Star Wars III: The Clone Wars | Feral, 2011 | ✓\* |
 | LEGO Pirates of the Caribbean | TransGaming, 2011 | ✓\* |
 | LEGO Batman 2: DC Super Heroes | Feral, 2012 | - |
 | LEGO Harry Potter: Years 5-7 | Feral, 2012 | - |
+| LEGO The Lord of the Rings | Feral, 2013 | - |
 | LEGO Marvel Super Heroes | Feral, 2014 | Experimental |
+| LEGO The Hobbit | Feral, 2014 | - |
 | LEGO Batman 3: Beyond Gotham | Feral, 2014 | - |
 | The LEGO Movie Videogame | Feral, 2014 | - |
 
@@ -37,7 +40,16 @@ cd native
 make GAME=pirates   SOURCE_APP="/path/to/LEGO Pirates of the Caribbean.app" bundle
 make GAME=clonewars SOURCE_APP="/path/to/LEGO Star Wars III.app"           bundle
 make GAME=marvel    SOURCE_APP="/path/to/LEGO Marvel Super Heroes.app"     bundle
+make GAME=saga      SOURCE_APP="/path/to/LEGO Star Wars Saga.app"         bundle
 ```
+
+Complete Saga's WIP build and current limitations are documented in
+[native/SAGA.md](native/SAGA.md). Short probes reach the new-game cantina;
+the full campaign and controllers remain unverified.
+`GAME=saga` builds the Steam edition and requires an explicit `SOURCE_APP` path. Its output is
+`native/build/LEGOCompleteSaga-Steam-Compat.app`; keep the copied
+`LEGOStarWarsSagaData` directory beside it. The retail update is opt-in with
+`SAGA_EDITION=retail` and uses a separate bundle.
 
 This compiles the loader and assembles a self-contained app in
 `native/build/` (`LEGOPirates-Compat.app`, `LEGOCloneWars-Compat.app`, or

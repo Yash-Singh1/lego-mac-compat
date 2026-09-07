@@ -85,7 +85,7 @@ static int callback_size(struct steam_callback *callback)
 }
 static const void *callback_vtable[] = {callback_run, callback_result, callback_size};
 
-enum { STEAM_USER, STEAM_STATS, STEAM_APPS, STEAM_UTILS, STEAM_STORAGE };
+enum { STEAM_USER, STEAM_STATS, STEAM_APPS, STEAM_UTILS, STEAM_STORAGE, STEAM_SCREENSHOTS };
 static struct {
     const char *name;
     void *host;
@@ -94,7 +94,13 @@ static struct {
     {"_SteamUser", NULL, 0}, {"_SteamUserStats", NULL, 0},
     {"_SteamApps", NULL, 0}, {"_SteamUtils", NULL, 0},
     {"_SteamRemoteStorage", NULL, 0},
+    {"_SteamScreenshots", NULL, 0},
 };
+
+int steam_bridge32_call_uses_sret(const char *name,const uint32_t *args) {
+    return !strcmp(name,"_lp32_steam_0_2") && interfaces[STEAM_USER].guest &&
+        args[0] != interfaces[STEAM_USER].guest && args[1] == interfaces[STEAM_USER].guest;
+}
 
 /* Only known signatures are callable. Unimplemented slots trap through the
    normal diagnostic path rather than guessing a C++ ABI or returning success. */
@@ -109,14 +115,28 @@ static int interface_call(unsigned which, unsigned slot, const uint32_t *a, uint
 #define CALL1(type, t1, v1) ((type (*)(void *, t1))function)(object, v1)
 #define CALL2(type, t1, v1, t2, v2) ((type (*)(void *, t1, t2))function)(object, v1, v2)
 #define CALL3(type, t1, v1, t2, v2, t3, v3) ((type (*)(void *, t1, t2, t3))function)(object, v1, v2, v3)
+#define CALL4(type, t1, v1, t2, v2, t3, v3, t4, v4) ((type (*)(void *, t1, t2, t3, t4))function)(object, v1, v2, v3, v4)
     if (which == STEAM_USER) {
         if (slot == 0) { *result = CALL0(int32_t); return 1; }
         if (slot == 1) { *result = CALL0(bool); return 1; }
-        /* CSteamID is returned via a hidden result pointer on i386. */
+        if (slot == 6) {
+            bool success=CALL2(bool,char *,PTR(1),int32_t,(int32_t)a[2]);
+            const char *test=getenv("LP32_STEAM_TEST_DATA_DIR");
+            if(success && test && test[0]) {
+                if(strlen(test)+1>a[2]) success=false;
+                else memcpy(PTR(1),test,strlen(test)+1);
+            }
+            *result=success;return 1;
+        }
+        /* Clang returns the trivial eight-byte CSteamID in EDX:EAX; older
+           GCC clients pass a hidden result pointer before this. Identify
+           the layout from the interface token, not from the game title. */
         if (slot == 2) {
+            if(a[0] != interfaces[which].guest && a[1] != interfaces[which].guest) return 0;
             uint64_t id = CALL0(uint64_t);
-            memcpy(PTR(0), &id, sizeof(id));
-            *result = a[0]; return 1;
+            if(a[0] == interfaces[which].guest) *result = id;
+            else {memcpy(PTR(0), &id, sizeof(id));*result = a[0];}
+            return 1;
         }
     } else if (which == STEAM_APPS) {
         if (slot <= 3) { *result = CALL0(bool); return 1; }
@@ -143,7 +163,22 @@ static int interface_call(unsigned which, unsigned slot, const uint32_t *a, uint
         case 14: *result = CALL0(uint32_t); return 1;
         case 15: *result = compat_runtime32_copy_cstring(CALL1(const char *, uint32_t, a[1])); return 1;
         }
+    } else if (which == STEAM_SCREENSHOTS) {
+        if (slot == 0) { *result = CALL4(uint32_t,const void *,PTR(1),uint32_t,a[2],int32_t,(int32_t)a[3],int32_t,(int32_t)a[4]); return 1; }
+        if (slot == 1) { *result = CALL4(uint32_t,const char *,PTR(1),const char *,PTR(2),int32_t,(int32_t)a[3],int32_t,(int32_t)a[4]); return 1; }
+        if (slot == 2) { CALL0(void); *result=0; return 1; }
+        if (slot == 3) { CALL1(void,bool,a[1]!=0); *result=0; return 1; }
+        if (slot == 4) { *result=CALL2(bool,uint32_t,a[1],const char *,PTR(2)); return 1; }
+        if (slot == 5 || slot == 6) { *result=CALL2(bool,uint32_t,a[1],uint64_t,(uint64_t)a[2]|((uint64_t)a[3]<<32)); return 1; }
     } else if (which == STEAM_STORAGE) {
+        /* RemoteStorage013 inserts three async methods after FileRead.
+           Keep the earlier interface's slot mapping for older bundled SDKs. */
+        if (steam_symbol("SteamAPI_ISteamRemoteStorage_FileReadAsync")) {
+            if (slot == 2) { *result=CALL3(uint64_t,const char *,PTR(1),const void *,PTR(2),uint32_t,a[3]);return 1; }
+            if (slot == 3) { *result=CALL3(uint64_t,const char *,PTR(1),uint32_t,a[2],uint32_t,a[3]);return 1; }
+            if (slot == 4) { *result=CALL3(bool,uint64_t,(uint64_t)a[1]|((uint64_t)a[2]<<32),void *,PTR(3),uint32_t,a[4]);return 1; }
+            if (slot >= 5) slot -= 3;
+        }
         switch (slot) {
         case 0: *result = CALL3(bool, const char *, PTR(1), const void *, PTR(2), int32_t, (int32_t)a[3]); return 1;
         case 1: *result = (uint32_t)CALL3(int32_t, const char *, PTR(1), void *, PTR(2), int32_t, (int32_t)a[3]); return 1;
@@ -166,6 +201,7 @@ static int interface_call(unsigned which, unsigned slot, const uint32_t *a, uint
 #undef CALL1
 #undef CALL2
 #undef CALL3
+#undef CALL4
     return 0;
 }
 
@@ -210,10 +246,14 @@ int steam_bridge32_dispatch(const char *name, const uint32_t *args, uint64_t *re
     if (strncmp(name, "_lp32_steam_", 11) == 0) {
         unsigned which, slot;
         if (sscanf(name, "_lp32_steam_%u_%u", &which, &slot) != 2) return 0;
-        bool storage = which == STEAM_STORAGE && slot <= 20;
-        if (storage && slot <= 1) trace_storage_call(slot, args, 0, "begin");
+        if(getenv("LP32_TRACE_STEAM"))fprintf(stderr,"compat32: Steam interface=%u slot=%u args=%08x,%08x,%08x,%08x\n",which,slot,args[0],args[1],args[2],args[3]);
+        unsigned trace_slot=slot;
+        bool async_slots=which==STEAM_STORAGE && steam_symbol("SteamAPI_ISteamRemoteStorage_FileReadAsync");
+        if(async_slots && slot>=5)trace_slot-=3;
+        bool storage=which==STEAM_STORAGE && trace_slot<=20 && !(async_slots && slot>=2 && slot<=4);
+        if (storage && trace_slot <= 1) trace_storage_call(trace_slot, args, 0, "begin");
         int handled = interface_call(which, slot, args, result);
-        if (storage && handled) trace_storage_call(slot, args, *result, "end");
+        if (storage && handled) trace_storage_call(trace_slot, args, *result, "end");
         return handled;
     }
     if (strncmp(name, "_Steam", 6) != 0) return 0;
@@ -274,6 +314,9 @@ int steam_bridge32_dispatch(const char *name, const uint32_t *args, uint64_t *re
         }
         *result = 0;
         return 1;
+    }
+    if (strcmp(name, "_SteamAPI_IsSteamRunning") == 0) {
+        bool (*function)(void)=steam_symbol(name+1);if(!function)return 0;*result=function();return 1;
     }
     if (strcmp(name, "_SteamAPI_Init") == 0) {
         bool (*function)(void) = steam_symbol(name + 1);

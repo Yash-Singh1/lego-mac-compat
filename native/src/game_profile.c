@@ -298,6 +298,43 @@ static const struct lp32_game_profile marvel_profile = {
     .application_will_unhide = 0x0043d220,
 };
 
+/* Feral Complete Saga 1.0 (R17), plain i386 Carbon executable. */
+static const struct lp32_game_profile saga_10_profile = {
+    .title = LP32_TITLE_COMPLETE_SAGA,
+    .name = "LEGOCompleteSaga10",
+    .display_name = "LEGO Star Wars: The Complete Saga",
+    .log_directory = "LEGOCompleteSagaCompat",
+    .image_file = "LEGOCompleteSaga.image",
+    .entry_eip = 0x00002460,
+    .image_end = 0x0264d000,
+    .thread_argument_is_direct = 1, /* 0x341b60 consumes its persistent wrapper */
+};
+
+/* Feral's 1.1.1 (RC4) update adds the publisher's online activation flow. */
+static const struct lp32_game_profile saga_profile = {
+    .title = LP32_TITLE_COMPLETE_SAGA,
+    .name = "LEGOCompleteSaga",
+    .display_name = "LEGO Star Wars: The Complete Saga 1.1.1",
+    .log_directory = "LEGOCompleteSagaCompat",
+    .image_file = "LEGOCompleteSaga.image",
+    .entry_eip = 0x000355b4,
+    .image_end = 0x0276b000,
+    .thread_argument_is_direct = 1,
+};
+
+/* Steam 1.2.1 RC4 (124676.25672), Clang i386 with an LC_MAIN entry. */
+static const struct lp32_game_profile saga_steam_profile = {
+    .title = LP32_TITLE_COMPLETE_SAGA,
+    .name = "LEGOCompleteSagaSteam",
+    .display_name = "LEGO Star Wars: The Complete Saga 1.2.1 (Steam)",
+    .log_directory = "LEGOCompleteSagaSteamCompat",
+    .image_file = "LEGOCompleteSaga.image",
+    .entry_eip = 0x0016ee80,
+    .image_end = 0x02ed4640,
+    .thread_argument_is_direct = 1,
+    .callee_pops_struct_return = 1,
+};
+
 static const struct lp32_game_profile unknown_profile = {
     .title = LP32_TITLE_UNKNOWN,
     .name = "unknown",
@@ -310,6 +347,9 @@ static const struct lp32_game_profile *const known_profiles[] = {
     &pirates_profile,
     &clone_wars_profile,
     &marvel_profile,
+    &saga_profile,
+    &saga_10_profile,
+    &saga_steam_profile,
 };
 
 static const struct lp32_game_profile *current_profile = &unknown_profile;
@@ -327,6 +367,10 @@ const struct lp32_game_profile *lp32_profile_named(const char *name)
             return known_profiles[index];
         }
     }
+    if (!strcasecmp(name, "saga") || !strcasecmp(name, "lswc") ||
+        !strcasecmp(name, "completesaga") || !strcasecmp(name, "saga-steam"))
+        return &saga_steam_profile;
+    if (!strcasecmp(name, "saga-retail")) return &saga_profile;
     /* Accept the friendlier spellings used on the command line. */
     if (strcasecmp(name, "marvel") == 0) return &marvel_profile;
     if (strcasecmp(name, "pirates") == 0) return &pirates_profile;
@@ -346,6 +390,7 @@ static uint32_t call_target(const struct macho_image32 *image, uint32_t site)
 
 uint32_t lp32_profile_main_address(const struct macho_image32 *image)
 {
+    if (image->main_address) return image->main_address;
     /*
      * crt1's `start` stub ends with `call __start; hlt`.  The C-level
      * `__start` asks dyld for its initializer/terminator hooks through the
