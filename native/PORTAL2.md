@@ -415,3 +415,96 @@ Wide-text fixtures cover Unicode, field widths, assignment suppression,
 floating-point and 64-bit integers, and guards around i386 long/pointer output
 cells. Native Steam fixture binaries and generated loader stress inputs are
 original test code; no game or Steam client binaries are tracked.
+
+## Intermittent Core Audio crashes
+
+A dev.2 user on an M2 Air running macOS 26.5.2 reported SIGILL in caulk's
+allocator during `AudioQueueStart` after repeated map loads. Their equivalent
+standalone native queue test did not reproduce it, and the game later stopped
+crashing without an identified change. This does not establish a memory leak,
+a device-specific cause, or a fix from restarting Core Audio.
+
+The bridge now converts both AudioUnit input/render callback properties from
+8-byte i386 structures to native callbacks, translates callback property reads,
+and retires standalone units and callbacks on `CloseComponent`. OpenAL capture
+uses device handles, including safe failed-open/close cleanup. Real microphone
+capture and in-game voice chat still need testing. Wide-character libc support
+includes integer conversions with i386 range limits, duplication/search/case
+operations, character classification, and `vswscanf`; guest `errno` is writable
+and thread-local through `__error`.
+
+SIGILL now writes register diagnostics before default signal termination, so
+macOS can still produce a full crash report. If the crash recurs, collect:
+
+- The `~/Library/Logs/Portal2Compat/` folder. Current builds keep ten recent
+  `run-*.log` files, plus `last-run.log` and `previous-run.log` aliases. Older
+  builds only have `last-run.log`, which must be copied **before launching again**.
+- The matching `Portal2Compat*.ips` report from
+  `~/Library/Logs/DiagnosticReports/` (include the whole file).
+- The exact macOS version/build, selected audio output, and map transition.
+
+For a reproduction with queue lifecycle details, run the converted executable
+from Terminal with `LP32_TRACE_AUDIO=1`, redirecting stderr to a file. The trace
+records queue format, native handle, total allocated buffers/bytes, entry into
+start/stop/reset/dispose, and completion status. It does not log PCM data.
+The missing callback translation is a confirmed defect; its connection to the
+intermittent caulk allocator assertion remains unproven.
+
+`make test-guest-dyld` checks real i386 callbacks through a native AudioUnit
+without opening the microphone, repeated callback replacement, eight-byte
+property sizes, guarded outputs, OpenAL failed-open cleanup, and SIGILL from
+both host and guest instructions. It also repeatedly starts/stops queues with
+the reported 128 buffers of 1024 silent bytes, stereo 44100 Hz/16-bit PCM.
+These regression checks are not a substitute for repeated in-game map loads
+on the affected machine.
+
+### September 7 crash-log follow-up
+
+[Issue #7](https://github.com/Yash-Singh1/lego-mac-compat/issues/7) says the
+French reporter crashes at launch; it has no further reproduction steps.
+The report's loader UUID `6745ccbf-1383-3ff7-9adc-1e66f7ab174b` matches the
+published dev.2 converter's loader. It is from `MacBookAir10,1` on macOS 27.0
+build `26A5425a`. This is a different immediate failure from the caulk report.
+
+With the current Steam Mac engine and dev.2's module placement, guest RIP
+`0x7131e77d` resolves to `engine.dylib+0x31d77d`, the `ud2` at the end of
+`Sys_Error_Internal`. The saved EDI `0x7131e631` also matches that function's
+PIC anchor. Immediately before the trap the engine prints
+`##### Sys_Error: %s` and flushes stdout. The trap is deliberate; this does
+not identify the earlier error or establish an unsupported CPU instruction.
+The `.ips` contains neither that message nor the stack buffer holding it.
+
+Finder logging now captures stdout as well as stderr, and this particular
+fatal message is mirrored into the diagnostic log even for Terminal launches.
+Every session records macOS version/build, hardware model, and loader UUID.
+Each run gets its own file so another launch cannot truncate it. Retention
+keeps ten recent runs and skips files whose producing process is still alive.
+`LP32_LOG_DIR` redirects diagnostics into a supplied directory for isolated
+tests. Ordinary Terminal streams remain attached to their existing pipes;
+collect full Terminal output separately if detailed tracing is enabled.
+
+The audio reporter's ZIP distinguishes a dev.2 `.ips`, a patched dev.2 crash
+dump, an older patched crashing terminal run, and a successful patched dev.2
+run. The successful run rejects the malformed voice-input callback. Treat
+these as separate observations, not a controlled comparison of one change.
+The older crashing log creates exactly one output queue, allocates 128 buffers
+of 1024 bytes, and traps on its second start, after three consecutive immediate
+stops. It does not show repeated queue creation leaking handles. The clean log
+uses one queue, starts it ten times, and eventually frees its buffers and
+disposes it successfully.
+
+The caulk dump confirms the native instruction is an explicit `ud2`. With
+the matching caulk UUID `346531c7-e1c9-3570-91c0-972ab4dc0f11`, the preceding
+code reads the size from `rsi+24`; the supplied dump shows zero there. For the
+`0x8040` request, subtracting the request and 32-byte header produces the
+reported negative remainder `-0x8060`. This establishes invalid allocator
+state, but the dump cannot establish who produced it. Zero bytes alone do not
+prove memory was never written. Nor does re-enqueueing a buffer inside its
+AudioQueue completion callback constitute misuse: Apple's AudioQueue header
+explicitly permits it. The supplied silent/deferred callback experiments have
+not been incorporated as a production fix.
+
+The guest audio stress fixture now includes consecutive immediate stops and
+restarting the emptied queue, as well as filled-queue restarts. The logging
+fixture checks Finder output, fatal-error text, simultaneous launches, bounded
+history, unrelated-file preservation, and unchanged Terminal redirection.

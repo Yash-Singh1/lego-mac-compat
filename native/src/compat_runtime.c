@@ -47,6 +47,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <wchar.h>
+#include <wctype.h>
 #include <uuid/uuid.h>
 
 extern uint32_t run_compat32(uint32_t eip, uint32_t esp, uint16_t cs32);
@@ -210,7 +211,8 @@ static bool guest_heap_poison;
 static bool guest_heap_trace;
 static bool timing_trace;
 static uint64_t guest_heap_report_swap_interval = 600;
-static uint32_t guest_errno_address;
+static uint32_t guest_errno_address; /* Legacy global _errno import. */
+static _Thread_local uint32_t guest_thread_errno_address;
 static _Thread_local char *guest_strtok_state;
 static uint32_t guest_pthread_next_key;
 static _Thread_local uint32_t guest_pthread_values[128];
@@ -3080,7 +3082,7 @@ uint32_t *lp32_adjust_import_stack(uint32_t *stack)
     return stack;
 }
 
-uint64_t lp32_dispatch_import(uint32_t import_id, const uint32_t *arguments,
+static uint64_t dispatch_import_body(uint32_t import_id, const uint32_t *arguments,
                               uint32_t return_address)
 {
     /* Never mode-switch, allocate, or lock from an asynchronous native signal
@@ -3140,6 +3142,20 @@ uint64_t lp32_dispatch_import(uint32_t import_id, const uint32_t *arguments,
                 (unsigned long long)pthread_mach_thread_np(pthread_self()),
                 return_address, arguments[0], arguments[1], arguments[2]);
     }
+    return result;
+}
+
+uint64_t lp32_dispatch_import(uint32_t import_id, const uint32_t *arguments,
+                              uint32_t return_address)
+{
+    /* __error() exposes writable guest storage. Synchronize both directions
+       at the boundary so errno=0 before wcstoul works, cached errno pointers
+       observe ERANGE, and one guest thread cannot overwrite another's errno. */
+    uint32_t cell = guest_thread_errno_address ? guest_thread_errno_address : guest_errno_address;
+    if (cell) errno = *(int *)(uintptr_t)cell;
+    uint64_t result = dispatch_import_body(import_id, arguments, return_address);
+    cell = guest_thread_errno_address ? guest_thread_errno_address : guest_errno_address;
+    if (cell) *(int *)(uintptr_t)cell = errno;
     return result;
 }
 
@@ -3624,7 +3640,45 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
     if (import_is(name, "_wcsstr")) return (uint32_t)(uintptr_t)wcsstr((const wchar_t *)(uintptr_t)arguments[0], (const wchar_t *)(uintptr_t)arguments[1]);
     if (import_is(name, "_wcsncat")) return (uint32_t)(uintptr_t)wcsncat((wchar_t *)(uintptr_t)arguments[0], (const wchar_t *)(uintptr_t)arguments[1], arguments[2]);
     if (import_is(name, "_wcscoll")) return (uint32_t)wcscoll((const wchar_t *)(uintptr_t)arguments[0], (const wchar_t *)(uintptr_t)arguments[1]);
-    if (import_is(name, "_wcstod") || import_is(name, "_wcstof") || import_is(name, "_wcstol")) {
+    if (import_is(name, "_wcsdup")) {
+        const wchar_t *input = (const void *)(uintptr_t)arguments[0];
+        size_t count = wcslen(input) + 1;
+        uint32_t copy = compat_runtime32_allocate(count * sizeof(wchar_t), 0);
+        if (copy) wmemcpy((void *)(uintptr_t)copy, input, count);
+        return copy;
+    }
+    if (import_is(name, "_wcspbrk")) return (uint32_t)(uintptr_t)wcspbrk((const wchar_t *)(uintptr_t)arguments[0], (const wchar_t *)(uintptr_t)arguments[1]);
+    if (import_is(name, "_wcsspn")) return (uint32_t)wcsspn((const wchar_t *)(uintptr_t)arguments[0], (const wchar_t *)(uintptr_t)arguments[1]);
+    if (import_is(name, "_wcscspn")) return (uint32_t)wcscspn((const wchar_t *)(uintptr_t)arguments[0], (const wchar_t *)(uintptr_t)arguments[1]);
+    if (import_is(name, "_wcscasecmp")) return (uint32_t)wcscasecmp((const wchar_t *)(uintptr_t)arguments[0], (const wchar_t *)(uintptr_t)arguments[1]);
+    if (import_is(name, "_wcsncasecmp")) return (uint32_t)wcsncasecmp((const wchar_t *)(uintptr_t)arguments[0], (const wchar_t *)(uintptr_t)arguments[1], arguments[2]);
+    if (import_is(name, "_iswalnum")) return (uint32_t)iswalnum((wint_t)arguments[0]);
+    if (import_is(name, "_iswalpha")) return (uint32_t)iswalpha((wint_t)arguments[0]);
+    if (import_is(name, "_iswblank")) return (uint32_t)iswblank((wint_t)arguments[0]);
+    if (import_is(name, "_iswcntrl")) return (uint32_t)iswcntrl((wint_t)arguments[0]);
+    if (import_is(name, "_iswdigit")) return (uint32_t)iswdigit((wint_t)arguments[0]);
+    if (import_is(name, "_iswgraph")) return (uint32_t)iswgraph((wint_t)arguments[0]);
+    if (import_is(name, "_iswlower")) return (uint32_t)iswlower((wint_t)arguments[0]);
+    if (import_is(name, "_iswprint")) return (uint32_t)iswprint((wint_t)arguments[0]);
+    if (import_is(name, "_iswpunct")) return (uint32_t)iswpunct((wint_t)arguments[0]);
+    if (import_is(name, "_iswspace")) return (uint32_t)iswspace((wint_t)arguments[0]);
+    if (import_is(name, "_iswupper")) return (uint32_t)iswupper((wint_t)arguments[0]);
+    if (import_is(name, "_iswxdigit")) return (uint32_t)iswxdigit((wint_t)arguments[0]);
+    if (import_is(name, "_iswascii")) return (uint32_t)iswascii((wint_t)arguments[0]);
+    if (import_is(name, "_iswhexnumber")) return (uint32_t)iswhexnumber((wint_t)arguments[0]);
+    if (import_is(name, "_iswideogram")) return (uint32_t)iswideogram((wint_t)arguments[0]);
+    if (import_is(name, "_iswnumber")) return (uint32_t)iswnumber((wint_t)arguments[0]);
+    if (import_is(name, "_iswphonogram")) return (uint32_t)iswphonogram((wint_t)arguments[0]);
+    if (import_is(name, "_iswrune")) return (uint32_t)iswrune((wint_t)arguments[0]);
+    if (import_is(name, "_iswspecial")) return (uint32_t)iswspecial((wint_t)arguments[0]);
+    if (import_is(name, "_towlower")) return (uint32_t)towlower((wint_t)arguments[0]);
+    if (import_is(name, "_towupper")) return (uint32_t)towupper((wint_t)arguments[0]);
+    if (import_is(name, "_wctype")) return (uint32_t)wctype((const char *)(uintptr_t)arguments[0]);
+    if (import_is(name, "_wctrans")) return (uint32_t)wctrans((const char *)(uintptr_t)arguments[0]);
+    if (import_is(name, "_iswctype")) return (uint32_t)iswctype((wint_t)arguments[0], (wctype_t)arguments[1]);
+    if (import_is(name, "_towctrans")) return (uint32_t)towctrans((wint_t)arguments[0], (wctrans_t)arguments[1]);
+    if (import_is(name, "_wcstod") || import_is(name, "_wcstof") || import_is(name, "_wcstol") ||
+        import_is(name, "_wcstoul") || import_is(name, "_wcstoll") || import_is(name, "_wcstoull")) {
         const wchar_t *input = (const void *)(uintptr_t)arguments[0];
         wchar_t *end = NULL;
         uint64_t result;
@@ -3633,7 +3687,24 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
             if (value > INT32_MAX) { value = INT32_MAX; errno = ERANGE; }
             if (value < INT32_MIN) { value = INT32_MIN; errno = ERANGE; }
             result = (uint32_t)value;
-        } else if (import_is(name, "_wcstof")) result = return_guest_float(wcstof(input, &end));
+        } else if (import_is(name, "_wcstoul")) {
+            /* Host unsigned long is 64 bits. Parse the magnitude before
+               applying the sign: -1 is valid ULONG_MAX in the i386 ABI,
+               but -4294967296 must report ERANGE, not silently wrap. */
+            const wchar_t *digits = input;
+            while (iswspace(*digits)) ++digits;
+            bool negative = *digits == L'-';
+            if (*digits == L'-' || *digits == L'+') ++digits;
+            unsigned long long magnitude;
+            if (*digits == L'+' || *digits == L'-' || iswspace(*digits)) {
+                magnitude = 0; end = (wchar_t *)digits;
+            } else magnitude = wcstoull(digits, &end, (int)arguments[2]);
+            if (end == digits) { end = (wchar_t *)input; result = 0; }
+            else if (magnitude > UINT32_MAX) { result = UINT32_MAX; errno = ERANGE; }
+            else result = negative ? 0u - (uint32_t)magnitude : (uint32_t)magnitude;
+        } else if (import_is(name, "_wcstoll")) result = (uint64_t)wcstoll(input, &end, (int)arguments[2]);
+        else if (import_is(name, "_wcstoull")) result = wcstoull(input, &end, (int)arguments[2]);
+        else if (import_is(name, "_wcstof")) result = return_guest_float(wcstof(input, &end));
         else result = return_guest_double(wcstod(input, &end));
         if (arguments[1]) *(uint32_t *)(uintptr_t)arguments[1] = (uint32_t)(uintptr_t)end;
         return result;
@@ -3795,6 +3866,7 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         return __atomic_compare_exchange_n((uint64_t *)(uintptr_t)arguments[4], &expected, desired,
                                             false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
     }
+    if (import_is(name, "_atoll")) return (uint64_t)atoll((const char *)(uintptr_t)arguments[0]);
     if (import_is(name, "_atol")) return (uint32_t)strtol((const char *)(uintptr_t)arguments[0], NULL, 10);
     if (import_is(name, "_strtol") || import_is(name, "_strtoul")) {
         char *end = NULL;
@@ -4448,13 +4520,23 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
                     return_address, format, scratch);
         }
         if (!temporary && scratch != destination && destination) strcpy(destination, scratch);
-        if (temporary && formatted >= 0) fputs(scratch, stdout);
+        if (temporary && formatted >= 0) {
+            fputs(scratch, stdout);
+            /* Source deliberately executes ud2 after printing a fatal error.
+               Preserve the reason even when stdout belongs to a Terminal pipe. */
+            if (diagnostic_sink && strstr(scratch, "##### Sys_Error:")) {
+                diagnostic_sink(scratch);
+                diagnostic_sink("\n");
+            }
+        }
         if (scratch != destination) free(scratch);
         return (uint32_t)formatted;
     }
-    if (import_is(name, "_swscanf")) {
+    if (import_is(name, "_swscanf") || import_is(name, "_vswscanf")) {
+        const uint32_t *values = import_is(name, "_vswscanf") ?
+            (const void *)(uintptr_t)arguments[2] : arguments + 2;
         return (uint32_t)guest_vwscan((const wchar_t *)(uintptr_t)arguments[0],
-            (const wchar_t *)(uintptr_t)arguments[1], arguments + 2);
+            (const wchar_t *)(uintptr_t)arguments[1], values);
     }
     if (import_is(name, "_sscanf")) {
         const char *input = (const void *)(uintptr_t)arguments[0];
@@ -4683,9 +4765,13 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         return (uint64_t)(divide ? dividend / divisor : dividend % divisor);
     }
     if (import_is(name, "___error")) {
-        if (!guest_errno_address) guest_errno_address = guest_allocate(4, true);
-        if (guest_errno_address) *(int *)(uintptr_t)guest_errno_address = errno;
-        return guest_errno_address;
+        if (!guest_thread_errno_address) {
+            int value = errno;
+            guest_thread_errno_address = guest_allocate(sizeof(int), true);
+            if (guest_thread_errno_address) *(int *)(uintptr_t)guest_thread_errno_address = value;
+            errno = value;
+        }
+        return guest_thread_errno_address;
     }
     if (import_is(name, "_UpTime")) return mach_absolute_time();
     if (import_is(name, "_AbsoluteToNanoseconds") || import_is(name, "_NanosecondsToAbsolute")) {

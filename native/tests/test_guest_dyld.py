@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Build tiny original i386 fixtures with Apple's linker; no game/old SDK needed."""
 import os
+import signal
 from pathlib import Path
 import struct
 import subprocess
 import tempfile
+import time
 
 NATIVE = Path(__file__).resolve().parents[1]
 LOADER = NATIVE / "build/game_loader"
@@ -27,6 +29,7 @@ exports:
     symbols: [
       _NewTimerUPP, _DisposeTimerUPP, _InstallTimeTask, _PrimeTime, _PrimeTimeTask, _RemoveTimeTask,
       _NewSndCallBackUPP, _DisposeSndCallBackUPP, _SndNewChannel, _SndDisposeChannel, _SndDoCommand, _SndDoImmediate, _SndChannelStatus, _OTAtomicAdd32,
+      _wcstoul, _wcstoll, _wcstoull, _wcsdup, _wcspbrk, _wcsspn, _wcscspn, _wcscasecmp, _wcsncasecmp, _atoll, _vswscanf, _iswalnum, _iswalpha, _iswblank, _iswcntrl, _iswdigit, _iswgraph, _iswlower, _iswprint, _iswpunct, _iswspace, _iswupper, _iswxdigit, _towlower, _towupper, _iswctype, _wctype, _towctrans, _wctrans, ___error,
       _wcsstr, _wcsrchr, _wcsncat, _wcscoll, _wcstod, _wcstof, _wcstol, _swscanf, _strtoull, _strtoll, _getenv, _bootstrap_look_up, _bootstrap_port, _mach_task_self_, _mach_port_allocate,
       _mach_port_type, _mach_port_deallocate, _mach_port_mod_refs, _mach_msg, _kill, _kill$UNIX2003,
       _opendir$INODE64, _readdir$INODE64, _readdir_r, _closedir, _closedir$UNIX2003, _setlocale, _vswprintf, _swprintf, _wcscmp, _strlen,
@@ -38,6 +41,9 @@ exports:
       _pthread_create_suspended_np, _pthread_mach_thread_np, _thread_resume, _pthread_join, _pthread_join$UNIX2003, _usleep,
       _usleep$UNIX2003, _GetCurrentProcess, _AudioObjectGetPropertyData, _AudioQueueNewOutput, _AudioQueueAddPropertyListener, _AudioQueueAllocateBuffer, _AudioQueueSetParameter, _AudioQueueGetParameter,
       _AudioQueueEnqueueBuffer, _AudioQueueStart, _AudioQueueStop, _AudioQueueRemovePropertyListener, _AudioQueueFreeBuffer, _AudioQueueDispose,
+      _FindNextComponent, _OpenAComponent, _CloseComponent, _AudioUnitSetProperty, _AudioUnitGetProperty, _AudioUnitGetPropertyInfo,
+      _AudioUnitInitialize, _AudioUnitUninitialize, _AudioUnitRender, _alcCaptureOpenDevice, _alcCaptureCloseDevice, _alcGetError,
+      _printf, _fflush,
       _strcmp, _lp32_unavailable, _stat, _stat$INODE64, _open$UNIX2003, _open,
       _close, _close$UNIX2003, _lseek, _scandir, _alphasort, _free,
       _sigaction, _raise, _getpid, _iconv_open, _iconv, _iconv_close,
@@ -107,6 +113,7 @@ extern int check_mach_ipc(void);
 extern int check_steam(void);
 extern int check_wide_scan(void);
 extern int check_audio_threads(void);
+extern int check_audio_unit(void);
 extern int check_sound_manager(void);
 extern int check_time_manager(void);
 extern int MPCreateCriticalRegion(void **);
@@ -131,6 +138,11 @@ __attribute__((constructor)) static void initialize(void) {
     ++count;
 }
 int LauncherMain(void) {
+    if (getenv("LP32_FIXTURE_SIGILL")) {
+        printf("\\n ##### Sys_Error: %s", "diagnostic fixture fatal reason");
+        fflush(NULL);
+        __asm__ volatile("ud2");
+    }
     if (!strcmp || lp32_unavailable) return -4;
     unsigned missing_service = 123;
     if (!bootstrap_port || !bootstrap_look_up(bootstrap_port,
@@ -139,6 +151,7 @@ int LauncherMain(void) {
     int steam_error = check_steam(); if (steam_error) return steam_error;
     int ipc_error = check_mach_ipc(); if (ipc_error) return ipc_error;
     int context_error = check_context(); if (context_error) return context_error;
+    int unit_error = check_audio_unit(); if (unit_error) return unit_error;
     int audio_error = check_audio_threads(); if (audio_error) return audio_error;
     int timer_error = check_time_manager(); if (timer_error) return timer_error;
     int sound_error = check_sound_manager(); if (sound_error) return sound_error;
@@ -346,7 +359,7 @@ int check_directory(void) {
                 "-L" + str(root / "bin"), "-lfixture_dep", "-o", str(root / "bin/libfixture_reexport.dylib"))
             dependency = "fixture_reexport"
         run(*flags, "-dynamiclib", "-Wl,-install_name,@loader_path/launcher.dylib",
-            str(root / "launcher.c"), str(root / "many_imports.c"), str(NATIVE / "tests/fixtures/font.c"), str(NATIVE / "tests/fixtures/context.c"), str(NATIVE / "tests/fixtures/mach_ipc.c"), str(NATIVE / "tests/fixtures/steam_guest.c"), str(NATIVE / "tests/fixtures/wide_scan.c"), str(NATIVE / "tests/fixtures/audio_threads.c"), str(NATIVE / "tests/fixtures/sound_manager.c"), str(NATIVE / "tests/fixtures/time_manager.c"), str(root / "directory.o"), "-L" + str(root / "bin"), "-l" + dependency,
+            str(root / "launcher.c"), str(root / "many_imports.c"), str(NATIVE / "tests/fixtures/font.c"), str(NATIVE / "tests/fixtures/context.c"), str(NATIVE / "tests/fixtures/mach_ipc.c"), str(NATIVE / "tests/fixtures/steam_guest.c"), str(NATIVE / "tests/fixtures/wide_scan.c"), str(NATIVE / "tests/fixtures/audio_threads.c"), str(NATIVE / "tests/fixtures/audio_unit.c"), str(NATIVE / "tests/fixtures/sound_manager.c"), str(NATIVE / "tests/fixtures/time_manager.c"), str(root / "directory.o"), "-L" + str(root / "bin"), "-l" + dependency,
             "-o", str(root / "bin/launcher.dylib"))
         run(*flags, "-Wl,-e,_start,-no_pie", str(root / "start.S"), "-o", str(root / "portal2_osx"))
         # Exercise universal i386 selection on a real generated dylib.
@@ -366,8 +379,58 @@ int check_directory(void) {
         malformed = bytearray(thin)
         struct.pack_into("<I", malformed, 20, 0xFFFFFFFF)
         (root / "bin/broken.dylib").write_bytes(malformed)
-        environment = dict(os.environ, LP32_GAME="portal2", LP32_DYLD_SELFTEST="1",
-                           LP32_DYLD_FIXTURE_SELFTEST="1", LP32_STEAM_FIXTURE=str(root / "steamclient.dylib"))
+        environment = dict(os.environ, LP32_GAME="portal2", LP32_MUTE_AUDIO="1", LP32_DYLD_SELFTEST="1",
+                           LP32_DYLD_FIXTURE_SELFTEST="1", LP32_LOG_DIR=str(root / "logs"),
+                           LP32_STEAM_FIXTURE=str(root / "steamclient.dylib"))
+        if version == "10.5" and address == 0:
+            logs = root / "logs"
+            logs.mkdir()
+            (logs / "last-run.log").write_text("legacy log retained\n")
+            (logs / "user-note.log").write_text("keep this unrelated file\n")
+            command = ["arch", "-x86_64", str(LOADER), str(root / "portal2_osx")]
+            log_env = dict(environment, LP32_LOG_SELFTEST="1")
+            # Finder discards both streams; the session must capture both.
+            run(*command, env=log_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            assert (logs / "previous-run.log").read_text() == "legacy log retained\n"
+            latest = (logs / "last-run.log").read_text()
+            assert "diagnostic fixture stdout" in latest and "diagnostic fixture stderr" in latest
+            assert "loader-uuid=" in latest and "build=" in latest
+            # A second launch must not truncate the log an existing process owns.
+            held = subprocess.Popen(command, env=dict(log_env, LP32_LOG_SELFTEST="wait"),
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                deadline = time.monotonic() + 10
+                while True:
+                    held_logs = list(logs.glob(f"run-*-{held.pid}.log"))
+                    if held_logs and "diagnostic fixture stdout" in held_logs[0].read_text(): break
+                    assert time.monotonic() < deadline, "log self-test did not start"
+                    time.sleep(0.01)
+                first_text = held_logs[0].read_text()
+                # Exercise retention while the first process is still alive.
+                for _ in range(12):
+                    run(*command, env=log_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                assert held_logs[0].read_text() == first_text
+                held.communicate(b"x", timeout=10)
+                assert held.returncode == 0 and "diagnostic fixture done" in held_logs[0].read_text()
+            finally:
+                if held.poll() is None:
+                    held.kill(); held.wait()
+            # Terminal output remains attached to the caller's pipes.
+            terminal = run(*command, env=log_env, capture_output=True, text=True)
+            assert "diagnostic fixture stdout" in terminal.stdout and "diagnostic fixture stderr" in terminal.stderr
+            assert len(list(logs.glob("run-*.log"))) == 10
+            assert (logs / "user-note.log").read_text() == "keep this unrelated file\n"
+            print("Persistent logs: PASS (Finder stdout/stderr, concurrent runs, retention, Terminal pipes)")
+            for mode in ("host", "guest"):
+                crash_env = dict(environment)
+                crash_env["LP32_CRASH_DIAGNOSTIC_SELFTEST" if mode == "host" else "LP32_FIXTURE_SIGILL"] = "SIGILL"
+                crashed = subprocess.run(["arch", "-x86_64", str(LOADER), str(root / "portal2_osx")],
+                    env=crash_env, capture_output=True, text=True, timeout=30)
+                assert crashed.returncode == -signal.SIGILL, (mode, crashed.returncode, crashed.stderr)
+                assert "compat32: signal 4 " in crashed.stderr and "crash rax=" in crashed.stderr, crashed.stderr
+                if mode == "guest":
+                    assert "##### Sys_Error: diagnostic fixture fatal reason" in (logs / "last-run.log").read_text()
+            print("SIGILL diagnostics: PASS (host and i386 guest; default signal termination preserved)")
         run("arch", "-x86_64", str(LOADER), str(root / "portal2_osx"), env=environment)
         # Re-run the same real i386 code under the newer Mac depot layout.
         # The launcher's explicit bin/ paths must find libraries in osx32 too.

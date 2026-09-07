@@ -6,13 +6,17 @@ extern int GetCurrentProcess(void *);
 #include <stdint.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
 
 static volatile int worker_ran, returned_buffer, listener_ran;
+static int *worker_errno;
 static AudioQueueRef expected_queue;
 static AudioQueueBufferRef expected_buffer;
 
 static void *worker(void *info)
 {
+    worker_errno = &errno;
+    *worker_errno = EACCES;
     worker_ran = (uintptr_t)info == 0x12345 ? 1 : -1;
     return (void *)0x56789;
 }
@@ -26,6 +30,43 @@ static void state_changed(void *info, AudioQueueRef q, AudioQueuePropertyID prop
     if ((uintptr_t)info != 0x987 || q != expected_queue || property != kAudioQueueProperty_IsRunning)
         listener_ran = -100;
     else ++listener_ran;
+}
+
+static volatile int burst_error;
+static void burst_done(void *info, AudioQueueRef queue, AudioQueueBufferRef buffer)
+{
+    if (info != (void *)0xbeef || !queue || !buffer || !buffer->mAudioData ||
+        buffer->mAudioDataBytesCapacity != 1024 || buffer->mAudioDataByteSize > 1024)
+        burst_error = 1;
+}
+
+static int check_map_load_queues(const AudioStreamBasicDescription *format)
+{
+    /* The report's exact allocation shape, inside the loader rather than a
+       standalone native reproducer. PCM is zero throughout (silent). */
+    for (int cycle = 0; cycle < 3; ++cycle) {
+        AudioQueueRef queue = NULL;
+        AudioQueueBufferRef buffers[128];
+        if (AudioQueueNewOutput(format, burst_done, (void *)0xbeef, NULL, NULL, 0, &queue)) return -276;
+        for (int i = 0; i < 128; ++i) {
+            if (AudioQueueAllocateBuffer(queue, 1024, &buffers[i])) return -277;
+            memset(buffers[i]->mAudioData, 0, 1024);
+            buffers[i]->mAudioDataByteSize = 1024;
+        }
+        for (int burst = 0; burst < 8; ++burst) {
+            for (int i = 0; i < 128; ++i)
+                if (AudioQueueEnqueueBuffer(queue, buffers[i], 0, NULL)) return -278;
+            if (AudioQueueStart(queue, NULL)) return -279;
+            usleep(5000);
+            if (AudioQueueStop(queue, true) || AudioQueueStop(queue, true) ||
+                AudioQueueStop(queue, true) || burst_error) return -280;
+            /* Source also restarts the same queue after multiple immediate
+               stops, before its mixer has re-enqueued the returned buffers. */
+            if (AudioQueueStart(queue, NULL) || AudioQueueStop(queue, true)) return -282;
+        }
+        if (AudioQueueDispose(queue, true)) return -281;
+    }
+    return 0;
 }
 
 int check_audio_threads(void)
@@ -42,6 +83,8 @@ int check_audio_threads(void)
     if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &address, 0, NULL, &size, &device.id) !=
         kAudioHardwareUnknownPropertyError || device.guard != 0x1234abcd) return -222;
     worker_ran = returned_buffer = listener_ran = 0;
+    errno = EDOM;
+    int *main_errno = &errno;
     struct { pthread_t thread; uint32_t guard; } t = {0, 0x12345678};
     if (pthread_create_suspended_np(&t.thread, NULL, worker, (void *)0x12345)) return -200;
     usleep(10000);
@@ -50,7 +93,8 @@ int check_audio_threads(void)
     if (!port || thread_resume(port)) return -202;
     struct { void *value; uint32_t guard; } joined = {0, 0x87654321};
     if (pthread_join(t.thread, &joined.value) || worker_ran != 1 ||
-        joined.value != (void *)0x56789 || joined.guard != 0x87654321) return -203;
+        joined.value != (void *)0x56789 || joined.guard != 0x87654321 ||
+        worker_errno == main_errno || !worker_errno || *worker_errno != EACCES) return -203;
 
     AudioStreamBasicDescription format = {44100, kAudioFormatLinearPCM,
         kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked, 4, 1, 4, 2, 16, 0};
@@ -81,5 +125,5 @@ int check_audio_threads(void)
         if (AudioQueueNewOutput(&format, buffer_done, NULL, NULL, NULL, 0, &output.queue) ||
             AudioQueueDispose(output.queue, true)) return -216;
     }
-    return 0;
+    return check_map_load_queues(&format);
 }

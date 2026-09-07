@@ -13,5 +13,7 @@
     <key>LSApplicationCategoryType</key><string>public.app-category.games</string>
     <key>NSHighResolutionCapable</key><false/>
     <key>NSPrincipalClass</key><string>NSApplication</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Portal 2 uses the microphone for in-game voice chat.</string>
 </dict>
 </plist>

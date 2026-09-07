@@ -5,6 +5,8 @@
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <stdio.h>
+#include <time.h>
 #include <string.h>
 
 /* AudioQueueBuffer contains pointers, so neither it nor its native audio data
@@ -36,6 +38,27 @@ struct queue {
 enum { QUEUE_BASE = 0xff800001u, QUEUE_COUNT = 64 };
 static struct queue queues[QUEUE_COUNT];
 static pthread_mutex_t queue_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static bool trace_audio_queue(void)
+{
+    return getenv("LP32_TRACE_AUDIO") != NULL;
+}
+
+static void trace_queue_operation(const char *name, struct queue *q)
+{
+    if (!trace_audio_queue()) return;
+    unsigned count = 0;
+    size_t bytes = 0;
+    pthread_mutex_lock(&queue_lock);
+    for (struct queue_buffer *b = q->buffers; b; b = b->next) {
+        ++count; bytes += b->host->mAudioDataBytesCapacity;
+    }
+    fprintf(stderr, "compat32: %s begin t=%.6f queue=0x%08x host=%p buffers=%u bytes=%zu\n",
+        name + 1, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9, q->handle,
+        (void *)q->host, count, bytes);
+    pthread_mutex_unlock(&queue_lock);
+    fflush(stderr);
+}
 
 static void output_ready(void *context, AudioQueueRef host, AudioQueueBufferRef buffer)
 {
@@ -98,6 +121,13 @@ int audio_queue_bridge32_dispatch(const char *name, const uint32_t *a, uint64_t 
         }
         pthread_mutex_unlock(&queue_lock);
         if (!q) { status = -108; goto done; }
+        if (trace_audio_queue()) {
+            const AudioStreamBasicDescription *f = PTR(0);
+            fprintf(stderr, "compat32: AudioQueueNewOutput begin queue=0x%08x rate=%.3f format=0x%x flags=0x%x channels=%u bits=%u bytes/frame=%u frames/packet=%u\n",
+                q->handle, f->mSampleRate, f->mFormatID, f->mFormatFlags,
+                f->mChannelsPerFrame, f->mBitsPerChannel, f->mBytesPerFrame, f->mFramesPerPacket);
+            fflush(stderr);
+        }
         status = AudioQueueNewOutput(PTR(0), output_ready, q,
             a[3] ? objc_bridge32_host_object(a[3]) : NULL,
             a[4] ? objc_bridge32_host_object(a[4]) : NULL, a[5], &q->host);
@@ -108,6 +138,8 @@ int audio_queue_bridge32_dispatch(const char *name, const uint32_t *a, uint64_t 
     unsigned index = a[0] - QUEUE_BASE;
     struct queue *q = index < QUEUE_COUNT && queues[index].used ? &queues[index] : NULL;
     if (!q || !q->host) goto done;
+    if (IS("Start") || IS("Stop") || IS("Reset") || IS("Dispose"))
+        trace_queue_operation(name, q);
     if (IS("AllocateBuffer") || IS("AllocateBufferWithPacketDescriptions")) {
         bool packets = IS("AllocateBufferWithPacketDescriptions");
         unsigned out = packets ? 3 : 2;
@@ -220,6 +252,11 @@ int audio_queue_bridge32_dispatch(const char *name, const uint32_t *a, uint64_t 
         } else { pthread_mutex_lock(&queue_lock); q->disposing = false; pthread_mutex_unlock(&queue_lock); }
     } else return 0;
 done:
+    if (status || (trace_audio_queue() && (IS("NewOutput") || IS("Start") ||
+        IS("Stop") || IS("Reset") || IS("Dispose")))) {
+        fprintf(stderr, "compat32: %s end arg0=0x%08x status=%d\n", name + 1, a[0], (int)status);
+        fflush(stderr);
+    }
     *result = (uint32_t)status;
     return 1;
 #undef IS

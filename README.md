@@ -42,12 +42,18 @@ choose a specific version folder; ambiguous downloads are not mixed.
 Steam copies require Steam to be running and signed in to an account that owns
 Portal 2. The loader bridges the game's 32-bit Steam interfaces to the installed
 64-bit Steam client. It does not remove ownership or authentication checks.
-Folder support is available in
-[Portal 2 Converter 0.0.0-dev.2](https://github.com/Yash-Singh1/lego-mac-compat/releases/tag/portal2-converter-v0.0.0-dev.2)
-and when building the converter from this branch. The older dev.1 release
-accepts app bundles only.
+Download
+[Portal 2 Converter 0.0.0-dev.3](https://github.com/Yash-Singh1/lego-mac-compat/releases/tag/portal2-converter-v0.0.0-dev.3)
+or build the converter from this branch. Folder support requires dev.2 or
+newer; the older dev.1 release accepts app bundles only.
 The supplied depot build has been checked through the opening single-player
 room. Full playthrough and online features remain unverified.
+
+Dev.3 fixes audio callback structure conversion and adds missing libc/OpenAL
+capture support. It also preserves fatal-error messages and recent logs in
+`~/Library/Logs/Portal2Compat/`. The reported intermittent Core Audio allocator
+crash remains under investigation; this release is not a confirmed fix for it.
+Real microphone capture and in-game voice chat still need testing.
 
 The converter needs no Make, Python, Xcode, or Terminal to use. It includes the
 compiled compatibility loader and automatically downloads the required Apple
