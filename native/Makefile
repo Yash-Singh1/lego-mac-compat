@@ -286,6 +286,10 @@ test-rtti-bridge: $(BUILD_DIR)/test_rtti_bridge
 test-carbon-dispatch: $(BUILD_DIR)/game_loader
 	env LP32_CARBON_DISPATCH_SELFTEST=1 LP32_MUTE_AUDIO=1 LP32_BACKGROUND_TEST=1 LP32_NO_DIAGNOSTIC_LOG=1 arch -x86_64 ./$(BUILD_DIR)/game_loader "$(BUNDLE)/Contents/SharedSupport/$(IMAGE_NAME)"
 
+.PHONY: test-import-return
+test-import-return: $(BUILD_DIR)/game_loader
+	env LP32_IMPORT_RETURN_SELFTEST=1 LP32_NO_DIAGNOSTIC_LOG=1 arch -x86_64 ./$(BUILD_DIR)/game_loader "$(BUNDLE)/Contents/SharedSupport/$(IMAGE_NAME)"
+
 test-carbon-geometry: $(BUILD_DIR)/game_loader
 	env LP32_CARBON_GEOMETRY_SELFTEST=1 LP32_MUTE_AUDIO=1 LP32_BACKGROUND_TEST=1 LP32_NO_DIAGNOSTIC_LOG=1 arch -x86_64 ./$(BUILD_DIR)/game_loader "$(BUNDLE)/Contents/SharedSupport/$(IMAGE_NAME)"
 
@@ -377,3 +381,7 @@ $(BUILD_DIR)/test_sound_manager_bridge: tests/test_sound_manager_bridge.c src/so
 
 test-sound-manager-bridge: $(BUILD_DIR)/test_sound_manager_bridge
 	arch -x86_64 ./$(BUILD_DIR)/test_sound_manager_bridge
+
+.PHONY: test-pointer-proxy
+test-pointer-proxy: $(BUILD_DIR)/game_loader
+	env LP32_POINTER_SELFTEST=1 LP32_NO_DIAGNOSTIC_LOG=1 LP32_MUTE_AUDIO=1 arch -x86_64 ./$(BUILD_DIR)/game_loader

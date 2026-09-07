@@ -2721,6 +2721,8 @@ static uint8_t dynamic_import_stage_table[kDynamicThunkCapacity];
 static lp32_fast_import_fn *fast_import_table;
 static lp32_fast_import_fn dynamic_fast_import_table[kDynamicThunkCapacity];
 static bool fast_imports_disabled;
+static uint8_t import_return_kinds[MACHO_IMAGE32_MAX_IMPORTS];
+static uint8_t dynamic_return_kinds[kDynamicThunkCapacity];
 
 /* Per-import time accounting for LP32_FRAME_STATS (racy across threads by
    design; it is diagnostic only). */
@@ -2980,6 +2982,8 @@ int compat_runtime32_initialize(struct macho_image32 *image)
     fast_import_table = calloc(image->import_count ? image->import_count : 1,
                                sizeof(*fast_import_table));
     fast_imports_disabled = getenv("LP32_NO_FAST_IMPORTS") != NULL;
+    memset(import_return_kinds, 0, sizeof(import_return_kinds));
+    memset(dynamic_return_kinds, 0, sizeof(dynamic_return_kinds));
     const char *reuse_text = getenv("LP32_GUEST_HEAP_REUSE");
     guest_heap_reuse = !(reuse_text && strcmp(reuse_text, "0") == 0);
     guest_heap_poison = getenv("LP32_GUEST_HEAP_POISON") != NULL;
@@ -3050,11 +3054,10 @@ static const char *import_name_for_id(uint32_t import_id)
     return "<invalid import>";
 }
 
-/* Clang's i386 callers compensate for the callee popping the hidden sret
-   pointer. Older GCC ports retain their existing caller-cleanup convention. */
-uint32_t *lp32_adjust_import_stack(uint32_t *stack)
+enum import_return_kind { kReturnUnknown, kReturnOrdinary, kReturnStruct,
+                          kReturnSteamDynamic };
+static unsigned import_return_kind(const char *name)
 {
-    const char *name = import_name_for_id(stack[0]);
     if (strcmp(name, "__ZNKSt3__18ios_base6getlocEv") == 0 ||
         strcmp(name, "_CFAbsoluteTimeGetGregorianDate") == 0 ||
         strcmp(name, "_CTFontGetBoundingBox") == 0 ||
@@ -3062,8 +3065,30 @@ uint32_t *lp32_adjust_import_stack(uint32_t *stack)
         strcmp(name, "_CTFontGetBoundingRectsForGlyphs") == 0 ||
         strcmp(name, "_CTLineGetImageBounds") == 0 ||
         strcmp(name, "_CGDisplayBounds") == 0 ||
-        strcmp(name, "_objc_msgSend_stret") == 0 ||
-        steam_bridge32_call_uses_sret(name, stack + 2)) {
+        strcmp(name, "_objc_msgSend_stret") == 0) return kReturnStruct;
+    /* Steam's user-ID call selects its ABI from the arguments and interface
+       state. Cache only that it needs a dynamic check, never its result. */
+    if (strncmp(name, "_lp32_steam_", 12) == 0) return kReturnSteamDynamic;
+    return kReturnOrdinary;
+}
+
+/* Clang's i386 callers compensate for the callee popping the hidden sret
+   pointer. Older GCC ports retain their existing caller-cleanup convention.
+   Like the fast dispatcher, memoize immutable properties by import ID: this
+   runs after every import, including thousands of ordinary GL calls/frame. */
+uint32_t *lp32_adjust_import_stack(uint32_t *stack)
+{
+    uint32_t id = stack[0], index = id & UINT32_C(0x7fffffff);
+    uint8_t *slot = id & UINT32_C(0x80000000) ?
+        (index < kDynamicThunkCapacity ? &dynamic_return_kinds[index] : NULL) :
+        (index < MACHO_IMAGE32_MAX_IMPORTS ? &import_return_kinds[index] : NULL);
+    unsigned kind = slot ? __atomic_load_n(slot, __ATOMIC_RELAXED) : kReturnUnknown;
+    if (kind == kReturnUnknown) {
+        kind = import_return_kind(import_name_for_id(id));
+        if (slot) __atomic_store_n(slot, kind, __ATOMIC_RELAXED);
+    }
+    if (kind == kReturnStruct || (kind == kReturnSteamDynamic &&
+        steam_bridge32_call_uses_sret(import_name_for_id(id), stack + 2))) {
         stack[2] = stack[1];
         return stack + 1;
     }
@@ -3083,6 +3108,75 @@ static uint64_t dispatch_import_chained(uint32_t import_id, const char *name,
         *fast_slot = handler ? handler : kFastImportNone;
     }
     return result;
+}
+
+static uint32_t *uncached_import_return_for_test(uint32_t *stack)
+{
+    const char *name = import_name_for_id(stack[0]);
+    unsigned kind = import_return_kind(name);
+    if (kind == kReturnStruct || (kind == kReturnSteamDynamic &&
+        steam_bridge32_call_uses_sret(name, stack + 2))) {
+        stack[2] = stack[1]; return stack + 1;
+    }
+    return stack;
+}
+
+int compat_runtime32_run_import_return_self_test(void)
+{
+    static const struct { const char *name; unsigned kind; } cases[] = {
+        {"__ZNKSt3__18ios_base6getlocEv", kReturnStruct},
+        {"_CFAbsoluteTimeGetGregorianDate", kReturnStruct},
+        {"_CTFontGetBoundingBox", kReturnStruct},
+        {"_CFUUIDGetUUIDBytes", kReturnStruct},
+        {"_CTFontGetBoundingRectsForGlyphs", kReturnStruct},
+        {"_CTLineGetImageBounds", kReturnStruct},
+        {"_CGDisplayBounds", kReturnStruct},
+        {"_objc_msgSend_stret", kReturnStruct},
+        {"_glDrawRangeElements", kReturnOrdinary},
+        {"_OSAtomicAdd32Barrier", kReturnOrdinary},
+        {"_objc_msgSend", kReturnOrdinary},
+        {"_lp32_steam_0_2", kReturnSteamDynamic},
+    };
+    uint32_t ordinary_id = 0;
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        if (!compat_runtime32_guest_callback(cases[i].name)) return -1;
+        uint32_t index;
+        for (index = 0; index < dynamic_symbol_count; ++index)
+            if (!strcmp(dynamic_symbol_names[index], cases[i].name)) break;
+        if (index == dynamic_symbol_count) return -1;
+        uint32_t id = UINT32_C(0x80000000) | index;
+        if (cases[i].kind == kReturnOrdinary) ordinary_id = id;
+        for (unsigned pass = 0; pass < 2; ++pass) {
+            uint32_t stack[] = {id, 0x12345678, 0x456789ab, 0xabcdefff};
+            uint32_t expected[] = {id, 0x12345678, 0x456789ab, 0xabcdefff};
+            uint32_t *adjusted = lp32_adjust_import_stack(stack);
+            uint32_t *reference = uncached_import_return_for_test(expected);
+            if ((adjusted - stack) != (reference - expected) ||
+                memcmp(stack, expected, sizeof(stack)) ||
+                dynamic_return_kinds[index] != cases[i].kind) return -1;
+            if (cases[i].kind == kReturnStruct &&
+                (adjusted != stack + 1 || stack[2] != 0x12345678)) return -1;
+            if (cases[i].kind == kReturnOrdinary && adjusted != stack) return -1;
+        }
+    }
+    /* Static Mach-O IDs use a separate table and must make the same decision. */
+    for (uint32_t i = 0; i < current_image->import_count; ++i) {
+        uint32_t a[] = {i, 123, 456, 789}, b[] = {i, 123, 456, 789};
+        if (lp32_adjust_import_stack(a) - a != uncached_import_return_for_test(b) - b ||
+            memcmp(a, b, sizeof(a))) return -1;
+    }
+    uint32_t stack[] = {ordinary_id, 0, 0, 0};
+    uint32_t *(*volatile functions[])(uint32_t *) = {
+        uncached_import_return_for_test, lp32_adjust_import_stack};
+    for (unsigned pass = 0; pass < 2; ++pass) {
+        uint64_t start = hitch_now();
+        for (unsigned i = 0; i < 1000000; ++i)
+            if (functions[pass](stack) != stack) return -1;
+        fprintf(stderr, "import-return-selftest: %s %.1f ns/call\n",
+                pass ? "cached" : "uncached", (hitch_now() - start) / 1e6);
+    }
+    puts("import-return-selftest: PASS (static/dynamic IDs, structure return stack, ordinary calls, Steam dynamic classification)");
+    return 0;
 }
 
 static uint8_t hitch_import_kinds[MACHO_IMAGE32_MAX_IMPORTS];

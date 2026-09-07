@@ -871,8 +871,39 @@ static CFStringRef format_cf_string32(CFStringRef format, const uint32_t *guest)
 }
 
 void *objc_bridge32_host_object(uint32_t token) { return object_for_argument(token); }
-uint32_t objc_bridge32_guest_pointer(void *pointer) {
-    return pointer ? proxy_for_object([NSValue valueWithPointer:pointer]) : 0;
+/* Opaque pointer handles represent an address, not ownership of the pointed-to
+ * resource. Intern their NSValue boxes: Cocoa allocates a fresh box on every
+ * valueWithPointer:, which otherwise consumes a persistent proxy per query.
+ * Address reuse is safe here because no context state or resource is cached.
+ * The table cannot fill before the shared proxy table (at most 50% load). */
+static struct { void *pointer; uint32_t token; } pointer_proxies[kProxyCapacity * 2];
+static pthread_mutex_t pointer_proxy_mutex = PTHREAD_MUTEX_INITIALIZER;
+uint32_t objc_bridge32_guest_pointer(void *pointer)
+{
+    if (!pointer) return 0;
+    uintptr_t hash = (uintptr_t)pointer;
+    hash ^= hash >> 33;
+    hash *= UINT64_C(0xff51afd7ed558ccd);
+    hash ^= hash >> 33;
+    size_t slot = hash & (kProxyCapacity * 2 - 1);
+    pthread_mutex_lock(&pointer_proxy_mutex);
+    while (pointer_proxies[slot].pointer && pointer_proxies[slot].pointer != pointer)
+        slot = (slot + 1) & (kProxyCapacity * 2 - 1);
+    uint32_t token = pointer_proxies[slot].token;
+    if (!token) {
+        NSValue *box = [[NSValue alloc] initWithBytes:&pointer objCType:@encode(void *)];
+        bool previous = creating_cf_object;
+        creating_cf_object = false; /* The box is borrowed; it owns no resource. */
+        token = proxy_for_object(box);
+        creating_cf_object = previous;
+        [box release];
+        if (token) {
+            pointer_proxies[slot].pointer = pointer;
+            pointer_proxies[slot].token = token;
+        }
+    }
+    pthread_mutex_unlock(&pointer_proxy_mutex);
+    return token;
 }
 uint32_t objc_bridge32_guest_object(void *object) { return proxy_for_object((id)object); }
 
@@ -5258,6 +5289,12 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     static uint64_t fast_##name(const uint32_t *arguments, \
                                 uint32_t return_address)
 
+FAST_GL(CGLGetCurrentContext)
+{
+    (void)arguments; (void)return_address;
+    return objc_bridge32_guest_pointer(CGLGetCurrentContext());
+}
+
 FAST_GL(glVertexAttribPointer)
 {
     (void)return_address;
@@ -5574,6 +5611,7 @@ lp32_fast_import_fn objc_bridge32_fast_import(const char *import_name)
         const char *name;
         lp32_fast_import_fn handler;
     } table[] = {
+        {"CGLGetCurrentContext", fast_CGLGetCurrentContext},
         {"glVertexAttribPointer", fast_glVertexAttribPointer},
         {"glVertexAttribPointerARB", fast_glVertexAttribPointer},
         {"glEnableVertexAttribArray", fast_glEnableVertexAttribArray},
@@ -6545,8 +6583,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CGLGetCurrentContext")) {
-        CGLContextObj context = CGLGetCurrentContext();
-        *result = context ? proxy_for_object([NSValue valueWithPointer:context]) : 0;
+        *result = fast_CGLGetCurrentContext(arguments, 0);
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CGLSetCurrentContext") ||
@@ -8642,7 +8679,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         }
         if (strcmp(selector_name, "CGLContextObj") == 0) {
             CGLContextObj context = [(NSOpenGLContext *)receiver CGLContextObj];
-            *result = context ? proxy_for_object([NSValue valueWithPointer:context]) : 0;
+            *result = objc_bridge32_guest_pointer(context);
             return 1;
         }
         if (strcmp(selector_name, "terminate:") == 0 &&
@@ -8977,6 +9014,97 @@ int objc_bridge32_run_gl_parameter_self_test(void)
     return 0;
 }
 
+static void *pointer_proxy_test_worker(void *pointer)
+{
+    uint32_t token = 0;
+    for (unsigned i = 0; i < 10000; ++i) {
+        uint32_t next = objc_bridge32_guest_pointer(pointer);
+        if (!next || (token && next != token)) return NULL;
+        token = next;
+    }
+    return (void *)(uintptr_t)token;
+}
+
+int objc_bridge32_run_pointer_self_test(void)
+{
+    @autoreleasepool {
+        if (objc_bridge32_guest_pointer(NULL)) return -1;
+        void *pointer = (void *)UINT64_C(0x123456789abcdef0);
+        pthread_t workers[4];
+        uint32_t before = proxy_count, token = 0;
+        for (unsigned i = 0; i < 4; ++i)
+            if (pthread_create(&workers[i], NULL, pointer_proxy_test_worker, pointer)) return -1;
+        for (unsigned i = 0; i < 4; ++i) {
+            void *value;
+            if (pthread_join(workers[i], &value) || !value) return -1;
+            if (token && token != (uint32_t)(uintptr_t)value) return -1;
+            token = (uint32_t)(uintptr_t)value;
+        }
+        if (proxy_count != before + 1 || [(NSValue *)object_for_receiver(token) pointerValue] != pointer) return -1;
+        /* Different addresses remain distinct, even after hash collisions. */
+        for (uintptr_t i = 1; i <= 2048; ++i) {
+            void *p = (void *)(UINT64_C(0x700000000000) + i * 4096);
+            uint32_t t = objc_bridge32_guest_pointer(p);
+            if (!t || t == token || [(NSValue *)object_for_receiver(t) pointerValue] != p) return -1;
+        }
+        before = proxy_count;
+        for (uintptr_t i = 1; i <= 2048; ++i)
+            if (!objc_bridge32_guest_pointer((void *)(UINT64_C(0x700000000000) + i * 4096))) return -1;
+        if (proxy_count != before) return -1;
+        uint64_t ignored;
+        objc_bridge32_dispatch("_CFRetain", &token, &ignored);
+        objc_bridge32_dispatch("_CFRelease", &token, &ignored);
+        if (objc_bridge32_guest_pointer(pointer) != token || [(NSValue *)object_for_receiver(token) pointerValue] != pointer) return -1;
+
+        NSOpenGLPixelFormatAttribute attrs[] = {NSOpenGLPFAAccelerated, 0};
+        NSOpenGLPixelFormat *format = [[[NSOpenGLPixelFormat alloc] initWithAttributes:attrs] autorelease];
+        NSOpenGLContext *first = [[[NSOpenGLContext alloc] initWithFormat:format shareContext:nil] autorelease];
+        NSOpenGLContext *second = [[[NSOpenGLContext alloc] initWithFormat:format shareContext:first] autorelease];
+        if (!first || !second) return -1;
+        CGLContextObj contexts[] = {first.CGLContextObj, second.CGLContextObj, NULL, first.CGLContextObj};
+        lp32_fast_import_fn fast = objc_bridge32_fast_import("_CGLGetCurrentContext");
+        if (!fast || fast != objc_bridge32_fast_import("CGLGetCurrentContext")) return -1;
+        uint32_t args[] = {0, objc_bridge32_guest_selector("CGLContextObj")};
+        uint32_t first_token = 0;
+        for (unsigned i = 0; i < 4; ++i) {
+            if (CGLSetCurrentContext(contexts[i])) return -1;
+            uint64_t value, direct = fast(NULL, 0);
+            if (!objc_bridge32_dispatch("_CGLGetCurrentContext", NULL, &value) || value != direct) return -1;
+            if (!contexts[i]) { if (direct) return -1; continue; }
+            if (i == 0) first_token = (uint32_t)direct;
+            if ((i == 1 && direct == first_token) || (i == 3 && direct != first_token)) return -1;
+            args[0] = proxy_for_object(i == 1 ? second : first);
+            if (!objc_bridge32_dispatch("_objc_msgSend", args, &value) || value != direct) return -1;
+            if ([(NSValue *)object_for_receiver((uint32_t)value) pointerValue] != contexts[i]) return -1;
+        }
+        GLuint refs = CGLGetContextRetainCount(contexts[0]);
+        before = proxy_count;
+        uint64_t start = hitch_now();
+        for (unsigned i = 0; i < 100000; ++i)
+            if (fast(NULL, 0) != first_token) return -1;
+        fprintf(stderr, "pointer-selftest: interned current-context %.1f ns/call, %u new proxies/100000 calls\n", (hitch_now() - start) / 100000.0, proxy_count - before);
+        if (proxy_count != before || CGLGetContextRetainCount(contexts[0]) != refs) return -1;
+        before = proxy_count; start = hitch_now();
+        for (unsigned i = 0; i < 1000; ++i) {
+            @autoreleasepool { if (!proxy_for_object([NSValue valueWithPointer:CGLGetCurrentContext()])) return -1; }
+        }
+        fprintf(stderr, "pointer-selftest: previous boxing %.1f ns/call, %u new proxies/1000 calls\n", (hitch_now() - start) / 1000.0, proxy_count - before);
+        CGLSetCurrentContext(NULL);
+        /* Destroying/recreating contexts must not retain resources or return a
+         * different raw address if the driver's allocator reuses an address. */
+        for (unsigned i = 0; i < 128; ++i) {
+            CGLContextObj temporary;
+            if (CGLCreateContext(format.CGLPixelFormatObj, NULL, &temporary)) return -1;
+            GLuint retain_count = CGLGetContextRetainCount(temporary);
+            uint32_t t = objc_bridge32_guest_pointer(temporary);
+            if ([(NSValue *)object_for_receiver(t) pointerValue] != temporary || CGLGetContextRetainCount(temporary) != retain_count) return -1;
+            CGLDestroyContext(temporary);
+        }
+        puts("pointer-selftest: PASS (concurrent interning, distinct addresses, ownership, context switches, direct/chained/ObjC queries, bounded repetition, resource lifetime/reuse)");
+        return 0;
+    }
+}
+
 int objc_bridge32_run_gl_buffer_self_test(void)
 {
 #pragma clang diagnostic push
@@ -9020,6 +9148,12 @@ int objc_bridge32_run_gl_buffer_self_test(void)
         return -1;
     }
 
+    uint32_t context_callback = compat_runtime32_guest_callback("_CGLGetCurrentContext");
+    uint32_t context_token = objc_bridge32_guest_pointer(context);
+    if (!context_callback || !context_token) return -1;
+    for (unsigned i = 0; i < 16; ++i)
+        if (compat_runtime32_call(context_callback, NULL, 0) != context_token) return -1;
+
     enum { kTestSize = 32 };
     unsigned char initial_a[kTestSize];
     unsigned char initial_b[kTestSize];
@@ -9033,7 +9167,7 @@ int objc_bridge32_run_gl_buffer_self_test(void)
 
     /* Both symbol spellings must use identical handlers, including names
        reached through dlsym and through a Mach-O import stub. */
-    const char *fast_names[] = {"glBindBuffer", "glBindBufferARB", "glDrawArrays",
+    const char *fast_names[] = {"CGLGetCurrentContext", "glBindBuffer", "glBindBufferARB", "glDrawArrays",
         "glDrawRangeElements", "glVertexAttribPointer", "glBindTexture",
         "glProgramEnvParameters4fvEXT", "glDepthFunc"};
     for (unsigned i = 0; i < sizeof(fast_names) / sizeof(fast_names[0]); ++i) {

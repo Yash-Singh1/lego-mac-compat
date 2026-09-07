@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <mach/mach_time.h>
 
 /* Fixed storage; no allocation, driver queries, or file writes on a draw.
  * One render-thread producer, one log writer, and a small worker-event ring.
@@ -46,7 +47,19 @@ static _Thread_local uint32_t vertex_program, fragment_program;
 static _Thread_local struct hitch_scope *active_scope;
 static _Thread_local uint64_t frame_generation;
 
-uint64_t hitch_now(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+static mach_timebase_info_data_t hitch_timebase;
+__attribute__((constructor)) static void initialize_hitch_clock(void)
+{
+    mach_timebase_info(&hitch_timebase);
+}
+uint64_t hitch_now(void)
+{
+    /* CLOCK_UPTIME_RAW uses this same clock. Rosetta's 1:1 timebase lets us
+       avoid clock_gettime's dispatch/conversion on every timed import. */
+    uint64_t ticks = mach_absolute_time();
+    if (hitch_timebase.numer == hitch_timebase.denom) return ticks;
+    return (uint64_t)((__uint128_t)ticks * hitch_timebase.numer / hitch_timebase.denom);
+}
 
 unsigned hitch_classify(const char *name)
 {

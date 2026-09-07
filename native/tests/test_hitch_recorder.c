@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 
 static uint64_t end = 1000000000ULL, swap;
 static void frame(uint64_t duration, uint64_t target, bool active)
@@ -20,6 +21,13 @@ static void *worker(void *unused)
 }
 int main(void)
 {
+    /* Keep the recorder in the same nanosecond domain as frame pacing. */
+    for (unsigned i = 0; i < 1000; ++i) {
+        uint64_t before = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        uint64_t measured = hitch_now();
+        uint64_t after = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        assert(before <= measured && measured <= after);
+    }
     assert(hitch_classify("glDrawRangeElements") == HITCH_DRAW);
     assert(hitch_classify("_glDrawArrays") == HITCH_DRAW);
     assert(hitch_classify("_glDrawBuffers") == HITCH_GL_STATE);

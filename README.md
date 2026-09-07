@@ -93,6 +93,9 @@ symbol spellings and the existing atomic-operation aliases. This removes
 dispatch overhead introduced while expanding Complete Saga support, without
 disabling that port. `make -C native GAME=marvel test-carbon-dispatch` checks
 foreign-call rejection, native export caching, and real guest atomic calls.
+Structure-return classification is also cached per import, preserving each
+profile's stack convention and Steam's argument-dependent return handling.
+`make -C native GAME=marvel test-import-return` checks static and dynamic imports.
 
 The storage repair is selected by the SDK library's UUID and a SHA-256 match
 of the entire defective routine, independently of the game profile. It keeps
@@ -142,8 +145,15 @@ byte counts, enumeration results and SDK return values also appear as
 (stderr for terminal launches), capped at 1024 lines per session. These logs
 do not contain save payloads and do not change storage behavior.
 
+The shared bridge reuses handles for repeated native pointer queries, including
+OpenGL contexts, instead of allocating a permanent handle on every query.
+`make -C native test-pointer-proxy` checks concurrent queries, context switching,
+and resource lifetime without launching a game.
+
 The recorder uses fixed memory and a background log writer, with no screenshot
-capture or GPU readback. Reports trigger above 25 ms (or 1.5 times an intentional
+capture or GPU readback. Its timestamps use the Mach uptime clock directly,
+with nanosecond conversion checked against `CLOCK_UPTIME_RAW` in the tests.
+Reports trigger above 25 ms (or 1.5 times an intentional
 frame cap, whichever is larger), with a five-second cooldown and a limit of 128
 reports per session. Inactive frames do not trigger reports. A report finishes
 after its following frames arrive; abrupt termination can lose the pending

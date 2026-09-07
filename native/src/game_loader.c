@@ -657,6 +657,9 @@ int main(int argc, char **argv)
         raise(SIGSEGV);
         return EXIT_FAILURE;
     }
+    if (getenv("LP32_POINTER_SELFTEST")) {
+        return objc_bridge32_run_pointer_self_test() == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
     if (getenv("LP32_OBJC_PROXY_SELFTEST")) {
         return objc_bridge32_run_proxy_self_test() == 0 ?
             EXIT_SUCCESS : EXIT_FAILURE;
@@ -768,6 +771,11 @@ int main(int argc, char **argv)
     }
     if (getenv("LP32_CARBON_DISPATCH_SELFTEST")) {
         int result = carbon_bridge32_run_dispatch_self_test();
+        macho_image32_unload(&image);
+        return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (getenv("LP32_IMPORT_RETURN_SELFTEST")) {
+        int result = compat_runtime32_run_import_return_self_test();
         macho_image32_unload(&image);
         return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
