@@ -11,10 +11,13 @@ Support for the original 32-bit Mac releases:
 
 | Game | Mac release | Status |
 | --- | --- | --- |
+| LEGO Star Wars: The Video Game | Aspyr, 2005; universal binary update in 2007 (initially PowerPC only) | - |
 | LEGO Star Wars II: The Original Trilogy | Aspyr, 2006 | - |
+| LEGO Indiana Jones: The Original Adventures | 2008 | - |
 | LEGO Batman: The Videogame | Feral, 2009 | - |
 | LEGO Star Wars: The Complete Saga | Feral, Steam 1.2.1 | WIP; launcher, menus and new-game cantina verified |
 | LEGO Indiana Jones 2: The Adventure Continues | Feral, 2009 | - |
+| LEGO Harry Potter: Years 1-4 | Feral, 2011 | - |
 | LEGO Star Wars III: The Clone Wars | Feral, 2011 | ✓\* |
 | LEGO Pirates of the Caribbean | TransGaming, 2011 | ✓\* |
 | LEGO Batman 2: DC Super Heroes | Feral, 2012 | - |
