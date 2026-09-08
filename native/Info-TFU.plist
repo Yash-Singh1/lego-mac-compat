@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>CFBundleExecutable</key><string>TFUCompat</string>
+    <key>CFBundleIconFile</key><string>AppIcon.icns</string>
+    <key>CFBundleIdentifier</key><string>com.aspyr.SWTFU.compat</string>
+    <key>CFBundleName</key><string>The Force Unleashed (Compatibility)</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>0.1</string>
+    <key>CFBundleVersion</key><string>1</string>
+    <key>LSMinimumSystemVersion</key><string>11.0</string>
+    <key>LSApplicationCategoryType</key><string>public.app-category.games</string>
+    <key>NSHighResolutionCapable</key><false/>
+    <key>NSPrincipalClass</key><string>NSApplication</string>
+</dict></plist>

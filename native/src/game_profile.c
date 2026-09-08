@@ -265,6 +265,22 @@ static const struct lp32_game_profile portal2_profile = {
     .main_address = 0x00001d60,
 };
 
+/* Aspyr's 1.2 (94531) i386 executable. Its crt directly calls main, then exit. */
+static const struct lp32_code_signature tfu_display_id_sentinel = {
+    .address = 0x0000fefb, .expected = {0xb9, 1, 0, 0, 0}, .length = 5,
+};
+static const struct lp32_game_profile tfu_profile = {
+    .title = LP32_TITLE_TFU,
+    .name = "TFU",
+    .display_name = "Star Wars: The Force Unleashed",
+    .log_directory = "TFUCompat",
+    .image_file = "TFU.image",
+    .entry_eip = 0x00002550,
+    .image_end = 0x03bf5984,
+    .main_address = 0x0005dc08,
+    .display_id_sentinel = &tfu_display_id_sentinel,
+};
+
 static const struct lp32_game_profile unknown_profile = {
     .title = LP32_TITLE_UNKNOWN,
     .name = "unknown",
@@ -277,6 +293,7 @@ static const struct lp32_game_profile *const known_profiles[] = {
     &pirates_profile,
     &clone_wars_profile,
     &portal2_profile,
+    &tfu_profile,
 };
 
 static const struct lp32_game_profile *current_profile = &unknown_profile;

@@ -1,13 +1,16 @@
 #include "compat_runtime.h"
+#include "movie_bridge.h"
 #include "wide_format.h"
 #include "audio_bridge.h"
 #include "controller_bridge.h"
+#include "tfu_controller.h"
 #include "game_profile.h"
 #include "guest_dyld.h"
 #include "guest_memory.h"
 #include "network_bridge.h"
 #include "font_bridge.h"
 #include "objc_bridge.h"
+#include "carbon_bridge.h"
 #include "name_match.h"
 
 #include <architecture/i386/table.h>
@@ -78,7 +81,10 @@ enum {
     kExitThunkOffset = 0x000,
     kExitFarPointerOffset = 0x010,
     kGatewayFarPointerOffset = 0x040,
-    kImportThunksOffset = 0x1000,
+    /* Large Carbon games have over 1,200 imports. Keep their thunks on
+       separate i386 pages, clear of the dynamic thunks and mode gateways. */
+    kMainImportCodeBase = 0x7f020000,
+    kMainImportCodeSize = MACHO_IMAGE32_MAX_IMPORTS * 16,
     kImportThunkSize = 16,
     kDynamicThunksOffset = 0x4000,
     kDynamicThunkCapacity = 2048,
@@ -148,7 +154,7 @@ static pthread_t source_thread_for_handle(uint32_t handle)
 }
 
 enum {
-    kGuestHeapBase = 0x02000000,
+    kDefaultGuestHeapBase = 0x02000000,
     kGuestHeapEnd = 0x70000000,
     kGuestHeapHeaderSize = 16,
     kGuestHeapBinCount = 64,
@@ -194,7 +200,8 @@ struct guest_heap_stats {
     uintptr_t high_water;
 };
 
-static uintptr_t guest_heap_cursor = kGuestHeapBase;
+static uintptr_t guest_heap_base = kDefaultGuestHeapBase;
+static uintptr_t guest_heap_cursor = kDefaultGuestHeapBase;
 static uint32_t guest_heap_free_bins[kGuestHeapBinCount];
 static struct guest_heap_site_stats guest_heap_sites[kGuestHeapSiteCapacity];
 static unsigned guest_heap_site_count;
@@ -1162,6 +1169,8 @@ static void start_code_churn_if_requested(void)
 static int build_transition_bridge(void)
 {
     uint8_t *code = (void *)(uintptr_t)kBridgeCodeBase;
+    uint8_t *imports = (void *)(uintptr_t)kMainImportCodeBase;
+    memset(imports, 0xcc, kMainImportCodeSize);
     memset(code, 0xcc, kBridgeCodeSize);
     mode_guards_disabled = getenv("LP32_NO_MODE_GUARDS") != NULL;
     if (mode_guards_disabled) {
@@ -1203,7 +1212,7 @@ static int build_transition_bridge(void)
 
     for (uint32_t index = 0; index < current_image->import_count; ++index) {
         if (current_image->imports[index].kind == MACHO_IMPORT32_POINTER) continue;
-        uint8_t *thunk = code + kImportThunksOffset + index * kImportThunkSize;
+        uint8_t *thunk = imports + index * kImportThunkSize;
         /* push $import_index; ljmp *gateway_far_pointer */
         thunk[0] = 0x68;
         emit_u32(thunk + 1, index);
@@ -1246,7 +1255,13 @@ static int build_transition_bridge(void)
     memset(data_cell, 0, kBridgeDataSize);
     for (uint32_t index = 0; index < current_image->import_count; ++index) {
         if (current_image->imports[index].kind != MACHO_IMPORT32_POINTER) continue;
-        if ((data_cells + 4) * sizeof(*data_cell) > kModeGuardCountersOffset) {
+        if (!strcmp(current_image->imports[index].name, "__DefaultRuneLocale")) {
+            uint32_t locale = compat_runtime32_resolve_symbol("__DefaultRuneLocale", true);
+            if (!locale) return runtime_error("guest character classification table");
+            *(uint32_t *)(uintptr_t)current_image->imports[index].address = locale;
+            continue;
+        }
+        if ((data_cells + 8) * sizeof(*data_cell) > kModeGuardCountersOffset) {
             errno = ENOSPC;
             return runtime_error("i386 import data cells");
         }
@@ -1262,11 +1277,13 @@ static int build_transition_bridge(void)
         }
         uint32_t objc_pointer =
             objc_bridge32_pointer_import(current_image->imports[index].name);
+        if (!objc_pointer) objc_pointer = carbon_bridge32_pointer_import(current_image->imports[index].name);
         if (objc_pointer) data_cell[data_cells] = objc_pointer;
+        carbon_bridge32_data_import(current_image->imports[index].name, data_cell + data_cells, 32);
         uint32_t standard_file =
             guest_standard_file_import(current_image->imports[index].name);
         if (standard_file) data_cell[data_cells] = standard_file;
-        data_cells += 4;
+        data_cells += 8;
     }
 
     size_t context_size = (uintptr_t)lp32_context_end - (uintptr_t)lp32_context_start;
@@ -1278,12 +1295,15 @@ static int build_transition_bridge(void)
     if (mprotect(code, kBridgeCodeSize, PROT_READ | PROT_EXEC) != 0) {
         return runtime_error("mprotect transition bridge");
     }
+    if (mprotect(imports, kMainImportCodeSize, PROT_READ | PROT_EXEC) != 0) {
+        return runtime_error("mprotect main import thunks");
+    }
     return 0;
 }
 
-static uint32_t guest_thunk_for_dynamic_symbol(const char *name)
+static uint32_t guest_context_symbol(const char *name)
 {
-    if (lp32_profile()->title == LP32_TITLE_PORTAL2) {
+    if (lp32_profile()->title == LP32_TITLE_PORTAL2 || lp32_profile()->title == LP32_TITLE_TFU) {
         const uint8_t *entry = NULL;
         if (!strcmp(name, "_setjmp")) entry = lp32_context_setjmp;
         else if (!strcmp(name, "__setjmp")) entry = lp32_context_fast_setjmp;
@@ -1292,6 +1312,13 @@ static uint32_t guest_thunk_for_dynamic_symbol(const char *name)
         else if (!strcmp(name, "__longjmp")) entry = lp32_context_fast_longjmp;
         if (entry) return kBridgeCodeBase + 0xc000 + (uint32_t)(entry - lp32_context_start);
     }
+    return 0;
+}
+
+static uint32_t guest_thunk_for_dynamic_symbol(const char *name)
+{
+    uint32_t context = guest_context_symbol(name);
+    if (context) return context;
     for (uint32_t index = 0; index < dynamic_symbol_count; ++index) {
         if (strcmp(dynamic_symbol_names[index], name) == 0) {
             return kBridgeCodeBase + kDynamicThunksOffset + index * kImportThunkSize;
@@ -1627,12 +1654,12 @@ static bool guest_heap_validate_header_locked(uint32_t pointer,
                                               bool *already_free)
 {
     if (already_free) *already_free = false;
-    if (pointer < kGuestHeapBase + kGuestHeapHeaderSize ||
+    if (pointer < guest_heap_base + kGuestHeapHeaderSize ||
         (pointer & 15) != 0 || pointer > guest_heap_cursor) {
         return false;
     }
     uintptr_t header_address = pointer - kGuestHeapHeaderSize;
-    if (header_address < kGuestHeapBase ||
+    if (header_address < guest_heap_base ||
         header_address + kGuestHeapHeaderSize > guest_heap_cursor) {
         return false;
     }
@@ -1709,13 +1736,13 @@ static uint32_t guest_heap_coalesce_free_locked(uint32_t header_address)
         }
     }
 
-    if (header_address >= kGuestHeapBase + kGuestHeapHeaderSize + 32) {
+    if (header_address >= guest_heap_base + kGuestHeapHeaderSize + 32) {
         const uint32_t *previous_footer =
             (const void *)(uintptr_t)(header_address - 8);
         uint32_t previous_capacity = previous_footer[1];
         if (previous_footer[0] == kGuestHeapFreeMagic &&
             previous_capacity >= 32 && (previous_capacity & 15) == 0 &&
-            previous_capacity <= header_address - kGuestHeapBase -
+            previous_capacity <= header_address - guest_heap_base -
                                  kGuestHeapHeaderSize) {
             uint32_t previous_address = header_address -
                 kGuestHeapHeaderSize - previous_capacity;
@@ -1752,7 +1779,7 @@ static uint32_t guest_heap_take_free_locked(size_t needed_capacity)
         while (*link && traversed++ < guest_heap_statistics.valid_frees +
                                       guest_heap_statistics.split_blocks + 1) {
             uint32_t header_address = *link;
-            if (header_address < kGuestHeapBase ||
+            if (header_address < guest_heap_base ||
                 (header_address & 15) != 0 ||
                 (uintptr_t)header_address + kGuestHeapHeaderSize >
                     guest_heap_cursor) {
@@ -2162,7 +2189,7 @@ static size_t guest_string_length(uint32_t object)
 
 static void guest_string_dispose_rep(uint32_t rep)
 {
-    if (!rep || rep < kGuestHeapBase + kGuestHeapHeaderSize) {
+    if (!rep || rep < guest_heap_base + kGuestHeapHeaderSize) {
         return; /* Includes libstdc++'s mapped static empty representation. */
     }
     pthread_mutex_lock(&guest_heap_lock);
@@ -2828,7 +2855,7 @@ static void *run_guest_thread(void *opaque)
     if (getenv("LP32_TRACE_THREADS")) {
         uint64_t thread_id = 0;
         pthread_threadid_np(NULL, &thread_id);
-        if (lp32_profile()->title == LP32_TITLE_PORTAL2) {
+        if (lp32_profile()->title == LP32_TITLE_PORTAL2 || lp32_profile()->title == LP32_TITLE_TFU) {
             fprintf(stderr, "compat32: guest thread tid=%llu entry=0x%08x argument=0x%08x\n",
                     (unsigned long long)thread_id, context.function, context.argument);
         } else {
@@ -2938,6 +2965,15 @@ int compat_runtime32_initialize(struct macho_image32 *image)
         errno = ENOTSUP;
         return runtime_error("x86_64 host is not running through Rosetta");
     }
+    /* TFU has almost 60 MiB of image data, including BSS. Keep allocations
+       above it; the smaller titles retain their original 32 MiB heap base. */
+    uintptr_t image_end = ((uintptr_t)image->max_address + 0xffff) & ~(uintptr_t)0xffff;
+    if (image_end >= kGuestHeapEnd || guest_heap_cursor != kDefaultGuestHeapBase) {
+        errno = EINVAL;
+        return runtime_error("invalid or already initialized guest heap");
+    }
+    guest_heap_base = image_end > kDefaultGuestHeapBase ? image_end : kDefaultGuestHeapBase;
+    guest_heap_cursor = guest_heap_base;
     current_image = image;
     import_stage_table = calloc(image->import_count ? image->import_count : 1,
                                 sizeof(*import_stage_table));
@@ -2966,11 +3002,15 @@ int compat_runtime32_initialize(struct macho_image32 *image)
     guest_heap_statistics.high_water = guest_heap_cursor;
     if (allocate_cs32() != 0) return -1;
     if (build_transition_bridge() != 0) return -1;
+    for (uint32_t i = 0; i < image->import_count; ++i) {
+        uint32_t target = guest_context_symbol(image->imports[i].name);
+        if (target && macho_image32_bind_import(&image->imports[i], target)) return -1;
+    }
     printf("compat32: cs32=0x%04x imports=%" PRIu32 " bridge=0x%08x\n",
            lp32_cs32, image->import_count, kBridgeCodeBase);
     fprintf(stderr,
-            "compat32: guest heap validation enabled, reuse=%s poison=%s\n",
-            guest_heap_reuse ? "on" : "off",
+            "compat32: guest heap base=0x%08lx validation enabled, reuse=%s poison=%s\n",
+            (unsigned long)guest_heap_base, guest_heap_reuse ? "on" : "off",
             guest_heap_poison ? "on" : "off");
     if (getenv("LP32_TRACE_IMPORT_TABLE")) {
         for (uint32_t index = 0; index < image->import_count; ++index) {
@@ -3227,6 +3267,77 @@ static uint64_t fast_memset(const uint32_t *arguments, uint32_t return_address)
     return arguments[0];
 }
 
+/* TFU's D3D-to-GLSL compiler makes millions of these calls on the first
+   rendered frame of a level. Retain libc's semantics and the i386 return
+   width while avoiding the unrelated network/font/platform dispatchers. */
+static uint64_t fast_tfu_tolower(const uint32_t *a, uint32_t return_address)
+{
+    (void)return_address;
+    return (uint32_t)tolower((int)a[0]);
+}
+
+static uint64_t fast_tfu_strlen(const uint32_t *a, uint32_t return_address)
+{
+    (void)return_address;
+    return (uint32_t)strlen((const char *)(uintptr_t)a[0]);
+}
+
+static uint64_t fast_tfu_strcmp(const uint32_t *a, uint32_t return_address)
+{
+    (void)return_address;
+    return (uint32_t)strcmp((const char *)(uintptr_t)a[0], (const char *)(uintptr_t)a[1]);
+}
+
+static uint64_t fast_tfu_memcmp(const uint32_t *a, uint32_t return_address)
+{
+    (void)return_address;
+    return (uint32_t)memcmp((const void *)(uintptr_t)a[0], (const void *)(uintptr_t)a[1], a[2]);
+}
+
+int compat_runtime32_run_tfu_text_self_test(void)
+{
+    uint32_t lower = compat_runtime32_resolve_symbol("___tolower", false);
+    uint32_t length = compat_runtime32_resolve_symbol("_strlen", false);
+    uint32_t compare = compat_runtime32_resolve_symbol("_strcmp", false);
+    uint32_t memory_compare = compat_runtime32_resolve_symbol("_memcmp", false);
+    uint32_t memory = compat_runtime32_allocate(32, 1);
+    if (!lower || !length || !compare || !memory_compare || !memory) return -1;
+    unsigned char *bytes = (void *)(uintptr_t)memory;
+    memcpy(bytes, "Ab\0z", 4);
+    memcpy(bytes + 16, "Ab\0a", 4);
+    bool failed = false;
+    /* Repeat through real i386 thunks so the first chained dispatch and
+       subsequent cached handlers both exercise the ABI, including EOF. */
+    for (unsigned pass = 0; pass < 2; ++pass) {
+        for (int c = -1; c <= 255; ++c) {
+            uint32_t argument = (uint32_t)c;
+            failed |= compat_runtime32_call(lower, &argument, 1) != (uint32_t)tolower(c);
+            failed |= compat_runtime32_last_call_trapped();
+        }
+        uint32_t a[] = {memory, memory + 16, 4};
+        failed |= compat_runtime32_call(length, a, 1) != 2;
+        failed |= compat_runtime32_last_call_trapped();
+        failed |= compat_runtime32_call(compare, a, 2) != 0;
+        failed |= compat_runtime32_last_call_trapped();
+        failed |= (int32_t)compat_runtime32_call(memory_compare, a, 3) <= 0;
+        failed |= compat_runtime32_last_call_trapped();
+        a[0] = memory + 16; a[1] = memory;
+        failed |= (int32_t)compat_runtime32_call(memory_compare, a, 3) >= 0;
+        failed |= compat_runtime32_last_call_trapped();
+    }
+    bytes[0] = 0x80;
+    uint32_t a[] = {memory, memory + 16};
+    failed |= (int32_t)compat_runtime32_call(compare, a, 2) <= 0;
+    failed |= compat_runtime32_last_call_trapped();
+    a[0] = memory + 2;
+    failed |= compat_runtime32_call(length, a, 1) != 0;
+    failed |= compat_runtime32_last_call_trapped();
+    compat_runtime32_deallocate(memory);
+    fprintf(stderr, "TFU text self-test: %s (i386 thunks, byte case mapping, EOF, NUL, high bytes, comparison sign)\n",
+            failed ? "FAIL" : "PASS");
+    return failed ? -1 : 0;
+}
+
 static uint64_t fast_logf(const uint32_t *arguments, uint32_t return_address)
 {
     (void)return_address;
@@ -3286,6 +3397,12 @@ static uint64_t fast_pthread_mutex_unlock(const uint32_t *arguments,
 
 static lp32_fast_import_fn runtime_fast_import(const char *name)
 {
+    if (lp32_profile()->title == LP32_TITLE_TFU && !getenv("LP32_NO_TFU_FAST_TEXT")) {
+        if (!strcmp(name, "___tolower")) return fast_tfu_tolower;
+        if (!strcmp(name, "_strlen")) return fast_tfu_strlen;
+        if (!strcmp(name, "_strcmp")) return fast_tfu_strcmp;
+        if (!strcmp(name, "_memcmp")) return fast_tfu_memcmp;
+    }
     static const struct {
         const char *name;
         lp32_fast_import_fn handler;
@@ -3727,6 +3844,10 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         memset_pattern16((void *)(uintptr_t)arguments[0], (const void *)(uintptr_t)arguments[1], arguments[2]);
         return 0;
     }
+    if (import_is(name, "_OSAtomicAdd64") || import_is(name, "_OSAtomicAdd64Barrier")) {
+        uint64_t amount = arguments[0] | ((uint64_t)arguments[1] << 32);
+        return __atomic_add_fetch((uint64_t *)(uintptr_t)arguments[2], amount, __ATOMIC_SEQ_CST);
+    }
     if (import_is(name, "_OSAtomicCompareAndSwap64") || import_is(name, "_OSAtomicCompareAndSwap64Barrier")) {
         uint64_t expected = (uint64_t)arguments[0] | ((uint64_t)arguments[1] << 32);
         uint64_t desired = (uint64_t)arguments[2] | ((uint64_t)arguments[3] << 32);
@@ -3835,6 +3956,10 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         return lp32_profile()->title == LP32_TITLE_PORTAL2 ?
             (uint32_t)guest_dyld32_close(arguments[0]) : 0;
     }
+    if (!strncmp(name, "_lp32_tfu_", 10)) {
+        uint64_t result;
+        if (tfu_controller32_dispatch(name, arguments, &result)) return result;
+    }
     if (import_is(name, kControllerGlyphCallbackName)) {
         controller_bridge32_button_glyph(arguments[0],
                                          (char *)(uintptr_t)arguments[1]);
@@ -3855,6 +3980,10 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
      * host/guest teardown callbacks.
      */
     if (import_is(name, "_exit") || import_is(name, "__exit")) {
+        if (lp32_profile()->title == LP32_TITLE_TFU && import_is(name, "_exit")) {
+            const uint32_t finalize_arguments[] = {0};
+            compat_runtime32_dispatch_import("___cxa_finalize", finalize_arguments);
+        }
         fprintf(stderr, "compat32: guest requested process exit status=%d\n",
                 (int)arguments[0]);
         compat_runtime32_heap_report("guest-exit");
@@ -4162,6 +4291,8 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
                (const char *)(uintptr_t)arguments[1]);
         return arguments[0];
     }
+    if (import_is(name, "_strlcpy")) return (uint32_t)strlcpy((char *)(uintptr_t)arguments[0], (const char *)(uintptr_t)arguments[1], arguments[2]);
+    if (import_is(name, "_strlcat")) return (uint32_t)strlcat((char *)(uintptr_t)arguments[0], (const char *)(uintptr_t)arguments[1], arguments[2]);
     if (import_is(name, "_strncpy")) {
         strncpy((char *)(uintptr_t)arguments[0],
                 (const char *)(uintptr_t)arguments[1], arguments[2]);
@@ -4665,12 +4796,28 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         import_is(name, "_OSAtomicAdd32Barrier")) {
         return fast_OSAtomicAdd32(arguments, return_address);
     }
-    if (import_is(name, "_OSAtomicCompareAndSwap32") || import_is(name, "_OSAtomicCompareAndSwap32Barrier")) {
+    /* Guest long and pointers are 32 bits, including on an LP64 host. */
+    if (import_is(name, "_OSAtomicCompareAndSwap32") || import_is(name, "_OSAtomicCompareAndSwap32Barrier") ||
+        import_is(name, "_OSAtomicCompareAndSwapLong") || import_is(name, "_OSAtomicCompareAndSwapLongBarrier") ||
+        import_is(name, "_OSAtomicCompareAndSwapPtr") || import_is(name, "_OSAtomicCompareAndSwapPtrBarrier")) {
         return fast_OSAtomicCompareAndSwap32(arguments, return_address);
     }
     if (import_is(name, "_pthread_once")) {
         return guest_pthread_once(arguments[0], arguments[1]);
     }
+    if (import_is(name, "_nanosleep")) {
+        movie_bridge32_service_main();
+        const int32_t *request = (const void *)(uintptr_t)arguments[0];
+        if (!request) { errno = EFAULT; return (uint32_t)-1; }
+        struct timespec duration = {request[0], request[1]}, remaining = {0};
+        int status = nanosleep(&duration, arguments[1] ? &remaining : NULL);
+        if (status == -1 && errno == EINTR && arguments[1]) {
+            int32_t *output = (void *)(uintptr_t)arguments[1];
+            output[0] = remaining.tv_sec; output[1] = remaining.tv_nsec;
+        }
+        return (uint32_t)status;
+    }
+    if (import_is(name, "_clock")) return (uint32_t)clock();
     if (import_is(name, "_chdir")) {
         const char *path = (const char *)(uintptr_t)arguments[0];
         return path ? (uint32_t)chdir(path) : (uint32_t)-1;
@@ -4715,7 +4862,14 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
     if (import_is(name, "_tanf")) return return_guest_float(tanf(guest_float(arguments[0])));
     if (import_is(name, "_atan2f")) return return_guest_float(atan2f(guest_float(arguments[0]), guest_float(arguments[1])));
     if (import_is(name, "_fmodf")) return return_guest_float(fmodf(guest_float(arguments[0]), guest_float(arguments[1])));
+    if (import_is(name, "_coshf")) return return_guest_float(coshf(guest_float(arguments[0])));
+    if (import_is(name, "_sinhf")) return return_guest_float(sinhf(guest_float(arguments[0])));
+    if (import_is(name, "_tanhf")) return return_guest_float(tanhf(guest_float(arguments[0])));
+    if (import_is(name, "_frexpf")) return return_guest_float(frexpf(guest_float(arguments[0]), (int *)(uintptr_t)arguments[1]));
+    if (import_is(name, "_ldexpf")) return return_guest_float(ldexpf(guest_float(arguments[0]), (int)arguments[1]));
+    if (import_is(name, "_modff")) return return_guest_float(modff(guest_float(arguments[0]), (float *)(uintptr_t)arguments[1]));
 
+    if (import_is(name, "_cbrt")) return return_guest_double(cbrt(guest_double(arguments)));
     if (import_is(name, "_log")) return return_guest_double(log(guest_double(arguments)));
     if (import_is(name, "_exp")) return return_guest_double(exp(guest_double(arguments)));
     if (import_is(name, "_sin")) return return_guest_double(sin(guest_double(arguments)));
@@ -4763,7 +4917,7 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         struct guest_thread_context *context = malloc(sizeof(*context));
         if (!context) return (uint32_t)ENOMEM;
         context->function = arguments[2];
-        if (lp32_profile()->title == LP32_TITLE_PORTAL2) {
+        if (lp32_profile()->title == LP32_TITLE_PORTAL2 || lp32_profile()->title == LP32_TITLE_TFU) {
             context->argument = arguments[3];
         } else {
             /* The engine's sole pthread_create site (Pirates 0x2fxxxx, Clone
@@ -4805,7 +4959,7 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         uint32_t *guest_thread = (void *)(uintptr_t)arguments[0];
         if (guest_thread) {
             static uint32_t next_handle = 1;
-            *guest_thread = lp32_profile()->title == LP32_TITLE_PORTAL2 ?
+            *guest_thread = (lp32_profile()->title == LP32_TITLE_PORTAL2 || lp32_profile()->title == LP32_TITLE_TFU) ?
                 source_thread_handle(thread) : __atomic_fetch_add(&next_handle, 1, __ATOMIC_RELAXED);
         }
         return 0;
@@ -4865,6 +5019,7 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
     if (import_is(name, "_MPCreateSemaphore")) {
         uint32_t handle = guest_semaphore_create((int32_t)arguments[0],
                                                  (int32_t)arguments[1]);
+        if (getenv("LP32_TRACE_SYNC")) fprintf(stderr, "MP semaphore create max=%u initial=%u handle=%08x caller=%08x\n", arguments[0], arguments[1], handle, return_address);
         if (!handle) return (uint32_t)-1;
         uint32_t *output = (void *)(uintptr_t)arguments[2];
         if (output) *output = handle;
@@ -4885,6 +5040,7 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         struct guest_semaphore *semaphore =
             guest_semaphore_acquire(arguments[0]);
         if (!semaphore) return (uint32_t)-1;
+        if (getenv("LP32_TRACE_SYNC")) fprintf(stderr, "MP semaphore signal handle=%08x count=%d caller=%08x\n", arguments[0], semaphore->count, return_address);
         if (semaphore->count < semaphore->maximum) ++semaphore->count;
         pthread_cond_signal(&semaphore->condition);
         pthread_mutex_unlock(&semaphore->mutex);
@@ -4895,13 +5051,41 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
             guest_semaphore_acquire(arguments[0]);
         if (!semaphore) return (uint32_t)-1;
         uint32_t generation = semaphore->generation;
+        if (getenv("LP32_TRACE_SYNC")) fprintf(stderr, "MP semaphore wait handle=%08x count=%d duration=%d caller=%08x\n", arguments[0], semaphore->count, (int32_t)arguments[1], return_address);
         if ((int32_t)arguments[1] == 0 && semaphore->count <= 0) {
             pthread_mutex_unlock(&semaphore->mutex);
-            return (uint32_t)-1;
+            /* Carbon kMPTimeoutErr. TFU translates this specific status to
+               WAIT_TIMEOUT; a generic -1 is incorrectly treated as success. */
+            return (uint32_t)-29296;
         }
+        /* Carbon Duration is milliseconds when positive, microseconds when
+           negative, and INT32_MAX means forever. TFU uses finite waits as
+           worker deadlines; treating every nonzero duration as forever can
+           block progress until an unrelated signal arrives. Use one uptime
+           deadline so spurious wakeups cannot restart the timeout. */
+        int32_t duration = (int32_t)arguments[1];
+        bool finite = lp32_profile()->title == LP32_TITLE_TFU && duration != INT32_MAX;
+        uint64_t deadline = finite ? profile_now() + (duration < 0 ?
+            (uint64_t)-(int64_t)duration * 1000 : (uint64_t)duration * 1000000) : 0;
         while (semaphore->initialized &&
                semaphore->generation == generation && semaphore->count <= 0) {
-            pthread_cond_wait(&semaphore->condition, &semaphore->mutex);
+            if (!finite) {
+                pthread_cond_wait(&semaphore->condition, &semaphore->mutex);
+                continue;
+            }
+            uint64_t now = profile_now();
+            if (now >= deadline) {
+                pthread_mutex_unlock(&semaphore->mutex);
+                return (uint32_t)-29296;
+            }
+            uint64_t remaining = deadline - now;
+            struct timespec timeout = {remaining / 1000000000, remaining % 1000000000};
+            int status = pthread_cond_timedwait_relative_np(
+                &semaphore->condition, &semaphore->mutex, &timeout);
+            if (status && status != ETIMEDOUT) {
+                pthread_mutex_unlock(&semaphore->mutex);
+                return (uint32_t)-1;
+            }
         }
         if (!semaphore->initialized || semaphore->generation != generation) {
             pthread_mutex_unlock(&semaphore->mutex);
@@ -4912,6 +5096,13 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         return 0;
     }
 
+    if (import_is(name, "_abs") || import_is(name, "_labs")) return (uint32_t)abs((int32_t)arguments[0]);
+    if (import_is(name, "_getrlimit")) {
+        return (uint32_t)getrlimit((int)arguments[0], (struct rlimit *)(uintptr_t)arguments[1]);
+    }
+    if (import_is(name, "_setrlimit")) {
+        return (uint32_t)setrlimit((int)arguments[0], (const struct rlimit *)(uintptr_t)arguments[1]);
+    }
     if (import_is(name, "_Gestalt")) {
         int32_t *response = (void *)(uintptr_t)arguments[1];
         int32_t value;
@@ -4919,13 +5110,18 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
             case UINT32_C(0x73797331): value = 10; break; /* sys1: major */
             case UINT32_C(0x73797332): value = 7; break;  /* sys2: minor */
             case UINT32_C(0x73797333): value = 5; break;  /* sys3: bugfix */
-            default: return (uint32_t)-5551;              /* gestaltUndefSelectorErr */
+            default: {
+                uint64_t result;
+                if (lp32_profile()->title == LP32_TITLE_TFU &&
+                    carbon_bridge32_dispatch(name, arguments, &result)) return result;
+                return (uint32_t)-5551; /* gestaltUndefSelectorErr */
+            }
         }
         if (response) *response = value;
         return 0;
     }
 
-    if (lp32_profile()->title == LP32_TITLE_PORTAL2 && !strncmp(name, "_IO", 3)) {
+    if ((lp32_profile()->title == LP32_TITLE_PORTAL2 || lp32_profile()->title == LP32_TITLE_TFU) && !strncmp(name, "_IO", 3)) {
         uint64_t result = 0;
         if (objc_bridge32_dispatch(name, arguments, &result)) return result;
     }
@@ -4959,11 +5155,11 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
     }
     if (import_is(name, "_IOServiceAddInterestNotification") ||
         import_is(name, "_IOServiceAddMatchingNotification")) return UINT32_C(0xe00002c7);
-    if (lp32_profile()->title != LP32_TITLE_PORTAL2 &&
+    if (lp32_profile()->title != LP32_TITLE_PORTAL2 && lp32_profile()->title != LP32_TITLE_TFU &&
         (import_is(name, "_CFRunLoopAddSource") || import_is(name, "_CFRunLoopRemoveSource") ||
          import_is(name, "_CFRunLoopContainsSource"))) return 0;
 
-    if (import_is(name, "___cxa_atexit") || import_is(name, "___cxa_finalize")) {
+    if (import_is(name, "_atexit") || import_is(name, "___cxa_atexit") || import_is(name, "___cxa_finalize")) {
         /* Dylibs stay resident. Keep guest destructors in guest space; host
            atexit cannot call an i386 function pointer. */
         struct destructor { uint32_t function, argument, dso; };
@@ -4971,12 +5167,14 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         static unsigned count;
         static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
         pthread_mutex_lock(&lock);
-        if (import_is(name, "___cxa_atexit")) {
+        if (import_is(name, "_atexit") || import_is(name, "___cxa_atexit")) {
             if (count == sizeof(destructors) / sizeof(destructors[0])) {
                 pthread_mutex_unlock(&lock);
                 return (uint32_t)-1;
             }
-            destructors[count++] = (struct destructor){arguments[0], arguments[1], arguments[2]};
+            bool plain = import_is(name, "_atexit");
+            /* i386 cdecl permits the unused argument for a void(void) callback. */
+            destructors[count++] = (struct destructor){arguments[0], plain ? 0 : arguments[1], plain ? 0 : arguments[2]};
         } else {
             for (unsigned i = count; i; --i) {
                 struct destructor d = destructors[i - 1];
@@ -5047,6 +5245,7 @@ static uint64_t dispatch_bridge_stages(uint32_t import_id, const char *name,
         return result;
     }
 
+    if (carbon_bridge32_dispatch(name, arguments, &result)) return result;
     if (objc_bridge32_dispatch(name, arguments, &result)) {
         if (stage_start) frame_profile.objc_ns += profile_now() - stage_start;
         if (known_stage == kImportStageUnknown && !dispatch_name_matched) {
@@ -5061,8 +5260,8 @@ static uint64_t dispatch_bridge_stages(uint32_t import_id, const char *name,
             " args=%08" PRIx32 ",%08" PRIx32 ",%08" PRIx32 ",%08" PRIx32 "\n",
             import_id, name, return_address, arguments[0], arguments[1],
             arguments[2], arguments[3]);
-    if (lp32_profile()->title == LP32_TITLE_PORTAL2) {
-        /* A trap on Source's worker thread must not leave its Cocoa main
+    if (lp32_profile()->title == LP32_TITLE_PORTAL2 || lp32_profile()->title == LP32_TITLE_TFU) {
+        /* A trap on a game worker thread must not leave its Cocoa main
            loop running indefinitely after the worker has escaped. */
         fflush(NULL);
         _Exit(EXIT_FAILURE);
@@ -5257,7 +5456,7 @@ static bool guest_heap_validate_free_lists(void)
         uint32_t fast = slow;
         uint64_t count = 0;
         while (slow) {
-            if (++count > maximum_nodes || slow < kGuestHeapBase ||
+            if (++count > maximum_nodes || slow < guest_heap_base ||
                 (slow & 15) != 0 ||
                 (uintptr_t)slow + kGuestHeapHeaderSize > guest_heap_cursor) {
                 valid = false;
@@ -5281,7 +5480,7 @@ static bool guest_heap_validate_free_lists(void)
             slow = metadata[3];
 
             for (unsigned step = 0; step < 2 && fast; ++step) {
-                if (fast < kGuestHeapBase || (fast & 15) != 0 ||
+                if (fast < guest_heap_base || (fast & 15) != 0 ||
                     (uintptr_t)fast + kGuestHeapHeaderSize >
                         guest_heap_cursor) {
                     valid = false;
@@ -5844,15 +6043,20 @@ struct sync_self_test_waiter {
     uint32_t mutex;
     uint32_t result;
     uint32_t ready;
+    int32_t duration;
+    uint64_t elapsed;
 };
 
 static void *sync_self_test_semaphore_waiter(void *opaque)
 {
     struct sync_self_test_waiter *waiter = opaque;
-    uint32_t arguments[4] = {waiter->semaphore, UINT32_C(0x7fffffff), 0, 0};
+    uint32_t arguments[4] = {waiter->semaphore,
+        waiter->duration ? (uint32_t)waiter->duration : UINT32_C(0x7fffffff), 0, 0};
     __atomic_store_n(&waiter->ready, 1, __ATOMIC_RELEASE);
+    uint64_t start = profile_now();
     waiter->result = (uint32_t)compat_runtime32_dispatch_import(
         "_MPWaitOnSemaphore", arguments);
+    waiter->elapsed = profile_now() - start;
     return NULL;
 }
 
@@ -5883,6 +6087,19 @@ static uint32_t sync_self_test_free_list_length(struct host_sync_free_node *node
 
 int compat_runtime32_run_sync_self_test(void)
 {
+    uint32_t atomic_cell = compat_runtime32_allocate(8, 1);
+    if (!atomic_cell) return -1;
+    uint64_t added = compat_runtime32_dispatch_import("_OSAtomicAdd64Barrier",
+        (uint32_t[]){3, 1, atomic_cell});
+    uint64_t subtracted = compat_runtime32_dispatch_import("_OSAtomicAdd64",
+        (uint32_t[]){(uint32_t)-5, UINT32_MAX, atomic_cell});
+    uint64_t loaded = compat_runtime32_dispatch_import("_OSAtomicAdd64Barrier",
+        (uint32_t[]){0, 0, atomic_cell});
+    bool atomic_ok = added == UINT64_C(0x100000003) &&
+        subtracted == UINT64_C(0xfffffffe) && loaded == subtracted &&
+        *(uint64_t *)(uintptr_t)atomic_cell == loaded;
+    compat_runtime32_deallocate(atomic_cell);
+    if (!atomic_ok) { fputs("sync-selftest: 64-bit atomic add ABI failed\n", stderr); return -1; }
     enum {
         object_total = 8192,
         semaphore_total = kGuestSemaphoreCapacity - 1,
@@ -6083,12 +6300,43 @@ int compat_runtime32_run_sync_self_test(void)
         arguments[1] = 0;
         if (compat_runtime32_dispatch_import("_MPWaitOnSemaphore", arguments) ||
             compat_runtime32_dispatch_import("_MPWaitOnSemaphore", arguments) !=
-            (uint32_t)-1) {
+            (uint32_t)-29296) {
             failure = "semaphore count/maximum not honoured";
             break;
         }
         struct sync_self_test_waiter waiter = {.semaphore = handles[1]};
         pthread_t thread;
+        if (lp32_profile()->title == LP32_TITLE_TFU && wave == 0) {
+            const int32_t durations[] = {20, -20000};
+            for (unsigned i = 0; i < 2 && !failure; ++i) {
+                struct sync_self_test_waiter timed = {.semaphore = handles[2], .duration = durations[i]};
+                if (pthread_create(&thread, NULL, sync_self_test_semaphore_waiter, &timed)) {
+                    failure = "timed semaphore pthread_create failed";
+                    break;
+                }
+                while (!__atomic_load_n(&timed.ready, __ATOMIC_ACQUIRE)) sched_yield();
+                /* Wake without signalling. The original deadline must survive
+                   these wakeups. A delayed real signal also releases the old
+                   broken implementation, making this test fail, not hang. */
+                for (unsigned wake = 0; wake < 10; ++wake) {
+                    usleep(5000);
+                    struct guest_semaphore *s = guest_semaphore_acquire(handles[2]);
+                    pthread_cond_broadcast(&s->condition);
+                    pthread_mutex_unlock(&s->mutex);
+                }
+                usleep(50000);
+                arguments[0] = handles[2];
+                compat_runtime32_dispatch_import("_MPSignalSemaphore", arguments);
+                pthread_join(thread, NULL);
+                if (timed.result != (uint32_t)-29296 || timed.elapsed < 20000000 || timed.elapsed > 50000000)
+                    failure = "finite semaphore timeout/deadline not honoured";
+                /* A timeout must not consume the later signal. */
+                arguments[1] = 0;
+                if (compat_runtime32_dispatch_import("_MPWaitOnSemaphore", arguments))
+                    failure = "finite semaphore wait lost a signal";
+            }
+            if (failure) break;
+        }
         if (pthread_create(&thread, NULL, sync_self_test_semaphore_waiter,
                            &waiter) != 0) {
             failure = "pthread_create failed";

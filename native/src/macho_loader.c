@@ -11,6 +11,7 @@
 #include <mach/vm_prot.h>
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
+#include <mach-o/reloc.h>
 #include <mach/i386/thread_status.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -31,12 +32,12 @@ struct source_file {
  * The __LEGACY zerofill in address_space_reserve.S pins the whole low 2 GiB.
  * Only the pages the image actually occupies are released here; everything
  * else in the reservation is carved with MAP_FIXED by the runtime (guest heap
- * at 0x02000000, stacks and bridge pages at 0x7c000000+), so the image must
- * end below the heap base.
+ * above the main image, stacks and bridge pages at 0x7c000000+). Leave at
+ * least 1.5 GiB for heap allocations below the guest dylib region.
  */
 enum {
     kLegacyReservationStart = 0x00001000,
-    kLegacyReservationEnd = 0x02000000,
+    kLegacyReservationEnd = 0x10000000,
     kLegacyPageSize = 0x1000,
 };
 
@@ -121,10 +122,11 @@ static int verify_address_hole(uint32_t start, uint32_t end)
 static int release_legacy_reservation(uint32_t image_start, uint32_t image_end)
 {
     uintptr_t reservation = kLegacyReservationStart;
-    uint32_t release_end = (image_end + kLegacyPageSize - 1) & ~(uint32_t)(kLegacyPageSize - 1);
-    if (image_start < kLegacyReservationStart || release_end > kLegacyReservationEnd) {
+    if (image_start < kLegacyReservationStart || image_end > kLegacyReservationEnd ||
+        image_end <= image_start) {
         return fail_message("host legacy-address reservation does not cover image");
     }
+    uint32_t release_end = (image_end + kLegacyPageSize - 1) & ~(uint32_t)(kLegacyPageSize - 1);
     if (munmap((void *)reservation, release_end - kLegacyReservationStart) != 0) {
         return fail_errno("munmap host legacy-address reservation");
     }
@@ -314,22 +316,128 @@ static int collect_imports(struct macho_image32 *image)
                         symbols[symbol_index].n_un.n_strx >= symtab->strsize) {
                         return fail_message("Mach-O indirect symbol index is invalid");
                     }
-                    if (image->import_count >= MACHO_IMAGE32_MAX_IMPORTS) {
-                        return fail_message("Mach-O import table exceeds loader capacity");
-                    }
                     const char *name = strings + symbols[symbol_index].n_un.n_strx;
                     if (!memchr(name, '\0', symtab->strsize - symbols[symbol_index].n_un.n_strx)) {
                         return fail_message("Mach-O import name is unterminated");
                     }
-                    struct macho_import32 *import = &image->imports[image->import_count++];
-                    import->name = name;
-                    import->address = sections[section_index].addr + item * stride;
-                    import->kind = kind;
+                    struct macho_import32 import = {
+                        .name = name,
+                        .address = sections[section_index].addr + item * stride,
+                        .kind = kind,
+                    };
+                    unsigned symbol_type = symbols[symbol_index].n_type & N_TYPE;
+                    if (symbol_type == N_SECT || symbol_type == N_ABS) {
+                        /* ld's indirect table can reference definitions in
+                           this executable. TFU leaves their stubs as HLTs
+                           and their pointer slots zero for dyld to fill. */
+                        if (macho_image32_bind_import(&import, symbols[symbol_index].n_value)) return -1;
+                        continue;
+                    }
+                    if (image->import_count >= MACHO_IMAGE32_MAX_IMPORTS) {
+                        return fail_message("Mach-O import table exceeds loader capacity");
+                    }
+                    image->imports[image->import_count++] = import;
                 }
             }
         }
         cursor += command->cmdsize;
     }
+    return 0;
+}
+
+int macho_image32_bind_import(const struct macho_import32 *import, uint32_t target)
+{
+    uintptr_t address = import->address;
+    size_t size = import->kind == MACHO_IMPORT32_STUB ? 5 : 4;
+    uintptr_t page = address & ~(uintptr_t)0xfff;
+    size_t span = ((address + size + 0xfff) & ~(uintptr_t)0xfff) - page;
+    if (mprotect((void *)page, span, PROT_READ | PROT_WRITE | PROT_EXEC)) {
+        return fail_errno("mprotect image binding");
+    }
+    if (import->kind == MACHO_IMPORT32_STUB) {
+        uint32_t displacement = target - (import->address + 5);
+        *(uint8_t *)address = 0xe9;
+        memcpy((void *)(address + 1), &displacement, 4);
+    } else {
+        memcpy((void *)address, &target, 4);
+    }
+    return 0;
+}
+
+int macho_image32_bind_external_relocations(const struct macho_image32 *image,
+    uint32_t (*resolve)(const char *, void *), void *context)
+{
+    const struct symtab_command *symtab = NULL;
+    const struct dysymtab_command *dysymtab = NULL;
+    const struct segment_command *linkedit = NULL;
+    const uint8_t *cursor = (const void *)(image->header + 1);
+    uint32_t base = 0;
+    bool have_base = false;
+    for (uint32_t i = 0; i < image->header->ncmds; ++i) {
+        const struct load_command *cmd = (const void *)cursor;
+        if (cmd->cmd == LC_SYMTAB) symtab = (const void *)cmd;
+        if (cmd->cmd == LC_DYSYMTAB) dysymtab = (const void *)cmd;
+        if (cmd->cmd == LC_SEGMENT) {
+            const struct segment_command *segment = (const void *)cmd;
+            if (!have_base && (!(image->header->flags & MH_SPLIT_SEGS) || (segment->initprot & VM_PROT_WRITE))) {
+                base = segment->vmaddr; have_base = true;
+            }
+            if (!strncmp(segment->segname, SEG_LINKEDIT, 16)) linkedit = segment;
+        }
+        cursor += cmd->cmdsize;
+    }
+    if (!symtab || !dysymtab || !linkedit) return fail_message("missing relocation metadata");
+    if (image->header->flags & MH_PREBOUND) return fail_message("prebound external relocations are not supported");
+#define LINK_RANGE(off, size) ((off) >= linkedit->fileoff && range_inside((off) - linkedit->fileoff, (size), linkedit->filesize))
+    if (!LINK_RANGE(symtab->symoff, (size_t)symtab->nsyms * sizeof(struct nlist)) ||
+        !LINK_RANGE(symtab->stroff, symtab->strsize) ||
+        (dysymtab->nextrel && !LINK_RANGE(dysymtab->extreloff, (size_t)dysymtab->nextrel * 8)))
+        return fail_message("external relocation metadata outside LINKEDIT");
+#undef LINK_RANGE
+    const uint8_t *linkbase = (const void *)(uintptr_t)(linkedit->vmaddr - linkedit->fileoff);
+    const struct nlist *symbols = (const void *)(linkbase + symtab->symoff);
+    const char *strings = (const void *)(linkbase + symtab->stroff);
+    const uint32_t *relocations = (const void *)(linkbase + dysymtab->extreloff);
+    for (uint32_t i = 0; i < dysymtab->nextrel; ++i) {
+        uint32_t offset = relocations[2 * i], flags = relocations[2 * i + 1];
+        uint32_t symbol_index = flags & 0x00ffffff;
+        uint64_t address = (uint64_t)base + offset;
+        if ((offset & R_SCATTERED) || ((flags >> 25) & 3) != 2 ||
+            (flags >> 28) != GENERIC_RELOC_VANILLA || !(flags & (1u << 27)) ||
+            symbol_index >= symtab->nsyms || address > UINT32_MAX)
+            return fail_message("unsupported main-image external relocation");
+        bool mapped = false;
+        cursor = (const void *)(image->header + 1);
+        for (uint32_t j = 0; j < image->header->ncmds; ++j) {
+            const struct load_command *cmd = (const void *)cursor;
+            if (cmd->cmd == LC_SEGMENT) {
+                const struct segment_command *s = (const void *)cmd;
+                if (strncmp(s->segname, SEG_PAGEZERO, 16) && address >= s->vmaddr &&
+                    address - s->vmaddr + 4 <= s->vmsize) mapped = true;
+            }
+            cursor += cmd->cmdsize;
+        }
+        if (!mapped) return fail_message("main-image relocation destination is unmapped");
+        const struct nlist *symbol = symbols + symbol_index;
+        uint32_t target;
+        unsigned type = symbol->n_type & N_TYPE;
+        if (type == N_SECT || type == N_ABS) target = symbol->n_value;
+        else {
+            if (symbol->n_un.n_strx >= symtab->strsize ||
+                !memchr(strings + symbol->n_un.n_strx, 0, symtab->strsize - symbol->n_un.n_strx))
+                return fail_message("invalid external relocation symbol name");
+            const char *name = strings + symbol->n_un.n_strx;
+            target = resolve(name, context);
+            if (!target) { fprintf(stderr, "game_loader: cannot relocate %s\n", name); return -1; }
+        }
+        uint32_t value;
+        memcpy(&value, (const void *)(uintptr_t)address, 4);
+        struct macho_import32 slot = {NULL, (uint32_t)address, MACHO_IMPORT32_POINTER};
+        /* Fixed-address executable: no slide. Linker's addends already
+           include the source address for PC-relative relocations. */
+        if (macho_image32_bind_import(&slot, value + target)) return -1;
+    }
+    fprintf(stderr, "compat32: bound %u main-image external relocations\n", dysymtab->nextrel);
     return 0;
 }
 

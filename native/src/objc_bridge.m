@@ -9,6 +9,8 @@
 #include "guest_dyld.h"
 #include "gl_shader_bridge.h"
 #include "gl_misc_bridge.h"
+#include "agl_bridge.h"
+#include "carbon_native.h"
 #include "name_match.h"
 
 #define GL_SILENCE_DEPRECATION 1
@@ -38,6 +40,7 @@
 #include <pthread.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 #include <mach/mach_time.h>
 
@@ -896,6 +899,7 @@ static id object_for_argument(uint32_t value)
 
 void *objc_bridge32_host_object(uint32_t handle) { return object_for_argument(handle); }
 uint32_t objc_bridge32_guest_object(void *object) { return proxy_for_object((id)object); }
+uint32_t objc_bridge32_owned_object(void *object) { return proxy_for_owned_value((id)object); }
 
 struct guest_runloop_context {
     uint32_t words[10];
@@ -2018,13 +2022,24 @@ static int compare_frame_ns(const void *left, const void *right)
     return (a > b) - (a < b);
 }
 
+void *objc_bridge32_game_screen(void) { return preferred_game_screen(); }
+void objc_bridge32_observe_cursor_window(void *window) { observe_portal_cursor_focus(window); }
+
 /* Source owns its NSOpenGLContext instead of using OpenGLView.swapBuffers.
    Keep its presentation measurement separate from the LEGO frame pacer. */
 static void portal_flush_buffer(NSOpenGLContext *context)
 {
+    static bool trace_signal_initialized;
+    if (!trace_signal_initialized) {
+        if (getenv("LP32_TRACE_GL_RENDER") || lp32_profile()->title == LP32_TITLE_TFU) {
+            install_gl_trace_signal();
+            gl_trace_printf("compat32: enabled SIGQUIT-triggered GL tracing for context presentation\n");
+        }
+        trace_signal_initialized = true;
+    }
     static int stats_enabled = -1;
     if (stats_enabled < 0)
-        stats_enabled = getenv("LP32_PORTAL_FRAME_STATS") != NULL ||
+        stats_enabled = getenv("LP32_PORTAL_FRAME_STATS") != NULL || getenv("LP32_FRAME_STATS") != NULL ||
                         compat_runtime32_frame_profile_enabled;
     uint64_t start = stats_enabled ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
     [context flushBuffer];
@@ -2064,6 +2079,8 @@ static void portal_flush_buffer(NSOpenGLContext *context)
     }
     trace_gl_frame_boundary();
 }
+
+void objc_bridge32_flush_context(void *context) { portal_flush_buffer(context); }
 
 /*
  * Quit from the Dock menu (or any other quit Apple event) reaches AppKit's own
@@ -3328,6 +3345,10 @@ struct guest_buffer_state {
     bool flush_on_unmap;
     bool size_known;
     GLint size;
+    unsigned char *shadow;
+    size_t shadow_size;
+    bool gpu_writable;
+    uint64_t revision;
 };
 
 struct guest_buffer_mapping {
@@ -3344,6 +3365,10 @@ struct guest_buffer_mapping {
     struct guest_buffer_state *state;
     bool range_mapping;
     bool active;
+    CGLContextObj cached_context;
+    struct guest_buffer_state *cached_state;
+    uint64_t cached_revision, last_use;
+    bool cached_valid;
 };
 
 static struct guest_buffer_state guest_buffer_states[kGuestBufferStateCapacity];
@@ -3351,6 +3376,9 @@ static struct guest_buffer_mapping
     guest_buffer_mappings[kGuestBufferMappingCapacity];
 static bool logged_guest_buffer_state_exhaustion;
 static bool logged_guest_buffer_mapping_exhaustion;
+static size_t guest_buffer_shadow_bytes;
+static uint64_t guest_buffer_mapping_serial;
+static uint64_t guest_buffer_mapping_reuses, guest_buffer_mapping_saved_bytes;
 
 /*
  * CGDisplayAvailableModes/CGDisplayCurrentMode stopped returning useful
@@ -3444,13 +3472,36 @@ static NSArray *legacy_modes_for_display(CGDirectDisplayID display)
         }
         CFRelease(current);
     }
+    if (lp32_profile()->title == LP32_TITLE_TFU && [legacy_modes count]) {
+        /* TFU retains its game resolution when moving to another monitor.
+           Borderless presentation can render these standard sizes on either
+           display without requiring a physical desktop mode switch. */
+        const int sizes[][2] = {{640,480}, {800,600}, {1024,768}, {1280,720},
+            {1280,800}, {1280,1024}, {1440,900}, {1600,900}, {1680,1050},
+            {1920,1080}, {1920,1200}, {2560,1440}, {2560,1600}};
+        for (unsigned i = 0; i < sizeof(sizes)/sizeof(sizes[0]); ++i) {
+            NSString *identity = [NSString stringWithFormat:@"%dx%d@60.000", sizes[i][0], sizes[i][1]];
+            if ([seen_modes containsObject:identity]) continue;
+            NSMutableDictionary *mode = [[legacy_modes[0] mutableCopy] autorelease];
+            mode[@"Width"] = @(sizes[i][0]); mode[@"Height"] = @(sizes[i][1]);
+            mode[@"RefreshRate"] = @60; mode[@"Mode"] = mode[@"IODisplayModeID"] = @(0x70000000u + i);
+            mode[@"kCGDisplayBytesPerRow"] = @(sizes[i][0] * 4);
+            mode[@"UsableForDesktopGUI"] = mode[@"kCGDisplayModeIsSafeForHardware"] = @YES;
+            mode[@"kCGDisplayModeIsInterlaced"] = mode[@"kCGDisplayModeIsStretched"] = mode[@"kCGDisplayModeIsTelevisionOutput"] = @NO;
+            mode[@"IOFlags"] = @(kDisplayModeValidFlag | kDisplayModeSafeFlag);
+            [legacy_modes addObject:mode]; [seen_modes addObject:identity];
+        }
+    }
     NSArray *result = [NSArray arrayWithArray:legacy_modes];
     [cache setObject:result forKey:display_key];
     return result;
 }
 
+static NSMutableDictionary *tfu_emulated_display_modes;
 static NSDictionary *legacy_current_mode_for_display(CGDirectDisplayID display)
 {
+    if (lp32_profile()->title == LP32_TITLE_TFU && tfu_emulated_display_modes[@(display)])
+        return tfu_emulated_display_modes[@(display)];
     if (guest_display_mode.width > 0 && display == preferred_game_display_id()) {
         for (NSDictionary *candidate in legacy_modes_for_display(display)) {
             if ([[candidate objectForKey:@"Width"] doubleValue] == guest_display_mode.width &&
@@ -3512,7 +3563,8 @@ static bool portal_buffer_cache_enabled(void)
 {
     static int disabled = -1;
     if (disabled < 0) disabled = getenv("LP32_NO_BUFFER_CACHE") != NULL;
-    return lp32_profile()->title == LP32_TITLE_PORTAL2 && !disabled;
+    return (lp32_profile()->title == LP32_TITLE_PORTAL2 ||
+            lp32_profile()->title == LP32_TITLE_TFU) && !disabled;
 }
 
 static int buffer_target_index(GLenum target)
@@ -3650,6 +3702,100 @@ static GLint mapped_buffer_size(GLenum target, struct guest_buffer_state *state)
     return size;
 }
 
+static void discard_buffer_shadow(struct guest_buffer_state *state)
+{
+    if (!state) return;
+    ++state->revision;
+    if (!state->shadow) return;
+    guest_buffer_shadow_bytes -= state->shadow_size;
+    free(state->shadow);
+    state->shadow = NULL;
+    state->shadow_size = 0;
+}
+
+/* Only CPU-written TFU vertex/index stores qualify. A pixel-pack binding
+   permanently excludes the object, because glReadPixels can change it on
+   the GPU. Keep host-address copies (outside the limited i386 heap), capped
+   at 256 MiB; allocation pressure simply restores the readback path. */
+static void read_mapped_buffer(GLenum target, struct guest_buffer_state *state,
+                               size_t offset, size_t size, void *destination)
+{
+    static int enabled = -1;
+    if (enabled < 0) enabled = !getenv("LP32_NO_TFU_BUFFER_SHADOW");
+    static int trace = -1;
+    static uint64_t period, hits, cold, fallback, copied_bytes, readback_bytes;
+    if (trace < 0) trace = getenv("LP32_TRACE_BUFFER_CACHE") != NULL;
+    if (trace && period != objc_bridge_swap_count / 240) {
+        fprintf(stderr, "compat32: buffer-cache swap=%llu hits=%llu cold=%llu "
+                "fallback=%llu copied-MiB=%.2f readback-MiB=%.2f resident-MiB=%.2f "
+                "reused=%llu saved-MiB=%.2f\n",
+                (unsigned long long)objc_bridge_swap_count,
+                (unsigned long long)hits, (unsigned long long)cold,
+                (unsigned long long)fallback, copied_bytes / 1048576.0,
+                readback_bytes / 1048576.0, guest_buffer_shadow_bytes / 1048576.0,
+                (unsigned long long)guest_buffer_mapping_reuses,
+                guest_buffer_mapping_saved_bytes / 1048576.0);
+        period = objc_bridge_swap_count / 240;
+        hits = cold = fallback = copied_bytes = readback_bytes = 0;
+        guest_buffer_mapping_reuses = guest_buffer_mapping_saved_bytes = 0;
+    }
+    bool eligible = enabled && lp32_profile()->title == LP32_TITLE_TFU &&
+        state && !state->gpu_writable && state->size > 0 &&
+        (target == GL_ARRAY_BUFFER || target == GL_ELEMENT_ARRAY_BUFFER);
+    if (eligible && state->shadow && state->shadow_size != (size_t)state->size)
+        discard_buffer_shadow(state);
+    if (eligible && !state->shadow &&
+        (size_t)state->size <= 256u * 1024 * 1024 - guest_buffer_shadow_bytes) {
+        state->shadow = malloc((size_t)state->size);
+        if (state->shadow) {
+            state->shadow_size = state->size;
+            guest_buffer_shadow_bytes += state->shadow_size;
+            glGetBufferSubData(target, 0, state->size, state->shadow);
+            if (trace) { ++cold; readback_bytes += state->size; }
+        }
+    }
+    if (eligible && state->shadow && offset <= state->shadow_size &&
+        size <= state->shadow_size - offset) {
+        memcpy(destination, state->shadow + offset, size);
+        if (trace) { ++hits; copied_bytes += size; }
+    } else {
+        glGetBufferSubData(target, (GLintptr)offset, (GLsizeiptr)size, destination);
+        if (trace) { ++fallback; readback_bytes += size; }
+    }
+}
+
+static void update_buffer_shadow(GLenum target, GLintptr offset,
+                                  GLsizeiptr size, const void *data)
+{
+    if (lp32_profile()->title != LP32_TITLE_TFU) return;
+    struct guest_buffer_state *state = buffer_state_for_name(
+        CGLGetCurrentContext(), bound_buffer_for_target(target), false);
+    if (state && state->shadow && data && offset >= 0 && size >= 0 &&
+        (size_t)offset <= state->shadow_size &&
+        (size_t)size <= state->shadow_size - (size_t)offset) {
+        memcpy(state->shadow + offset, data, (size_t)size);
+        ++state->revision;
+    }
+}
+
+/* TFU repeatedly locks its 2 MiB streaming VBO to flush a small subrange.
+   Retain a bounded set of staging allocations for those objects. APPLE's
+   explicit-flush contract requires every modified range to be flushed;
+   unflushed modifications are undefined. Thus a conforming write-only map
+   can reuse its staging bytes, while read maps always use committed data.
+   A different context, external upload, orphan, or GPU write forces refresh.
+   https://registry.khronos.org/OpenGL/extensions/APPLE/APPLE_flush_buffer_range.txt */
+static bool cacheable_buffer_mapping(const struct guest_buffer_mapping *mapping)
+{
+    static int enabled = -1;
+    if (enabled < 0) enabled = !getenv("LP32_NO_TFU_MAP_REUSE");
+    const struct guest_buffer_state *state = mapping->state;
+    return enabled && lp32_profile()->title == LP32_TITLE_TFU && state &&
+        !state->gpu_writable && state->shadow && !state->flush_on_unmap &&
+        !mapping->range_mapping && mapping->access == GL_WRITE_ONLY &&
+        mapping->size >= 65536 && mapping->size <= 2 * 1024 * 1024;
+}
+
 /* Keep the guest's low-address staging allocation, but commit it through a
    native map. BufferSubData makes Apple's Metal-backed GL driver repeatedly
    end render passes and enqueue GPU copies, even for small streaming writes.
@@ -3675,6 +3821,7 @@ static void upload_mapped_buffer_range(GLenum target, GLintptr offset,
         }
     }
     glBufferSubData(target, offset, size, data);
+    update_buffer_shadow(target, offset, size, data);
 }
 
 static struct guest_buffer_mapping *active_buffer_mapping(
@@ -3697,23 +3844,27 @@ static struct guest_buffer_mapping *begin_buffer_mapping(
     struct guest_buffer_mapping *mapping =
         active_buffer_mapping(context, target, buffer);
     if (mapping) return mapping;
+    struct guest_buffer_mapping *choice = NULL;
     for (size_t index = 0;
          index < sizeof(guest_buffer_mappings) / sizeof(guest_buffer_mappings[0]);
          ++index) {
         if (!guest_buffer_mappings[index].active) {
             mapping = &guest_buffer_mappings[index];
-            uint32_t storage = mapping->storage;
-            size_t capacity = mapping->capacity;
-            memset(mapping, 0, sizeof(*mapping));
-            mapping->storage = storage;
-            mapping->capacity = capacity;
-            mapping->context = context;
-            mapping->target = target;
-            mapping->buffer = buffer;
-            mapping->state = state;
-            mapping->active = true;
-            return mapping;
+            if (mapping->cached_valid && mapping->cached_context == context &&
+                mapping->cached_state == state) { choice = mapping; break; }
+            if (!choice || (!mapping->cached_valid && choice->cached_valid) ||
+                (mapping->cached_valid && choice->cached_valid &&
+                 mapping->last_use < choice->last_use)) choice = mapping;
         }
+    }
+    if (choice) {
+        choice->context = context;
+        choice->target = target;
+        choice->buffer = buffer;
+        choice->state = state;
+        choice->active = true;
+        choice->last_use = ++guest_buffer_mapping_serial;
+        return choice;
     }
     if (!logged_guest_buffer_mapping_exhaustion) {
         fprintf(stderr,
@@ -3767,6 +3918,10 @@ static void discard_buffer_state(CGLContextObj context, GLuint buffer)
          ++index) {
         struct guest_buffer_state *state = &guest_buffer_states[index];
         if (state->buffer != buffer || state->share_group != share_group) continue;
+        for (unsigned slot = 0; slot < kGuestBufferMappingCapacity; ++slot)
+            if (guest_buffer_mappings[slot].cached_state == state)
+                guest_buffer_mappings[slot].cached_valid = false;
+        discard_buffer_shadow(state);
         memset(state, 0, sizeof(*state));
     }
 }
@@ -4275,6 +4430,42 @@ static struct gl_index_diagnostic trace_index_buffer(
     return diagnostic;
 }
 
+static FILE *open_gl_data_dump(const char *kind, GLuint object)
+{
+    const char *directory = getenv("LP32_DUMP_GL_DATA");
+    char capture_directory[PATH_MAX];
+    /* A live TFU capture must retain small texture pixels as well as names:
+       a complete texture can still contain the wrong material's image. */
+    if ((!directory || !*directory) && lp32_profile()->title == LP32_TITLE_TFU &&
+        gl_render_trace_remaining && gl_program_dump_directory[0]) {
+        mkdir(gl_program_dump_directory, 0700);
+        int n = snprintf(capture_directory, sizeof(capture_directory),
+                         "%s/data-%ld-%llu", gl_program_dump_directory,
+                         (long)getpid(), (unsigned long long)gl_render_trace_generation);
+        if (n > 0 && (size_t)n < sizeof(capture_directory)) directory = capture_directory;
+    }
+    if (!directory || !*directory) return NULL;
+    mkdir(directory, 0700);
+    char path[PATH_MAX];
+    int count = snprintf(path, sizeof(path), "%s/%s-%u.bin", directory, kind, object);
+    if (count < 0 || (size_t)count >= sizeof(path)) return NULL;
+    return fopen(path, "wx"); /* First snapshot in this capture directory. */
+}
+
+static void trace_dump_buffer(GLenum target, GLuint buffer, GLint size)
+{
+    if (size <= 0 || size > 256 * 1024) return;
+    FILE *file = open_gl_data_dump("buffer", buffer);
+    if (!file) return;
+    void *data = malloc(size);
+    if (data) {
+        glGetBufferSubData(target, 0, size, data);
+        fwrite(data, 1, size, file);
+        free(data);
+    }
+    fclose(file);
+}
+
 static void trace_vertex_attributes(GLuint minimum, GLuint maximum)
 {
     GLint previous_array_buffer = 0;
@@ -4287,7 +4478,8 @@ static void trace_vertex_attributes(GLuint minimum, GLuint maximum)
     for (GLuint index = 0; index < (GLuint)maximum_attributes; ++index) {
         GLint enabled = 0;
         glGetVertexAttribiv(index, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &enabled);
-        if (!enabled) continue;
+        bool legacy_position = index == 0 && glIsEnabled(GL_VERTEX_ARRAY);
+        if (!enabled && !legacy_position) continue;
 
         GLint size = 0;
         GLint type = 0;
@@ -4304,6 +4496,14 @@ static void trace_vertex_attributes(GLuint minimum, GLuint maximum)
                             &buffer);
         glGetVertexAttribPointerv(index, GL_VERTEX_ATTRIB_ARRAY_POINTER,
                                   &raw_pointer);
+        if (legacy_position) {
+            glGetIntegerv(GL_VERTEX_ARRAY_SIZE, &size);
+            glGetIntegerv(GL_VERTEX_ARRAY_TYPE, &type);
+            glGetIntegerv(GL_VERTEX_ARRAY_STRIDE, &stride);
+            glGetIntegerv(GL_VERTEX_ARRAY_BUFFER_BINDING, &buffer);
+            glGetPointerv(GL_VERTEX_ARRAY_POINTER, &raw_pointer);
+            normalized = 0;
+        }
 
         size_t component_size = gl_attribute_component_size((GLenum)type);
         size_t element_size = size > 0 && component_size &&
@@ -4316,6 +4516,7 @@ static void trace_vertex_attributes(GLuint minimum, GLuint maximum)
             glBindBuffer(GL_ARRAY_BUFFER, (GLuint)buffer);
             glGetBufferParameteriv(GL_ARRAY_BUFFER, GL_BUFFER_SIZE,
                                    &buffer_size);
+            trace_dump_buffer(GL_ARRAY_BUFFER, (GLuint)buffer, buffer_size);
         }
 
         bool range_valid = maximum >= minimum && element_size &&
@@ -4478,6 +4679,38 @@ static void trace_texture_2d_content(GLint unit, GLuint texture,
         glGetTexLevelParameteriv(GL_TEXTURE_2D, base_level,
                                  GL_TEXTURE_COMPRESSED_IMAGE_SIZE,
                                  &compressed_size);
+    }
+    if ((base_format == GL_RGBA32F_ARB || base_format == GL_RGBA16F_ARB ||
+         base_format == GL_RGBA8) &&
+        base_width > 0 && base_height > 0 &&
+        (uint64_t)base_width * base_height <= 65536) {
+        /* Read half-float reflection targets as floats, preserving NaNs and
+         * infinities that would disappear in an RGBA8 screenshot. */
+        bool floating = base_format != GL_RGBA8;
+        FILE *file = open_gl_data_dump(floating ? "texture-rgba32f" : "texture-rgba8", texture);
+        if (file) {
+            size_t bytes = (size_t)base_width * base_height * 4 * (floating ? sizeof(float) : 1);
+            void *data = malloc(bytes);
+            if (data) {
+                const GLenum names[] = {GL_PACK_ALIGNMENT, GL_PACK_ROW_LENGTH,
+                    GL_PACK_SKIP_ROWS, GL_PACK_SKIP_PIXELS, GL_PACK_IMAGE_HEIGHT,
+                    GL_PACK_SKIP_IMAGES, GL_PACK_SWAP_BYTES, GL_PACK_LSB_FIRST};
+                GLint saved[8], pack_buffer;
+                glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pack_buffer);
+                glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+                for (unsigned i = 0; i < 8; ++i) {
+                    glGetIntegerv(names[i], &saved[i]);
+                    glPixelStorei(names[i], i ? 0 : 1);
+                }
+                glGetTexImage(GL_TEXTURE_2D, base_level, GL_RGBA,
+                              floating ? GL_FLOAT : GL_UNSIGNED_BYTE, data);
+                for (unsigned i = 0; i < 8; ++i) glPixelStorei(names[i], saved[i]);
+                glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)pack_buffer);
+                fwrite(data, 1, bytes, file);
+                free(data);
+            }
+            fclose(file);
+        }
     }
 
     GLint required_last = base_level;
@@ -4940,12 +5173,24 @@ static void trace_texture_units(void)
 
     for (GLint unit = 0; unit < maximum_units; ++unit) {
         glActiveTexture((GLenum)(GL_TEXTURE0 + unit));
+        GLint texture_1d = 0;
         GLint texture_2d = 0;
         GLint texture_3d = 0;
         GLint texture_cube = 0;
+        glGetIntegerv(GL_TEXTURE_BINDING_1D, &texture_1d);
         glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture_2d);
         glGetIntegerv(GL_TEXTURE_BINDING_3D, &texture_3d);
         glGetIntegerv(GL_TEXTURE_BINDING_CUBE_MAP, &texture_cube);
+        if (texture_1d) {
+            GLint width = 0, format = 0, base = 0, maximum = 0, filter = 0;
+            glGetTexParameteriv(GL_TEXTURE_1D, GL_TEXTURE_BASE_LEVEL, &base);
+            glGetTexParameteriv(GL_TEXTURE_1D, GL_TEXTURE_MAX_LEVEL, &maximum);
+            glGetTexParameteriv(GL_TEXTURE_1D, GL_TEXTURE_MIN_FILTER, &filter);
+            glGetTexLevelParameteriv(GL_TEXTURE_1D, base, GL_TEXTURE_WIDTH, &width);
+            glGetTexLevelParameteriv(GL_TEXTURE_1D, base, GL_TEXTURE_INTERNAL_FORMAT, &format);
+            gl_trace_printf("compat32: texture-1d swap=%llu unit=%d texture=%d width=%d format=%04x base=%d max=%d min=%04x\n",
+                (unsigned long long)objc_bridge_swap_count, unit, texture_1d, width, format, base, maximum, filter);
+        }
         if (!texture_2d && !texture_3d && !texture_cube) continue;
 
         GLint width_2d = 0;
@@ -5029,6 +5274,8 @@ static void trace_draw_call(const char *kind, GLenum mode, GLint first,
     GLfloat alpha_reference = 0.0f;
     GLint depth_function = 0;
     GLint cull_mode = 0;
+    GLint glsl_program = 0;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &glsl_program);
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &framebuffer);
     glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &array_buffer);
     glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &element_buffer);
@@ -5074,7 +5321,7 @@ static void trace_draw_call(const char *kind, GLenum mode, GLint first,
         "fboStatus=%04x vbo=%d ibo=%d vp=%u fp=%u vpEnabled=%d "
         "fpEnabled=%d blend=%d blendFunc={%04x,%04x} blendEq=%04x "
         "alphaTest=%d alphaFunc=%04x alphaRef=%.7g depthTest=%d "
-        "depthFunc=%04x cull=%d cullMode=%04x\n",
+        "depthFunc=%04x cull=%d cullMode=%04x glsl=%d\n",
         kind, (unsigned long long)objc_bridge_swap_count, mode, first, count,
         framebuffer, framebuffer_status, array_buffer, element_buffer,
         trace_vertex_program, trace_fragment_program,
@@ -5083,7 +5330,51 @@ static void trace_draw_call(const char *kind, GLenum mode, GLint first,
         blend_source, blend_destination, blend_equation,
         glIsEnabled(GL_ALPHA_TEST), alpha_function, alpha_reference,
         glIsEnabled(GL_DEPTH_TEST), depth_function,
-        glIsEnabled(GL_CULL_FACE), cull_mode);
+        glIsEnabled(GL_CULL_FACE), cull_mode, glsl_program);
+    if (glsl_program) {
+        if (getenv("LP32_DUMP_GL_DATA") &&
+            glGetUniformLocation(glsl_program, "DMMExtras_s2") >= 0) {
+            const char *matrices[] = {"gLocalToWorld", "gWorldToProjection"};
+            for (unsigned m = 0; m < 2; ++m) for (unsigned row = 0; row < 4; ++row) {
+                char name[64]; snprintf(name, sizeof(name), "%s[%u]", matrices[m], row);
+                GLint location = glGetUniformLocation(glsl_program, name);
+                if (location >= 0) {
+                    GLfloat values[4]; glGetUniformfv(glsl_program, location, values);
+                    gl_trace_printf("compat32: DMM matrix program=%d %s={%.9g,%.9g,%.9g,%.9g}\n",
+                        glsl_program, name, values[0], values[1], values[2], values[3]);
+                }
+            }
+        }
+        static uint64_t seen[4096];
+        unsigned slot = (unsigned)glsl_program % 4096;
+        uint64_t key = ((gl_render_trace_generation + 1) << 32) | (unsigned)glsl_program;
+        if (seen[slot] != key) {
+            seen[slot] = key;
+            if (lp32_profile()->title == LP32_TITLE_TFU && gl_program_dump_directory[0]) {
+                char directory[PATH_MAX];
+                mkdir(gl_program_dump_directory, 0700);
+                int n = snprintf(directory, sizeof(directory), "%s/glsl-%ld-%llu", gl_program_dump_directory,
+                    (long)getpid(), (unsigned long long)gl_render_trace_generation);
+                if (n > 0 && (size_t)n < sizeof(directory))
+                    gl_shader_bridge32_dump_program(glsl_program, directory);
+            }
+            GLint count = 0;
+            glGetProgramiv(glsl_program, GL_ACTIVE_UNIFORMS, &count);
+            for (GLint i = 0; i < count; ++i) {
+                char name[256]; GLsizei length; GLint size; GLenum type;
+                glGetActiveUniform(glsl_program, i, sizeof(name), &length, &size, &type, name);
+                GLint location = glGetUniformLocation(glsl_program, name);
+                if (type == GL_FLOAT_VEC4 || type == GL_FLOAT) {
+                    GLfloat value[4] = {0};
+                    glGetUniformfv(glsl_program, location, value);
+                    gl_trace_printf("compat32: GLSL uniform program=%d name=%s size=%d value={%.9g,%.9g,%.9g,%.9g}\n", glsl_program, name, size, value[0], value[1], value[2], value[3]);
+                } else if (type == GL_SAMPLER_1D || type == GL_SAMPLER_2D || type == GL_SAMPLER_3D || type == GL_SAMPLER_CUBE) {
+                    GLint unit = 0; glGetUniformiv(glsl_program, location, &unit);
+                    gl_trace_printf("compat32: GLSL sampler program=%d name=%s unit=%d\n", glsl_program, name, unit);
+                }
+            }
+        }
+    }
     gl_trace_printf(
         "compat32: framebuffer-state swap=%llu fbo=%d "
         "drawBuffers={%04x,%04x,%04x,%04x} "
@@ -5096,6 +5387,11 @@ static void trace_draw_call(const char *kind, GLenum mode, GLint first,
         attachment_names[2], attachment_names[3]);
 
     if (indexed) {
+        if (getenv("LP32_DUMP_GL_DATA") && element_buffer) {
+            GLint bytes = 0;
+            glGetBufferParameteriv(GL_ELEMENT_ARRAY_BUFFER, GL_BUFFER_SIZE, &bytes);
+            trace_dump_buffer(GL_ELEMENT_ARRAY_BUFFER, element_buffer, bytes);
+        }
         struct gl_index_diagnostic diagnostic = trace_index_buffer(
             count, index_type, index_pointer, advertised_start,
             advertised_end, element_buffer);
@@ -5112,6 +5408,62 @@ static void trace_draw_call(const char *kind, GLenum mode, GLint first,
  * render trace and logs each change together with the programs that made it,
  * so the draw that paints a given screen region can be identified.
  */
+/* Opt-in reflection diagnostic. Scan a small floating-point attachment after
+ * each traced draw to identify the first program introducing NaNs, rather
+ * than losing them in the final normalized framebuffer. */
+static void probe_float_target(const char *kind)
+{
+    static int target = -1;
+    if (target < 0) {
+        const char *value = getenv("LP32_TRACE_FLOAT_TARGET");
+        target = value ? atoi(value) : 0;
+    }
+    if (!target || !gl_render_trace_remaining ||
+        objc_bridge_swap_count < gl_render_trace_first_swap) return;
+    GLint framebuffer, attachment = 0, type = 0, viewport[4];
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &framebuffer);
+    if (!framebuffer) return;
+    glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+        GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
+    if (type != GL_TEXTURE) return;
+    glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+        GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &attachment);
+    if (attachment != target) return;
+    glGetIntegerv(GL_VIEWPORT, viewport);
+    if (viewport[2] <= 0 || viewport[3] <= 0 ||
+        (uint64_t)viewport[2] * viewport[3] > 65536) return;
+    size_t count = (size_t)viewport[2] * viewport[3] * 4;
+    GLfloat *pixels = malloc(count * sizeof(*pixels));
+    if (!pixels) return;
+    GLint read_fbo, read_buffer, pack_buffer, saved[8];
+    const GLenum names[] = {GL_PACK_ALIGNMENT, GL_PACK_ROW_LENGTH,
+        GL_PACK_SKIP_ROWS, GL_PACK_SKIP_PIXELS, GL_PACK_IMAGE_HEIGHT,
+        GL_PACK_SKIP_IMAGES, GL_PACK_SWAP_BYTES, GL_PACK_LSB_FIRST};
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_fbo);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
+    glGetIntegerv(GL_READ_BUFFER, &read_buffer);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pack_buffer);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    for (unsigned i = 0; i < 8; ++i) {
+        glGetIntegerv(names[i], &saved[i]); glPixelStorei(names[i], i ? 0 : 1);
+    }
+    glReadPixels(viewport[0], viewport[1], viewport[2], viewport[3], GL_RGBA, GL_FLOAT, pixels);
+    for (unsigned i = 0; i < 8; ++i) glPixelStorei(names[i], saved[i]);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, pack_buffer);
+    glReadBuffer(read_buffer);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, read_fbo);
+    size_t nonfinite = 0, first = count;
+    for (size_t i = 0; i < count; ++i) if (!isfinite(pixels[i])) {
+        if (first == count) first = i;
+        ++nonfinite;
+    }
+    GLint program = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+    gl_trace_printf("compat32: float-target swap=%llu after=%s texture=%d glsl=%d nonfinite=%zu first=%zu\n",
+        (unsigned long long)objc_bridge_swap_count, kind, target, program, nonfinite, first);
+    free(pixels);
+}
+
 static void probe_trace_pixel(const char *kind)
 {
     static int state = -1;
@@ -5124,7 +5476,8 @@ static void probe_trace_pixel(const char *kind)
             state = 1;
         }
     }
-    if (state != 1 || !gl_render_trace_remaining) return;
+    if (state != 1 || !gl_render_trace_remaining ||
+        objc_bridge_swap_count < gl_render_trace_first_swap) return;
     GLint viewport[4] = {0, 0, 0, 0};
     GLint framebuffer = 0;
     glGetIntegerv(GL_VIEWPORT, viewport);
@@ -5158,13 +5511,15 @@ static void probe_trace_pixel(const char *kind)
     glReadPixels(x, y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
     if (memcmp(pixel, last, sizeof(pixel)) == 0) return;
     memcpy(last, pixel, sizeof(pixel));
+    GLint glsl_program = 0;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &glsl_program);
     gl_trace_printf(
         "compat32: pixel-probe swap=%llu after=%s fbo=%d viewport={%d,%d,%d,%d} "
-        "at=(%d,%d) rgba={%u,%u,%u,%u} vp=%u fp=%u\n",
+        "at=(%d,%d) rgba={%u,%u,%u,%u} vp=%u fp=%u glsl=%d\n",
         (unsigned long long)objc_bridge_swap_count, kind, framebuffer,
         viewport[0], viewport[1], viewport[2], viewport[3], x, y,
         pixel[0], pixel[1], pixel[2], pixel[3], trace_vertex_program,
-        trace_fragment_program);
+        trace_fragment_program, glsl_program);
 }
 
 static uint32_t guest_gl_string(GLenum name)
@@ -5291,6 +5646,7 @@ FAST_GL(glDrawRangeElements)
                         (GLsizei)arguments[3], arguments[4],
                         (const void *)(uintptr_t)arguments[5]);
     probe_trace_pixel("glDrawRangeElements");
+    probe_float_target("glDrawRangeElements");
     restore_unbound_fragment_samplers(&sampler_restore);
     return 0;
 }
@@ -5304,6 +5660,7 @@ FAST_GL(glDrawArrays)
                     0, 0, (GLsizei)arguments[2], 0, 0, false);
     glDrawArrays(arguments[0], arguments[1], arguments[2]);
     probe_trace_pixel("glDrawArrays");
+    probe_float_target("glDrawArrays");
     restore_unbound_fragment_samplers(&sampler_restore);
     return 0;
 }
@@ -5418,6 +5775,10 @@ FAST_GL(glBindBuffer)
     }
     glBindBuffer(arguments[0], arguments[1]);
     remember_buffer_binding(arguments[0], arguments[1]);
+    if (lp32_profile()->title == LP32_TITLE_TFU && arguments[0] == GL_PIXEL_PACK_BUFFER && arguments[1]) {
+        struct guest_buffer_state *state = buffer_state_for_name(CGLGetCurrentContext(), arguments[1], true);
+        if (state) { state->gpu_writable = true; discard_buffer_shadow(state); }
+    }
     return 0;
 }
 
@@ -5578,16 +5939,32 @@ FAST_GL(glUniform1f)
 }
 FAST_GL(glUseProgram) { (void)return_address; glUseProgram(arguments[0]); return 0; }
 
+/* TFU asks for its Carbon task storage tens of thousands of times per frame.
+   Preserve the native thread-local semantics without the full bridge chain. */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+FAST_GL(MPGetTaskStorageValue) { (void)return_address; return (uint32_t)(uintptr_t)MPGetTaskStorageValue(arguments[0]); }
+FAST_GL(MPSetTaskStorageValue) { (void)return_address; return (uint32_t)MPSetTaskStorageValue(arguments[0], (void *)(uintptr_t)arguments[1]); }
+#pragma clang diagnostic pop
+
 #undef FAST_GL
 
 lp32_fast_import_fn objc_bridge32_fast_import(const char *import_name)
 {
+    if ((!strcmp(import_name, "_MPGetTaskStorageValue") ||
+         !strcmp(import_name, "_MPSetTaskStorageValue")) &&
+        getenv("LP32_NO_CARBON_TLS_FAST")) return NULL;
+    if (lp32_profile()->title == LP32_TITLE_TFU &&
+        (!strcmp(import_name, "_glGetIntegerv") || !strcmp(import_name, "_glGetFloatv") ||
+         !strcmp(import_name, "glGetIntegerv") || !strcmp(import_name, "glGetFloatv"))) return NULL;
     if (!strcmp(import_name, "_CGLGetCurrentContext") &&
         getenv("LP32_NO_CGL_CONTEXT_CACHE")) return NULL;
     static const struct {
         const char *name;
         lp32_fast_import_fn handler;
     } table[] = {
+        {"_MPGetTaskStorageValue", fast_MPGetTaskStorageValue},
+        {"_MPSetTaskStorageValue", fast_MPSetTaskStorageValue},
         {"_CGLGetCurrentContext", fast_CGLGetCurrentContext},
         {"glVertexAttribPointer", fast_glVertexAttribPointer},
         {"glVertexAttribPointerARB", fast_glVertexAttribPointer},
@@ -5648,7 +6025,8 @@ lp32_fast_import_fn objc_bridge32_fast_import(const char *import_name)
         if (!strncmp(query, "_gl", 3)) ++query;
         if ((!strncmp(candidate, "glUniform", 9) ||
              !strncmp(candidate, "glUseProgram", 12)) &&
-            (lp32_profile()->title != LP32_TITLE_PORTAL2 ||
+            ((lp32_profile()->title != LP32_TITLE_PORTAL2 &&
+              lp32_profile()->title != LP32_TITLE_TFU) ||
              getenv("LP32_NO_FAST_GLSL"))) continue;
         if (strcmp(query, candidate) == 0) {
             return table[index].handler;
@@ -5684,6 +6062,7 @@ int objc_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
                  (import_name[0] == '_' && import_name[1] == 'g' &&
                   import_name[2] == 'l');
     if (is_gl) {
+        if (lp32_profile()->title == LP32_TITLE_TFU && agl_bridge32_gl_dispatch(import_name, arguments, result)) return 1;
         if (gl_shader_bridge32_dispatch(import_name, arguments, result)) return 1;
         if (gl_misc_bridge32_dispatch(import_name, arguments, result)) return 1;
         if (objc_bridge32_dispatch_body(import_name, import_length, arguments, result)) return 1;
@@ -5841,7 +6220,8 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     if (LP32_NAME_IS(import_name, import_length, "_CFStringCreateWithCString") ||
         LP32_NAME_IS(import_name, import_length, "_CFStringCreateWithCStringNoCopy")) {
         CFStringRef string = CFStringCreateWithCString(NULL, (const char *)(uintptr_t)arguments[1], arguments[2]);
-        *result = lp32_profile()->title == LP32_TITLE_PORTAL2 ?
+        if (getenv("LP32_TRACE_CF_STRINGS")) fprintf(stderr, "CF string: %s\n", string ? [(NSString *)string UTF8String] : "(invalid)");
+        *result = (lp32_profile()->title == LP32_TITLE_PORTAL2 || lp32_profile()->title == LP32_TITLE_TFU) ?
             proxy_for_owned_value((id)string) : proxy_for_object((id)string);
         if (string) CFRelease(string);
         return 1;
@@ -5934,6 +6314,11 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         NSDictionary *mode = object_for_argument(arguments[1]);
         NSSize requested = NSMakeSize([[mode objectForKey:@"Width"] doubleValue],
                                       [[mode objectForKey:@"Height"] doubleValue]);
+        if (lp32_profile()->title == LP32_TITLE_TFU && mode) {
+            if (!tfu_emulated_display_modes) tfu_emulated_display_modes = [[NSMutableDictionary alloc] init];
+            tfu_emulated_display_modes[@(arguments[0])] = mode;
+            carbon_native32_display_mode(arguments[0], requested.width, requested.height);
+        }
         if (arguments[0] == preferred_game_display_id() && mode) {
             set_guest_display_mode(requested);
             [presenting_view applyGuestDisplayMode];
@@ -5946,13 +6331,17 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CGDisplayRelease")) {
+        if (lp32_profile()->title == LP32_TITLE_TFU) {
+            [tfu_emulated_display_modes removeObjectForKey:@(arguments[0])];
+            carbon_native32_display_mode(arguments[0], 0, 0);
+        }
         /* Releasing the captured display restores the desktop mode. */
         set_guest_display_mode(NSZeroSize);
         [presenting_view applyGuestDisplayMode];
         *result = kCGErrorSuccess;
         return 1;
     }
-    if (lp32_profile()->title == LP32_TITLE_PORTAL2 &&
+    if ((lp32_profile()->title == LP32_TITLE_PORTAL2 || lp32_profile()->title == LP32_TITLE_TFU) &&
         (LP32_NAME_IS(import_name, import_length, "_CGDisplayHideCursor") ||
          LP32_NAME_IS(import_name, import_length, "_CGDisplayShowCursor"))) {
         /* Source repeats hide/show until its visibility query changes. Keep
@@ -6066,8 +6455,11 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     if (LP32_NAME_IS(import_name, import_length, "_CGDisplayIsActive")) {
         *result = CGDisplayIsActive(arguments[0]); return 1;
     }
+    if (LP32_NAME_IS(import_name, import_length, "_CGDisplayIsInMirrorSet")) {
+        *result = CGDisplayIsInMirrorSet(arguments[0]); return 1;
+    }
     if (LP32_NAME_IS(import_name, import_length, "_CGCursorIsVisible")) {
-        if (lp32_profile()->title == LP32_TITLE_PORTAL2) {
+        if ((lp32_profile()->title == LP32_TITLE_PORTAL2 || lp32_profile()->title == LP32_TITLE_TFU)) {
             pthread_mutex_lock(&portal_cursor_lock);
             *result = portal_cursor.hide_count == 0;
             pthread_mutex_unlock(&portal_cursor_lock);
@@ -6091,7 +6483,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     }
     if (LP32_NAME_IS(import_name, import_length, "_CGWarpMouseCursorPosition")) {
         const float *point = (const void *)arguments;
-        if (lp32_profile()->title == LP32_TITLE_PORTAL2) {
+        if ((lp32_profile()->title == LP32_TITLE_PORTAL2 || lp32_profile()->title == LP32_TITLE_TFU)) {
             pthread_mutex_lock(&portal_cursor_lock);
             if (!portal_cursor.focused && ++portal_background_warps == 1 &&
                 getenv("LP32_TRACE_DISPLAY"))
@@ -6103,7 +6495,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         *result = CGWarpMouseCursorPosition(CGPointMake(point[0], point[1])); return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CGAssociateMouseAndMouseCursorPosition")) {
-        if (lp32_profile()->title == LP32_TITLE_PORTAL2) {
+        if ((lp32_profile()->title == LP32_TITLE_PORTAL2 || lp32_profile()->title == LP32_TITLE_TFU)) {
             pthread_mutex_lock(&portal_cursor_lock);
             *result = lp32_cursor_capture(&portal_cursor, &portal_cursor_host, !arguments[0]);
             if (getenv("LP32_TRACE_DISPLAY"))
@@ -6340,6 +6732,9 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     }
     if (LP32_NAME_IS(import_name, import_length, "glBufferData") ||
         LP32_NAME_IS(import_name, import_length, "glBufferDataARB")) {
+        if (lp32_profile()->title == LP32_TITLE_TFU)
+            discard_buffer_shadow(buffer_state_for_name(CGLGetCurrentContext(),
+                bound_buffer_for_target(arguments[0]), false));
         if (portal_buffer_cache_enabled()) {
             struct guest_buffer_state *state = buffer_state_for_name(
                 CGLGetCurrentContext(), bound_buffer_for_target(arguments[0]), false);
@@ -6373,6 +6768,9 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         glBufferSubData(arguments[0], (GLintptr)(int32_t)arguments[1],
                         (GLsizeiptr)(int32_t)arguments[2],
                         (const void *)(uintptr_t)arguments[3]);
+        update_buffer_shadow(arguments[0], (GLintptr)(int32_t)arguments[1],
+                             (GLsizeiptr)(int32_t)arguments[2],
+                             (const void *)(uintptr_t)arguments[3]);
         *result = 0; return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "glBufferParameteriAPPLE")) {
@@ -6411,6 +6809,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         }
         size_t size = (size_t)byte_count;
         if (size > mapping->capacity) {
+            mapping->cached_valid = false;
             uint32_t storage = compat_runtime32_reallocate(
                 mapping->storage, size ? size : 1);
             if (!storage) {
@@ -6427,6 +6826,14 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         mapping->mapped_offset = 0;
         mapping->size = size;
         mapping->range_mapping = false;
+        bool reuse = cacheable_buffer_mapping(mapping) && mapping->cached_valid &&
+            mapping->cached_context == context && mapping->cached_state == state &&
+            mapping->cached_revision == state->revision;
+        mapping->cached_valid = false;
+        if (reuse) {
+            ++guest_buffer_mapping_reuses;
+            guest_buffer_mapping_saved_bytes += size;
+        }
         if (trace_gl_buffer_call()) {
             fprintf(stderr,
                     "compat32: glMapBuffer swap=%llu target=%04x "
@@ -6436,9 +6843,13 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                     mapping->target, buffer, mapping->access, mapping->size,
                     mapping->storage, state->flush_on_unmap);
         }
-        if (size && (mapping->access != GL_WRITE_ONLY ||
-                     state->flush_on_unmap)) {
-            glGetBufferSubData(mapping->target, 0, (GLsizeiptr)size,
+        /* Aspyr's D3D vertex-buffer Lock(0, 0, ..., 0) exposes a write-only
+           GL map even to the mesh loader that reads bone indices from it.
+           Legacy drivers returned the existing store; a recycled staging
+           slot contains unrelated data and corrupts the loader's stack. */
+        if (!reuse && size && (mapping->access != GL_WRITE_ONLY ||
+                     state->flush_on_unmap || lp32_profile()->title == LP32_TITLE_TFU)) {
+            read_mapped_buffer(mapping->target, state, 0, size,
                                (void *)(uintptr_t)mapping->storage);
         }
         *result = mapping->storage;
@@ -6463,6 +6874,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             return 1;
         }
         size_t size = (size_t)signed_size;
+        mapping->cached_valid = false;
         if (size > mapping->capacity) {
             uint32_t storage = compat_runtime32_reallocate(
                 mapping->storage, size ? size : 1);
@@ -6485,10 +6897,8 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                          (GL_MAP_INVALIDATE_RANGE_BIT |
                           GL_MAP_INVALIDATE_BUFFER_BIT)) == 0;
         if (size && (readable || preserve)) {
-            glGetBufferSubData(mapping->target,
-                               (GLintptr)mapping->mapped_offset,
-                               (GLsizeiptr)mapping->size,
-                               (void *)(uintptr_t)mapping->storage);
+            read_mapped_buffer(mapping->target, state, mapping->mapped_offset,
+                               mapping->size, (void *)(uintptr_t)mapping->storage);
         }
         if (trace_gl_buffer_call()) {
             fprintf(stderr,
@@ -6519,8 +6929,16 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             mapping->access != GL_READ_ONLY;
         bool explicit_flush = mapping->range_mapping &&
             (mapping->access_flags & GL_MAP_FLUSH_EXPLICIT_BIT) != 0;
+        /* Aspyr's texture surface writes every row into its unpack PBO but
+           flushes only pitch * (height - 1) bytes. Legacy coherent mappings
+           still exposed the final row; strict staging left it zero. This is
+           especially visible in float deformation textures: missing vertices
+           land at the world origin and stretch foliage across the level.
+           Preserve this behavior only for TFU's classic pixel-unpack maps. */
+        bool complete_tfu_pixels = lp32_profile()->title == LP32_TITLE_TFU &&
+            mapping->target == GL_PIXEL_UNPACK_BUFFER && !mapping->range_mapping;
         bool upload_all = writable && !explicit_flush &&
-            (mapping->range_mapping || state->flush_on_unmap);
+            (mapping->range_mapping || state->flush_on_unmap || complete_tfu_pixels);
         if (mapping->size && upload_all) {
             upload_mapped_buffer_range(mapping->target,
                             (GLintptr)mapping->mapped_offset,
@@ -6538,6 +6956,12 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                     mapping->range_mapping ? mapping->access_flags :
                                              mapping->access,
                     mapping->range_mapping, upload_all);
+        }
+        if (cacheable_buffer_mapping(mapping)) {
+            mapping->cached_valid = true;
+            mapping->cached_context = context;
+            mapping->cached_state = state;
+            mapping->cached_revision = state->revision;
         }
         deactivate_buffer_mapping(mapping);
         *result = GL_TRUE;
@@ -7153,6 +7577,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                      arguments[4], arguments[5], arguments[6], arguments[7],
                      (const void *)(uintptr_t)arguments[8]);
         repair_bound_texture_mipmap_range(arguments[0]);
+        gl_misc_bridge32_trace_texture_upload("image", arguments[0], arguments[1], arguments[8]);
         *result = 0; return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_glTexParameterf")) {
@@ -7251,8 +7676,11 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         *result = proxy_for_object(data);
         return 1;
     }
-    if (LP32_NAME_IS(import_name, import_length, "_IOServiceMatching")) {
-        CFMutableDictionaryRef matching = IOServiceMatching((const char *)(uintptr_t)arguments[0]);
+    if (LP32_NAME_IS(import_name, import_length, "_IOServiceMatching") ||
+        LP32_NAME_IS(import_name, import_length, "_IOServiceNameMatching")) {
+        CFMutableDictionaryRef matching = LP32_NAME_IS(import_name, import_length, "_IOServiceNameMatching") ?
+            IOServiceNameMatching((const char *)(uintptr_t)arguments[0]) :
+            IOServiceMatching((const char *)(uintptr_t)arguments[0]);
         *result = proxy_for_object((id)matching);
         if (matching) CFRelease(matching);
         return 1;
@@ -7265,6 +7693,11 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         *result = IORegisterForSystemPower(context, &port, guest_power_callback, (io_object_t *)(uintptr_t)arguments[3]);
         if (arguments[1]) *(uint32_t *)(uintptr_t)arguments[1] = port ? proxy_for_object([NSValue valueWithPointer:port]) : 0;
         if (!*result) free(context); /* Successful callbacks stay valid for the process lifetime. */
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_IONotificationPortCreate")) {
+        IONotificationPortRef port = IONotificationPortCreate(arguments[0]);
+        *result = port ? proxy_for_object([NSValue valueWithPointer:port]) : 0;
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_IONotificationPortGetRunLoopSource")) {
@@ -7290,12 +7723,37 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     if (LP32_NAME_IS(import_name, import_length, "_IORegistryEntryCreateCFProperty")) {
         CFTypeRef property = IORegistryEntryCreateCFProperty(arguments[0],
             (CFStringRef)object_for_argument(arguments[1]), NULL, arguments[3]);
+        if (lp32_profile()->title == LP32_TITLE_TFU &&
+            [object_for_argument(arguments[1]) isEqual:@"clock-frequency"]) {
+            int translated = 0; size_t size = sizeof(translated);
+            if (!sysctlbyname("sysctl.proc_translated", &translated, &size, NULL, 0) && translated) {
+                /* ARM's device-tree clock is the 24 MHz reference clock,
+                   not an x86 processor frequency. Let the guest fall back
+                   to Gestalt's processor-speed response under Rosetta. */
+                if (property) CFRelease(property);
+                property = NULL;
+            }
+        }
+        if (getenv("LP32_TRACE_SYSTEM")) fprintf(stderr, "compat32: IOKit property %s -> %s\n",
+            [[object_for_argument(arguments[1]) description] UTF8String], [[(id)property description] UTF8String] ?: "null");
         *result = proxy_for_object((id)property);
         if (property) CFRelease(property);
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_IOServiceGetMatchingServices")) {
         CFDictionaryRef matching = (CFDictionaryRef)object_for_argument(arguments[1]);
+        if (getenv("LP32_TRACE_SYSTEM")) fprintf(stderr, "compat32: IOKit matching %s\n", [[(id)matching description] UTF8String]);
+        if (lp32_profile()->title == LP32_TITLE_TFU &&
+            [[(NSDictionary *)matching objectForKey:@"IOProviderClass"] hasPrefix:@"IOHID"]) {
+            /* Legacy HID Utilities assumes every enumerated service exposes
+               an i386 IOHIDDevice COM interface. That bridge is not present
+               here. Return a valid empty iterator instead of devices whose
+               unsupported interface would subsequently be dereferenced. */
+            NSMutableDictionary *filtered = [[(NSDictionary *)matching mutableCopy] autorelease];
+            filtered[@"IOProviderClass"] = @"LP32UnsupportedLegacyHIDDevice";
+            matching = (CFDictionaryRef)filtered;
+            fprintf(stderr, "compat32: TFU legacy HID enumeration disabled; gamepads use the GameController bridge\n");
+        }
         if (matching) CFRetain(matching); /* IOKit consumes one reference. */
         *result = (uint32_t)IOServiceGetMatchingServices(arguments[0], matching, (io_iterator_t *)(uintptr_t)arguments[2]);
         return 1;
@@ -7309,6 +7767,28 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     if (LP32_NAME_IS(import_name, import_length, "_IORegistryEntryGetParentEntry")) {
         *result = (uint32_t)IORegistryEntryGetParentEntry(arguments[0], (const char *)(uintptr_t)arguments[1], (io_registry_entry_t *)(uintptr_t)arguments[2]);
         return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_IORegistryEntryGetChildEntry")) {
+        *result = (uint32_t)IORegistryEntryGetChildEntry(arguments[0], (const char *)(uintptr_t)arguments[1], (io_registry_entry_t *)(uintptr_t)arguments[2]);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_IORegistryEntryGetPath")) {
+        *result = (uint32_t)IORegistryEntryGetPath(arguments[0], (const char *)(uintptr_t)arguments[1], (char *)(uintptr_t)arguments[2]); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_IORegistryEntryFromPath")) {
+        *result = IORegistryEntryFromPath(arguments[0], (const char *)(uintptr_t)arguments[1]); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_IORegistryEntryCreateIterator")) {
+        *result = (uint32_t)IORegistryEntryCreateIterator(arguments[0], (const char *)(uintptr_t)arguments[1], arguments[2], (io_iterator_t *)(uintptr_t)arguments[3]); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_IOObjectGetClass")) {
+        *result = (uint32_t)IOObjectGetClass(arguments[0], (char *)(uintptr_t)arguments[1]); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_IOObjectConformsTo")) {
+        *result = IOObjectConformsTo(arguments[0], (const char *)(uintptr_t)arguments[1]); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_IOObjectRetain")) {
+        *result = (uint32_t)IOObjectRetain(arguments[0]); return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_IORegistryEntryCreateCFProperties")) {
         CFMutableDictionaryRef properties = NULL;
@@ -7378,7 +7858,10 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                itself, so the bridge answers for the launcher. */
             thunk = compat_runtime32_guest_callback(kFeralMainEntryCallbackName);
         } else if (symbol && dlsym(RTLD_DEFAULT, symbol)) {
-            thunk = compat_runtime32_guest_callback(symbol);
+            char import_name[1024];
+            int length = snprintf(import_name, sizeof(import_name), "_%s", symbol);
+            if (length > 0 && (size_t)length < sizeof(import_name))
+                thunk = compat_runtime32_guest_callback(import_name);
         }
         if (!thunk && getenv("LP32_TRACE_DISPLAY")) {
             fprintf(stderr, "compat32: CFBundleGetFunctionPointerForName %s -> none\n",
@@ -7492,7 +7975,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         CFIndex length = (int32_t)arguments[2];
         CFStringRef string = CFStringCreateWithBytes(NULL, bytes, length,
                                                      arguments[3], false);
-        *result = lp32_profile()->title == LP32_TITLE_PORTAL2 ?
+        *result = (lp32_profile()->title == LP32_TITLE_PORTAL2 || lp32_profile()->title == LP32_TITLE_TFU) ?
             proxy_for_owned_value((id)string) : proxy_for_object((id)string);
         if (string) CFRelease(string);
         return 1;
@@ -7657,7 +8140,8 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFRunLoopGetCurrent")) {
-        if (lp32_profile()->title == LP32_TITLE_PORTAL2) {
+        if (lp32_profile()->title == LP32_TITLE_PORTAL2 ||
+            lp32_profile()->title == LP32_TITLE_TFU) {
             *result = proxy_for_object((id)CFRunLoopGetCurrent()); return 1;
         }
         /* A host-thread token is sufficient because Add/Remove operate on
@@ -8254,6 +8738,15 @@ int objc_bridge32_run_gl_parameter_self_test(void)
 /* Readback alone cannot catch an upload corrupting draws already queued on
    the GPU. Exercise serialized overwrites, nonoverlapping unsynchronized
    ranges, and orphaning while earlier draws are still in flight. */
+static void test_buffer_data(GLenum target, uint32_t size, const void *data, GLenum usage)
+{
+    uint32_t guest = data ? compat_runtime32_allocate(size, 0) : 0;
+    if (guest) memcpy((void *)(uintptr_t)guest, data, size);
+    uint64_t result;
+    objc_bridge32_dispatch("glBufferData", (const uint32_t[]){target, size, guest, usage}, &result);
+    if (guest) compat_runtime32_deallocate(guest);
+}
+
 static int test_mapped_buffer_draw_order(void)
 {
     GLuint texture = 0, framebuffer = 0;
@@ -8326,6 +8819,34 @@ done:
     return status;
 }
 
+static int test_buffer_gpu_write(void)
+{
+    GLuint buffer = bound_buffer_for_target(GL_ARRAY_BUFFER);
+    uint64_t result;
+    test_buffer_data(GL_ARRAY_BUFFER, 16, NULL, GL_DYNAMIC_DRAW);
+    objc_bridge32_dispatch("glMapBuffer", (const uint32_t[]){GL_ARRAY_BUFFER, GL_READ_ONLY}, &result);
+    if (!result) return -1;
+    objc_bridge32_dispatch("glUnmapBuffer", (const uint32_t[]){GL_ARRAY_BUFFER}, &result);
+    GLuint texture, fbo;
+    glGenTextures(1, &texture); glBindTexture(GL_TEXTURE_2D, texture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glGenFramebuffersEXT(1, &fbo); glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo);
+    glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D, texture, 0);
+    glClearColor(1, 0, 1, 1); glClear(GL_COLOR_BUFFER_BIT);
+    fast_glBindBuffer((const uint32_t[]){GL_PIXEL_PACK_BUFFER, buffer}, 0);
+    glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    fast_glBindBuffer((const uint32_t[]){GL_PIXEL_PACK_BUFFER, 0}, 0);
+    objc_bridge32_dispatch("glMapBuffer", (const uint32_t[]){GL_ARRAY_BUFFER, GL_READ_ONLY}, &result);
+    const unsigned char expected[] = {255, 0, 255, 255};
+    int status = !result || memcmp((const void *)(uintptr_t)result, expected, 4) ? -1 : 0;
+    objc_bridge32_dispatch("glUnmapBuffer", (const uint32_t[]){GL_ARRAY_BUFFER}, &result);
+    glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, 0);
+    glDeleteFramebuffersEXT(1, &fbo); glDeleteTextures(1, &texture);
+    if (glGetError() != GL_NO_ERROR) status = -1;
+    if (status) fputs("gl-buffer-selftest: stale CPU copy after pixel-pack GPU write\n", stderr);
+    return status;
+}
+
 static int test_large_mapped_buffer_upload(void)
 {
     if (CGLEnable(CGLGetCurrentContext(), kCGLCEMPEngine) != kCGLNoError)
@@ -8388,6 +8909,121 @@ static int test_large_mapped_buffer_upload(void)
     return status;
 }
 
+static int test_streaming_map_reuse(void)
+{
+    enum { size = 131072, count = 3 };
+    GLuint previous_buffer = bound_buffer_for_target(GL_ARRAY_BUFFER);
+    unsigned char *expected[count] = {0}, *actual = malloc(size);
+    GLuint buffers[count] = {0};
+    uint64_t result = 0;
+    int status = -1;
+    if (!actual) return -1;
+    glGenBuffers(count, buffers);
+    for (unsigned i = 0; i < count; ++i) {
+        expected[i] = malloc(size);
+        if (!expected[i]) goto cleanup;
+        memset(expected[i], 0x30 + i, size);
+        fast_glBindBuffer((const uint32_t[]){GL_ARRAY_BUFFER, buffers[i]}, 0);
+        test_buffer_data(GL_ARRAY_BUFFER, size, expected[i], GL_STREAM_DRAW);
+        objc_bridge32_dispatch("glBufferParameteriAPPLE",
+            (const uint32_t[]){GL_ARRAY_BUFFER, GL_BUFFER_FLUSHING_UNMAP_APPLE, GL_FALSE}, &result);
+    }
+    for (unsigned turn = 0; turn < 18; ++turn) {
+        unsigned i = turn % count, offset = 16381 + turn * 41;
+        fast_glBindBuffer((const uint32_t[]){GL_ARRAY_BUFFER, buffers[i]}, 0);
+        /* An external upload and a same-sized replacement must invalidate
+           retained maps, including bytes outside the next flushed region. */
+        if (turn == 8) {
+            uint32_t data = compat_runtime32_allocate(16, 0);
+            if (!data) goto cleanup;
+            memset((void *)(uintptr_t)data, 0x9d, 16);
+            objc_bridge32_dispatch("glBufferSubData",
+                (const uint32_t[]){GL_ARRAY_BUFFER, 9, 16, data}, &result);
+            compat_runtime32_deallocate(data);
+            memset(expected[i] + 9, 0x9d, 16);
+        }
+        if (turn == 12) {
+            memset(expected[i], 0x6b, size);
+            test_buffer_data(GL_ARRAY_BUFFER, size, expected[i], GL_STREAM_DRAW);
+        }
+        objc_bridge32_dispatch("glMapBuffer",
+            (const uint32_t[]){GL_ARRAY_BUFFER, GL_WRITE_ONLY}, &result);
+        if (!result) goto cleanup;
+        unsigned char *mapped = (void *)(uintptr_t)(uint32_t)result;
+        if (lp32_profile()->title == LP32_TITLE_TFU &&
+            memcmp(mapped, expected[i], size)) goto cleanup;
+        memset(mapped + offset, 0x70 + turn, 37);
+        memset(expected[i] + offset, 0x70 + turn, 37);
+        objc_bridge32_dispatch("glFlushMappedBufferRangeAPPLE",
+            (const uint32_t[]){GL_ARRAY_BUFFER, offset, 37}, &result);
+        objc_bridge32_dispatch("glUnmapBuffer",
+            (const uint32_t[]){GL_ARRAY_BUFFER}, &result);
+        glGetBufferSubData(GL_ARRAY_BUFFER, 0, size, actual);
+        if (memcmp(actual, expected[i], size)) goto cleanup;
+    }
+    status = glGetError() == GL_NO_ERROR ? 0 : -1;
+cleanup:
+    for (unsigned i = 0; i < count; ++i) {
+        discard_buffer_state(CGLGetCurrentContext(), buffers[i]);
+        free(expected[i]);
+    }
+    glDeleteBuffers(count, buffers);
+    fast_glBindBuffer((const uint32_t[]){GL_ARRAY_BUFFER, previous_buffer}, 0);
+    free(actual);
+    if (status) fputs("gl-buffer-selftest: streaming map reuse/invalidation failed\n", stderr);
+    return status;
+}
+
+static int test_tfu_pixel_unpack_tail(void)
+{
+    if (lp32_profile()->title != LP32_TITLE_TFU) return 0;
+    enum { width = 32, height = 17, components = width * height * 4,
+           bytes = components * sizeof(float) };
+    GLuint previous_unpack = bound_buffer_for_target(GL_PIXEL_UNPACK_BUFFER);
+    GLuint previous_pack = bound_buffer_for_target(GL_PIXEL_PACK_BUFFER);
+    GLint previous_texture;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous_texture);
+    GLuint buffer = 0, texture = 0;
+    glGenBuffers(1, &buffer); glGenTextures(1, &texture);
+    fast_glBindBuffer((const uint32_t[]){GL_PIXEL_UNPACK_BUFFER, 0}, 0);
+    fast_glBindBuffer((const uint32_t[]){GL_PIXEL_PACK_BUFFER, 0}, 0);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F_ARB, width, height, 0, GL_RGBA, GL_FLOAT, NULL);
+    fast_glBindBuffer((const uint32_t[]){GL_PIXEL_UNPACK_BUFFER, buffer}, 0);
+    test_buffer_data(GL_PIXEL_UNPACK_BUFFER, bytes, NULL, GL_STREAM_DRAW);
+    uint64_t result = 0;
+    objc_bridge32_dispatch("glBufferParameteriAPPLE",
+        (const uint32_t[]){GL_PIXEL_UNPACK_BUFFER, GL_BUFFER_FLUSHING_UNMAP_APPLE, GL_FALSE}, &result);
+    objc_bridge32_dispatch("glMapBufferARB",
+        (const uint32_t[]){GL_PIXEL_UNPACK_BUFFER, GL_WRITE_ONLY}, &result);
+    int status = -1;
+    if (!result) goto cleanup;
+    float *mapped = (void *)(uintptr_t)(uint32_t)result;
+    for (unsigned i = 0; i < components; ++i) mapped[i] = i * .5f - 500.0f;
+    /* Aspyr writes every row but excludes the last row from its flush. */
+    objc_bridge32_dispatch("glFlushMappedBufferRangeAPPLE",
+        (const uint32_t[]){GL_PIXEL_UNPACK_BUFFER, 0, (height - 1) * width * 4 * sizeof(float)}, &result);
+    objc_bridge32_dispatch("glUnmapBufferARB", (const uint32_t[]){GL_PIXEL_UNPACK_BUFFER}, &result);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_FLOAT, NULL);
+    float actual[components];
+    glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_FLOAT, actual);
+    for (unsigned i = 0; i < components; ++i) {
+        if (actual[i] != i * .5f - 500.0f) {
+            fprintf(stderr, "gl-buffer-selftest: TFU pixel upload row %u component %u: %.2f != %.2f\n",
+                i / (width * 4), i % (width * 4), actual[i], i * .5f - 500.0f);
+            goto cleanup;
+        }
+    }
+    status = glGetError() == GL_NO_ERROR ? 0 : -1;
+cleanup:
+    discard_buffer_state(CGLGetCurrentContext(), buffer);
+    glDeleteBuffers(1, &buffer); glDeleteTextures(1, &texture);
+    fast_glBindBuffer((const uint32_t[]){GL_PIXEL_UNPACK_BUFFER, previous_unpack}, 0);
+    fast_glBindBuffer((const uint32_t[]){GL_PIXEL_PACK_BUFFER, previous_pack}, 0);
+    glBindTexture(GL_TEXTURE_2D, (GLuint)previous_texture);
+    return status;
+}
+
 int objc_bridge32_run_gl_buffer_self_test(void)
 {
 #pragma clang diagnostic push
@@ -8444,7 +9080,7 @@ int objc_bridge32_run_gl_buffer_self_test(void)
     int status = 0;
 
     fast_glBindBuffer((const uint32_t[]){GL_ARRAY_BUFFER, buffers[0]}, 0);
-    glBufferData(GL_ARRAY_BUFFER, kTestSize, initial_a, GL_DYNAMIC_DRAW);
+    test_buffer_data(GL_ARRAY_BUFFER, kTestSize, initial_a, GL_DYNAMIC_DRAW);
     const uint32_t disable_flush[] = {
         GL_ARRAY_BUFFER, GL_BUFFER_FLUSHING_UNMAP_APPLE, GL_FALSE,
     };
@@ -8496,6 +9132,16 @@ int objc_bridge32_run_gl_buffer_self_test(void)
         status = -1;
         goto cleanup;
     }
+    if (lp32_profile()->title == LP32_TITLE_TFU) {
+        const unsigned char *mapped = (void *)(uintptr_t)(uint32_t)dispatch_result;
+        for (size_t index = 0; index < kTestSize; ++index) {
+            unsigned char expected = index >= 8 && index < 16 ? 0xa1 : 0x11;
+            if (mapped[index] != expected) {
+                fputs("gl-buffer-selftest: TFU write-only remap lost existing contents\n", stderr);
+                status = -1; goto cleanup;
+            }
+        }
+    }
     memset((void *)(uintptr_t)(uint32_t)dispatch_result, 0xc3, kTestSize);
     objc_bridge32_dispatch("glUnmapBuffer", unmap_arguments, &dispatch_result);
     memset(actual, 0, sizeof(actual));
@@ -8522,7 +9168,7 @@ int objc_bridge32_run_gl_buffer_self_test(void)
 
     /* A second buffer on the same target must retain the default TRUE. */
     fast_glBindBuffer((const uint32_t[]){GL_ARRAY_BUFFER, buffers[1]}, 0);
-    glBufferData(GL_ARRAY_BUFFER, kTestSize, initial_b, GL_DYNAMIC_DRAW);
+    test_buffer_data(GL_ARRAY_BUFFER, kTestSize, initial_b, GL_DYNAMIC_DRAW);
     objc_bridge32_dispatch("glMapBuffer", map_arguments, &dispatch_result);
     uint32_t second_mapping = (uint32_t)dispatch_result;
     if (!second_mapping) {
@@ -8546,8 +9192,28 @@ int objc_bridge32_run_gl_buffer_self_test(void)
         }
     }
 
+    /* A guest SubData upload must be visible on remap even after a committed
+       CPU copy exists. Invalid ranges must not corrupt that copy. */
+    uint32_t subdata = compat_runtime32_allocate(8, 0);
+    if (!subdata) { status = -1; goto cleanup; }
+    memset((void *)(uintptr_t)subdata, 0x48, 8);
+    objc_bridge32_dispatch("glBufferSubDataARB",
+        (const uint32_t[]){GL_ARRAY_BUFFER, 4, 8, subdata}, &dispatch_result);
+    objc_bridge32_dispatch("glBufferSubDataARB",
+        (const uint32_t[]){GL_ARRAY_BUFFER, UINT32_MAX, 8, subdata}, &dispatch_result);
+    compat_runtime32_deallocate(subdata);
+    if (glGetError() != GL_INVALID_VALUE) { status = -1; goto cleanup; }
+    objc_bridge32_dispatch("glMapBuffer", (const uint32_t[]){GL_ARRAY_BUFFER, GL_READ_ONLY}, &dispatch_result);
+    if (!dispatch_result) { status = -1; goto cleanup; }
+    for (size_t i = 0; i < kTestSize; ++i) {
+        unsigned char value = ((unsigned char *)(uintptr_t)dispatch_result)[i];
+        if (value != (i >= 4 && i < 12 ? 0x48 : 0xb2)) status = -1;
+    }
+    objc_bridge32_dispatch("glUnmapBuffer", unmap_arguments, &dispatch_result);
+    if (status) { fputs("gl-buffer-selftest: SubData/remap mismatch\n", stderr); goto cleanup; }
+
     /* Core map-range flush offsets are relative to the mapped window. */
-    glBufferData(GL_ARRAY_BUFFER, kTestSize, initial_b, GL_DYNAMIC_DRAW);
+    test_buffer_data(GL_ARRAY_BUFFER, kTestSize, initial_b, GL_DYNAMIC_DRAW);
     const uint32_t map_range_arguments[] = {
         GL_ARRAY_BUFFER, 4, 16,
         GL_MAP_WRITE_BIT | GL_MAP_FLUSH_EXPLICIT_BIT,
@@ -8664,10 +9330,13 @@ int objc_bridge32_run_gl_buffer_self_test(void)
         status = -1;
         goto cleanup;
     }
+    if (test_streaming_map_reuse()) { status = -1; goto cleanup; }
+    if (test_tfu_pixel_unpack_tail()) { status = -1; goto cleanup; }
     if (test_mapped_buffer_draw_order()) {
         status = -1;
         goto cleanup;
     }
+    if (test_buffer_gpu_write()) { status = -1; goto cleanup; }
 
 cleanup:
     {

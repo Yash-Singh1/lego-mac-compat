@@ -21,8 +21,13 @@ Supported and candidate games:
 | LEGO Batman 3: Beyond Gotham | Feral, 2014 | - |
 | The LEGO Movie Videogame | Feral, 2014 | - |
 | Portal 2 | Valve, 2011 | Experimental: main menu and first level render; gameplay checks ongoing |
+| Star Wars: The Force Unleashed | Aspyr, version 1.2 | Work in progress on `tfu`: executable initialization passes; platform bridges under development |
 
 \* Not verified with a 100% run yet, report any bugs or problems in the issues tab.
+
+The `tfu` branch builds on `portal2`. Its current status, input layout, and
+build commands are in [native/TFU.md](native/TFU.md). A generated TFU bundle
+is not yet a verified playable port.
 
 ## Portal 2 converter
 

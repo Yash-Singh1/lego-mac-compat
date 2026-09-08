@@ -19,6 +19,7 @@ enum lp32_title {
     LP32_TITLE_PIRATES,
     LP32_TITLE_CLONE_WARS,
     LP32_TITLE_PORTAL2,
+    LP32_TITLE_TFU,
 };
 
 /* Splash-dismiss repeat latch (see game_loader.c). */
@@ -166,6 +167,7 @@ struct lp32_game_profile {
     const struct lp32_button_font_layout *button_font; /* NULL = Xbox glyphs only */
     const struct lp32_save_worker_patch *save_worker;  /* NULL = single init */
     const struct lp32_texture_bind_guard *texture_bind_guard; /* NULL = none */
+    const struct lp32_code_signature *display_id_sentinel; /* mov ecx,1 -> UINT32_MAX */
     const struct lp32_display_layout *display;
     const struct lp32_render_pool *render_pool;
     const struct lp32_activator_layout *activator;

@@ -1,4 +1,5 @@
 #include "controller_bridge.h"
+#include "tfu_controller.h"
 #include "compat_runtime.h"
 #include "game_profile.h"
 
@@ -1347,6 +1348,7 @@ static void trace_game_controller_states(uint64_t swap_count)
 
 int controller_bridge32_install(void)
 {
+    if (lp32_profile()->title == LP32_TITLE_TFU) return tfu_controller32_install();
     if (bridge_installed) return 0;
     layout = lp32_profile()->controller;
     if (!layout) {
@@ -1560,6 +1562,7 @@ done:
 
 int controller_bridge32_run_self_test(void)
 {
+    if (lp32_profile()->title == LP32_TITLE_TFU) return tfu_controller32_self_test();
     if (!bridge_installed) return self_test_failure("bridge not installed");
     if (virtual_controller_count < 2) {
         return self_test_failure("LP32_VIRTUAL_CONTROLLERS must be at least 2");

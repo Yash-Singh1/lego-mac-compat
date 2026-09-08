@@ -54,6 +54,20 @@ int check_font(void)
     CGContextRef context = CGBitmapContextCreate(0, 64, 32, 8, 64 * 4, space, kCGImageAlphaPremultipliedLast);
     CGColorSpaceRelease(space);
     if (!context) return -43;
+    /* TFU's dialog drawing uses float CGRect arguments and nested graphics
+       state. Check pixels, then clear the bitmap for the text test below. */
+    CGContextSetRGBFillColor(context, 1, 1, 1, 1);
+    CGContextFillRect(context, CGRectMake(0, 0, 64, 32));
+    CGContextSaveGState(context);
+    CGContextSetRGBFillColor(context, 1, 0, 0, 1);
+    CGContextFillRect(context, CGRectMake(16, 8, 32, 16));
+    CGContextRestoreGState(context);
+    CGContextFillRect(context, CGRectMake(0, 0, 8, 8));
+    const unsigned char *drawing = CGBitmapContextGetData(context);
+    unsigned center = (16 * 64 + 32) * 4;
+    if (drawing[center] != 255 || drawing[center + 1] || drawing[center + 2] ||
+        drawing[center + 3] != 255 || drawing[0] != 255 || drawing[1] != 255 || drawing[2] != 255) return -56;
+    CGContextClearRect(context, CGRectMake(0, 0, 64, 32));
     /* Exercise reclamation beyond the number of available layout slots. */
     for (unsigned i = 0; i < 2050; ++i) {
         UniChar text[] = {'A'}; uint32_t length = 1;

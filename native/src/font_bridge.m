@@ -1,6 +1,7 @@
 #include "font_bridge.h"
 #include "objc_bridge.h"
 #include "compat_runtime.h"
+#include "carbon_native.h"
 #import <Foundation/Foundation.h>
 #import <CoreText/CoreText.h>
 #include <math.h>
@@ -85,7 +86,9 @@ static bool update_style(struct font_style *style)
 static CGContextRef context_for(uint32_t handle)
 {
     struct font_object *object = lookup(handle, BITMAP);
-    return object ? object->bitmap.context : (CGContextRef)objc_bridge32_host_object(handle);
+    if (object) return object->bitmap.context;
+    CGContextRef native = carbon_native32_pointer(handle);
+    return native ?: (CGContextRef)objc_bridge32_host_object(handle);
 }
 static int32_t fixed(CGFloat value) { return (int32_t)llround(value * 65536.0); }
 static float float_arg(uint32_t word) { float value; memcpy(&value, &word, 4); return value; }
@@ -297,6 +300,21 @@ static int dispatch(const char *name, const uint32_t *a, uint64_t *r)
     } else if (IS("_CGContextSetRGBStrokeColor")) {
         CGContextRef context = context_for(a[0]); if (!context) return 0;
         CGContextSetRGBStrokeColor(context, float_arg(a[1]), float_arg(a[2]), float_arg(a[3]), float_arg(a[4]));
+    } else if (IS("_CGContextSaveGState") || IS("_CGContextRestoreGState")) {
+        CGContextRef context = context_for(a[0]); if (!context) return 0;
+        if (IS("_CGContextSaveGState")) CGContextSaveGState(context); else CGContextRestoreGState(context);
+    } else if (IS("_CGContextSetRGBFillColor")) {
+        CGContextRef context = context_for(a[0]); if (!context) return 0;
+        CGContextSetRGBFillColor(context, float_arg(a[1]), float_arg(a[2]), float_arg(a[3]), float_arg(a[4]));
+    } else if (IS("_CGContextFillRect") || IS("_CGContextStrokeRect") || IS("_CGContextStrokeRectWithWidth")) {
+        CGContextRef context = context_for(a[0]); if (!context) return 0;
+        CGRect rect = CGRectMake(float_arg(a[1]), float_arg(a[2]), float_arg(a[3]), float_arg(a[4]));
+        if (IS("_CGContextFillRect")) CGContextFillRect(context, rect);
+        else if (IS("_CGContextStrokeRect")) CGContextStrokeRect(context, rect);
+        else CGContextStrokeRectWithWidth(context, rect, float_arg(a[5]));
+    } else if (IS("_CGContextSetTextMatrix")) {
+        CGContextRef context = context_for(a[0]); if (!context) return 0;
+        CGContextSetTextMatrix(context, CGAffineTransformMake(float_arg(a[1]), float_arg(a[2]), float_arg(a[3]), float_arg(a[4]), float_arg(a[5]), float_arg(a[6])));
     } else if (IS("_CGContextSetTextDrawingMode")) {
         CGContextRef context = context_for(a[0]); if (!context) return 0; CGContextSetTextDrawingMode(context, a[1]);
     } else return 0;

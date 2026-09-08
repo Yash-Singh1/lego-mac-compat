@@ -1,4 +1,6 @@
 #include "audio_bridge.h"
+#include "movie_bridge.h"
+#include "openal_bridge.h"
 #include "audio_queue_bridge.h"
 #include "compat_runtime.h"
 #include "game_profile.h"
@@ -39,6 +41,88 @@ static pthread_mutex_t audio_object_lock = PTHREAD_MUTEX_INITIALIZER;
 static AudioComponent component_objects[128];
 static unsigned component_count;
 enum { kGuestComponentHandleBase = 0x7f0a0000 };
+enum { kGuestConverterHandleBase = 0x7f0b0000 };
+static AudioConverterRef converter_objects[kGuestAudioHandleCapacity];
+
+struct converter_input_context {
+    uint32_t handle, function, refcon, scratch;
+    AudioStreamBasicDescription input;
+};
+static OSStatus converter_input(AudioConverterRef converter, UInt32 *packets,
+                                AudioBufferList *data, AudioStreamPacketDescription **descriptions, void *opaque)
+{
+    (void)converter;
+    struct converter_input_context *context = opaque;
+    uint32_t *scratch = (void *)(uintptr_t)context->scratch;
+    scratch[0] = *packets * context->input.mBytesPerPacket;
+    scratch[1] = 0;
+    uint32_t args[] = {context->handle, context->scratch, context->scratch + 4, context->refcon};
+    OSStatus status = (OSStatus)compat_runtime32_call(context->function, args, 4);
+    *packets = scratch[0] / context->input.mBytesPerPacket;
+    data->mNumberBuffers = 1;
+    data->mBuffers[0] = (AudioBuffer){context->input.mChannelsPerFrame, scratch[0], (void *)(uintptr_t)scratch[1]};
+    if (descriptions) *descriptions = NULL;
+    return compat_runtime32_last_call_trapped() ? kAudio_ParamError : status;
+}
+
+static int converter_dispatch(const char *name, const uint32_t *a, uint64_t *result)
+{
+    if (strncmp(name, "_AudioConverter", 15)) return 0;
+    if (!strcmp(name, "_AudioConverterNew")) {
+        if (!a[0] || !a[1] || !a[2]) { *result = (uint32_t)kAudio_ParamError; return 1; }
+        *(uint32_t *)(uintptr_t)a[2] = 0;
+        /* ASBD has the same 40-byte field layout in both ABIs. */
+        AudioStreamBasicDescription input, output;
+        memcpy(&input, (void *)(uintptr_t)a[0], sizeof(input));
+        memcpy(&output, (void *)(uintptr_t)a[1], sizeof(output));
+        AudioConverterRef converter = NULL;
+        OSStatus status = AudioConverterNew(&input, &output, &converter);
+        if (!status) {
+            pthread_mutex_lock(&audio_object_lock);
+            unsigned slot;
+            for (slot = 0; slot < kGuestAudioHandleCapacity; ++slot) if (!converter_objects[slot]) break;
+            if (slot < kGuestAudioHandleCapacity) {
+                converter_objects[slot] = converter;
+                *(uint32_t *)(uintptr_t)a[2] = kGuestConverterHandleBase + slot;
+            } else { AudioConverterDispose(converter); status = kAudio_MemFullError; }
+            pthread_mutex_unlock(&audio_object_lock);
+        }
+        *result = (uint32_t)status;
+        return 1;
+    }
+    uint32_t slot = a[0] - kGuestConverterHandleBase;
+    pthread_mutex_lock(&audio_object_lock);
+    AudioConverterRef converter = slot < kGuestAudioHandleCapacity ? converter_objects[slot] : NULL;
+    if (!strcmp(name, "_AudioConverterDispose") && converter) converter_objects[slot] = NULL;
+    pthread_mutex_unlock(&audio_object_lock);
+    if (!converter) { *result = (uint32_t)kAudio_ParamError; return 1; }
+    if (!strcmp(name, "_AudioConverterDispose")) { *result = (uint32_t)AudioConverterDispose(converter); return 1; }
+    if (!strcmp(name, "_AudioConverterFillBuffer")) {
+        if (!a[1] || !a[3] || !a[4]) { *result = (uint32_t)kAudio_ParamError; return 1; }
+        struct converter_input_context context = {.handle = a[0], .function = a[1], .refcon = a[2]};
+        AudioStreamBasicDescription output;
+        UInt32 size = sizeof(context.input);
+        OSStatus status = AudioConverterGetProperty(converter, kAudioConverterCurrentInputStreamDescription, &size, &context.input);
+        size = sizeof(output);
+        if (!status) status = AudioConverterGetProperty(converter, kAudioConverterCurrentOutputStreamDescription, &size, &output);
+        /* The old FillBuffer API accepts constant packet sizes and a single
+           interleaved buffer. Express that contract with the supported API. */
+        if (!status && (!context.input.mBytesPerPacket || !output.mBytesPerPacket ||
+            (context.input.mFormatFlags & kAudioFormatFlagIsNonInterleaved) ||
+            (output.mFormatFlags & kAudioFormatFlagIsNonInterleaved))) status = kAudioConverterErr_FormatNotSupported;
+        if (status) { *result = (uint32_t)status; return 1; }
+        context.scratch = compat_runtime32_allocate(8, 1);
+        if (!context.scratch) { *result = (uint32_t)kAudio_MemFullError; return 1; }
+        UInt32 *bytes = (void *)(uintptr_t)a[3];
+        UInt32 packets = *bytes / output.mBytesPerPacket;
+        AudioBufferList data = {1, {{output.mChannelsPerFrame, *bytes, (void *)(uintptr_t)a[4]}}};
+        *result = (uint32_t)AudioConverterFillComplexBuffer(converter, converter_input, &context, &packets, &data, NULL);
+        *bytes = data.mBuffers[0].mDataByteSize;
+        compat_runtime32_deallocate(context.scratch);
+        return 1;
+    }
+    return 0;
+}
 
 struct guest_audio_buffer {
     uint32_t channels;
@@ -1556,9 +1640,13 @@ static OSStatus set_unit_parameter_for_guest(const uint32_t *arguments,
 int audio_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
                             uint64_t *result)
 {
+    if (converter_dispatch(import_name, arguments, result)) return 1;
+    if (openal_bridge32_dispatch(import_name, arguments, result)) return 1;
     if (audio_queue_bridge32_dispatch(import_name, arguments, result)) return 1;
     const size_t import_length = strlen(import_name);
     if (LP32_NAME_IS(import_name, import_length, "_FindNextComponent")) {
+        if (lp32_profile()->title == LP32_TITLE_TFU &&
+            movie_bridge32_dispatch(import_name, arguments, result)) return 1;
         pthread_mutex_lock(&audio_object_lock);
         uint32_t index = arguments[0] - kGuestComponentHandleBase;
         AudioComponent previous = arguments[0] && index < component_count ? component_objects[index] : NULL;

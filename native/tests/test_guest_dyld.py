@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Build tiny original i386 fixtures with Apple's linker; no game/old SDK needed."""
+import argparse
 import os
 from pathlib import Path
 import struct
@@ -8,6 +9,10 @@ import tempfile
 
 NATIVE = Path(__file__).resolve().parents[1]
 LOADER = NATIVE / "build/game_loader"
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--math-only", action="store_true",
+                    help="Exercise math imports without requiring active displays or Carbon UI")
+options = parser.parse_args()
 
 
 def run(*args, **kwargs):
@@ -17,6 +22,7 @@ def run(*args, **kwargs):
 with tempfile.TemporaryDirectory(prefix="lp32-dyld-") as tmp:
     root = Path(tmp)
     (root / "bin").mkdir()
+    (root / "carbon-test.txt").write_bytes(b"fixture\n")
     # Link-time declarations only. All actual system calls go through the bridge.
     (root / "libSystem.tbd").write_text("""--- !tapi-tbd-v3
 archs: [ i386 ]
@@ -27,6 +33,7 @@ exports:
     symbols: [
       _opendir$INODE64, _readdir$INODE64, _readdir_r, _closedir, _closedir$UNIX2003, _setlocale, _vswprintf, _swprintf, _wcscmp, _strlen,
       _getrusage, _asinf, _atanf, _finite, ___fixunssfdi, _GetGlobalMouse,
+      _cbrt, _coshf, _sinhf, _tanhf, _frexpf, _ldexpf, _modff,
       _CGDisplayHideCursor, _CGDisplayShowCursor, _CGCursorIsVisible,
       _CFStringGetBytes, _CFCharacterSetGetPredefined, _CFCharacterSetIsLongCharacterMember, _UpTime, _AbsoluteToNanoseconds, _NanosecondsToAbsolute,
       ___divdi3, ___moddi3, _setjmp, __setjmp, _sigsetjmp, _longjmp,
@@ -52,6 +59,23 @@ exports:
       _CFStringCreateWithCString, _ATSFontFindFromName, _ATSUCreateStyle, _ATSUSetAttributes, _ATSUCreateTextLayoutWithTextPtr, _ATSUSetLayoutControls,
       _ATSUDirectGetLayoutDataArrayPtrFromTextLayout, _ATSUGlyphGetScreenMetrics, _ATSUDrawText, _ATSUDisposeTextLayout, _ATSUDisposeStyle, _CGColorSpaceCreateDeviceRGB,
       _CGColorSpaceRelease, _CGBitmapContextCreate, _CGBitmapContextGetData, _CGContextRelease, ___stack_chk_guard, ___stack_chk_fail,
+      ___CFConstantStringClassReference, _memcmp, _FSPathMakeRef, _FSGetCatalogInfo, _PBMakeFSRefSync, _FSCompareFSRefs, _FSOpenFork, _FSReadFork, _PBReadForkAsync, _FSCloseFork,
+      _AudioConverterNew, _AudioConverterFillBuffer, _AudioConverterDispose,
+      _CGContextSaveGState, _CGContextRestoreGState, _CGContextSetRGBFillColor, _CGContextFillRect, _CGContextClearRect,
+      _DMGetDeskRegion, _GetRegionBounds, _NewRgn, _DisposeRgn,
+      _getenv, _GetApplicationEventTarget, _InstallEventHandler, _CreateEvent, _SetEventParameter, _GetEventParameter,
+      _GetEventClass, _GetEventKind, _GetEventTime, _SendEventToEventTarget, _CallNextEventHandler, _RetainEvent,
+      _GetEventRetainCount, _ReleaseEvent, _RemoveEventHandler, _MPAllocateTaskStorageIndex, _MPSetTaskStorageValue,
+      _MPGetTaskStorageValue, _MPCreateEvent, _MPSetEvent, _MPWaitForEvent, _MPDeleteEvent, _MPCreateTask,
+      _CFStringCreateWithFormat, _CFStringCreateMutableCopy, _CFStringAppend, _CFStringGetCString,
+      _PBHGetVInfoSync, _GetCurrentProcess, _GetProcessInformation,
+      _HIObjectRegisterSubclass, _HIObjectCreate, _calloc,
+      _GetCurrentEventLoop, _RunCurrentEventLoop, _QuitEventLoop, _InstallEventLoopTimer, _RemoveEventLoopTimer,
+      _GetMainDevice, _GetDeviceList, _GetNextDevice, _DMGetDisplayIDByGDevice, _DMGetGDeviceByDisplayID, _TestDeviceAttribute,
+      _FSGetVolumeInfo,
+      _GetCurrentEventQueue, _PostEventToQueue, _ReceiveNextEvent, _FSOpenIterator, _FSGetCatalogInfoBulk, _FSCloseIterator,
+      _XML_ParserCreate_MM, _XML_ParserFree, _XML_Parse, _XML_SetUserData, _XML_SetElementHandler, _XML_SetCharacterDataHandler,
+      _XML_GetErrorCode, _XML_GetCurrentLineNumber, _XML_ErrorString, _malloc,
       dyld_stub_binder
     ]
 ...
@@ -85,8 +109,10 @@ extern int dependency_value(void);
 extern int strcmp(const char *, const char *) __attribute__((weak_import));
 extern int lp32_unavailable(void) __attribute__((weak_import));
 extern int check_directory(void);
+extern int check_carbon(void);
 extern int check_font(void);
 extern int check_context(void);
+extern int check_math_imports(void);
 extern int check_audio_threads(void);
 extern int MPCreateCriticalRegion(void **);
 extern int MPDeleteCriticalRegion(void *);
@@ -110,6 +136,9 @@ __attribute__((constructor)) static void initialize(void) {
     ++count;
 }
 int LauncherMain(void) {
+    { int status = check_math_imports(); if (status) return status; }
+    if (getenv("LP32_DYLD_MATH_ONLY")) return 26;
+    { int status = check_carbon(); if (status) return -1000 + status; }
     if (!strcmp || lp32_unavailable) return -4;
     int context_error = check_context(); if (context_error) return context_error;
     int audio_error = check_audio_threads(); if (audio_error) return audio_error;
@@ -317,7 +346,7 @@ int check_directory(void) {
                 "-L" + str(root / "bin"), "-lfixture_dep", "-o", str(root / "bin/libfixture_reexport.dylib"))
             dependency = "fixture_reexport"
         run(*flags, "-dynamiclib", "-Wl,-install_name,@loader_path/launcher.dylib",
-            str(root / "launcher.c"), str(NATIVE / "tests/fixtures/font.c"), str(NATIVE / "tests/fixtures/context.c"), str(NATIVE / "tests/fixtures/audio_threads.c"), str(root / "directory.o"), "-L" + str(root / "bin"), "-l" + dependency,
+            str(root / "launcher.c"), str(NATIVE / "tests/fixtures/font.c"), str(NATIVE / "tests/fixtures/carbon.c"), str(NATIVE / "tests/fixtures/context.c"), str(NATIVE / "tests/fixtures/audio_threads.c"), str(root / "directory.o"), "-L" + str(root / "bin"), "-l" + dependency,
             "-o", str(root / "bin/launcher.dylib"))
         run(*flags, "-Wl,-e,_start,-no_pie", str(root / "start.S"), "-o", str(root / "portal2_osx"))
         # Exercise universal i386 selection on a real generated dylib.
@@ -337,7 +366,10 @@ int check_directory(void) {
         malformed = bytearray(thin)
         struct.pack_into("<I", malformed, 20, 0xFFFFFFFF)
         (root / "bin/broken.dylib").write_bytes(malformed)
-        environment = dict(os.environ, LP32_GAME="portal2", LP32_DYLD_SELFTEST="1",
+        environment = dict(os.environ, LP32_CARBON_FIXTURE_FILE=str(root / "carbon-test.txt"), LP32_GAME="portal2", LP32_DYLD_SELFTEST="1",
                            LP32_DYLD_FIXTURE_SELFTEST="1")
+        environment.pop("LP32_DYLD_MATH_ONLY", None)
+        if options.math_only:
+            environment["LP32_DYLD_MATH_ONLY"] = "1"
         run("arch", "-x86_64", str(LOADER), str(root / "portal2_osx"), env=environment)
-        print(f"Guest dylib fixtures: PASS (macOS {version}, preferred address 0x{address:x})")
+        print(f"Guest dylib fixtures{' (math only)' if options.math_only else ''}: PASS (macOS {version}, preferred address 0x{address:x})")

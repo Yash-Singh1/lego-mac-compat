@@ -1,8 +1,8 @@
 BUILD_DIR := build
 
 # One loader serves every supported title; the bundle targets pick the title
-# with GAME=pirates (default), GAME=clonewars or GAME=portal2.
-GAME ?= pirates
+# with GAME=tfu (this branch default), pirates, clonewars or portal2.
+GAME ?= tfu
 GUEST_RUNTIME_DIR ?= $(BUILD_DIR)/guest-runtime
 ifeq ($(GAME),clonewars)
 BUNDLE := $(BUILD_DIR)/LEGOCloneWars-Compat.app
@@ -32,6 +32,19 @@ INFO_PLIST := Info-Portal2.plist
 GAME_DATA :=
 ICON := $(SOURCE_CONTENTS)/Resources/game.icns
 ICON_NAME := game.icns
+else ifeq ($(GAME),tfu)
+BUNDLE := $(BUILD_DIR)/TFU-Compat.app
+SOURCE_APP := /Volumes/Storage/games/mac/tfu/Star Wars The Force Unleashed/Star Wars The Force Unleashed.app
+SOURCE_CONTENTS := $(SOURCE_APP)/Contents
+ASSETS_DIR ?= $(SOURCE_APP)/../Assets
+IMAGE_SOURCE := $(SOURCE_CONTENTS)/MacOS/Star Wars The Force Unleashed
+IMAGE_PREREQ :=
+IMAGE_NAME := TFU.image
+LOADER_NAME := TFUCompat
+INFO_PLIST := Info-TFU.plist
+GAME_DATA :=
+ICON := $(SOURCE_CONTENTS)/Resources/AppIcon.icns
+ICON_NAME := AppIcon.icns
 else ifeq ($(GAME),pirates)
 BUNDLE := $(BUILD_DIR)/LEGOPirates-Compat.app
 SOURCE_APP := /Volumes/Storage/games/mac/LEGOPirates.app
@@ -49,7 +62,7 @@ GAME_DATA := GAME.DAT GAME0.DAT GAME1.DAT GAME2.DAT GAME3.DAT GAME4.DAT
 ICON := icons/LEGOPirates.icns
 ICON_NAME := icon.icns
 else
-$(error Unknown GAME "$(GAME)"; choose pirates, clonewars or portal2)
+$(error Unknown GAME "$(GAME)"; choose pirates, clonewars, portal2 or tfu)
 endif
 # Python for the Pirates unpacker.  By default a venv under $(BUILD_DIR) with
 # `unicorn` installed is created on first use (system and Homebrew Pythons
@@ -118,6 +131,10 @@ $(BUILD_DIR)/test_macho_file: tests/test_macho_file.c src/macho_file.c src/macho
 test-macho-file: $(BUILD_DIR)/test_macho_file
 	./$(BUILD_DIR)/test_macho_file
 
+.PHONY: test-large-image
+test-large-image: $(BUILD_DIR)/game_loader
+	python3 tests/test_large_image.py
+
 test-guest-dyld: $(BUILD_DIR)/game_loader
 	python3 tests/test_guest_dyld.py
 
@@ -127,6 +144,27 @@ test-portal2-loader: $(BUILD_DIR)/game_loader
 .PHONY: test-portal2-loader-image
 test-portal2-loader-image: $(BUILD_DIR)/game_loader
 	env LP32_DYLD_SELFTEST=1 arch -x86_64 ./$(BUILD_DIR)/game_loader "$(SOURCE_APP)/Contents/MacOS/portal2_osx"
+
+.PHONY: test-tfu-loader test-tfu-loader-image test-tfu-platform test-tfu-platform-image tfu-runtime
+tfu-runtime: portal2-runtime
+
+test-tfu-loader: $(BUILD_DIR)/game_loader
+	$(MAKE) GAME=tfu test-tfu-loader-image
+
+test-tfu-loader-image: $(BUILD_DIR)/game_loader
+	env LP32_HEAP_SELFTEST=1 arch -x86_64 ./$(BUILD_DIR)/game_loader "$(IMAGE_SOURCE)"
+	env LP32_GUEST_RUNTIME_DIR="$(abspath $(GUEST_RUNTIME_DIR))" LP32_INITIALIZERS_SELFTEST=1 arch -x86_64 ./$(BUILD_DIR)/game_loader "$(IMAGE_SOURCE)"
+
+test-tfu-platform: $(BUILD_DIR)/game_loader
+	$(MAKE) GAME=tfu test-tfu-platform-image
+
+test-tfu-platform-image: $(BUILD_DIR)/game_loader
+	env LP32_HEADLESS=1 LP32_TFU_TEXT_SELFTEST=1 arch -x86_64 ./$(BUILD_DIR)/game_loader "$(IMAGE_SOURCE)"
+	env LP32_HEADLESS=1 LP32_NO_TFU_FAST_TEXT=1 LP32_TFU_TEXT_SELFTEST=1 arch -x86_64 ./$(BUILD_DIR)/game_loader "$(IMAGE_SOURCE)"
+	env LP32_HEADLESS=1 LP32_SYNC_SELFTEST=1 arch -x86_64 ./$(BUILD_DIR)/game_loader "$(IMAGE_SOURCE)"
+	env LP32_HEADLESS=1 LP32_AGL_SELFTEST=1 arch -x86_64 ./$(BUILD_DIR)/game_loader "$(IMAGE_SOURCE)"
+	env LP32_HEADLESS=1 LP32_OPENAL_SELFTEST=1 arch -x86_64 ./$(BUILD_DIR)/game_loader "$(IMAGE_SOURCE)"
+	env LP32_HEADLESS=1 LP32_MOVIE_SELFTEST="$(ASSETS_DIR)/FMV/FMV-AttractMode.mov" arch -x86_64 ./$(BUILD_DIR)/game_loader "$(IMAGE_SOURCE)"
 
 $(BUILD_DIR)/controller_probe: src/controller_probe.m | $(BUILD_DIR)
 	$(CLANG) $(CFLAGS) $^ -framework Foundation -framework GameController -o $@
@@ -148,19 +186,40 @@ $(BUILD_DIR)/mode32_probe: src/mode32_probe.c src/mode32_switch.S src/address_sp
 	$(CLANG) $(CFLAGS) $(LDFLAGS) $^ -o $@
 	codesign --force --sign - $@
 
-$(BUILD_DIR)/game_loader: src/game_loader.c src/game_profile.c src/macho_loader.c src/macho_file.c src/guest_dyld.c src/guest_memory.c src/network_bridge.c src/font_bridge.m src/gl_shader_bridge.c src/gl_misc_bridge.c src/compat_runtime.c src/wide_format.c src/audio_bridge.c src/audio_queue_bridge.c src/controller_bridge.m src/cursor_state.c src/objc_bridge.m src/arb_program_guard.c src/arb_sampler_usage.c src/mode32_switch.S src/import_gateway.S src/guest_context.S src/address_space_reserve.S | $(BUILD_DIR)
-	$(CLANG) $(CFLAGS) $(LDFLAGS) $^ -framework Cocoa -framework Carbon -framework OpenGL -framework ImageIO -framework CoreText -framework AudioToolbox -framework AudioUnit -framework CoreAudio -framework GameController -framework IOKit -liconv -o $@
+$(BUILD_DIR)/game_loader: src/game_loader.c src/game_profile.c src/macho_loader.c src/macho_file.c src/guest_dyld.c src/guest_memory.c src/network_bridge.c src/font_bridge.m src/carbon_bridge.m src/carbon_ui.m src/carbon_native.m src/carbon_text.m src/carbon_files.m src/cf_format.c src/movie_bridge.m src/openal_bridge.m src/agl_bridge.m src/carbon_display.m src/xml_bridge.m src/gl_shader_bridge.c src/gl_misc_bridge.c src/gl_volume_bridge.c src/compat_runtime.c src/wide_format.c src/audio_bridge.c src/audio_queue_bridge.c src/controller_bridge.m src/tfu_controller.m src/cursor_state.c src/objc_bridge.m src/arb_program_guard.c src/arb_sampler_usage.c src/mode32_switch.S src/import_gateway.S src/guest_context.S src/address_space_reserve.S src/tfu_timing.h | $(BUILD_DIR)
+	$(CLANG) $(CFLAGS) $(LDFLAGS) $(filter-out %.h,$^) -framework Cocoa -framework Carbon -framework OpenGL -framework ImageIO -framework CoreText -framework AudioToolbox -framework AudioUnit -framework CoreAudio -framework GameController -framework IOKit -framework AVFoundation -framework CoreVideo -framework CoreMedia -framework OpenAL -lexpat -liconv -o $@
 	codesign --force --sign - $@
 
 $(BUILD_DIR)/test_arb_sampler_usage: tests/test_arb_sampler_usage.c src/arb_sampler_usage.c src/arb_sampler_usage.h | $(BUILD_DIR)
 	$(CLANG) $(CFLAGS) -Isrc tests/test_arb_sampler_usage.c src/arb_sampler_usage.c -o $@
 
-$(BUILD_DIR)/test_gl_shader_bridge: tests/test_gl_shader_bridge.c src/gl_shader_bridge.c src/gl_shader_bridge.h | $(BUILD_DIR)
+$(BUILD_DIR)/test_gl_shader_bridge: tests/test_gl_shader_bridge.c src/gl_shader_bridge.c src/gl_shader_bridge.h src/tfu_timing.h | $(BUILD_DIR)
 	$(CLANG) $(CFLAGS) -Wl,-no_pie,-pagezero_size,0x1000 -Isrc tests/test_gl_shader_bridge.c src/gl_shader_bridge.c -framework OpenGL -o $@
 
 .PHONY: test-gl-shader-bridge
+.PHONY: test-tfu-keyboard
+test-tfu-keyboard: $(BUILD_DIR)/game_loader
+	env LP32_TFU_KEYBOARD_SELFTEST=1 arch -x86_64 ./$(BUILD_DIR)/game_loader "$(BUILD_DIR)/TFU-Compat.app/Contents/SharedSupport/TFU.image"
+
 test-gl-shader-bridge: $(BUILD_DIR)/test_gl_shader_bridge
 	arch -x86_64 ./$(BUILD_DIR)/test_gl_shader_bridge
+
+$(BUILD_DIR)/test_gl_volume_bridge: tests/test_gl_volume_bridge.c src/gl_volume_bridge.c src/gl_volume_bridge.h src/gl_misc_bridge.c src/gl_misc_bridge.h | $(BUILD_DIR)
+	$(CLANG) $(CFLAGS) -Wl,-no_pie,-pagezero_size,0x1000 -Isrc tests/test_gl_volume_bridge.c src/gl_volume_bridge.c src/gl_misc_bridge.c -framework OpenGL -o $@
+
+.PHONY: test-gl-volume-bridge
+test-gl-volume-bridge: $(BUILD_DIR)/test_gl_volume_bridge
+	arch -x86_64 ./$(BUILD_DIR)/test_gl_volume_bridge
+
+$(BUILD_DIR)/test_gl_texture_provenance: tests/test_gl_texture_provenance.c src/gl_misc_bridge.c src/gl_misc_bridge.h src/gl_volume_bridge.c src/gl_volume_bridge.h | $(BUILD_DIR)
+	$(CLANG) $(CFLAGS) -Isrc $(filter-out %.h,$^) -framework OpenGL -o $@
+
+.PHONY: test-gl-texture-provenance
+test-gl-texture-provenance: $(BUILD_DIR)/test_gl_texture_provenance
+	arch -x86_64 ./$(BUILD_DIR)/test_gl_texture_provenance
+
+$(BUILD_DIR)/tfu_cmd_tab_probe: tests/tfu_cmd_tab_probe.m | $(BUILD_DIR)
+	$(CLANG) $(CFLAGS) -fobjc-arc -Wno-deprecated-declarations $< -framework Cocoa -framework Carbon -o $@
 
 $(BUILD_DIR)/test_arb_program_guard: tests/test_arb_program_guard.c src/arb_program_guard.c src/arb_program_guard.h | $(BUILD_DIR)
 	$(CLANG) $(CFLAGS) -Isrc tests/test_arb_program_guard.c src/arb_program_guard.c -o $@
@@ -200,7 +259,7 @@ $(BUILD_DIR)/LEGOPirates.unpacked.macbin: tools/unpack_securom.py $(UNPACK_PYTHO
 bundle: $(BUILD_DIR)/game_loader $(IMAGE_PREREQ) $(INFO_PLIST)
 	test -d "$(SOURCE_CONTENTS)" || { echo "missing $(SOURCE_APP); pass SOURCE_APP=/path/to/the/game.app" >&2; exit 1; }
 	test -f "$(IMAGE_SOURCE)" || { echo "missing $(IMAGE_SOURCE)" >&2; exit 1; }
-ifeq ($(GAME),portal2)
+ifneq ($(filter $(GAME),portal2 tfu),)
 	test -f "$(GUEST_RUNTIME_DIR)/libstdc++.6.dylib" -a -f "$(GUEST_RUNTIME_DIR)/libc++abi.dylib" || { echo "missing Portal 2 C++ runtime; run make portal2-runtime or set GUEST_RUNTIME_DIR" >&2; exit 1; }
 endif
 	mkdir -p $(BUNDLE)/Contents/MacOS $(BUNDLE)/Contents/Resources $(BUNDLE)/Contents/SharedSupport $(BUNDLE)/Contents/Library/Frameworks
@@ -210,6 +269,11 @@ endif
 ifeq ($(GAME),portal2)
 	ditto --noextattr --noqtn "$(SOURCE_CONTENTS)/MacOS" $(BUNDLE)/Contents/SharedSupport/Portal2
 	ditto --noextattr --noqtn "$(GUEST_RUNTIME_DIR)" $(BUNDLE)/Contents/SharedSupport/Portal2/compat-runtime
+else ifeq ($(GAME),tfu)
+	test -f "$(ASSETS_DIR)/PC_LevelSelectList.txt" -a -d "$(ASSETS_DIR)/LevelPacks" || { echo "missing TFU Assets beside source app; set ASSETS_DIR=/path/to/Assets" >&2; exit 1; }
+	ditto --noextattr --noqtn "$(SOURCE_APP)" "$(BUNDLE)/Contents/SharedSupport/TFU/Star Wars The Force Unleashed.app"
+	ditto --noextattr --noqtn "$(ASSETS_DIR)" "$(BUNDLE)/Contents/SharedSupport/TFU/Assets"
+	ditto --noextattr --noqtn "$(GUEST_RUNTIME_DIR)" "$(BUNDLE)/Contents/SharedSupport/TFU/compat-runtime"
 else
 	for data in $(GAME_DATA); do cp "$(SOURCE_CONTENTS)/MacOS/$$data" $(BUNDLE)/Contents/MacOS/$$data; done
 	ditto --noextattr --noqtn "$(SOURCE_CONTENTS)/Library/Frameworks/Cg.framework" $(BUNDLE)/Contents/Library/Frameworks/Cg.framework
@@ -217,7 +281,12 @@ endif
 	cp $(INFO_PLIST) $(BUNDLE)/Contents/Info.plist
 	ditto --noextattr --noqtn "$(SOURCE_CONTENTS)/Resources" $(BUNDLE)/Contents/Resources
 	cp "$(ICON)" $(BUNDLE)/Contents/Resources/$(ICON_NAME)
-ifeq ($(GAME),portal2)
+ifeq ($(GAME),tfu)
+	# Legacy Finder/resource-fork metadata cannot be sealed in the new app.
+	# Strip it only from the generated copy, never from SOURCE_APP/ASSETS_DIR.
+	xattr -cr "$(BUNDLE)"
+endif
+ifneq ($(filter $(GAME),portal2 tfu),)
 	codesign --force --sign - $(BUNDLE)
 else
 	codesign --force --deep --sign - $(BUNDLE)
@@ -230,7 +299,7 @@ promote-loader: $(BUILD_DIR)/game_loader
 	cp $(BUILD_DIR)/game_loader $(BUNDLE)/Contents/MacOS/$(LOADER_NAME).new
 	mv $(BUNDLE)/Contents/MacOS/$(LOADER_NAME).new $(BUNDLE)/Contents/MacOS/$(LOADER_NAME)
 	if test -f "$(ICON)"; then cp "$(ICON)" $(BUNDLE)/Contents/Resources/$(ICON_NAME); fi
-ifeq ($(GAME),portal2)
+ifneq ($(filter $(GAME),portal2 tfu),)
 	codesign --force --sign - $(BUNDLE)
 else
 	codesign --force --deep --sign - $(BUNDLE)

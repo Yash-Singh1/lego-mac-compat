@@ -2,6 +2,10 @@
 #include "controller_bridge.h"
 #include "game_profile.h"
 #include "guest_dyld.h"
+#include "carbon_bridge.h"
+#include "movie_bridge.h"
+#include "openal_bridge.h"
+#include "agl_bridge.h"
 #include "macho_loader.h"
 #include "objc_bridge.h"
 
@@ -53,7 +57,9 @@ static void open_guest_diagnostic_log(const char *executable_path)
         perror("compat32: create diagnostic log directory");
         return;
     }
-    length = snprintf(path, sizeof(path), "%s/last-run.log", directory);
+    const char *override = getenv("LP32_DIAGNOSTIC_LOG");
+    length = override ? snprintf(path, sizeof(path), "%s", override) :
+        snprintf(path, sizeof(path), "%s/last-run.log", directory);
     if (length < 0 || (size_t)length >= sizeof(path)) return;
 
     guest_diagnostic_fd = open(path,
@@ -371,6 +377,24 @@ static int install_texture_bind_guard(void)
     return 0;
 }
 
+static int install_display_id_sentinel_fix(void)
+{
+    const struct lp32_code_signature *signature = lp32_profile()->display_id_sentinel;
+    if (!signature) return 0;
+    /* Aspyr initializes previousDisplayID to 1 before comparing consecutive
+       renderers. Apple's built-in panel now actually has display ID 1. On
+       the first iteration that falsely reuses the preceding (nonexistent)
+       renderer's mode array, leaving it empty. Use an invalid ID sentinel. */
+    if (signature->length != 5 || signature->expected[0] != 0xb9 ||
+        memcmp((void *)(uintptr_t)signature->address, signature->expected, signature->length)) {
+        fprintf(stderr, "compat32: display-ID sentinel signature mismatch\n"); return -1;
+    }
+    const uint8_t replacement[] = {0xb9, 0xff, 0xff, 0xff, 0xff};
+    if (write_guest_code(signature->address, replacement, sizeof(replacement), "display-ID sentinel")) return -1;
+    fprintf(stderr, "compat32: fixed display-ID 1 collision in Aspyr renderer enumeration\n");
+    return 0;
+}
+
 static void flush_guest_instruction(uintptr_t address)
 {
     __builtin___clear_cache((char *)address, (char *)(address + 1));
@@ -391,9 +415,11 @@ static void guest_crash_diagnostic(int signal_number, siginfo_t *info,
             return;
         }
         if (rip == guest_breakpoint_address + 1) {
-            unsigned count = ++guest_breakpoint_count;
+            const char *minimum_edx = getenv("LP32_TRACE_GUEST_EDX_MIN");
+            bool matches = !minimum_edx || (uint32_t)context->uc_mcontext->__ss.__rdx >= strtoul(minimum_edx, NULL, 0);
+            unsigned count = matches ? ++guest_breakpoint_count : guest_breakpoint_count;
             const uint32_t *words = (const void *)(uintptr_t)rsp;
-            if (count > guest_breakpoint_skip) {
+            if (matches && count > guest_breakpoint_skip) {
             GUEST_DIAGNOSTIC(
                     "compat32: guest breakpoint 0x%08llx hit %u "
                     "eax=%08llx ebx=%08llx ecx=%08llx edx=%08llx "
@@ -407,6 +433,16 @@ static void guest_crash_diagnostic(int signal_number, siginfo_t *info,
                     context->uc_mcontext->__ss.__rdi & UINT32_MAX,
                     context->uc_mcontext->__ss.__rbp & UINT32_MAX,
                     rsp & UINT32_MAX);
+            const char *frame_dump = getenv("LP32_TRACE_GUEST_FRAME");
+            if (frame_dump) {
+                const uint32_t *frame = (void *)(uintptr_t)(uint32_t)context->uc_mcontext->__ss.__rbp;
+                char *end; long offset = strtol(frame_dump, &end, 0);
+                unsigned length = *end == ':' ? strtoul(end + 1, NULL, 0) : 16;
+                if (length <= 64) for (unsigned i = 0; i < length; ++i) {
+                    const uint32_t *cell = (void *)((const char *)frame + offset + i * 4);
+                    GUEST_DIAGNOSTIC("compat32: breakpoint frame[%ld]=0x%08x\n", offset + i * 4, *cell);
+                }
+            }
             if (rsp >= UINT32_C(0x1000) && rsp < UINT32_C(0x80000000)) {
                 for (unsigned index = 0; index < 12; ++index) {
                     GUEST_DIAGNOSTIC(
@@ -534,7 +570,7 @@ static void guest_crash_diagnostic(int signal_number, siginfo_t *info,
     _exit(128 + signal_number);
 }
 
-static void install_guest_crash_diagnostics(void)
+static void install_guest_crash_diagnostics(bool include_illegal_instruction)
 {
     struct sigaction action;
     memset(&action, 0, sizeof(action));
@@ -543,6 +579,7 @@ static void install_guest_crash_diagnostics(void)
     sigemptyset(&action.sa_mask);
     sigaction(SIGSEGV, &action, NULL);
     sigaction(SIGBUS, &action, NULL);
+    if (include_illegal_instruction) sigaction(SIGILL, &action, NULL);
     action.sa_flags = SA_SIGINFO;
     sigaction(SIGTRAP, &action, NULL);
 }
@@ -598,7 +635,7 @@ static void runtime_diagnostic_line(const char *line)
 static const char *default_image_path(const char *argv0, char *buffer,
                                       size_t size)
 {
-    static const char *const candidates[] = {"LEGOPirates", "LEGOCloneWars", "Portal2"};
+    static const char *const candidates[] = {"LEGOPirates", "LEGOCloneWars", "Portal2", "TFU"};
     const char *slash = strrchr(argv0, '/');
     size_t directory_length = slash ? (size_t)(slash - argv0) : 0;
     for (size_t index = 0; index < sizeof(candidates) / sizeof(candidates[0]); ++index) {
@@ -618,9 +655,12 @@ static const char *default_image_path(const char *argv0, char *buffer,
 
 int main(int argc, char **argv)
 {
-    install_guest_crash_diagnostics();
+    const char *crash_selftest = getenv("LP32_CRASH_DIAGNOSTIC_SELFTEST");
+    bool illegal_selftest = crash_selftest && !strcmp(crash_selftest, "SIGILL");
+    install_guest_crash_diagnostics(illegal_selftest);
     compat_runtime32_set_diagnostic_sink(runtime_diagnostic_line);
-    if (getenv("LP32_CRASH_DIAGNOSTIC_SELFTEST")) {
+    if (crash_selftest) {
+        if (illegal_selftest) __builtin_trap();
         raise(SIGSEGV);
         return EXIT_FAILURE;
     }
@@ -647,6 +687,13 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
     open_guest_diagnostic_log(argc > 0 ? argv[0] : NULL);
+    /* TFU can terminate with SIGILL under the translated guest runtime.
+       Preserve the faulting instruction address/registers in our own log;
+       macOS does not always produce an .ips report for these exits. */
+    if (lp32_profile()->title == LP32_TITLE_TFU)
+        install_guest_crash_diagnostics(true);
+    if (lp32_profile()->title == LP32_TITLE_TFU &&
+        (guest_dyld32_initialize(image_path) || carbon_bridge32_configure(image_path))) return EXIT_FAILURE;
     if (lp32_profile()->title == LP32_TITLE_PORTAL2) {
         if (guest_dyld32_initialize(image_path) || chdir(guest_dyld32_game_root())) {
             fprintf(stderr, "game_loader: unable to select Portal 2 data directory\n");
@@ -681,6 +728,15 @@ int main(int argc, char **argv)
         macho_image32_unload(&image);
         return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
+    if (getenv("LP32_TFU_TEXT_SELFTEST"))
+        return compat_runtime32_run_tfu_text_self_test() ? EXIT_FAILURE : EXIT_SUCCESS;
+    if (getenv("LP32_MOVIE_SELFTEST")) {
+        return movie_bridge32_self_test(getenv("LP32_MOVIE_SELFTEST")) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (getenv("LP32_TFU_KEYBOARD_SELFTEST"))
+        return carbon_bridge32_keyboard_self_test() ? EXIT_FAILURE : EXIT_SUCCESS;
+    if (getenv("LP32_OPENAL_SELFTEST")) return openal_bridge32_self_test() == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    if (getenv("LP32_AGL_SELFTEST")) return agl_bridge32_self_test() == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     if (getenv("LP32_DYLD_SELFTEST")) {
         return lp32_profile()->title == LP32_TITLE_PORTAL2 &&
             guest_dyld32_self_test() == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
@@ -715,6 +771,7 @@ int main(int argc, char **argv)
         macho_image32_unload(&image);
         return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
+    if (lp32_profile()->title == LP32_TITLE_TFU && guest_dyld32_bind_main_cxx(&image)) return EXIT_FAILURE;
     if (controller_bridge32_install() != 0) {
         macho_image32_unload(&image);
         return EXIT_FAILURE;
@@ -740,6 +797,9 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
+    if (install_display_id_sentinel_fix() != 0) {
+        macho_image32_unload(&image); return EXIT_FAILURE;
+    }
     const uint32_t *initializers =
         (const void *)(uintptr_t)image.initializer_address;
     int initialization_trapped = 0;
@@ -758,6 +818,13 @@ int main(int argc, char **argv)
             break;
         }
     }
+
+    if (getenv("LP32_INITIALIZERS_SELFTEST")) {
+        fprintf(stderr, "Guest initializers self-test: %s\n",
+                initialization_trapped ? "FAIL" : "PASS");
+        return initialization_trapped ? EXIT_FAILURE : EXIT_SUCCESS;
+    }
+    if (initialization_trapped) return EXIT_FAILURE;
 
     if (!initialization_trapped) {
         printf("initializers completed: %" PRIu32 "/%" PRIu32 "\n",
@@ -827,7 +894,7 @@ int main(int argc, char **argv)
             sizeof(main_arguments) / sizeof(main_arguments[0]));
         printf("game main returned/escaped: 0x%08" PRIx32 " trapped=%d\n",
                result, compat_runtime32_last_call_trapped());
-        if (lp32_profile()->title == LP32_TITLE_PORTAL2) {
+        if (lp32_profile()->title == LP32_TITLE_PORTAL2 || lp32_profile()->title == LP32_TITLE_TFU) {
             return compat_runtime32_last_call_trapped() ? EXIT_FAILURE : (int)result;
         }
     }

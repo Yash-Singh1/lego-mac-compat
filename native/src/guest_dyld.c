@@ -2,6 +2,7 @@
 #include "macho_file.h"
 #include "compat_runtime.h"
 #include "objc_bridge.h"
+#include "game_profile.h"
 
 #include <dlfcn.h>
 #include <errno.h>
@@ -224,7 +225,7 @@ int guest_dyld32_initialize(const char *image_path)
     char *support = strrchr(path, '/');
     if (support && !strcmp(support, "/SharedSupport")) {
         if (strlen(path) + sizeof("/Portal2") > sizeof(path)) return fail("game path is too long");
-        strcat(path, "/Portal2");
+        strcat(path, lp32_profile()->title == LP32_TITLE_TFU ? "/TFU" : "/Portal2");
     }
     if (!realpath(path, game_root)) return fail("game directory: %s", strerror(errno));
     pthread_once(&loader_once, create_lock);
@@ -786,6 +787,45 @@ uint32_t guest_dyld32_symbol(uint32_t handle, const char *symbol)
     } else fail("invalid guest dylib handle 0x%08x", handle);
     pthread_mutex_unlock(&loader_lock);
     return result;
+}
+
+static uint32_t main_runtime_symbol(const char *name, void *context)
+{
+    uint32_t runtime = (uint32_t)(uintptr_t)context;
+    uint32_t address = guest_dyld32_symbol(runtime, name + 1);
+    if (address) return address;
+    error_pending = false;
+    if (!strncmp(name, "__Z", 3)) return 0;
+    return compat_runtime32_resolve_symbol(name, true);
+}
+
+int guest_dyld32_bind_main_cxx(const struct macho_image32 *image)
+{
+    char path[PATH_MAX];
+    const char *directory = getenv("LP32_GUEST_RUNTIME_DIR");
+    int n = directory ? snprintf(path, sizeof(path), "%s/libstdc++.6.dylib", directory) :
+        snprintf(path, sizeof(path), "%s/compat-runtime/libstdc++.6.dylib", game_root);
+    if (n < 0 || (size_t)n >= sizeof(path)) return fail("C++ runtime path too long");
+    uint32_t runtime = guest_dyld32_open(path, RTLD_NOW);
+    if (!runtime) {
+        fprintf(stderr, "compat32: cannot load i386 C++ runtime: %s\n", loader_error);
+        return -1;
+    }
+    unsigned bound = 0;
+    for (uint32_t i = 0; i < image->import_count; ++i) {
+        const struct macho_import32 *import = &image->imports[i];
+        /* RTTI walks guest vtables and type_info objects, so dynamic_cast
+           must execute in the same i386 ABI as the mangled C++ methods. */
+        if (strncmp(import->name, "__Z", 3) && strcmp(import->name, "___dynamic_cast")) continue;
+        uint32_t target = guest_dyld32_symbol(runtime, import->name + 1);
+        if (!target || macho_image32_bind_import(import, target)) {
+            fprintf(stderr, "compat32: unable to bind C++ import %s\n", import->name);
+            return -1;
+        }
+        ++bound;
+    }
+    fprintf(stderr, "compat32: bound %u main-image C++ imports to i386 runtime\n", bound);
+    return macho_image32_bind_external_relocations(image, main_runtime_symbol, (void *)(uintptr_t)runtime);
 }
 
 int guest_dyld32_close(uint32_t handle)

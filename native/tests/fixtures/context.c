@@ -35,6 +35,50 @@ static int format_wide(wchar_t *output, size_t size, const wchar_t *format, ...)
     return result;
 }
 
+int check_math_imports(void)
+{
+    /* TFU stopped at _cbrt with these exact i386 argument words. Exercise
+       the imported function and x87 return ABI, including repeated calls. */
+    volatile double cubes[] = {-0x1.d91fecb4512ccp-131, -8.0, 27.0,
+                               0x1p-1074, -0x1p-1074, 0x1p1023};
+    const double roots[] = {-0x1.8bd15332be562p-44, -2.0, 3.0,
+                            0x1p-358, -0x1p-358, 0x1p341};
+    for (unsigned repeat = 0; repeat < 16; ++repeat) {
+        for (unsigned i = 0; i < sizeof(cubes) / sizeof(cubes[0]); ++i) {
+            double ratio = cbrt(cubes[i]) / roots[i];
+            if (!(ratio > 1.0 - 0x1p-49 && ratio < 1.0 + 0x1p-49)) return -234;
+        }
+    }
+    volatile double special[] = {0.0, -0.0, INFINITY, -INFINITY, NAN};
+    for (unsigned i = 0; i < 4; ++i) {
+        union { double value; uint64_t bits; } input = {.value = special[i]},
+            output = {.value = cbrt(special[i])};
+        if (input.bits != output.bits) return -235;
+    }
+    double nan_root = cbrt(special[4]);
+    if (nan_root == nan_root) return -236;
+
+    /* These float imports are also present in TFU. Their arguments occupy
+       one guest word; frexpf/modff must write exactly four bytes through the
+       second word and return the fraction in ST(0). */
+    volatile float x = -0.5f;
+    float c = coshf(x), s = sinhf(x), t = tanhf(x);
+    if (!(c > 1.12762f && c < 1.12763f && s > -0.52110f && s < -0.52109f &&
+          t > -0.46212f && t < -0.46211f)) return -237;
+    struct { uint32_t before; int value; uint32_t after; } exponent =
+        {0x12345678, 0, 0x87654321};
+    struct { uint32_t before; float value; uint32_t after; } whole =
+        {0x12345678, 0, 0x87654321};
+    x = -13.5f;
+    float fraction = frexpf(x, &exponent.value);
+    if (fraction != -0.84375f || exponent.value != 4 ||
+        ldexpf(fraction, exponent.value) != x || exponent.before != 0x12345678 ||
+        exponent.after != 0x87654321) return -238;
+    if (modff(x, &whole.value) != -0.5f || whole.value != -13.0f ||
+        whole.before != 0x12345678 || whole.after != 0x87654321) return -239;
+    return 0;
+}
+
 int check_context(void)
 {
     /* The guest must observe its own balanced cursor state even when the

@@ -6,6 +6,8 @@
 
 /* Source's dlopen/dlsym run against guest i386 images, never host dlopen. */
 int guest_dyld32_initialize(const char *image_path);
+struct macho_image32;
+int guest_dyld32_bind_main_cxx(const struct macho_image32 *image);
 const char *guest_dyld32_game_root(void);
 uint32_t guest_dyld32_open(const char *path, int flags);
 uint32_t guest_dyld32_symbol(uint32_t handle, const char *symbol);
