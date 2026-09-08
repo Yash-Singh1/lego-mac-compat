@@ -15,7 +15,11 @@ from pathlib import Path
 api = json.loads(Path(sys.argv[1]).read_text())
 typedefs = {x["typedef"]: x["type"] for x in api["typedefs"]}
 enums = {x["enumname"] for x in api["enums"]}
+for interface in api["interfaces"]:
+    for enum in interface.get("enums", []):
+        enums.add(enum.get("fqname", interface["classname"] + "::" + enum["enumname"]))
 structs = {x["struct"]: x["fields"] for x in api["structs"]}
+structs.update({x["struct"]: x["fields"] for x in api["callback_structs"]})
 
 
 def scalar(t):
@@ -52,14 +56,13 @@ def safe_struct(t, seen=()):
                 "unsigned long long",
             )
             or t in enums
-            or t.startswith("E")
         )
     if t in seen:
         return False
     return all(safe_struct(f["fieldtype"], seen + (t,)) for f in structs[t])
 
 
-def code(t, result=False):
+def code(t, result=False, output_string=False):
     t = t.replace("const ", "").strip()
     if t in ("CSteamID", "CGameID"):
         return "q"
@@ -67,6 +70,8 @@ def code(t, result=False):
         return "W"
     if t == "SteamAPI_CheckCallbackRegistered_t":
         return "K"
+    if t == "SteamInputActionEventCallbackPointer":
+        return "E"
     if t == "HServerListRequest":
         return "h"
     if result and (t.startswith("ISteam") and t.endswith("*") or t == "void *"):
@@ -74,9 +79,24 @@ def code(t, result=False):
     if result and t == "char *":
         return "s"
     t = scalar(t)
+    aggregates = {"InputDigitalActionData_t": "D", "ControllerDigitalActionData_t": "D",
+                  "InputAnalogActionData_t": "A", "ControllerAnalogActionData_t": "A",
+                  "InputMotionData_t": "M", "ControllerMotionData_t": "M",
+                  "SteamIPAddress_t": "I", "SteamPartyBeaconLocation_t": "L"}
+    if t in aggregates:
+        return aggregates[t]
     if "*" in t or "&" in t:
-        base = t.rstrip(" *&").strip()
-        if "*" in base or base.startswith("ISteam") or not safe_struct(base):
+        # Remove exactly one indirection. rstrip(" *&") silently erased all
+        # pointer depth, allowing native writes through four-byte guest cells.
+        base = re.sub(r"[ *&]+$", "", t)
+        depth = t.count("*") + t.count("&")
+        if depth == 2 and base == "char" and output_string and not result:
+            return "S"
+        if depth != 1:
+            return "?"
+        if base == "SteamParamStringArray_t" and not result:
+            return "T"
+        if base.startswith("ISteam") or not safe_struct(base):
             return "?"
         return "p" if not result else "?"
     if t == "void":
@@ -95,7 +115,6 @@ def code(t, result=False):
         return "u"
     if (
         t in ("int", "unsigned int", "uint32", "int32", "long", "unsigned long")
-        or t.startswith("E")
         or t in enums
     ):
         return "i"
@@ -119,6 +138,9 @@ for obj in api["interfaces"]:
     ):
         header_name = "isteammatchmaking.h"
     header = (Path(sys.argv[2]) / header_name).read_text(encoding="latin1")
+    declared_versions = re.findall(r'#define\s+\w*INTERFACE_VERSION\w*\s+"([^"]+)"', header)
+    if declared_versions and version not in declared_versions:
+        raise ValueError(f"SDK version mismatch: JSON {version}, {header_name} {declared_versions}")
     header = re.sub(r"/\*.*?\*/|//[^\n]*", "", header, flags=re.S)
     body = re.search(
         r"class\s+" + obj["classname"] + r"\s*\{(.*?)^\};", header, re.M | re.S
@@ -171,14 +193,21 @@ for obj in api["interfaces"]:
     start = len(methods)
     for m in entries:
         ret = code(m["returntype"], True)
-        args = "".join(code(p["paramtype"]) for p in m.get("params", []))
+        # Interface factories take a version string. Other object returns need
+        # their own proxy/lifetime contract; an integer argument is not a name.
+        if ret == "o" and not (m["methodname"].startswith("GetISteam") and
+                               m.get("params") and m["params"][-1]["paramtype"] == "const char *"):
+            ret = "?"
+        args = "".join(code(p["paramtype"], output_string="out_string" in p)
+                       for p in m.get("params", []))
         methods.append((m["methodname"], ret, args))
     interfaces.append((version, start, len(entries)))
 # libsteam_api also asks for its older client facade during InitSafe. The
 # v1.32 header (3aa76d12fa78) describes SteamClient017's distinct ordinals.
 legacy_header = (Path(sys.argv[2]) / "isteamclient017.h").read_text(encoding="latin1")
 legacy_names = re.findall(r"virtual\s+[\w\s*&]+?\b(\w+)\s*\(", legacy_header)
-client_methods = {m[0]: m for m in methods[:42]}
+client = next(i for i in interfaces if i[0] == "SteamClient020")
+client_methods = {m[0]: m for m in methods[client[1]:client[1] + client[2]]}
 legacy_start = len(methods)
 for name in legacy_names:
     entry = client_methods.get(name, (name, "?", ""))
@@ -194,7 +223,9 @@ input_header = (Path(sys.argv[2]) / "isteaminput005.h").read_text(encoding="lati
 input_header = re.sub(r"/\*.*?\*/|//[^\n]*", "", input_header, flags=re.S)
 input_names = re.findall(r"virtual\s+[\w\s*&]+?\b(\w+)\s*\(", input_header)
 input_start = len(methods)
-input_methods = {m[0]: m for m in methods[500:547]}
+input_interface = next((i for i in interfaces if i[0] == "SteamInput006"), None)
+input_methods = ({m[0]: m for m in methods[input_interface[1]:input_interface[1] + input_interface[2]]}
+                 if input_interface else {})
 for name in input_names:
     methods.append(input_methods.get(name, (name, "?", "")))
 interfaces.append(("SteamInput005", input_start, len(input_names)))

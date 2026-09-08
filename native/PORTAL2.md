@@ -40,7 +40,7 @@ launcher/dependency loading. With Steam signed in, the converted app loads
 `sp_a1_intro1` and renders the opening relaxation room and LOOK UP tutorial
 prompt. A 90-second background test completed without a crash, and the game's
 framebuffer was inspected. This is a startup/rendering check; sustained
-playthrough, co-op, Workshop, and controller gameplay remain unverified. Steam must be running and signed in to an account
+playthrough, co-op, Workshop, and a full controller playthrough remain unverified. Steam must be running and signed in to an account
 that owns Portal 2. `steam_bridge.c` connects the original i386 Steam API library
 to the installed x86_64 Steam client using guest interface proxies and libffi.
 It preserves Steam's authentication and ownership requirements. Both the older
@@ -57,6 +57,26 @@ payloads containing native pointers and application-supplied C++ callback
 objects need additional translation. Unregistered private Steam callbacks are
 released without being delivered to the game. The loader retains its own crash
 handler because Steam's native Breakpad cannot unwind the mixed-mode stacks.
+
+Steam controller polling supports the packed digital, analog, and motion
+results on SteamInput005, SteamInput006, and SteamController008. Analog and
+motion results use i386 hidden output pointers with callee stack cleanup;
+digital results use the two bytes in EAX. Input action event callbacks copy
+their packed records into guest memory and can re-enter the bridge from a
+native callback thread. Portal uses Steam Input for controllers; the absence
+of a LEGO-style legacy HID profile is expected.
+
+Controller glyph PNG decoding also needs `zlib_bridge.c`: the original
+56-byte i386 `z_stream` cannot be passed to native zlib. The bridge retains
+native stream state outside the guest record, translates counters/pointers,
+and invokes the game's allocator callbacks in i386 mode. It implements all
+nine zlib imports present in the supplied game libraries, including CRC,
+inflate/deflate initialization, streaming, reset, and disposal.
+
+The Steam ABI audit and remaining unsupported interfaces are recorded in
+[STEAM_ABI.md](STEAM_ABI.md). `make test-steam-abi` checks real i386 calls,
+packed results, callback re-entry, guarded pointer outputs, Workshop tags,
+and zlib streaming with both native and guest allocators.
 
 Other depot startup fixes include `bin/osx32` library search, matching duplicate
 guest Cocoa class layouts, 8,192 dynamic import slots on separate i386 code

@@ -5,6 +5,7 @@
 # One-off probes and conversion helpers (native/tools/ is part of the build)
 /tools/
 /.research-tools/
+/.omp/
 # Build output, including the assembled game bundles (they contain the games)
 native/build/
 

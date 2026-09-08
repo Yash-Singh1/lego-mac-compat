@@ -5,4 +5,5 @@
 uint32_t steam_bridge32_open(const char *path);
 uint32_t steam_bridge32_symbol(const char *name);
 int steam_bridge32_dispatch(const char *name, const uint32_t *args, uint64_t *result);
+int steam_bridge32_stret(const char *name);
 #endif

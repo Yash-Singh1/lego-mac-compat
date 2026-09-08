@@ -5,6 +5,7 @@
 #include "game_profile.h"
 #include "guest_dyld.h"
 #include "steam_bridge.h"
+#include "zlib_bridge.h"
 #include "time_manager_bridge.h"
 #include "guest_memory.h"
 #include "network_bridge.h"
@@ -3075,7 +3076,8 @@ uint32_t *lp32_adjust_import_stack(uint32_t *stack)
 {
     const char *name = import_name_for_id(stack[0]);
     if (lp32_profile()->title == LP32_TITLE_PORTAL2 &&
-        (!strcmp(name, "_objc_msgSend_stret") || !strcmp(name, "_CGDisplayBounds"))) {
+        (!strcmp(name, "_objc_msgSend_stret") || !strcmp(name, "_CGDisplayBounds") ||
+         steam_bridge32_stret(name))) {
         stack[2] = stack[1];
         return stack + 1;
     }
@@ -3381,6 +3383,7 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
     dispatch_name_matched = false;
     uint64_t network_result;
     if (steam_bridge32_dispatch(name, arguments, &network_result)) return network_result;
+    if (zlib_bridge32_dispatch(name, arguments, &network_result)) return network_result;
     if (time_manager_bridge32_dispatch(name, arguments, &network_result)) return network_result;
     if (network_bridge32_dispatch(name, arguments, &network_result)) return network_result;
     if (font_bridge32_dispatch(name, arguments, &network_result)) return network_result;

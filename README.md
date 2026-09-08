@@ -43,17 +43,21 @@ Steam copies require Steam to be running and signed in to an account that owns
 Portal 2. The loader bridges the game's 32-bit Steam interfaces to the installed
 64-bit Steam client. It does not remove ownership or authentication checks.
 Download
-[Portal 2 Converter 0.0.0-dev.3](https://github.com/Yash-Singh1/lego-mac-compat/releases/tag/portal2-converter-v0.0.0-dev.3)
+[Portal 2 Converter 0.0.0-dev.4](https://github.com/Yash-Singh1/lego-mac-compat/releases/tag/portal2-converter-v0.0.0-dev.4)
 or build the converter from this branch. Folder support requires dev.2 or
 newer; the older dev.1 release accepts app bundles only.
 The supplied depot build has been checked through the opening single-player
 room. Full playthrough and online features remain unverified.
 
-Dev.3 fixes audio callback structure conversion and adds missing libc/OpenAL
-capture support. It also preserves fatal-error messages and recent logs in
-`~/Library/Logs/Portal2Compat/`. The reported intermittent Core Audio allocator
-crash remains under investigation; this release is not a confirmed fix for it.
-Real microphone capture and in-game voice chat still need testing.
+Dev.4 fixes Steam controller data conversion and the missing PNG decompression
+needed for controller button glyphs. DualShock 4 buttons and sticks have been
+confirmed working in-game. It also fixes Workshop filename pointer corruption,
+tag-array conversion, and other Steam ABI defects. The filename fix is a
+candidate for issue #7's dev.3 crash; confirmation from the reporter is still
+needed. Remaining Steam API gaps are listed in [native/STEAM_ABI.md](native/STEAM_ABI.md).
+The earlier audio/libc fixes and logs in `~/Library/Logs/Portal2Compat/` remain
+included. The intermittent Core Audio allocator crash remains under
+investigation; real microphone capture and in-game voice chat need testing.
 
 The converter needs no Make, Python, Xcode, or Terminal to use. It includes the
 compiled compatibility loader and automatically downloads the required Apple

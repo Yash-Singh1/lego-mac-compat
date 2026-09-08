@@ -22,14 +22,72 @@ static _Atomic uint32_t warning_hook, callback_check_hook;
 static pthread_mutex_t cache_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool trace;
 
+/* Valve packs the input records and SteamIPAddress_t to one byte on both
+   Darwin architectures. Use typed native calls: libffi's natural struct
+   layout would round the 13-byte analog result to 16 bytes. */
+#pragma pack(push, 1)
+struct steam_digital { bool state, active; };
+struct steam_analog { int32_t mode; float x, y; bool active; };
+struct steam_motion { float value[10]; };
+struct steam_ip { uint8_t address[16]; int32_t type; };
+#pragma pack(pop)
+#pragma pack(push, 4)
+struct steam_location { int32_t type; uint64_t id; };
+#pragma pack(pop)
+_Static_assert(sizeof(struct steam_digital) == 2, "Steam digital ABI");
+_Static_assert(sizeof(struct steam_analog) == 13, "Steam analog ABI");
+_Static_assert(sizeof(struct steam_motion) == 40, "Steam motion ABI");
+_Static_assert(sizeof(struct steam_ip) == 20, "Steam IP ABI");
+_Static_assert(sizeof(struct steam_location) == 12, "Steam party ABI");
+
+static bool indirect_result(char result)
+{
+    return result == 'A' || result == 'M' || result == 'I';
+}
+
+int steam_bridge32_stret(const char *name)
+{
+    const char *prefix = "_lp32_steam_method_";
+    if (strncmp(name, prefix, strlen(prefix))) return 0;
+    unsigned index = (unsigned)strtoul(name + strlen(prefix), NULL, 10);
+    return index < sizeof(steam_methods) / sizeof(steam_methods[0]) &&
+        indirect_result(steam_methods[index].result);
+}
+
+static uint64_t guest_u64(const uint32_t *words)
+{
+    return (uint64_t)words[0] | (uint64_t)words[1] << 32;
+}
+
+static _Atomic uint32_t input_event_hooks[2];
+static void input_event(unsigned slot, const void *event)
+{
+    uint32_t hook = input_event_hooks[slot];
+    if (!hook || !event) return;
+    // Packed handle, event kind, and the larger (21-byte) analog union member.
+    uint32_t copy = compat_runtime32_allocate(33, 0);
+    if (!copy) return;
+    memcpy((void *)(uintptr_t)copy, event, 33);
+    compat_runtime32_call(hook, &copy, 1);
+    compat_runtime32_deallocate(copy);
+}
+static void input_event005(void *event) { input_event(0, event); }
+static void input_event006(void *event) { input_event(1, event); }
+
 static uint32_t string_copy_locked(const char *text)
 {
     // Native accessors return borrowed strings; retain a stable guest copy.
-    static uint32_t strings[1024];
-    static unsigned count;
+    static uint32_t *strings;
+    static size_t count, capacity;
     if (!text) return 0;
-    for (unsigned i = 0; i < count; ++i) if (!strcmp((const char *)(uintptr_t)strings[i], text)) return strings[i];
-    if (count == 1024) return 0;
+    for (size_t i = 0; i < count; ++i) if (!strcmp((const char *)(uintptr_t)strings[i], text)) return strings[i];
+    if (count == capacity) {
+        size_t next = capacity ? capacity * 2 : 64;
+        if (next < capacity || next > SIZE_MAX / sizeof(*strings)) return 0;
+        uint32_t *resized = realloc(strings, next * sizeof(*strings));
+        if (!resized) return 0;
+        strings = resized; capacity = next;
+    }
     uint32_t result = compat_runtime32_copy_cstring(text);
     if (result) strings[count++] = result;
     return result;
@@ -143,7 +201,8 @@ static ffi_type *abi_type(char c)
     case 'q': return &ffi_type_uint64;
     case 'f': return &ffi_type_float;
     case 'd': return &ffi_type_double;
-    case 'p': case 's': case 'o': case 'W': case 'K': return &ffi_type_pointer;
+    case 'p': case 's': case 'o': case 'W': case 'K': case 'S': case 'T': case 'E':
+        return &ffi_type_pointer;
     default: return NULL;
     }
 }
@@ -152,6 +211,7 @@ static int call_method(unsigned index, const uint32_t *args, uint64_t *result)
 {
     if (index >= sizeof(steam_methods) / sizeof(steam_methods[0])) return 0;
     const struct steam_method *method = &steam_methods[index];
+    uint32_t output = indirect_result(method->result) ? *args++ : 0;
     uint32_t object = args[0];
     const struct steam_proxy *proxy = NULL;
     pthread_mutex_lock(&cache_lock);
@@ -159,40 +219,132 @@ static int call_method(unsigned index, const uint32_t *args, uint64_t *result)
     pthread_mutex_unlock(&cache_lock);
     if (!proxy || index < proxy->interface->first || index >= proxy->interface->first + proxy->interface->count) return 0;
     if (trace) fprintf(stderr, "compat32: Steam %s::%s\n", proxy->interface->version, method->name);
+    void **vtable = *(void ***)proxy->host;
+    void *function = vtable[index - proxy->interface->first];
+    if (method->result == 'D') {
+        struct steam_digital value = ((struct steam_digital (*)(void *, uint64_t, uint64_t))function)(
+            proxy->host, guest_u64(args + 1), guest_u64(args + 3));
+        *result = (unsigned)value.state | (unsigned)value.active << 8;
+        return 1;
+    }
+    if (method->result == 'A') {
+        struct steam_analog value = ((struct steam_analog (*)(void *, uint64_t, uint64_t))function)(
+            proxy->host, guest_u64(args + 1), guest_u64(args + 3));
+        memcpy((void *)(uintptr_t)output, &value, sizeof(value));
+        *result = output; return 1;
+    }
+    if (method->result == 'M') {
+        struct steam_motion value = ((struct steam_motion (*)(void *, uint64_t))function)(
+            proxy->host, guest_u64(args + 1));
+        memcpy((void *)(uintptr_t)output, &value, sizeof(value));
+        *result = output; return 1;
+    }
+    if (method->result == 'I') {
+        struct steam_ip value = ((struct steam_ip (*)(void *))function)(proxy->host);
+        memcpy((void *)(uintptr_t)output, &value, sizeof(value));
+        *result = output; return 1;
+    }
+    if (!strcmp(method->args, "iIub")) {
+        struct steam_ip ip; memcpy(&ip, args + 2, sizeof(ip));
+        *result = ((uint32_t (*)(void *, int, struct steam_ip, uint16_t, bool))function)(
+            proxy->host, (int)args[1], ip, (uint16_t)args[7], args[8] != 0);
+        return 1;
+    }
+    if (!strcmp(method->args, "Iui")) {
+        struct steam_ip ip; memcpy(&ip, args + 1, sizeof(ip));
+        *result = ((uint32_t (*)(void *, struct steam_ip, uint16_t, int))function)(
+            proxy->host, ip, (uint16_t)args[6], (int)args[7]);
+        return 1;
+    }
+    if (!strcmp(method->args, "Lipi")) {
+        struct steam_location location; memcpy(&location, args + 1, sizeof(location));
+        *result = ((bool (*)(void *, struct steam_location, int, char *, int))function)(
+            proxy->host, location, (int)args[4], (char *)(uintptr_t)args[5], (int)args[6]);
+        return 1;
+    }
     unsigned count = (unsigned)strlen(method->args);
-    if (count > 14 || !abi_type(method->result)) return 0;
+    if (count > 14 || !abi_type(method->result)) {
+        fprintf(stderr, "compat32: unsupported Steam return ABI %s::%s (%c)\n",
+                proxy->interface->version, method->name, method->result);
+        return 0;
+    }
+    for (unsigned i = 0; i < count; ++i) {
+        if (!abi_type(method->args[i])) {
+            fprintf(stderr, "compat32: unsupported Steam argument ABI %s::%s argument %u (%c)\n",
+                    proxy->interface->version, method->name, i + 1, method->args[i]);
+            return 0;
+        }
+    }
     ffi_type *types[16]; void *values[16]; uint64_t storage[16] = {0};
+    const char *output_strings[16] = {0};
+    uint32_t string_cells[16] = {0};
+    struct { const char **strings; int32_t count; } string_arrays[16] = {0};
     types[0] = &ffi_type_pointer; storage[0] = (uintptr_t)proxy->host; values[0] = &storage[0];
     unsigned word = 1;
     const char *interface_version = NULL;
     for (unsigned i = 0; i < count; ++i) {
         char code = method->args[i];
-        if (!(types[i + 1] = abi_type(code))) {
-            fprintf(stderr, "compat32: unsupported Steam argument ABI %s::%s\n", proxy->interface->version, method->name);
-            return 0;
-        }
+        types[i + 1] = abi_type(code);
         storage[i + 1] = args[word++];
         if (code == 'q' || code == 'd') storage[i + 1] |= (uint64_t)args[word++] << 32;
         if (code == 'W') {
             warning_hook = (uint32_t)storage[i + 1]; storage[i + 1] = warning_hook ? (uintptr_t)native_warning : 0;
         } else if (code == 'K') {
             callback_check_hook = (uint32_t)storage[i + 1]; storage[i + 1] = callback_check_hook ? (uintptr_t)native_callback_check : 0;
+        } else if (code == 'E') {
+            unsigned slot = !strcmp(proxy->interface->version, "SteamInput005") ? 0 : 1;
+            input_event_hooks[slot] = (uint32_t)storage[i + 1];
+            storage[i + 1] = storage[i + 1] ? (uintptr_t)(slot ? input_event006 : input_event005) : 0;
+        } else if (code == 'S' && storage[i + 1]) {
+            string_cells[i] = (uint32_t)storage[i + 1];
+            storage[i + 1] = (uintptr_t)&output_strings[i];
+        } else if (code == 'T' && storage[i + 1]) {
+            uint32_t guest[2]; memcpy(guest, (void *)(uintptr_t)storage[i + 1], sizeof(guest));
+            int32_t length = (int32_t)guest[1];
+            if (length < 0 || length > 65536 || (length && !guest[0])) goto conversion_failed;
+            string_arrays[i].count = length;
+            if (length) {
+                string_arrays[i].strings = calloc((size_t)length, sizeof(char *));
+                if (!string_arrays[i].strings) goto conversion_failed;
+                for (int32_t j = 0; j < length; ++j) {
+                    uint32_t pointer;
+                    memcpy(&pointer, (char *)(uintptr_t)guest[0] + j * 4, 4);
+                    string_arrays[i].strings[j] = (const char *)(uintptr_t)pointer;
+                }
+            }
+            storage[i + 1] = (uintptr_t)&string_arrays[i];
         }
         values[i + 1] = &storage[i + 1];
         if (method->result == 'o' && i + 1 == count) interface_version = (const char *)(uintptr_t)storage[i + 1];
     }
-    if (!strcmp(method->name, "GetAPICallResult") && !plain_callback((int)args[5])) return 0;
+    if (!strcmp(method->name, "GetAPICallResult") && !plain_callback((int)args[5])) goto unsupported;
     ffi_cif cif;
-    if (ffi_prep_cif(&cif, FFI_DEFAULT_ABI, count + 1, abi_type(method->result), types) != FFI_OK) return 0;
-    void **vtable = *(void ***)proxy->host;
+    if (ffi_prep_cif(&cif, FFI_DEFAULT_ABI, count + 1, abi_type(method->result), types) != FFI_OK) goto unsupported;
     uint64_t returned = 0;
     ffi_call(&cif, FFI_FN(vtable[index - proxy->interface->first]), &returned, values);
+    if (method->result != 'b' || returned) {
+        for (unsigned i = 0; i < count; ++i) {
+            if (!string_cells[i]) continue;
+            uint32_t copy = string_copy(output_strings[i]);
+            if (output_strings[i] && !copy) { returned = 0; break; }
+            memcpy((void *)(uintptr_t)string_cells[i], &copy, sizeof(copy));
+        }
+    }
     if (method->result == 's') returned = string_copy((const char *)(uintptr_t)returned);
     else if (method->result == 'o') returned = proxy_for((void *)(uintptr_t)returned, interface_version);
     else if (method->result == 'f') { float value; memcpy(&value, &returned, 4); returned = compat_runtime32_return_float(value); }
     else if (method->result == 'd') { double value; memcpy(&value, &returned, 8); returned = compat_runtime32_return_double(value); }
     *result = returned;
+    for (unsigned i = 0; i < count; ++i) free(string_arrays[i].strings);
     return 1;
+conversion_failed:
+    fprintf(stderr, "compat32: Steam argument conversion failed %s::%s\n", proxy->interface->version, method->name);
+    *result = 0;
+    for (unsigned i = 0; i < count; ++i) free(string_arrays[i].strings);
+    return 1;
+unsupported:
+    for (unsigned i = 0; i < count; ++i) free(string_arrays[i].strings);
+    return 0;
 }
 
 struct native_callback { int user, id; void *data; int size; };
