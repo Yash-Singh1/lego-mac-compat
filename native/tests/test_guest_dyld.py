@@ -38,12 +38,12 @@ exports:
       _CFStringGetBytes, _CFCharacterSetGetPredefined, _CFCharacterSetIsLongCharacterMember, _UpTime, _AbsoluteToNanoseconds, _NanosecondsToAbsolute,
       ___divdi3, ___moddi3, _setjmp, __setjmp, _sigsetjmp, _longjmp,
       __longjmp, _siglongjmp, _sigprocmask, _sigprocmask$UNIX2003, _memcpy, ___memset_chk,
-      _pthread_create_suspended_np, _pthread_mach_thread_np, _thread_resume, _pthread_join, _pthread_join$UNIX2003, _usleep,
+      _pthread_create, _pthread_create_suspended_np, _pthread_mach_thread_np, _thread_resume, _pthread_join, _pthread_join$UNIX2003, _usleep,
       _usleep$UNIX2003, _GetCurrentProcess, _AudioObjectGetPropertyData, _AudioQueueNewOutput, _AudioQueueAddPropertyListener, _AudioQueueAllocateBuffer, _AudioQueueSetParameter, _AudioQueueGetParameter,
       _AudioQueueEnqueueBuffer, _AudioQueueStart, _AudioQueueStop, _AudioQueueRemovePropertyListener, _AudioQueueFreeBuffer, _AudioQueueDispose,
       _FindNextComponent, _OpenAComponent, _CloseComponent, _AudioUnitSetProperty, _AudioUnitGetProperty, _AudioUnitGetPropertyInfo,
       _AudioUnitInitialize, _AudioUnitUninitialize, _AudioUnitRender, _alcCaptureOpenDevice, _alcCaptureCloseDevice, _alcGetError,
-      _printf, _fflush,
+      _printf, _fflush, _malloc,
       _strcmp, _strncmp, _strncpy, _lp32_unavailable, _stat, _stat$INODE64, _open$UNIX2003, _open,
       _close, _close$UNIX2003, _lseek, _scandir, _alphasort, _free,
       _sigaction, _raise, _getpid, _iconv_open, _iconv, _iconv_close,
@@ -93,6 +93,7 @@ int dependency_value(void) { return *value_pointer; }
 #include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <pthread.h>
 #include <malloc/malloc.h>
 #include <sys/wait.h>
 #include <sys/socket.h>
@@ -133,11 +134,37 @@ static void timer_ready(CFRunLoopTimerRef timer, void *info) {
     ++*(int *)info; CFRunLoopStop(CFRunLoopGetCurrent());
 }
 static void child_changed(int signal_number) { received_signal = signal_number; }
+static void *bad_stack_worker(void *unused) {
+    (void)unused;
+    __asm__ volatile("movl $1, %esp; ud2");
+    __builtin_unreachable();
+}
 __attribute__((constructor)) static void initialize(void) {
     initialized = dependency_pointer() + 3;
     ++count;
 }
 int LauncherMain(void) {
+    if (getenv("LP32_FIXTURE_BAD_STACK_WORKER")) {
+        pthread_t worker;
+        if (pthread_create(&worker, NULL, bad_stack_worker, NULL)) return -101;
+        pthread_join(worker, NULL);
+        return -102;
+    }
+    if (getenv("LP32_FIXTURE_BAD_STACK")) {
+        __asm__ volatile("movl $1, %esp; ud2");
+        __builtin_unreachable();
+    }
+    if (getenv("LP32_FIXTURE_LIFETIME")) {
+        volatile unsigned *object = malloc(256);
+        object[0] = 0x1234abcd;
+        free((void *)object);
+        __asm__ volatile("ud2" : : "a"(object) : "memory");
+        __builtin_unreachable();
+    }
+    if (getenv("LP32_FIXTURE_STEAM_REQUIRED")) {
+        printf("\\n ##### Sys_Error: %s", "Steam is not running. You must start Steam in order to play this game.");
+        __asm__ volatile("ud2"); // The loader must explain the failure and exit first.
+    }
     if (getenv("LP32_FIXTURE_IMPORT_CRASH")) {
         extern char *fixture_strncpy(char *, const char *, unsigned long) __asm("_strncpy");
         char destination[260];
@@ -154,6 +181,7 @@ int LauncherMain(void) {
     if (getenv("LP32_FIXTURE_SIGSEGV"))
         (void)*(volatile unsigned char *)(uintptr_t)1;
     if (getenv("LP32_FIXTURE_SIGBUS")) raise(SIGBUS);
+    if (getenv("LP32_FIXTURE_SIGABRT")) raise(SIGABRT);
     if (!strcmp || lp32_unavailable) return -4;
     unsigned missing_service = 123;
     if (!bootstrap_port || !bootstrap_look_up(bootstrap_port,
@@ -432,8 +460,50 @@ int check_directory(void) {
             assert len(list(logs.glob("run-*.log"))) == 10
             assert (logs / "user-note.log").read_text() == "keep this unrelated file\n"
             print("Persistent logs: PASS (Finder stdout/stderr, concurrent runs, retention, Terminal pipes)")
+            steam_env = dict(environment, LP32_FIXTURE_STEAM_REQUIRED="1", LP32_HEADLESS_ERRORS="1")
+            for finder in (False, True):
+                failed = subprocess.run(command, env=steam_env, text=True, timeout=30,
+                    stdout=subprocess.DEVNULL if finder else subprocess.PIPE,
+                    stderr=subprocess.DEVNULL if finder else subprocess.PIPE)
+                assert failed.returncode == 1, (failed.returncode, failed.stderr)
+                output = (logs / "last-run.log").read_text() if finder else failed.stderr
+                for expected in ("Steam startup failed; showing instructions before exiting",
+                                 "Portal 2 couldn’t connect to Steam",
+                                 "Open Steam and sign in", "then launch the game again"):
+                    assert expected in output, output
+                assert "compat32: signal " not in output, output
+            print("Steam startup error: PASS (visible-error helper, clean exit before ud2, Finder and Terminal logs)")
+            traced = run(*command, env=dict(environment, LP32_PHYSICS_TRACE_SELFTEST="1"),
+                         capture_output=True, text=True)
+            assert "Physics history self-test: PASS" in traced.stderr, traced.stderr
+            assert "Physics lifetime regression: PASS" in traced.stderr, traced.stderr
+            for kind in (5, 6, 7, 9, 10, 11, 13, 14, 15, 16):
+                assert f"kind=0x{kind:016x}" in traced.stderr, (kind, traced.stderr)
+            baseline = subprocess.run(command, env=dict(environment, LP32_PHYSICS_TRACE_SELFTEST="unfixed"),
+                                      capture_output=True, text=True, timeout=30)
+            assert baseline.returncode == -signal.SIGSEGV, (baseline.returncode, baseline.stderr)
+            assert "rip=0x0000000000000000" in baseline.stderr, baseline.stderr
+            print("Physics lifetime: PASS (unfixed fixture reproduces null-PC crash; fixed path preserves live updates)")
+            for fixture in ("BAD_STACK", "BAD_STACK_WORKER", "LIFETIME"):
+                crashed = subprocess.run(command, env=dict(environment, **{"LP32_FIXTURE_"+fixture: "1"}),
+                                         capture_output=True, text=True, timeout=30)
+                assert crashed.returncode == -signal.SIGILL, (fixture, crashed.returncode, crashed.stderr)
+                report = (logs / "last-run.log").read_text()
+                assert "capture begin version=1" in report and "capture end" in report, report
+                assert "capture image base=" in report, report
+                if fixture.startswith("BAD_STACK"):
+                    assert "sp=0x0000000000000001" in report and "unreadable" in report, report
+                else:
+                    assert "kind=0x0000000000000001" in report, report
+                    assert "kind=0x0000000000000002" in report, report
+                    assert "detail=0x000000001234abcd" in report, report
+                    assert "capture memory object" in report and "capture frame address=" in report, report
+                    analyzed = run("python3", str(NATIVE / "tools/analyze_crash.py"), str(logs / "last-run.log"),
+                                   capture_output=True, text=True)
+                    assert "Capture: complete" in analyzed.stdout and "LauncherMain" in analyzed.stdout, analyzed.stdout
+            print("Crash capture: PASS (broken main/worker guest stacks, freed object history, UUID-verified symbols, complete report)")
             for mode in ("host", "guest"):
-                for fatal_signal in (signal.SIGILL, signal.SIGSEGV, signal.SIGBUS):
+                for fatal_signal in (signal.SIGILL, signal.SIGSEGV, signal.SIGBUS, signal.SIGABRT):
                     crash_env = dict(environment)
                     crash_env["LP32_CRASH_DIAGNOSTIC_SELFTEST" if mode == "host" else
                               "LP32_FIXTURE_" + fatal_signal.name] = fatal_signal.name
@@ -443,9 +513,9 @@ int check_directory(void) {
                     assert f"compat32: signal {int(fatal_signal)} " in crashed.stderr and "crash rax=" in crashed.stderr, crashed.stderr
                     if mode == "guest" and fatal_signal == signal.SIGILL:
                         assert "##### Sys_Error: diagnostic fixture fatal reason" in (logs / "last-run.log").read_text()
-                    if mode == "host" or (mode == "guest" and fatal_signal != signal.SIGBUS):
+                    if mode == "host" or (mode == "guest" and fatal_signal not in (signal.SIGBUS, signal.SIGABRT)):
                         assert "active import " not in crashed.stderr, crashed.stderr
-            print("Fatal-signal diagnostics: PASS (SIGILL/SIGSEGV/SIGBUS, host and i386 guest; default signal termination preserved)")
+            print("Fatal-signal diagnostics: PASS (SIGILL/SIGSEGV/SIGBUS/SIGABRT, host and i386 guest; default signal termination preserved)")
             crashed = subprocess.run(["arch", "-x86_64", str(LOADER), str(root / "portal2_osx")],
                 env=dict(environment, LP32_FIXTURE_IMPORT_CRASH="1"),
                 capture_output=True, text=True, timeout=30)

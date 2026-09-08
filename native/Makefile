@@ -75,7 +75,7 @@ LDFLAGS := -Wl,-no_pie,-pagezero_size,0x1000,-segaddr,__TEXT,0x100000000,-segadd
 all: $(BUILD_DIR)/mode32_probe $(BUILD_DIR)/game_loader
 
 .PHONY: test-macho-file test-guest-dyld test-portal2-loader test-cursor-state
-.PHONY: test-steam-abi test-steam-filename
+.PHONY: test-steam-abi test-steam-filename test-steam-startup
 
 test-steam-abi: $(BUILD_DIR)/game_loader
 	python3 tests/test_steam_abi.py
@@ -84,6 +84,12 @@ test-steam-abi: $(BUILD_DIR)/game_loader
 
 test-steam-filename: $(BUILD_DIR)/game_loader
 	python3 tests/test_steam_filename.py
+
+$(BUILD_DIR)/test_steam_startup: tests/test_steam_startup.c src/steam_startup.c src/steam_startup.h | $(BUILD_DIR)
+	$(CLANG) $(CFLAGS) -Isrc tests/test_steam_startup.c src/steam_startup.c -o $@
+
+test-steam-startup: $(BUILD_DIR)/test_steam_startup
+	arch -x86_64 ./$(BUILD_DIR)/test_steam_startup
 
 $(BUILD_DIR)/test_cursor_state: tests/test_cursor_state.c src/cursor_state.c src/cursor_state.h | $(BUILD_DIR)
 	$(CLANG) $(CFLAGS) -Isrc tests/test_cursor_state.c src/cursor_state.c -o $@
@@ -130,7 +136,7 @@ $(BUILD_DIR)/test_macho_file: tests/test_macho_file.c src/macho_file.c src/macho
 test-macho-file: $(BUILD_DIR)/test_macho_file
 	./$(BUILD_DIR)/test_macho_file
 
-test-guest-dyld: $(BUILD_DIR)/game_loader test-steam-abi
+test-guest-dyld: $(BUILD_DIR)/game_loader test-steam-abi test-steam-startup test-crash-trace
 	python3 tests/test_guest_dyld.py
 
 test-portal2-loader: $(BUILD_DIR)/game_loader
@@ -163,7 +169,14 @@ $(BUILD_DIR)/mode32_probe: src/mode32_probe.c src/mode32_switch.S src/address_sp
 	$(CLANG) $(CFLAGS) $(LDFLAGS) $^ -o $@
 	codesign --force --sign - $@
 
-$(BUILD_DIR)/game_loader: src/game_loader.c src/game_profile.c src/macho_loader.c src/macho_file.c src/guest_dyld.c src/steam_bridge.c src/zlib_bridge.c src/zlib_bridge.h src/steam_bridge.h src/steam_abi.inc src/guest_memory.c src/network_bridge.c src/font_bridge.m src/gl_shader_bridge.c src/gl_misc_bridge.c src/compat_runtime.c src/wide_format.c src/audio_bridge.c src/audio_queue_bridge.c src/openal_capture_bridge.c src/openal_capture_bridge.h src/sound_manager_bridge.c src/sound_manager_bridge.h src/time_manager_bridge.c src/time_manager_bridge.h src/controller_bridge.m src/cursor_state.c src/objc_bridge.m src/arb_program_guard.c src/arb_sampler_usage.c src/mode32_switch.S src/import_gateway.S src/guest_context.S src/address_space_reserve.S | $(BUILD_DIR)
+.PHONY: test-crash-trace
+$(BUILD_DIR)/test_crash_trace: tests/test_crash_trace.c src/crash_trace.c src/crash_trace.h | $(BUILD_DIR)
+	$(CLANG) $(CFLAGS) -Isrc tests/test_crash_trace.c src/crash_trace.c -o $@
+
+test-crash-trace: $(BUILD_DIR)/test_crash_trace
+	arch -x86_64 ./$(BUILD_DIR)/test_crash_trace
+
+$(BUILD_DIR)/game_loader: src/game_loader.c src/crash_trace.c src/crash_trace.h src/physics_trace.c src/physics_trace.h src/game_profile.c src/macho_loader.c src/macho_file.c src/guest_dyld.c src/steam_bridge.c src/steam_startup.c src/steam_startup.h src/objc_bridge.h src/zlib_bridge.c src/zlib_bridge.h src/steam_bridge.h src/steam_abi.inc src/guest_memory.c src/network_bridge.c src/font_bridge.m src/gl_shader_bridge.c src/gl_misc_bridge.c src/compat_runtime.c src/wide_format.c src/audio_bridge.c src/audio_queue_bridge.c src/openal_capture_bridge.c src/openal_capture_bridge.h src/sound_manager_bridge.c src/sound_manager_bridge.h src/time_manager_bridge.c src/time_manager_bridge.h src/controller_bridge.m src/cursor_state.c src/objc_bridge.m src/arb_program_guard.c src/arb_sampler_usage.c src/mode32_switch.S src/import_gateway.S src/guest_context.S src/address_space_reserve.S | $(BUILD_DIR)
 	$(CLANG) $(CFLAGS) $(LDFLAGS) $(filter %.c %.m %.S,$^) -framework Cocoa -framework Carbon -framework OpenGL -framework ImageIO -framework CoreText -framework AudioToolbox -framework AudioUnit -framework CoreAudio -framework OpenAL -framework GameController -framework IOKit -liconv -lffi -lz -o $@
 	codesign --force --sign - $@
 

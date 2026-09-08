@@ -1,4 +1,6 @@
 #include "compat_runtime.h"
+#include "crash_trace.h"
+#include "physics_trace.h"
 #include "wide_format.h"
 #include "audio_bridge.h"
 #include "controller_bridge.h"
@@ -1880,6 +1882,8 @@ static uint32_t guest_allocate_at(size_t size, bool clear, uint32_t site)
     metadata[3] = site ? site : kGuestHeapHostSite;
     size_t capacity = metadata[2];
     guest_heap_record_allocation_locked(metadata[3], size, capacity);
+    lp32_trace_record(LP32_TRACE_ALLOC, header_address + kGuestHeapHeaderSize,
+                       (uint32_t)capacity, metadata[3], (uint32_t)size);
     pthread_mutex_unlock(&guest_heap_lock);
 
     uint32_t result = header_address + kGuestHeapHeaderSize;
@@ -1894,6 +1898,8 @@ static uint32_t guest_allocate(size_t size, bool clear)
 
 static bool guest_deallocate(uint32_t pointer)
 {
+    struct compat_runtime32_import_context context;
+    uint32_t caller = compat_runtime32_current_import(&context) ? context.return_address : 0;
     pthread_mutex_lock(&guest_heap_lock);
     ++guest_heap_statistics.free_calls;
     if (!pointer) {
@@ -1904,6 +1910,7 @@ static bool guest_deallocate(uint32_t pointer)
     uint32_t *metadata = NULL;
     bool already_free = false;
     if (!guest_heap_validate_header_locked(pointer, &metadata, &already_free)) {
+        lp32_trace_record(LP32_TRACE_BAD_FREE, pointer, 0, caller, already_free);
         if (already_free) {
             ++guest_heap_statistics.double_frees;
         } else {
@@ -1921,6 +1928,8 @@ static bool guest_deallocate(uint32_t pointer)
     uint32_t requested = metadata[0];
     uint32_t capacity = metadata[2];
     uint32_t site = metadata[3];
+    lp32_trace_record(LP32_TRACE_FREE, pointer, capacity, caller,
+                       *(const uint32_t *)(uintptr_t)pointer);
     guest_heap_record_free_locked(site, requested, capacity);
     metadata[0] = 0;
     metadata[1] = kGuestHeapFreeMagic;
@@ -2088,6 +2097,8 @@ static uint32_t guest_reallocate(uint32_t old_pointer, size_t new_size,
             }
         }
         ++guest_heap_statistics.realloc_in_place;
+        lp32_trace_record(LP32_TRACE_REALLOC, old_pointer, old_capacity,
+                           site, (uint32_t)new_size);
         pthread_mutex_unlock(&guest_heap_lock);
         return old_pointer;
     }
@@ -2123,6 +2134,8 @@ static uint32_t guest_reallocate(uint32_t old_pointer, size_t new_size,
                 }
             }
             ++guest_heap_statistics.realloc_in_place;
+            lp32_trace_record(LP32_TRACE_REALLOC, old_pointer,
+                               (uint32_t)needed_capacity, site, (uint32_t)new_size);
             pthread_mutex_unlock(&guest_heap_lock);
             return old_pointer;
         }
@@ -3367,6 +3380,8 @@ static uint64_t fast_pthread_mutex_unlock(const uint32_t *arguments,
 
 static lp32_fast_import_fn runtime_fast_import(const char *name)
 {
+    lp32_fast_import_fn trace = lp32_physics_trace_handler(name);
+    if (trace) return trace;
     static const struct {
         const char *name;
         lp32_fast_import_fn handler;
@@ -3394,6 +3409,8 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
                                       const uint32_t *arguments,
                                       uint32_t return_address)
 {
+    lp32_fast_import_fn trace = lp32_physics_trace_handler(name);
+    if (trace) return trace(arguments, return_address);
     char unix_name[512];
     const char *unix_suffix = strstr(name, "$UNIX2003");
     if (unix_suffix && !unix_suffix[9] && (size_t)(unix_suffix - name) < sizeof(unix_name)) {
@@ -5320,6 +5337,7 @@ static void create_guest_stack_slot_key(void)
 
 static bool acquire_guest_stack_slot(void)
 {
+    lp32_crash_thread_stack();
     enum { kGuestStackSlotCount = kGuestStackSize / kGuestStackPerThread };
     pthread_once(&guest_stack_slot_key_once, create_guest_stack_slot_key);
 

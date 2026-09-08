@@ -1,4 +1,6 @@
 #include "compat_runtime.h"
+#include "crash_trace.h"
+#include "physics_trace.h"
 #include "controller_bridge.h"
 #include "game_profile.h"
 #include "guest_dyld.h"
@@ -15,12 +17,14 @@
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <uuid/uuid.h>
 #include <unistd.h>
@@ -32,6 +36,7 @@ static volatile sig_atomic_t guest_breakpoint_count;
 static unsigned guest_breakpoint_limit;
 static unsigned guest_breakpoint_skip;
 static int guest_diagnostic_fd = -1;
+static char loader_executable[PATH_MAX];
 
 /* Finder launches do not retain stderr.  Mirror crash and breakpoint output
    into a persistent per-run file without changing normal console logging. */
@@ -553,6 +558,17 @@ static void guest_crash_diagnostic(int signal_number, siginfo_t *info,
             return;
         }
     }
+    const uint64_t capture_registers[] = {
+        context->uc_mcontext->__ss.__rax, context->uc_mcontext->__ss.__rbx,
+        context->uc_mcontext->__ss.__rcx, context->uc_mcontext->__ss.__rdx,
+        context->uc_mcontext->__ss.__rsi, context->uc_mcontext->__ss.__rdi,
+        context->uc_mcontext->__ss.__rbp, context->uc_mcontext->__ss.__r14};
+    int capture_fd = guest_diagnostic_fd >= 0 ? guest_diagnostic_fd : STDERR_FILENO;
+    /* Capture first, before the legacy printf summary: a signal may have
+       interrupted libc holding its stdio or allocation locks. */
+    lp32_crash_capture(capture_fd, rip, rsp, context->uc_mcontext->__ss.__rbp,
+        capture_registers, sizeof(capture_registers)/sizeof(capture_registers[0]),
+        context->uc_mcontext->__ss.__cs == 0x107);
     GUEST_DIAGNOSTIC(
             "compat32: signal %d code=%d address=%p "
             "rip=0x%016llx rsp=0x%016llx\n",
@@ -591,10 +607,11 @@ static void guest_crash_diagnostic(int signal_number, siginfo_t *info,
         }
     }
     if (rsp >= UINT32_C(0x1000) && rsp < UINT32_C(0x80000000)) {
-        const uint32_t *words = (const void *)(uintptr_t)rsp;
         for (unsigned index = 0; index < 16; ++index) {
+            uint32_t word;
+            if (!lp32_crash_read(rsp + index*4, &word, sizeof(word))) break;
             GUEST_DIAGNOSTIC("compat32: crash stack[%u]=0x%08x\n",
-                             index, words[index]);
+                             index, word);
         }
     }
     /* LP32_CRASH_DUMP=0xaddr:dwords[,...] appends guest cells to the report. */
@@ -608,11 +625,7 @@ static void guest_crash_diagnostic(int signal_number, siginfo_t *info,
             uint32_t address = (uint32_t)strtoul(item, NULL, 0);
             unsigned count = colon ? (unsigned)strtoul(colon + 1, NULL, 0) : 8;
             if (address < 0x1000 || address >= 0x7f000000 || count > 64) continue;
-            const uint32_t *words = (const void *)(uintptr_t)address;
-            for (unsigned index = 0; index < count; ++index) {
-                GUEST_DIAGNOSTIC("compat32: crash mem[0x%08x]=0x%08x\n",
-                                 address + 4 * index, words[index]);
-            }
+            lp32_crash_dump_words(capture_fd, "requested", address, count);
         }
     }
     fsync(guest_diagnostic_fd >= 0 ? guest_diagnostic_fd : STDERR_FILENO);
@@ -629,15 +642,17 @@ static void guest_crash_diagnostic(int signal_number, siginfo_t *info,
 
 static void install_guest_crash_diagnostics(void)
 {
+    int on_stack = lp32_crash_thread_stack() ? SA_ONSTACK : 0;
     struct sigaction action;
     memset(&action, 0, sizeof(action));
     action.sa_sigaction = guest_crash_diagnostic;
-    action.sa_flags = SA_SIGINFO | SA_RESETHAND;
+    action.sa_flags = SA_SIGINFO | SA_RESETHAND | on_stack;
     sigemptyset(&action.sa_mask);
     sigaction(SIGSEGV, &action, NULL);
     sigaction(SIGBUS, &action, NULL);
     sigaction(SIGILL, &action, NULL);
-    action.sa_flags = SA_SIGINFO;
+    sigaction(SIGABRT, &action, NULL);
+    action.sa_flags = SA_SIGINFO | on_stack;
     sigaction(SIGTRAP, &action, NULL);
 }
 
@@ -682,9 +697,46 @@ static int configure_guest_breakpoint(const struct macho_image32 *image)
     return 0;
 }
 
+static int run_steam_helper(const char *operation, const char *game_root)
+{
+    /* Probe Steam and show any UI outside the guest's event loop and locks.
+       Call before guest startup or from normal error dispatch, never from
+       a signal handler. */
+    fflush(NULL);
+    if (loader_executable[0]) {
+        char *arguments[] = {loader_executable, (char *)operation, (char *)game_root, NULL};
+        extern char **environ;
+        pid_t child;
+        int error = posix_spawn(&child, loader_executable, NULL, NULL, arguments, environ);
+        if (!error) {
+            int status;
+            pid_t waited;
+            do { waited = waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+            if (waited == child && WIFEXITED(status)) return WEXITSTATUS(status);
+        } else {
+            GUEST_DIAGNOSTIC("compat32: could not start Steam helper: %s\n", strerror(error));
+        }
+    }
+    return EXIT_FAILURE;
+}
+
+static void steam_startup_failure(void)
+{
+    (void)run_steam_helper("--steam-required", NULL);
+    if (guest_diagnostic_fd >= 0) fsync(guest_diagnostic_fd);
+    /* This is an explained startup failure, not a crash. Avoid running guest
+       shutdown callbacks after Steam initialization failed. */
+    _exit(EXIT_FAILURE);
+}
+
 static void runtime_diagnostic_line(const char *line)
 {
     GUEST_DIAGNOSTIC("%s", line);
+    if (lp32_profile()->title == LP32_TITLE_PORTAL2 &&
+        strstr(line, "##### Sys_Error: Steam is not running. You must start Steam in order to play this game.")) {
+        GUEST_DIAGNOSTIC("\ncompat32: Steam startup failed; showing instructions before exiting\n");
+        steam_startup_failure();
+    }
 }
 
 /* Bundled launches carry the image in Contents/SharedSupport; pick whichever
@@ -712,6 +764,19 @@ static const char *default_image_path(const char *argv0, char *buffer,
 
 int main(int argc, char **argv)
 {
+    if (argc == 2 && !strcmp(argv[1], "--steam-required")) {
+        objc_bridge32_show_steam_required();
+        return EXIT_FAILURE;
+    }
+    if (argc == 3 && !strcmp(argv[1], "--prepare-steam"))
+        return objc_bridge32_prepare_steam(argv[2]);
+    char executable[PATH_MAX];
+    uint32_t executable_size = sizeof(executable);
+    if (_NSGetExecutablePath(executable, &executable_size) != 0 ||
+        !realpath(executable, loader_executable)) {
+        fprintf(stderr, "game_loader: could not resolve its executable path\n");
+        return EXIT_FAILURE;
+    }
     install_guest_crash_diagnostics();
     compat_runtime32_set_diagnostic_sink(runtime_diagnostic_line);
     if (getenv("LP32_CRASH_DIAGNOSTIC_SELFTEST")) {
@@ -719,6 +784,8 @@ int main(int argc, char **argv)
             __asm__ volatile("ud2");
         if (!strcmp(getenv("LP32_CRASH_DIAGNOSTIC_SELFTEST"), "SIGBUS"))
             raise(SIGBUS);
+        if (!strcmp(getenv("LP32_CRASH_DIAGNOSTIC_SELFTEST"), "SIGABRT"))
+            raise(SIGABRT);
         if (!strcmp(getenv("LP32_CRASH_DIAGNOSTIC_SELFTEST"), "SIGSEGV"))
             (void)*(volatile unsigned char *)(uintptr_t)1;
         raise(SIGSEGV);
@@ -747,6 +814,15 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
     open_guest_diagnostic_log(argc > 0 ? argv[0] : NULL);
+    const unsigned char *main_uuid = NULL;
+    const struct load_command *main_command = (const void *)(image.header + 1);
+    for (unsigned i = 0; i < image.header->ncmds; ++i) {
+        if (main_command->cmd == LC_UUID && main_command->cmdsize >= sizeof(struct uuid_command))
+            main_uuid = ((const struct uuid_command *)main_command)->uuid;
+        main_command = (const void *)((const char *)main_command + main_command->cmdsize);
+    }
+    lp32_trace_module(image_path, image.min_address, image.max_address, 0, main_uuid);
+    fprintf(stderr, "compat32: crash history enabled (65536 heap events, 4096 physics events, safe memory capture)\n");
     const char *log_selftest = getenv("LP32_LOG_SELFTEST");
     if (log_selftest) {
         fprintf(stdout, "diagnostic fixture stdout\n");
@@ -795,6 +871,9 @@ int main(int argc, char **argv)
         int result = compat_runtime32_run_heap_self_test();
         macho_image32_unload(&image);
         return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (getenv("LP32_PHYSICS_TRACE_SELFTEST")) {
+        return lp32_physics_trace_selftest() == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
     if (getenv("LP32_DYLD_SELFTEST")) {
         return lp32_profile()->title == LP32_TITLE_PORTAL2 &&
@@ -851,6 +930,12 @@ int main(int argc, char **argv)
     }
     if (!getenv("LP32_DISABLE_TEXTURE_BIND_GUARD") &&
         install_texture_bind_guard() != 0) {
+        macho_image32_unload(&image);
+        return EXIT_FAILURE;
+    }
+
+    if (lp32_profile()->title == LP32_TITLE_PORTAL2 &&
+        run_steam_helper("--prepare-steam", guest_dyld32_game_root()) != EXIT_SUCCESS) {
         macho_image32_unload(&image);
         return EXIT_FAILURE;
     }

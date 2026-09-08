@@ -17,5 +17,8 @@ int objc_bridge32_run_proxy_self_test(void);
 int objc_bridge32_run_gl_parameter_self_test(void);
 int objc_bridge32_run_gl_buffer_self_test(void);
 int objc_bridge32_run_gl_texture_self_test(void);
+/* Native helper UI; invoke before initializing or entering the guest. */
+void objc_bridge32_show_steam_required(void);
+int objc_bridge32_prepare_steam(const char *game_root);
 
 #endif

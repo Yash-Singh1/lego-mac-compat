@@ -11,6 +11,24 @@ binaries or data are tracked by Git.
 
 ## Building and running
 
+Opening a converted app now checks Steam before starting the game. If Steam
+is closed or not ready, the launcher opens Steam and waits up to 60 seconds
+for initialization, then continues with the converted executable. This uses
+the supplied Steam API's native slice in an isolated helper when available;
+the game's own Steam initialization still checks authentication and ownership.
+Older Steam libraries without a native slice use a process-readiness check
+and leave API validation to the game.
+
+Steam's standard AppID relaunch selects the original executable installed in
+its library, so this launcher opens the client itself and keeps the converted
+app selected. If startup still fails, a native dialog explains how to open
+Steam and sign in, with Open Steam and Quit buttons. The known “Steam is not
+running” engine error also shows this dialog and exits normally before the
+engine's deliberate crash instruction. Other fatal errors retain crash reports.
+`LP32_HEADLESS_ERRORS=1` disables startup UI and opening Steam for automated
+tests. `make -C native test-steam-startup` checks readiness, automatic opening,
+sign-in waits, failure, and bounded timeouts without changing a real Steam session.
+
 From `native/`:
 
 ```sh
@@ -453,7 +471,79 @@ includes integer conversions with i386 range limits, duplication/search/case
 operations, character classification, and `vswscanf`; guest `errno` is writable
 and thread-local through `__error`.
 
-SIGILL now writes register diagnostics before default signal termination, so
+Dev.6 and later enable a bounded crash recorder automatically. There are no launch flags to
+remember. It retains 65,536 allocation/free/reallocation events in native memory,
+including allocation and free callers and the object's first word before free.
+An independent 4,096-event buffer records animation, pending physics entities,
+trigger callback entry/exit, and base-entity destruction. The physics hooks
+require server UUID `0420DBF7-9CD0-31E2-84DD-61DDC692B704` and matching instruction
+bytes; other server versions explicitly log that only general capture is enabled.
+Hooks retain the original functions. The lifetime fix below invalidates references
+to destroyed entities before those functions can consume them.
+
+On SIGSEGV, SIGBUS, SIGILL or SIGABRT, `capture begin version=1` through
+`capture end` in the run log contains the retained history, exact guest image
+paths/slides/UUIDs, a 4 KiB stack snapshot, up to 64 frame-chain entries, and
+bounded memory snapshots around register/stack object candidates (including
+allocator headers and one pointer indirection). Reads use Mach's memory-copy API;
+unreadable pointers are marked rather than dereferenced. The capture writer uses
+fixed buffers and `write`, without heap allocation or allocator/stdio locks.
+Guest execution threads receive alternate signal stacks, so a damaged guest
+stack can still be reported. Normal play performs no per-event disk writes.
+
+Analyze a new report with:
+
+```sh
+python3 native/tools/analyze_crash.py ~/Library/Logs/Portal2Compat/last-run.log
+# Inspect a particular entity, including allocations containing this address:
+python3 native/tools/analyze_crash.py /path/to/run.log --address 0x12a47180
+```
+
+The analyzer verifies each local i386 image's UUID before resolving function
+names. `--image-dir /path/to/matching/dylibs` supports images moved since the run.
+Keep the exact old binaries when upgrading if an unresolved crash still needs
+symbolication. The history is a rolling window, not a complete record of every
+memory write: an absent event does not prove an allocation/deletion never
+happened. Queue observations cap each vector at 256 entries per checkpoint.
+Capture may be incomplete after a forced kill or a machine/process failure that
+does not deliver a catchable signal.
+
+`make -C native test-crash-trace` checks unreadable memory, concurrent capture,
+and ring wrap. `make -C native test-guest-dyld` additionally checks destroyed
+main/worker guest stacks, freed-object history, verified symbolication, the five
+physics hooks with nested real i386 calls, and default fatal-signal termination.
+
+### Deferred physics entity lifetime fix
+
+The September 8 report confirmed that a destroyed `CFuncBrush` remained in the
+end-of-tick physics queue. Its memory was reused for a model filename before the
+queue consumed it. Dev.6 and later invalidate every matching entry
+in both deferred vectors on entry to the base-entity destructor, before memory
+can be freed and reused. This covers entities destroyed during world teardown
+as well as during physics callbacks.
+
+Invalidation leaves an empty slot so an active guest loop's cached count and
+indices remain valid. Before the next outer update, stable compaction removes
+empty slots and preserves the full pusher record, including its old origin.
+During an active update, trigger calls and both virtual-update loops skip empty
+slots. The virtual-loop guards run before the vtable dereference. Live entities
+continue through the original game code, and a new entity at a reused address
+can be queued normally. No allocator quarantine or permanent address blacklist
+is needed. New recorder events identify invalidations and compaction.
+
+The patch checks the server UUID and all modified instruction sequences before
+installing any hooks. The launch log reports `deferred physics lifetime fix
+enabled` when installed. It is included in the dev.6 converter and rebuilt local
+apps.
+
+The regression executes the supported server's end-of-tick instruction sequence
+with fixture dependencies. Bypassing the fixture destructor hook reproduces the
+null-PC crash; the fixed path survives deletion/reuse, duplicate references,
+self-deletion and deletion of a later object during a trigger, and reuse for a
+new live entity. It checks that surviving entities get their trigger/shadow
+updates and retain the correct old origin.
+
+SIGILL writes register diagnostics before default signal termination, so
 macOS can still produce a full crash report. If the crash recurs, collect:
 
 - The `~/Library/Logs/Portal2Compat/` folder. Current builds keep ten recent

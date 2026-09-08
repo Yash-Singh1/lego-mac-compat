@@ -1,4 +1,6 @@
 #include "guest_dyld.h"
+#include "physics_trace.h"
+#include "crash_trace.h"
 #include "steam_bridge.h"
 #include "macho_file.h"
 #include "compat_runtime.h"
@@ -660,6 +662,15 @@ static int bind_module(struct module32 *m)
         }
     }
     m->state = 2;
+    const unsigned char *uuid = NULL;
+    const struct load_command *command = (const void *)(m->header + 1);
+    for (unsigned i = 0; i < m->header->ncmds; ++i) {
+        if (command->cmd == LC_UUID && command->cmdsize >= sizeof(struct uuid_command))
+            uuid = ((const struct uuid_command *)command)->uuid;
+        command = (const void *)((const char *)command + command->cmdsize);
+    }
+    lp32_trace_module(m->path, m->base, m->end, m->slide, uuid);
+    lp32_physics_trace_install(m->path, m->slide, uuid);
     return 0;
 }
 

@@ -39,19 +39,25 @@ in depot **623**, including `bin/osx32`. You do not need to make an `.app`
 bundle or combine the folders yourself. If several versions are present,
 choose a specific version folder; ambiguous downloads are not mixed.
 
-Steam copies require Steam to be running and signed in to an account that owns
-Portal 2. The loader bridges the game's 32-bit Steam interfaces to the installed
+Steam copies require an account that owns Portal 2. The launcher opens Steam
+when needed and waits for it before starting the converted game.
+The loader bridges the game's 32-bit Steam interfaces to the installed
 64-bit Steam client. It does not remove ownership or authentication checks.
 Download
-[Portal 2 Converter 0.0.0-dev.5](https://github.com/Yash-Singh1/lego-mac-compat/releases/tag/portal2-converter-v0.0.0-dev.5)
+[Portal 2 Converter 0.0.0-dev.6](https://github.com/Yash-Singh1/lego-mac-compat/releases/tag/portal2-converter-v0.0.0-dev.6)
 or build the converter from this branch. Folder support requires dev.2 or
 newer; the older dev.1 release accepts app bundles only.
 The supplied depot build has been checked through the opening single-player
 room. Full playthrough and online features remain unverified.
 
-Dev.5 adds crash logs identifying the active imported function, guest caller,
-and argument words, and preserves macOS crash reporting for fatal signals.
-It includes regression tests for these diagnostics and Steam filename handling.
+Dev.6 fixes the confirmed deferred-physics crash: destroyed entities could
+remain queued after their memory was reused. It also starts Steam automatically
+and records allocation, physics, and memory evidence for future crashes.
+The physics fix verifies the supported server UUID and instruction bytes before
+patching; other server versions retain general crash capture only. Regression
+tests reproduce the original crash without the fix and preserve live physics
+updates with it. The original challenge/reload sequence still needs an in-game
+retest. Dev.5's import diagnostics and native macOS crash reports remain included.
 The reported co-op loading stall remains unresolved.
 
 Dev.4 fixes Steam controller data conversion and the missing PNG decompression

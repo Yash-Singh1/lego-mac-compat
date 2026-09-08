@@ -10,6 +10,7 @@
 #include "gl_shader_bridge.h"
 #include "gl_misc_bridge.h"
 #include "name_match.h"
+#include "steam_startup.h"
 
 #define GL_SILENCE_DEPRECATION 1
 #import <AppKit/AppKit.h>
@@ -40,6 +41,119 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <mach/mach_time.h>
+
+void objc_bridge32_show_steam_required(void)
+{
+    @autoreleasepool {
+        NSString *title = @"Portal 2 couldn’t connect to Steam";
+        NSString *message = @"Open Steam and sign in to an account that owns Portal 2, then launch the game again.\n\n"
+            @"If Steam is already open, quit and reopen it before retrying.";
+        fprintf(stderr, "%s\n%s\n", title.UTF8String, message.UTF8String);
+        /* Explicit opt-out for headless regression runs; normal launches
+           always show the error, including launches from Terminal. */
+        if (getenv("LP32_HEADLESS_ERRORS")) return;
+        [NSApplication sharedApplication];
+        [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+        [NSApp finishLaunching];
+        [NSApp activateIgnoringOtherApps:YES];
+        NSAlert *alert = [[NSAlert alloc] init];
+        alert.alertStyle = NSAlertStyleWarning;
+        alert.messageText = title;
+        alert.informativeText = message;
+        [alert addButtonWithTitle:@"Open Steam"];
+        [alert addButtonWithTitle:@"Quit"];
+        alert.window.level = NSModalPanelWindowLevel;
+        alert.window.collectionBehavior = NSWindowCollectionBehaviorMoveToActiveSpace |
+            NSWindowCollectionBehaviorFullScreenAuxiliary;
+        if ([alert runModal] == NSAlertFirstButtonReturn &&
+            ![[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:@"steam://open/main"]]) {
+            NSAlert *failed = [[NSAlert alloc] init];
+            failed.messageText = @"Steam couldn’t be opened";
+            failed.informativeText = @"Open Steam from Applications and sign in, then launch Portal 2 again.";
+            [failed addButtonWithTitle:@"OK"];
+            [failed runModal];
+            [failed release];
+        }
+        [alert release];
+    }
+}
+
+struct steam_startup_probe {
+    bool (*running)(void);
+    bool (*initialize)(void);
+    void (*shutdown)(void);
+    double deadline;
+};
+static bool startup_steam_running(void *opaque)
+{
+    struct steam_startup_probe *probe = opaque;
+    if (probe->running) return probe->running();
+    for (NSRunningApplication *app in [NSRunningApplication runningApplicationsWithBundleIdentifier:@"com.valvesoftware.steam"])
+        if (!app.terminated && app.finishedLaunching) return true;
+    return false;
+}
+static bool startup_steam_initialize(void *opaque)
+{
+    struct steam_startup_probe *probe = opaque;
+    return !probe->initialize || probe->initialize();
+}
+static void startup_steam_shutdown(void *opaque)
+{
+    struct steam_startup_probe *probe = opaque;
+    if (probe->shutdown) probe->shutdown();
+}
+static bool startup_steam_open(void *opaque)
+{
+    (void)opaque;
+    fprintf(stderr, "compat32: opening Steam before launching Portal 2\n");
+    if (getenv("LP32_HEADLESS_ERRORS")) return false;
+    return [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:@"steam://open/main"]];
+}
+static bool startup_steam_wait(void *opaque)
+{
+    struct steam_startup_probe *probe = opaque;
+    if (NSProcessInfo.processInfo.systemUptime >= probe->deadline) return false;
+    @autoreleasepool {
+        [NSThread sleepForTimeInterval:0.5];
+    }
+    return true;
+}
+int objc_bridge32_prepare_steam(const char *game_root)
+{
+    @autoreleasepool {
+        setenv("SteamAppId", "620", 1);
+        setenv("SteamGameId", "620", 1);
+        struct steam_startup_probe probe = {0};
+        void *library = NULL;
+        /* The supplied Steam API is universal. Probe its native slice in
+           this isolated helper; the game still initializes its own i386 API. */
+        for (NSString *directory in @[@"bin/osx32", @"bin"]) {
+            NSString *path = [NSString stringWithFormat:@"%s/%@/libsteam_api.dylib", game_root, directory];
+            library = dlopen(path.fileSystemRepresentation, RTLD_NOW | RTLD_LOCAL);
+            if (library) break;
+        }
+        if (library) {
+            probe.running = dlsym(library, "SteamAPI_IsSteamRunning");
+            probe.initialize = dlsym(library, "SteamAPI_InitSafe");
+            probe.shutdown = dlsym(library, "SteamAPI_Shutdown");
+            if (!probe.shutdown) probe.initialize = NULL;
+        }
+        if (!probe.initialize)
+            fprintf(stderr, "compat32: native Steam readiness probe unavailable; guest API will validate initialization\n");
+        probe.deadline = NSProcessInfo.processInfo.systemUptime + 60.0;
+        const struct steam_startup_ops ops = {&probe, startup_steam_running, startup_steam_initialize,
+            startup_steam_shutdown, startup_steam_open, startup_steam_wait};
+        enum steam_startup_result result = steam_startup_prepare(&ops);
+        if (result == STEAM_STARTUP_READY) {
+            fprintf(stderr, "compat32: Steam is ready; continuing with the converted game\n");
+            return EXIT_SUCCESS;
+        }
+        fprintf(stderr, "compat32: Steam startup %s\n",
+            result == STEAM_STARTUP_OPEN_FAILED ? "could not open the client" : "timed out waiting for the client");
+        objc_bridge32_show_steam_required();
+        return EXIT_FAILURE;
+    }
+}
 
 /* These GL 3.0 access flags are absent from Apple's legacy <OpenGL/gl.h>. */
 #ifndef GL_MAP_READ_BIT
