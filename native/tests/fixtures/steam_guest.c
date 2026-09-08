@@ -5,7 +5,11 @@
 #include <string.h>
 #define METHOD(obj, slot, type) ((type)((*(void ***)(obj))[slot]))
 static int checked_callback;
-static bool registered_callback(int callback) { checked_callback = callback; return false; }
+static bool registered_callback(int callback) {
+    (void)getenv("LP32_STEAM_FIXTURE"); // Nested guest import inside a native callback.
+    checked_callback = callback;
+    return false;
+}
 int check_steam(void) {
     const char *number = "0x123456789abcdef0!";
     struct { char *end; uint32_t guard; } parsed = {0, 0xaabbccdd};
@@ -33,6 +37,43 @@ int check_steam(void) {
     if (METHOD(utils, 9, app_fn)(utils) != 620 ||
         strcmp(METHOD(utils, 4, string_fn)(utils), "fixture-country")) return -74;
     if (!METHOD(stats, 5, rate_fn)(stats, "rate", 1.25f, 2.5)) return -75;
+    void *storage = get(client, 17, 23, "STEAMREMOTESTORAGE_INTERFACE_VERSION016");
+    typedef bool (*ugc_fn)(void *, uint64_t, unsigned *, char **, int *, uint64_t *);
+    if (!storage) return -84;
+    ugc_fn details = METHOD(storage, 26, ugc_fn);
+    struct { uint32_t before; char *name; uint32_t after; } filename = {
+        0x11223344, 0, 0xaabbccdd
+    };
+    unsigned ugc_app = 0; int ugc_size = 0; uint64_t ugc_owner = 0;
+    if (!details(storage, UINT64_C(0x123456789abcdef0), &ugc_app,
+                 &filename.name, &ugc_size, &ugc_owner) ||
+        filename.before != 0x11223344 || filename.after != 0xaabbccdd)
+        return -85;
+    if (!filename.name || (uintptr_t)filename.name >= 0x70000000U ||
+        strcmp(filename.name, "workshop/fixture-chamber.bsp") || ugc_app != 620 ||
+        ugc_size != 4096 || ugc_owner != UINT64_C(0xfedcba9876543210)) return -86;
+    char *saved_name = filename.name;
+    if (details(storage, 0, &ugc_app, &filename.name, &ugc_size, &ugc_owner) ||
+        filename.name != saved_name || filename.after != 0xaabbccdd) return -87;
+    filename.name = 0;
+    if (!details(storage, UINT64_C(0x123456789abcdef0), 0, &filename.name, 0, 0) ||
+        filename.name != saved_name || filename.after != 0xaabbccdd ||
+        !details(storage, UINT64_C(0x123456789abcdef0), 0, 0, 0, 0)) return -88;
+    if (!details(storage, 1, 0, &filename.name, 0, 0) || filename.name ||
+        filename.after != 0xaabbccdd) return -89;
+    /* Native Steam may reuse its string buffer; older guest copies must
+       survive subsequent queries and growth beyond the old 1024-entry cache. */
+    char *previous_name = saved_name;
+    for (unsigned n = 2; n < 1100; ++n) {
+        filename.name = previous_name;
+        bool ok = details(storage, n, 0, &filename.name, 0, 0);
+        if (filename.before != 0x11223344 || filename.after != 0xaabbccdd ||
+            strcmp(saved_name, "workshop/fixture-chamber.bsp")) return -90;
+        if (!ok) return -91;
+        if (!filename.name || filename.name == previous_name ||
+            strncmp(filename.name, "workshop/fixture-", 17)) return -92;
+        previous_name = filename.name;
+    }
     void *legacy = create("SteamClient017", &status);
     typedef void (*frame_fn)(void *);
     if (!legacy || status) return -81;

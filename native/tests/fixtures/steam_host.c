@@ -3,11 +3,39 @@
 #include <stdbool.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 struct object { void **vtable; };
 static void *client17_table[37];
 static void *client_table[42], *user_table[32], *utils_table[38], *stats_table[45];
+static void *storage_table[59];
 static struct object client17 = {client17_table};
 static struct object client = {client_table}, user = {user_table}, utils = {utils_table}, stats = {stats_table};
+static struct object storage = {storage_table};
+static char *ugc_name;
+static bool ugc_details(void *self, uint64_t content, unsigned *app,
+                        char **name, int *size, uint64_t *owner) {
+    if (self != &storage) abort();
+    if (content == 0) {
+        /* Output values on failure are not valid strings to dereference. */
+        if (name) *name = (char *)(uintptr_t)0xe3f1fe67;
+        return false;
+    }
+    if (content == 1) { if (name) *name = NULL; return true; }
+    if (content >= 2 && content < 1100) {
+        static char changing_name[64];
+        snprintf(changing_name, sizeof(changing_name), "workshop/fixture-%llu.bsp",
+                 (unsigned long long)content);
+        if (name) *name = changing_name;
+        return true;
+    }
+    if (content != UINT64_C(0x123456789abcdef0) ||
+        (uintptr_t)ugc_name <= UINT32_MAX) abort();
+    if (app) *app = 620;
+    if (name) *name = ugc_name;
+    if (size) *size = 4096;
+    if (owner) *owner = UINT64_C(0xfedcba9876543210);
+    return true;
+}
 static uint64_t steam_id(void *self) { if (self != &user) abort(); return UINT64_C(0x123456789abcdef0); }
 static unsigned app_id(void *self) { if (self != &utils) abort(); return 620; }
 static const char *country(void *self) { if (self != &utils) abort(); return "fixture-country"; }
@@ -15,7 +43,12 @@ static bool rate(void *self, const char *name, float count, double seconds) {
     return self == &stats && !strcmp(name, "rate") && count == 1.25f && seconds == 2.5;
 }
 static unsigned callback_count, frames;
-static void set_check(void *self, bool (*check)(int)) { if (self != &client || !check) abort(); }
+static void set_check(void *self, bool (*check)(int)) {
+    if (self != &client || !check) abort();
+    (void)check(1040044);
+    if (getenv("LP32_FIXTURE_NESTED_IMPORT_CRASH"))
+        (void)*(volatile unsigned char *)(uintptr_t)1;
+}
 static void run_frame(void *self) { if (self != &client17) abort(); ++frames; }
 static unsigned ipc_count(void *self) { if (self != &client17) abort(); return frames; }
 static void *get_interface(void *self, int u, int p, const char *version) {
@@ -23,9 +56,11 @@ static void *get_interface(void *self, int u, int p, const char *version) {
     if (!strcmp(version, "SteamUser021")) return &user;
     if (!strcmp(version, "SteamUtils010")) return &utils;
     if (!strcmp(version, "STEAMUSERSTATS_INTERFACE_VERSION012")) return &stats;
+    if (!strcmp(version, "STEAMREMOTESTORAGE_INTERFACE_VERSION016")) return &storage;
     return 0;
 }
 void *CreateInterface(const char *version, int *result) {
+    if (!ugc_name) ugc_name = strdup("workshop/fixture-chamber.bsp");
     callback_count = 0;
     if (!strcmp(version, "SteamClient017")) {
         frames = 0; client17_table[19] = run_frame; client17_table[20] = ipc_count;
@@ -35,6 +70,7 @@ void *CreateInterface(const char *version, int *result) {
     if (result) *result = strcmp(version, "SteamClient020") != 0;
     client_table[34] = set_check; client_table[12] = get_interface; user_table[2] = steam_id;
     utils_table[4] = country; utils_table[9] = app_id; stats_table[5] = rate;
+    storage_table[26] = ugc_details;
     return !strcmp(version, "SteamClient020") ? &client : 0;
 }
 struct callback { int user, id; void *data; int size; };

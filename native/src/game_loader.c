@@ -10,6 +10,8 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <signal.h>
@@ -572,6 +574,22 @@ static void guest_crash_diagnostic(int signal_number, siginfo_t *info,
             context->uc_mcontext->__ss.__rdi,
             context->uc_mcontext->__ss.__rbp,
             context->uc_mcontext->__ss.__r14);
+    struct compat_runtime32_import_context import;
+    if (compat_runtime32_current_import(&import)) {
+        GUEST_DIAGNOSTIC("compat32: active import %s caller=0x%08x arguments=%p\n",
+                         import.name, import.return_address, (const void *)import.arguments);
+        /* Do not turn a bad guest argument stack into a second signal while
+           reporting the original fault. Never dereference argument pointers. */
+        for (unsigned index = 0; index < 4; ++index) {
+            uint32_t word;
+            mach_vm_size_t copied = 0;
+            if (mach_vm_read_overwrite(mach_task_self(),
+                    (mach_vm_address_t)(uintptr_t)import.arguments + index * 4,
+                    sizeof(word), (mach_vm_address_t)(uintptr_t)&word, &copied) != KERN_SUCCESS ||
+                copied != sizeof(word)) break;
+            GUEST_DIAGNOSTIC("compat32: import argument[%u]=0x%08x\n", index, word);
+        }
+    }
     if (rsp >= UINT32_C(0x1000) && rsp < UINT32_C(0x80000000)) {
         const uint32_t *words = (const void *)(uintptr_t)rsp;
         for (unsigned index = 0; index < 16; ++index) {
@@ -598,18 +616,15 @@ static void guest_crash_diagnostic(int signal_number, siginfo_t *info,
         }
     }
     fsync(guest_diagnostic_fd >= 0 ? guest_diagnostic_fd : STDERR_FILENO);
-    if (signal_number == SIGILL) {
-        /* Darwin exempts SIGILL from SA_RESETHAND. Reset explicitly before
-           re-delivery, or a real ud2 can loop forever in this handler. Keep
-           default termination so macOS can produce its full crash report. */
-        struct sigaction action = {0};
-        action.sa_handler = SIG_DFL;
-        sigemptyset(&action.sa_mask);
-        if (sigaction(SIGILL, &action, NULL) != 0) _exit(128 + SIGILL);
-        raise(SIGILL);
-        return;
-    }
-    _exit(128 + signal_number);
+    /* Preserve default termination for every fatal signal so macOS can
+       produce the native stack and image list missing from the guest log.
+       _exit() suppresses that report. Reset explicitly: Darwin exempts
+       SIGILL from SA_RESETHAND, so a real ud2 otherwise loops here. */
+    struct sigaction action = {0};
+    action.sa_handler = SIG_DFL;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(signal_number, &action, NULL) != 0 || raise(signal_number) != 0)
+        _exit(128 + signal_number);
 }
 
 static void install_guest_crash_diagnostics(void)
@@ -702,6 +717,10 @@ int main(int argc, char **argv)
     if (getenv("LP32_CRASH_DIAGNOSTIC_SELFTEST")) {
         if (!strcmp(getenv("LP32_CRASH_DIAGNOSTIC_SELFTEST"), "SIGILL"))
             __asm__ volatile("ud2");
+        if (!strcmp(getenv("LP32_CRASH_DIAGNOSTIC_SELFTEST"), "SIGBUS"))
+            raise(SIGBUS);
+        if (!strcmp(getenv("LP32_CRASH_DIAGNOSTIC_SELFTEST"), "SIGSEGV"))
+            (void)*(volatile unsigned char *)(uintptr_t)1;
         raise(SIGSEGV);
         return EXIT_FAILURE;
     }

@@ -43,11 +43,16 @@ Steam copies require Steam to be running and signed in to an account that owns
 Portal 2. The loader bridges the game's 32-bit Steam interfaces to the installed
 64-bit Steam client. It does not remove ownership or authentication checks.
 Download
-[Portal 2 Converter 0.0.0-dev.4](https://github.com/Yash-Singh1/lego-mac-compat/releases/tag/portal2-converter-v0.0.0-dev.4)
+[Portal 2 Converter 0.0.0-dev.5](https://github.com/Yash-Singh1/lego-mac-compat/releases/tag/portal2-converter-v0.0.0-dev.5)
 or build the converter from this branch. Folder support requires dev.2 or
 newer; the older dev.1 release accepts app bundles only.
 The supplied depot build has been checked through the opening single-player
 room. Full playthrough and online features remain unverified.
+
+Dev.5 adds crash logs identifying the active imported function, guest caller,
+and argument words, and preserves macOS crash reporting for fatal signals.
+It includes regression tests for these diagnostics and Steam filename handling.
+The reported co-op loading stall remains unresolved.
 
 Dev.4 fixes Steam controller data conversion and the missing PNG decompression
 needed for controller button glyphs. DualShock 4 buttons and sticks have been

@@ -75,11 +75,14 @@ LDFLAGS := -Wl,-no_pie,-pagezero_size,0x1000,-segaddr,__TEXT,0x100000000,-segadd
 all: $(BUILD_DIR)/mode32_probe $(BUILD_DIR)/game_loader
 
 .PHONY: test-macho-file test-guest-dyld test-portal2-loader test-cursor-state
-.PHONY: test-steam-abi
+.PHONY: test-steam-abi test-steam-filename
 
 test-steam-abi: $(BUILD_DIR)/game_loader
 	python3 tests/test_steam_abi.py
 	python3 tests/test_steam_records.py
+	python3 tests/test_steam_filename.py
+
+test-steam-filename: $(BUILD_DIR)/game_loader
 	python3 tests/test_steam_filename.py
 
 $(BUILD_DIR)/test_cursor_state: tests/test_cursor_state.c src/cursor_state.c src/cursor_state.h | $(BUILD_DIR)
@@ -127,7 +130,7 @@ $(BUILD_DIR)/test_macho_file: tests/test_macho_file.c src/macho_file.c src/macho
 test-macho-file: $(BUILD_DIR)/test_macho_file
 	./$(BUILD_DIR)/test_macho_file
 
-test-guest-dyld: $(BUILD_DIR)/game_loader
+test-guest-dyld: $(BUILD_DIR)/game_loader test-steam-abi
 	python3 tests/test_guest_dyld.py
 
 test-portal2-loader: $(BUILD_DIR)/game_loader

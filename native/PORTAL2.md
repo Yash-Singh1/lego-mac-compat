@@ -528,3 +528,80 @@ The guest audio stress fixture now includes consecutive immediate stops and
 restarting the emptied queue, as well as filled-queue restarts. The logging
 fixture checks Finder output, fatal-error text, simultaneous launches, bounded
 history, unrelated-file preservation, and unchanged Terminal redirection.
+
+### Issue #7: dev.3 run
+
+The September 7 follow-up ZIP contains one identifiable dev.3 run,
+`run-20260907T180741-945255-12397.log`. Its loader UUID
+`9dc2cffb-a125-3c2a-bdfd-a29e956c3a61` matches the published dev.3 converter.
+`last-run.log` is byte-identical; `previous-run.log` has no dev.3 identity,
+and the graphics log contains sessions from multiple PIDs. Do not attribute
+the older Steam initialization failures or saved ARB program to this run.
+
+The current run successfully initializes native Steam and reports
+`CClientSteamContext logged on = 1`. It ends after loading `vaudio_speex`
+with SIGSEGV, code 1, accessing `0xe3f1fe67` at host RIP
+`0x7ff80c1c9ac0` (CS `0x2b`). It contains no `Sys_Error` message or SIGILL.
+That establishes a different immediate failure from the original report;
+the last codec warnings alone do not identify its cause. There is no native
+stack or image list in this ZIP to directly symbolize the failing host
+instruction, but its registers permit a narrower reconstruction.
+
+An isolated i386 fixture using the published dev.3 loader reproduces the
+reported `rax=0xe67`, `rcx=0x10`, `rdx=0x104`, `rsi=0xe3f1fe67`, and
+`rdi=0x102b6120` by calling
+`strncpy((char *)0x102b6120, (const char *)0xe3f1fe67, 260)`. Both crashes
+have `rbp-rsp=0x758`, matching the published import dispatcher's frame plus
+the return address of its direct native `strncpy` call. The native routine
+faults on the initial source read: `rax` is its source page offset, and
+`rcx` is the number of 16-byte chunks in the bounded copy. The destination
+is inside the guest heap range, not above 4 GiB. This strongly identifies
+the immediate failure as an invalid source-string pointer; it does not
+identify the guest caller, prove a memory leak, or establish why the pointer
+became invalid.
+
+Tracing 260-byte string-copy callers exposed a confirmed Steam bridge bug:
+[`GetUGCDetails`](https://partner.steamgames.com/doc/api/ISteamRemoteStorage#GetUGCDetails)
+returns its borrowed filename through `char **`. Dev.3 classified that as
+an ordinary pointer and let native Steam write eight bytes into a four-byte
+guest pointer cell, overwriting the following cell and exposing a truncated
+native address. The game's `CUGCFileRequest::Steam_OnUGCDownload` passes
+that filename to `V_strncpy` with a limit of 260. This is a plausible failure
+path, not a confirmed attribution of issue #7: the report lacks the guest
+return address needed to identify that particular call.
+
+The bridge now stages marked string outputs in native pointer cells, copies
+the strings into guest memory, and writes back only four bytes. Failed calls
+preserve the guest output. The ABI generator also rejects unconverted pointer
+arrays instead of stripping away their pointer depth. The mock Steam fixture
+returns a filename above 4 GiB and checks guard words, readable/stable copied
+text, failure behavior, and null output arguments. The guard check fails
+against the published dev.3 loader and passes with the fix; all four guest
+dylib fixture variants pass as well.
+
+Dev.3 preserved default SIGILL termination but still used `_exit` for
+SIGSEGV/SIGBUS, suppressing normal macOS crash reporting for those signals.
+The follow-up change preserves default termination after logging all fatal
+signals. Regression checks exercise real host/guest invalid reads and UD2,
+plus explicit SIGBUS, and require signal termination rather than an ordinary
+exit status. This repairs a diagnostic gap, not the invalid access itself.
+
+The completed follow-up also preserves the prior guest filename when the
+bridge cannot allocate a string copy. Its regression grows beyond the old
+1024-entry string cache,
+checks native buffers reused for different filenames, handles successful null
+outputs, and ensures invalid output pointers from failed native calls are
+never read. `make -C native test-steam-abi` checks generation of marked string
+outputs and rejection of pointer arrays, aliases, and pointer-bearing structs
+using an original fixture; no Steam SDK download is needed for that test.
+
+Fatal logs now identify the innermost active guest import, its guest return
+address, and up to four argument words. The per-thread context covers both
+normal and fast dispatch and restores the enclosing call after nested guest
+callbacks. Argument words are read through Mach's checked memory-copy API;
+the reporter does not dereference the string or object addresses they contain.
+The real i386 fixture recreates the reported bad `strncpy` read and verifies
+that its caller, `0xe3f1fe67` source, and 260-byte limit reach both stderr and
+the persistent log. A nested Steam callback regression verifies restoration,
+and direct guest faults verify that completed imports are not mislabeled as
+active. These checks run with `make -C native test-guest-dyld`.

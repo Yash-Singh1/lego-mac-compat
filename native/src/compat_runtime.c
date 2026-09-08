@@ -34,6 +34,7 @@
 #include <sched.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -3147,9 +3148,30 @@ static uint64_t dispatch_import_body(uint32_t import_id, const uint32_t *argumen
     return result;
 }
 
+struct active_import {
+    uint32_t id, return_address;
+    const uint32_t *arguments;
+};
+/* Publish only fully initialized frames. Stack-local records restore the
+   enclosing import after nested guest callbacks without a fixed depth limit. */
+static _Thread_local _Atomic(const struct active_import *) active_import;
+_Static_assert(ATOMIC_POINTER_LOCK_FREE == 2, "crash context needs lock-free pointers");
+
+int compat_runtime32_current_import(struct compat_runtime32_import_context *out)
+{
+    const struct active_import *frame = atomic_load_explicit(&active_import, memory_order_acquire);
+    if (!frame) return 0;
+    *out = (struct compat_runtime32_import_context){
+        import_name_for_id(frame->id), frame->return_address, frame->arguments};
+    return 1;
+}
+
 uint64_t lp32_dispatch_import(uint32_t import_id, const uint32_t *arguments,
                               uint32_t return_address)
 {
+    const struct active_import frame = {import_id, return_address, arguments};
+    const struct active_import *previous = atomic_load_explicit(&active_import, memory_order_relaxed);
+    atomic_store_explicit(&active_import, &frame, memory_order_release);
     /* __error() exposes writable guest storage. Synchronize both directions
        at the boundary so errno=0 before wcstoul works, cached errno pointers
        observe ERANGE, and one guest thread cannot overwrite another's errno. */
@@ -3158,6 +3180,7 @@ uint64_t lp32_dispatch_import(uint32_t import_id, const uint32_t *arguments,
     uint64_t result = dispatch_import_body(import_id, arguments, return_address);
     cell = guest_thread_errno_address ? guest_thread_errno_address : guest_errno_address;
     if (cell) *(int *)(uintptr_t)cell = errno;
+    atomic_store_explicit(&active_import, previous, memory_order_release);
     return result;
 }
 

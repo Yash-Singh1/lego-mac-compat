@@ -44,7 +44,7 @@ exports:
       _FindNextComponent, _OpenAComponent, _CloseComponent, _AudioUnitSetProperty, _AudioUnitGetProperty, _AudioUnitGetPropertyInfo,
       _AudioUnitInitialize, _AudioUnitUninitialize, _AudioUnitRender, _alcCaptureOpenDevice, _alcCaptureCloseDevice, _alcGetError,
       _printf, _fflush,
-      _strcmp, _lp32_unavailable, _stat, _stat$INODE64, _open$UNIX2003, _open,
+      _strcmp, _strncmp, _strncpy, _lp32_unavailable, _stat, _stat$INODE64, _open$UNIX2003, _open,
       _close, _close$UNIX2003, _lseek, _scandir, _alphasort, _free,
       _sigaction, _raise, _getpid, _iconv_open, _iconv, _iconv_close,
       _mmap, _mmap$UNIX2003, _munmap, _munmap$UNIX2003, _mprotect, _mprotect$UNIX2003,
@@ -138,11 +138,22 @@ __attribute__((constructor)) static void initialize(void) {
     ++count;
 }
 int LauncherMain(void) {
+    if (getenv("LP32_FIXTURE_IMPORT_CRASH")) {
+        extern char *fixture_strncpy(char *, const char *, unsigned long) __asm("_strncpy");
+        char destination[260];
+        /* Warm import resolution before reproducing the report. */
+        fixture_strncpy(destination, "valid", sizeof(destination));
+        fixture_strncpy(destination, (const char *)0xe3f1fe67, sizeof(destination));
+        return -99;
+    }
     if (getenv("LP32_FIXTURE_SIGILL")) {
         printf("\\n ##### Sys_Error: %s", "diagnostic fixture fatal reason");
         fflush(NULL);
         __asm__ volatile("ud2");
     }
+    if (getenv("LP32_FIXTURE_SIGSEGV"))
+        (void)*(volatile unsigned char *)(uintptr_t)1;
+    if (getenv("LP32_FIXTURE_SIGBUS")) raise(SIGBUS);
     if (!strcmp || lp32_unavailable) return -4;
     unsigned missing_service = 123;
     if (!bootstrap_port || !bootstrap_look_up(bootstrap_port,
@@ -422,15 +433,35 @@ int check_directory(void) {
             assert (logs / "user-note.log").read_text() == "keep this unrelated file\n"
             print("Persistent logs: PASS (Finder stdout/stderr, concurrent runs, retention, Terminal pipes)")
             for mode in ("host", "guest"):
-                crash_env = dict(environment)
-                crash_env["LP32_CRASH_DIAGNOSTIC_SELFTEST" if mode == "host" else "LP32_FIXTURE_SIGILL"] = "SIGILL"
-                crashed = subprocess.run(["arch", "-x86_64", str(LOADER), str(root / "portal2_osx")],
-                    env=crash_env, capture_output=True, text=True, timeout=30)
-                assert crashed.returncode == -signal.SIGILL, (mode, crashed.returncode, crashed.stderr)
-                assert "compat32: signal 4 " in crashed.stderr and "crash rax=" in crashed.stderr, crashed.stderr
-                if mode == "guest":
-                    assert "##### Sys_Error: diagnostic fixture fatal reason" in (logs / "last-run.log").read_text()
-            print("SIGILL diagnostics: PASS (host and i386 guest; default signal termination preserved)")
+                for fatal_signal in (signal.SIGILL, signal.SIGSEGV, signal.SIGBUS):
+                    crash_env = dict(environment)
+                    crash_env["LP32_CRASH_DIAGNOSTIC_SELFTEST" if mode == "host" else
+                              "LP32_FIXTURE_" + fatal_signal.name] = fatal_signal.name
+                    crashed = subprocess.run(["arch", "-x86_64", str(LOADER), str(root / "portal2_osx")],
+                        env=crash_env, capture_output=True, text=True, timeout=30)
+                    assert crashed.returncode == -fatal_signal, (mode, fatal_signal, crashed.returncode, crashed.stderr)
+                    assert f"compat32: signal {int(fatal_signal)} " in crashed.stderr and "crash rax=" in crashed.stderr, crashed.stderr
+                    if mode == "guest" and fatal_signal == signal.SIGILL:
+                        assert "##### Sys_Error: diagnostic fixture fatal reason" in (logs / "last-run.log").read_text()
+                    if mode == "host" or (mode == "guest" and fatal_signal != signal.SIGBUS):
+                        assert "active import " not in crashed.stderr, crashed.stderr
+            print("Fatal-signal diagnostics: PASS (SIGILL/SIGSEGV/SIGBUS, host and i386 guest; default signal termination preserved)")
+            crashed = subprocess.run(["arch", "-x86_64", str(LOADER), str(root / "portal2_osx")],
+                env=dict(environment, LP32_FIXTURE_IMPORT_CRASH="1"),
+                capture_output=True, text=True, timeout=30)
+            assert crashed.returncode == -signal.SIGSEGV, crashed.stderr
+            for expected in ("active import _strncpy caller=0x", "import argument[1]=0xe3f1fe67",
+                             "import argument[2]=0x00000104"):
+                assert expected in crashed.stderr, crashed.stderr
+                assert expected in (logs / "last-run.log").read_text()
+            print("Import crash context: PASS (strncpy caller and original i386 arguments)")
+            crashed = subprocess.run(["arch", "-x86_64", str(LOADER), str(root / "portal2_osx")],
+                env=dict(environment, LP32_FIXTURE_NESTED_IMPORT_CRASH="1"),
+                capture_output=True, text=True, timeout=30)
+            assert crashed.returncode == -signal.SIGSEGV, crashed.stderr
+            assert "active import _lp32_steam_method_34 caller=0x" in crashed.stderr, crashed.stderr
+            assert "active import _getenv " not in crashed.stderr, crashed.stderr
+            print("Nested import crash context: PASS (enclosing Steam call restored after callback)")
         run("arch", "-x86_64", str(LOADER), str(root / "portal2_osx"), env=environment)
         # Re-run the same real i386 code under the newer Mac depot layout.
         # The launcher's explicit bin/ paths must find libraries in osx32 too.

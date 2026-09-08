@@ -69,6 +69,16 @@ void compat_runtime32_check_mode_guards(uint64_t swap_count);
 int compat_runtime32_game_config_missing(void);
 void compat_runtime32_set_diagnostic_sink(void (*sink)(const char *line));
 
+/* Snapshot the innermost active import on this thread, including a host call
+   that has re-entered the guest. Argument memory must be read defensively by
+   the crash reporter; it is not necessarily valid after a memory fault. */
+struct compat_runtime32_import_context {
+    const char *name;
+    uint32_t return_address;
+    const uint32_t *arguments;
+};
+int compat_runtime32_current_import(struct compat_runtime32_import_context *out);
+
 /*
  * Direct handlers for the hottest imports.  The bridges match import names
  * with long if-chains; at 25-30 thousand imports per frame the chain walk
