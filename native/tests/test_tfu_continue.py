@@ -18,7 +18,7 @@ import time
 import uuid
 
 NATIVE = Path(__file__).resolve().parents[1]
-BUNDLE = NATIVE / "build/TFU-Compat.app"
+BUNDLE = Path(os.environ.get("LP32_CONTINUE_BUNDLE", NATIVE / "build/TFU-Compat.app"))
 OUTPUT = NATIVE / "build/test-tfu-continue"
 
 
@@ -71,12 +71,23 @@ def main():
                  GameDisplayWidth=1280, GameDisplayHeight=800,
                  GameDisplayDepth=32, GameDisplayFrequency=0,
                  IsKBAndMouse="FALSE", LowDetail="0")
+    guide = BUNDLE / "Contents/Resources/GameGuideInfo.plist"
+    if guide.exists() and not os.environ.get("LP32_CONTINUE_GUIDE"):
+        # Equivalent to selecting “Don't show again”, in this test's private
+        # preference domain only. LP32_CONTINUE_GUIDE exercises the launcher UI.
+        guide_key = plistlib.loads(guide.read_bytes()).get("PreferenceDoNotShowKey")
+        if guide_key:
+            prefs[guide_key] = True
     if os.environ.get("LP32_CONTINUE_FULLSCREEN"):
         prefs.update(GameDisplayMode=1, GameDisplayWidth=1920, GameDisplayHeight=1200)
     domain = "com.aspyr.SWTFU.compat-continue-" + uuid.uuid4().hex
     target = case / "user-data/Documents/Aspyr/Star Wars The Force Unleashed/SWTFU.BIN"
     target.parent.mkdir(parents=True)
     target.write_bytes(original_save)
+    # Steam 1.3 stores progress in Application Support, unlike retail 1.2.
+    steam_target = case / "user-data/Application Support/Star Wars The Force Unleashed/SWTFU.BIN"
+    steam_target.parent.mkdir(parents=True)
+    steam_target.write_bytes(original_save)
     (case / "save.sha256").write_text(hashlib.sha256(original_save).hexdigest() + "\n")
     loader = os.environ.get("LP32_TEST_LOADER", str(NATIVE / "build/game_loader"))
     env = dict(os.environ, LP32_BACKGROUND_TEST="1", LP32_MUTE_AUDIO="1",
@@ -86,6 +97,8 @@ def main():
                LP32_SLOW_IMPORT_MS="100",
                LP32_TRACE_BUFFER_CACHE="1", LP32_AGL_CAPTURE_FRAME=str(case / "frame.ppm"),
                LP32_AGL_CAPTURE_EVERY="120")
+    if os.environ.get("LP32_CONTINUE_FOREGROUND"):
+        env.pop("LP32_BACKGROUND_TEST", None)
     if os.environ.get("LP32_CONTINUE_SETTINGS"):
         env["LP32_CARBON_TEST_COMMANDS"] = "ok  "
     for key in ("LP32_HEADLESS", "LP32_BUILD_UI_ONLY", "LP32_GUEST_RUNTIME_DIR",
@@ -125,12 +138,17 @@ def main():
                 str(BUNDLE / "Contents/SharedSupport/TFU.image")],
                 cwd=NATIVE, env=env, stdout=log, stderr=subprocess.STDOUT)
             print(f"TFU Continue pid={process.pid}; artifacts: {case}", flush=True)
-            deadline = time.monotonic() + 75
+            deadline = time.monotonic() + float(os.environ.get("LP32_CONTINUE_STARTUP_SECONDS", "75"))
             ready = "movie intro omitted name=Aspyr.mov" if os.environ.get("LP32_CONTINUE_SKIP_INTROS") else "movie stop name=Aspyr.mov"
             while ready not in (case / "run.log").read_text():
                 assert time.monotonic() < deadline, "Startup movie did not finish"
                 wait(.5)
             wait(3)
+            if os.environ.get("LP32_CONTINUE_LAUNCH_ONLY"):
+                check_logo_playback((case / "run.log").read_text())
+                assert (case / "frame.ppm").exists(), "No launch framebuffer captured"
+                print(f"PASS launcher and complete intro playback; artifacts: {case}", flush=True)
+                return
             pulse(0x1000)  # Dismiss title prompt.
             wait(3)
             if (case / "frame.ppm").exists():
@@ -194,7 +212,9 @@ def main():
                 assert os.environ.get("LP32_CONTINUE_SABER_TRACE") or os.environ.get("LP32_CONTINUE_GRIP_ENTRY_TRACE"), "Blade check requires a saber or Grip entry trace"
                 check_standing_blade_texture(log_text, process.pid)
             assert "trapped import" not in log_text and "compat32: signal" not in log_text
-            assert "FMV-LoadScreen.mov" in log_text, "Continue did not load a checkpoint"
+            # Steam 1.3 can load directly into a mission cinematic without
+            # playing retail's FMV-LoadScreen.mov. The captured gameplay HUD
+            # above is the distribution-independent completion condition.
             print(f"PASS Continue observation (inspect checkpoint.ppm for level); artifacts: {case}", flush=True)
     finally:
         if process and process.poll() is None:
@@ -211,6 +231,7 @@ def main():
                 sampler.kill()
                 sampler.wait()
         subprocess.run(["defaults", "delete", domain], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        assert source.read_bytes() == original_save, "Original checkpoint changed during isolated test"
 
 
 if __name__ == "__main__":

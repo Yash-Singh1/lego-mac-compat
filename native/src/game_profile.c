@@ -1,5 +1,6 @@
 #include "game_profile.h"
 #include "macho_loader.h"
+#include "tfu_layout.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -265,21 +266,57 @@ static const struct lp32_game_profile portal2_profile = {
     .main_address = 0x00001d60,
 };
 
-/* Aspyr's 1.2 (94531) i386 executable. Its crt directly calls main, then exit. */
-static const struct lp32_code_signature tfu_display_id_sentinel = {
-    .address = 0x0000fefb, .expected = {0xb9, 1, 0, 0, 0}, .length = 5,
+/* TFU distributions share routines, not link addresses. Resolve a private
+   layout from verified code each time an image is loaded. */
+static struct lp32_tfu_layout tfu_layout;
+static struct lp32_code_signature tfu_display_id_sentinel = {
+    .expected = {0xb9, 1, 0, 0, 0}, .length = 5,
 };
-static const struct lp32_game_profile tfu_profile = {
-    .title = LP32_TITLE_TFU,
-    .name = "TFU",
+static struct lp32_game_profile tfu_profile = {
+    .title = LP32_TITLE_TFU, .name = "TFU",
     .display_name = "Star Wars: The Force Unleashed",
-    .log_directory = "TFUCompat",
-    .image_file = "TFU.image",
-    .entry_eip = 0x00002550,
-    .image_end = 0x03bf5984,
-    .main_address = 0x0005dc08,
-    .display_id_sentinel = &tfu_display_id_sentinel,
+    .log_directory = "TFUCompat", .image_file = "TFU.image",
+    .display_id_sentinel = &tfu_display_id_sentinel, .tfu = &tfu_layout,
 };
+
+static int tfu_image_matches(const struct macho_image32 *image)
+{
+    const char marker[] = "PC_LevelSelectList.txt";
+    const struct load_command *command = (const void *)(image->header + 1);
+    for (uint32_t i = 0; i < image->header->ncmds; ++i) {
+        if (command->cmd == LC_SEGMENT) {
+            const struct segment_command *segment = (const void *)command;
+            if (segment->initprot & VM_PROT_READ) {
+                const char *bytes = (const void *)(uintptr_t)segment->vmaddr;
+                for (size_t j = 0; j + sizeof(marker) <= segment->filesize; ++j)
+                    if (bytes[j] == marker[0] && !memcmp(bytes + j, marker, sizeof(marker))) return 1;
+            }
+        }
+        command = (const void *)((const char *)command + command->cmdsize);
+    }
+    return 0;
+}
+static int tfu_resolve(const struct macho_image32 *image)
+{
+    const struct load_command *command = (const void *)(image->header + 1);
+    for (uint32_t i = 0; i < image->header->ncmds; ++i) {
+        if (command->cmd == LC_SEGMENT) {
+            const struct segment_command *segment = (const void *)command;
+            const struct section *sections = (const void *)(segment + 1);
+            for (uint32_t j = 0; j < segment->nsects; ++j) {
+                const struct section *section = sections + j;
+                if (!strncmp(section->segname, "__TEXT", 16) &&
+                    !strncmp(section->sectname, "__text", 16)) {
+                    return tfu_layout_find((const void *)(uintptr_t)section->addr, section->size,
+                        section->addr, image->entry_eip, &tfu_layout,
+                        &tfu_display_id_sentinel.address, &tfu_profile.main_address);
+                }
+            }
+        }
+        command = (const void *)((const char *)command + command->cmdsize);
+    }
+    return -1;
+}
 
 static const struct lp32_game_profile unknown_profile = {
     .title = LP32_TITLE_UNKNOWN,
@@ -370,6 +407,8 @@ int lp32_profile_select(const struct macho_image32 *image)
             fprintf(stderr, "game_loader: unknown LP32_GAME profile: %s\n", override);
             return -1;
         }
+    } else if (tfu_image_matches(image)) {
+        selected = &tfu_profile;
     } else {
         for (size_t index = 0; index < sizeof(known_profiles) / sizeof(known_profiles[0]); ++index) {
             const struct lp32_game_profile *candidate = known_profiles[index];
@@ -385,6 +424,10 @@ int lp32_profile_select(const struct macho_image32 *image)
                 "game_loader: unrecognised image (entry=0x%08x end=0x%08x); "
                 "set LP32_GAME to force a profile\n",
                 image->entry_eip, image->max_address);
+        return -1;
+    }
+    if (selected->title == LP32_TITLE_TFU && tfu_resolve(image)) {
+        fprintf(stderr, "game_loader: this TFU Mac build has an unsupported or ambiguous routine; no patches applied\n");
         return -1;
     }
     current_profile = selected;

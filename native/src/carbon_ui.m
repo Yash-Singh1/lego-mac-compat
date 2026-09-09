@@ -382,10 +382,10 @@ int carbon_ui32_dispatch(const char *name, const uint32_t *a, uint64_t *result)
         if (a[5]) *(uint16_t *)PTR(5) = index + 1;
         RETURN(0);
     }
-    if (IS("DisableMenuCommand")) {
+    if (IS("DisableMenuCommand") || IS("EnableMenuCommand")) {
         NSMenu *menu = a[0] ? OBJ(0) : [NSApp mainMenu] ?: objc_getAssociatedObject(app_target(), &menu_properties_key);
         unsigned skip = 0; NSMenuItem *item = find_command(menu, a[1], &skip);
-        [item setEnabled:NO]; RETURN(0);
+        [item setEnabled:IS("EnableMenuCommand")]; RETURN(0);
     }
     if (IS("SetMenuItemProperty") || IS("GetMenuItemProperty")) {
         NSMenuItem *item = menu_item(a[0], a[1]);

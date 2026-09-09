@@ -1,4 +1,5 @@
 #include "objc_bridge.h"
+#include "app_termination.h"
 #include "arb_program_guard.h"
 #include "audio_bridge.h"
 #include "arb_sampler_usage.h"
@@ -11,6 +12,8 @@
 #include "gl_misc_bridge.h"
 #include "agl_bridge.h"
 #include "carbon_native.h"
+#include "carbon_bridge.h"
+#include "cf_format.h"
 #include "name_match.h"
 
 #define GL_SILENCE_DEPRECATION 1
@@ -410,6 +413,7 @@ static void restore_unbound_fragment_samplers(
 }
 
 static id object_for_receiver(uint32_t receiver);
+static bool legacy_readable(uint32_t address, size_t size);
 
 @interface LP32GuestAutoreleasePool : NSObject
 @end
@@ -428,6 +432,9 @@ static struct legacy_class_pair legacy_classes[128];
 static unsigned legacy_class_count;
 static struct { Class host; uint32_t methods; } legacy_categories[128];
 static unsigned legacy_category_count;
+static _Thread_local uint32_t tfu_carbon_modal_window;
+static _Thread_local bool tfu_carbon_modal_done;
+static _Thread_local bool tfu_cocoa_modal_active, tfu_cocoa_modal_done;
 
 static const struct legacy_class32 *legacy_class_for_host(Class host)
 {
@@ -849,15 +856,14 @@ static id object_for_receiver_unlocked(uint32_t receiver)
         const uint32_t *constant = (const void *)(uintptr_t)receiver;
         uint32_t bytes_address = constant[2];
         uint32_t length = constant[3];
-        if (length < UINT32_C(0x100000) &&
-            ((bytes_address >= UINT32_C(0x00001000) &&
-              bytes_address < bridge_image->max_address) ||
-             guest_dyld32_contains(bytes_address, length))) {
+        bool utf16 = (constant[1] & 0x10) != 0;
+        size_t byte_length = (size_t)length * (utf16 ? 2 : 1);
+        if (length < UINT32_C(0x100000) && legacy_readable(bytes_address, byte_length)) {
             NSString *string = [[[NSString alloc]
                 initWithBytes:(const void *)(uintptr_t)bytes_address
-                       length:length
-                     encoding:NSUTF8StringEncoding] autorelease];
-            if (!string) {
+                       length:byte_length
+                     encoding:utf16 ? NSUTF16LittleEndianStringEncoding : NSUTF8StringEncoding] autorelease];
+            if (!string && !utf16) {
                 string = [[[NSString alloc]
                     initWithBytes:(const void *)(uintptr_t)bytes_address
                            length:length
@@ -905,6 +911,27 @@ struct guest_runloop_context {
     uint32_t words[10];
     uint32_t callback;
 };
+
+struct guest_display_callback {
+    uint32_t function, user_data;
+    bool active;
+    struct guest_display_callback *next;
+};
+static struct guest_display_callback *guest_display_callbacks;
+static pthread_mutex_t guest_display_callback_lock = PTHREAD_MUTEX_INITIALIZER;
+static void guest_display_reconfigured(CGDirectDisplayID display,
+                                        CGDisplayChangeSummaryFlags flags, void *opaque)
+{
+    struct guest_display_callback *callback = opaque;
+    pthread_mutex_lock(&guest_display_callback_lock);
+    bool active = callback->active;
+    uint32_t function = callback->function, user_data = callback->user_data;
+    pthread_mutex_unlock(&guest_display_callback_lock);
+    if (active) {
+        uint32_t words[] = {display, flags, user_data};
+        compat_runtime32_call(function, words, 3);
+    }
+}
 
 struct guest_power_context { uint32_t info, callback; };
 static void guest_power_callback(void *opaque, io_service_t service, uint32_t message, void *argument)
@@ -966,9 +993,9 @@ static void guest_source_cancel(void *opaque, CFRunLoopRef loop, CFStringRef mod
     if (context->words[8]) compat_runtime32_call(context->words[8], args, 3);
 }
 
-static const struct legacy_method32 *legacy_method_for_object(id object, SEL selector)
+static const struct legacy_method32 *legacy_method_for_class(Class start, SEL selector)
 {
-    for (Class cls = object_getClass(object); cls; cls = class_getSuperclass(cls)) {
+    for (Class cls = start; cls; cls = class_getSuperclass(cls)) {
         for (unsigned j = 0; j < legacy_category_count; ++j) {
             if (legacy_categories[j].host != cls) continue;
             const uint32_t *list = (const void *)(uintptr_t)legacy_categories[j].methods;
@@ -988,6 +1015,11 @@ static const struct legacy_method32 *legacy_method_for_object(id object, SEL sel
     return NULL;
 }
 
+static const struct legacy_method32 *legacy_method_for_object(id object, SEL selector)
+{
+    return legacy_method_for_class(object_getClass(object), selector);
+}
+
 static uint32_t legacy_call_method(id object, SEL selector, const uint32_t *extra, size_t count)
 {
     const struct legacy_method32 *method = legacy_method_for_object(object, selector);
@@ -999,15 +1031,16 @@ static uint32_t legacy_call_method(id object, SEL selector, const uint32_t *extr
     return compat_runtime32_call(method->imp, arguments, count + 2);
 }
 
-static uintptr_t legacy_scalar_method(id object, SEL selector, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d)
+static uintptr_t legacy_scalar_method(id object, SEL selector, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d,
+                                      uintptr_t e, uintptr_t f, uintptr_t g, uintptr_t h)
 {
     const struct legacy_method32 *method = legacy_method_for_object(object, selector);
     if (!method) return 0;
     NSMethodSignature *signature = [NSMethodSignature signatureWithObjCTypes:(const char *)(uintptr_t)method->types];
     NSUInteger count = [signature numberOfArguments] - 2;
-    if (count > 4) return 0;
-    uintptr_t values[4] = {a, b, c, d};
-    uint32_t extra[4] = {0};
+    if (count > 8) return 0;
+    uintptr_t values[8] = {a, b, c, d, e, f, g, h};
+    uint32_t extra[8] = {0};
     for (NSUInteger i = 0; i < count; ++i) {
         const char *type = [signature getArgumentTypeAtIndex:i + 2];
         type = skip_type_qualifiers(type);
@@ -1017,9 +1050,10 @@ static uintptr_t legacy_scalar_method(id object, SEL selector, uintptr_t a, uint
     return legacy_call_method(object, selector, extra, count);
 }
 
-static id legacy_object_method(id object, SEL selector, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d)
+static id legacy_object_method(id object, SEL selector, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d,
+                               uintptr_t e, uintptr_t f, uintptr_t g, uintptr_t h)
 {
-    return object_for_receiver((uint32_t)legacy_scalar_method(object, selector, a, b, c, d));
+    return object_for_receiver((uint32_t)legacy_scalar_method(object, selector, a, b, c, d, e, f, g, h));
 }
 
 static id legacy_object_float3_method(id object, SEL selector, id a, uint32_t b, float c)
@@ -1036,6 +1070,37 @@ static id legacy_object_float4_method(id object, SEL selector, id a, uint32_t b,
     return object_for_receiver(legacy_call_method(object, selector, words, 4));
 }
 
+static void legacy_float_method(id object, SEL selector, float value)
+{
+    uint32_t word;
+    memcpy(&word, &value, 4);
+    (void)legacy_call_method(object, selector, &word, 1);
+}
+static float legacy_float_getter(id object, SEL selector)
+{
+    const struct legacy_method32 *method = legacy_method_for_object(object, selector);
+    if (!method) return 0;
+    uint32_t args[] = {proxy_for_object(object), method->name};
+    uint32_t bits = (uint32_t)compat_runtime32_call_result(method->imp, args, 2, 1);
+    float value; memcpy(&value, &bits, 4);
+    return compat_runtime32_last_call_trapped() ? 0 : value;
+}
+static void legacy_point_method(id object, SEL selector, NSPoint point)
+{
+    float fields[] = {(float)point.x, (float)point.y};
+    uint32_t words[2]; memcpy(words, fields, sizeof(words));
+    (void)legacy_call_method(object, selector, words, 2);
+}
+static NSPoint legacy_point_getter(id object, SEL selector)
+{
+    const struct legacy_method32 *method = legacy_method_for_object(object, selector);
+    if (!method) return NSZeroPoint;
+    uint32_t args[] = {proxy_for_object(object), method->name};
+    uint64_t bits = compat_runtime32_call_result(method->imp, args, 2, 0);
+    float fields[2]; memcpy(fields, &bits, sizeof(fields));
+    return compat_runtime32_last_call_trapped() ? NSZeroPoint : NSMakePoint(fields[0], fields[1]);
+}
+
 static void legacy_rect_method(id object, SEL selector, NSRect rect)
 {
     float fields[4] = {(float)rect.origin.x, (float)rect.origin.y,
@@ -1045,23 +1110,46 @@ static void legacy_rect_method(id object, SEL selector, NSRect rect)
     (void)legacy_call_method(object, selector, words, 4);
 }
 
+static bool legacy_readable(uint32_t address, size_t size)
+{
+    if (guest_dyld32_contains(address, size)) return true;
+    if (!bridge_image) return false;
+    const struct load_command *cmd = (const void *)(bridge_image->header + 1);
+    for (uint32_t i = 0; i < bridge_image->header->ncmds; ++i) {
+        if (cmd->cmd == LC_SEGMENT) {
+            const struct segment_command *seg = (const void *)cmd;
+            if ((seg->initprot & VM_PROT_READ) && address >= seg->vmaddr &&
+                (uint64_t)(address - seg->vmaddr) + size <= seg->vmsize) return true;
+        }
+        cmd = (const void *)((const char *)cmd + cmd->cmdsize);
+    }
+    return false;
+}
+
 static int legacy_install_methods(Class target, uint32_t address, bool category)
 {
     if (!address) return 0;
-    if (!guest_dyld32_contains(address, 8)) return -1;
+    if (!legacy_readable(address, 8)) return -1;
     const uint32_t *list = (const void *)(uintptr_t)address;
     const struct legacy_method32 *methods = (const void *)(list + 2);
-    if (list[1] > 256 || !guest_dyld32_contains(address, 8 + list[1] * 12)) return -1;
+    if (list[1] > 256 || !legacy_readable(address, 8 + list[1] * 12)) return -1;
     for (uint32_t j = 0; j < list[1]; ++j) {
         const char *sel_name = (const char *)(uintptr_t)methods[j].name;
         const char *types = (const char *)(uintptr_t)methods[j].types;
         SEL selector = sel_registerName(sel_name);
         NSMethodSignature *sig = [NSMethodSignature signatureWithObjCTypes:types];
         NSUInteger count = [sig numberOfArguments];
-        if (count < 2 || count > 6) return -1;
+        if (count < 2 || count > 10) {
+            fprintf(stderr, "compat32: unsupported legacy method arity %s %s\n", sel_name, types); return -1;
+        }
         IMP imp = *types == '@' ? (IMP)legacy_object_method : (IMP)legacy_scalar_method;
         char encoding[256];
         snprintf(encoding, sizeof(encoding), "%c@:", *types);
+        if (*types == 'f' && count == 2) imp = (IMP)legacy_float_getter;
+        if (!strncmp(types, "{_NSPoint=ff}", 13) && count == 2) {
+            imp = (IMP)legacy_point_getter;
+            snprintf(encoding, sizeof(encoding), "{CGPoint=dd}@:");
+        }
         for (NSUInteger k = 2; k < count; ++k) {
             const char *arg_type = skip_type_qualifiers([sig getArgumentTypeAtIndex:k]);
             const char *append = NULL;
@@ -1069,6 +1157,12 @@ static int legacy_install_methods(Class target, uint32_t address, bool category)
             if (*arg_type == '{' && !strcmp(sel_name, "drawRect:") && count == 3) {
                 imp = (IMP)legacy_rect_method;
                 append = "{CGRect={CGPoint=dd}{CGSize=dd}}";
+            } else if (!strncmp(arg_type, "{_NSPoint=ff}", 13) && count == 3 && *types == 'v') {
+                imp = (IMP)legacy_point_method;
+                append = "{CGPoint=dd}";
+            } else if (*arg_type == 'f' && count == 3 && *types == 'v') {
+                imp = (IMP)legacy_float_method;
+                append = "f";
             } else if (strchr("@#:cCiIlLsSB*", *arg_type)) {
                 append = scalar;
             } else if (*arg_type == '^') {
@@ -1097,29 +1191,71 @@ static int legacy_install_methods(Class target, uint32_t address, bool category)
     return 0;
 }
 
+static int legacy_install_object_ivars(Class host, const struct legacy_class32 *guest)
+{
+    if (!guest->ivars) return 0;
+    if (!legacy_readable(guest->ivars, 4)) return -1;
+    const uint32_t *list = (const void *)(uintptr_t)guest->ivars;
+    if (*list > 256 || !legacy_readable(guest->ivars, 4 + *list * 12)) return -1;
+    for (uint32_t i = 0; i < *list; ++i) {
+        const uint32_t *ivar = list + 1 + i * 3;
+        if (!legacy_readable(ivar[0], 1) || !legacy_readable(ivar[1], 1)) return -1;
+        const char *name = (const char *)(uintptr_t)ivar[0];
+        const char *type = (const char *)(uintptr_t)ivar[1];
+        uint32_t offset = ivar[2];
+        if (*type != '@') continue;
+        if (offset < 4 || offset > guest->instance_size - 4) return -1;
+        /* Nib outlets without compiled property accessors still use KVC.
+           Expose those fields through the mapped object's i386 twin, rather
+           than letting Cocoa look for 64-bit ivars on the native shell. */
+        NSString *key = [NSString stringWithUTF8String:name];
+        if (![key length]) return -1;
+        SEL getter = sel_registerName(name);
+        NSString *setterName = [NSString stringWithFormat:@"set%@%@:",
+            [[key substringToIndex:1] uppercaseString], [key substringFromIndex:1]];
+        SEL setter = NSSelectorFromString(setterName);
+        if (!class_getInstanceMethod(host, getter)) {
+            IMP imp = imp_implementationWithBlock(^id(id owner) {
+                uint32_t twin = proxy_for_object(owner);
+                return object_for_argument(*(uint32_t *)(uintptr_t)(twin + offset));
+            });
+            if (!class_addMethod(host, getter, imp, "@@:")) return -1;
+        }
+        if (!class_getInstanceMethod(host, setter)) {
+            IMP imp = imp_implementationWithBlock(^(id owner, id value) {
+                uint32_t twin = proxy_for_object(owner);
+                *(uint32_t *)(uintptr_t)(twin + offset) = proxy_for_object(value);
+            });
+            if (!class_addMethod(host, setter, imp, "v@:@")) return -1;
+        }
+    }
+    return 0;
+}
+
 int objc_bridge32_register_legacy_module(uint32_t address, uint32_t size)
 {
-    if (size % 16 || !guest_dyld32_contains(address, size)) return -1;
+    if (size % 16 || !legacy_readable(address, size)) return -1;
     for (uint32_t offset = 0; offset < size; offset += 16) {
         const uint32_t *module = (const void *)(uintptr_t)(address + offset);
         if (module[0] != 7 || module[1] != 16) return -1;
         if (!module[3]) continue;
         const uint32_t *symtab = (const void *)(uintptr_t)module[3];
-        if (!guest_dyld32_contains(module[3], 12)) return -1;
+        if (!legacy_readable(module[3], 12)) return -1;
         uint32_t count = symtab[2] & 0xffff, categories = symtab[2] >> 16;
-        if (!guest_dyld32_contains(module[3], 12 + (count + categories) * 4)) return -1;
+        if (!legacy_readable(module[3], 12 + (count + categories) * 4)) return -1;
         for (uint32_t i = 0; i < count; ++i) {
             uint32_t class_address = symtab[3 + i];
-            if (!guest_dyld32_contains(class_address, sizeof(struct legacy_class32))) return -1;
+            if (!legacy_readable(class_address, sizeof(struct legacy_class32))) return -1;
             const struct legacy_class32 *guest = (const void *)(uintptr_t)class_address;
             const char *name = (const char *)(uintptr_t)guest->name;
             const char *parent_name = (const char *)(uintptr_t)guest->superclass;
-            if (!guest_dyld32_contains(guest->name, 1) || !guest_dyld32_contains(guest->superclass, 1) ||
-                !guest_dyld32_contains(guest->isa, sizeof(struct legacy_class32)) ||
+            if (!legacy_readable(guest->name, 1) || !legacy_readable(guest->superclass, 1) ||
+                !legacy_readable(guest->isa, sizeof(struct legacy_class32)) ||
                 guest->instance_size < 4 || guest->instance_size > 65536) return -1;
             Class parent = objc_getClass(parent_name);
             Class cls = objc_getClass(name);
             if (cls && legacy_class_for_host(cls) == guest) continue;
+            if (!cls && !parent) return 1; /* parent may be in a later module */
             if (cls || !parent || legacy_class_count == 128) {
                 fprintf(stderr, "compat32: cannot register legacy class %s : %s\n", name, parent_name);
                 return -1;
@@ -1129,7 +1265,8 @@ int objc_bridge32_register_legacy_module(uint32_t address, uint32_t size)
             legacy_classes[legacy_class_count++] = (struct legacy_class_pair){guest, cls};
             const struct legacy_class32 *meta = (const void *)(uintptr_t)guest->isa;
             if (legacy_install_methods(cls, guest->methods, false) ||
-                legacy_install_methods(object_getClass(cls), meta->methods, false)) return -1;
+                legacy_install_methods(object_getClass(cls), meta->methods, false) ||
+                (lp32_profile()->title == LP32_TITLE_TFU && legacy_install_object_ivars(cls, guest))) return -1;
             objc_registerClassPair(cls);
             if (!strcmp(name, "NSValveApplication") && NSApp && object_getClass(NSApp) == [NSApplication class]) {
                 object_setClass(NSApp, cls);
@@ -1138,7 +1275,7 @@ int objc_bridge32_register_legacy_module(uint32_t address, uint32_t size)
         }
         for (uint32_t i = 0; i < categories; ++i) {
             uint32_t ptr = symtab[3 + count + i];
-            if (!guest_dyld32_contains(ptr, 20)) return -1;
+            if (!legacy_readable(ptr, 20)) return -1;
             const uint32_t *category = (const void *)(uintptr_t)ptr;
             const char *class_name = (const char *)(uintptr_t)category[1];
             Class cls = objc_getClass(class_name);
@@ -1150,6 +1287,92 @@ int objc_bridge32_register_legacy_module(uint32_t address, uint32_t size)
         }
     }
     return 0;
+}
+
+int objc_bridge32_register_main_image(void)
+{
+    struct { uint32_t address, size; bool done; } modules[128];
+    unsigned count = 0;
+    const struct load_command *cmd = (const void *)(bridge_image->header + 1);
+    for (uint32_t i = 0; i < bridge_image->header->ncmds; ++i) {
+        if (cmd->cmd == LC_SEGMENT) {
+            const struct segment_command *seg = (const void *)cmd;
+            const struct section *sec = (const void *)(seg + 1);
+            for (uint32_t j = 0; j < seg->nsects; ++j) {
+                if (strncmp(sec[j].sectname, "__module_info", 16)) continue;
+                if (sec[j].size % 16) return -1;
+                for (uint32_t offset = 0; offset < sec[j].size; offset += 16) {
+                    if (count == 128) return -1;
+                    modules[count++] = (typeof(modules[0])){sec[j].addr + offset, 16, false};
+                }
+            }
+        }
+        cmd = (const void *)((const char *)cmd + cmd->cmdsize);
+    }
+    /* Child classes can precede parents in the linked image. */
+    unsigned remaining = count;
+    while (remaining) {
+        unsigned before = remaining;
+        for (unsigned i = 0; i < count; ++i) {
+            if (modules[i].done) continue;
+            int result = objc_bridge32_register_legacy_module(modules[i].address, modules[i].size);
+            if (result < 0) {
+                const uint32_t *m = (const void *)(uintptr_t)modules[i].address;
+                fprintf(stderr, "compat32: main Cocoa module %08x failed (version=%u size=%u symtab=%08x)\n",
+                        modules[i].address, m[0], m[1], m[3]);
+            }
+            if (result < 0) return -1;
+            if (!result) { modules[i].done = true; --remaining; }
+        }
+        if (before == remaining) {
+            fprintf(stderr, "compat32: unresolved parents in main-image Cocoa classes\n"); return -1;
+        }
+    }
+    return 0;
+}
+
+int objc_bridge32_tfu_classes_self_test(void)
+{
+    Class app = objc_getClass("AspyrApp"), animation = objc_getClass("ScrollViewAnimation");
+    if (!app || !animation) return -1;
+    id object = [app alloc], scroll = [animation alloc];
+    ((void (*)(id, SEL, float))objc_msgSend)(object, sel_registerName("setFontSize:"), 17.25f);
+    float size = ((float (*)(id, SEL))objc_msgSend)(object, sel_registerName("fontSize"));
+    ((void (*)(id, SEL, NSPoint))objc_msgSend)(scroll, sel_registerName("setStart:"), NSMakePoint(-3.5, 42.25));
+    NSPoint point = ((NSPoint (*)(id, SEL))objc_msgSend)(scroll, sel_registerName("start"));
+    bool ok = !compat_runtime32_last_call_trapped() && size == 17.25f && point.x == -3.5 && point.y == 42.25;
+    Class guide = objc_getClass("GameGuideWindow"), child = objc_getClass("SWTFUGameGuideWindow");
+    id owner = [guide alloc];
+    NSDictionary *info = @{@"test": @"retained"};
+    ((void (*)(id, SEL, id))objc_msgSend)(owner, sel_registerName("setGameGuideInfo:"), info);
+    id readback = ((id (*)(id, SEL))objc_msgSend)(owner, sel_registerName("gameGuideInfo"));
+    ok &= readback == info && !compat_runtime32_last_call_trapped();
+    id outletOwner = [child alloc];
+    [outletOwner setValue:info forKey:@"gameResolution"];
+    ok &= [outletOwner valueForKey:@"gameResolution"] == info;
+    SEL init = sel_registerName("initWithGameGuideInfo:");
+    ok &= legacy_method_for_class(guide, init) != legacy_method_for_class(child, init);
+    uint64_t result = 0;
+    uint32_t dictionary_args[] = {proxy_for_object([NSDictionary class]),
+        compat_runtime32_copy_cstring("dictionaryWithObjectsAndKeys:"),
+        proxy_for_object(@"value"), proxy_for_object(@"key"), 0};
+    ok &= objc_bridge32_dispatch("_objc_msgSend", dictionary_args, &result) &&
+        [object_for_argument((uint32_t)result) isEqual:@{@"key": @"value"}];
+    uint32_t format_args[] = {proxy_for_object([NSString class]),
+        compat_runtime32_copy_cstring("stringWithFormat:"), proxy_for_object(@"%@ %d"),
+        proxy_for_object(@"TFU"), 42};
+    ok &= objc_bridge32_dispatch("_objc_msgSend", format_args, &result) &&
+        [object_for_argument((uint32_t)result) isEqual:@"TFU 42"];
+    uint32_t pool_args[] = {proxy_for_object([NSAutoreleasePool class]), compat_runtime32_copy_cstring("alloc")};
+    unsigned depth = guest_pool_depth;
+    ok &= objc_bridge32_dispatch("_objc_msgSend", pool_args, &result);
+    uint32_t pool = result;
+    ok &= objc_bridge32_dispatch("_objc_msgSend", pool_args, &result) && guest_pool_depth == depth + 2;
+    pool_args[0] = pool; pool_args[1] = compat_runtime32_copy_cstring("drain");
+    ok &= objc_bridge32_dispatch("_objc_msgSend", pool_args, &result);
+    ok &= objc_bridge32_dispatch("_objc_msgSend", pool_args, &result) && guest_pool_depth == depth;
+    fprintf(stderr, "TFU Cocoa ABI self-test: %s real float/point/property methods, nib outlets, super lookup, varargs, nested pools\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : -1;
 }
 
 static NSBundle *legacy_game_bundle(void)
@@ -2082,61 +2305,6 @@ static void portal_flush_buffer(NSOpenGLContext *context)
 
 void objc_bridge32_flush_context(void *context) { portal_flush_buffer(context); }
 
-/*
- * Quit from the Dock menu (or any other quit Apple event) reaches AppKit's own
- * -terminate:, not the guest's, so the objc_msgSend hook that ends a guest
- * quit with _Exit never sees it.  AppKit then runs the normal termination
- * teardown, which can wait forever on the mixed-ABI audio graph (see the exit
- * handling in compat_runtime.c), leaving a process that only Force Quit ends.
- * Leave the same way the guest's quit does, from the notification AppKit
- * posts right before exit().
- */
-@interface LP32QuitEventHandler : NSObject
-- (void)handleQuit:(NSAppleEventDescriptor *)event
-    withReplyEvent:(NSAppleEventDescriptor *)reply;
-@end
-
-@implementation LP32QuitEventHandler
-- (void)handleQuit:(NSAppleEventDescriptor *)event
-    withReplyEvent:(NSAppleEventDescriptor *)reply
-{
-    (void)event;
-    (void)reply;
-    fprintf(stderr, "compat32: quit Apple event received; exiting\n");
-    compat_runtime32_heap_report("quit-apple-event");
-    fflush(NULL);
-    _Exit(EXIT_SUCCESS);
-}
-@end
-
-static void install_termination_handler(void)
-{
-    static bool installed;
-    if (installed) return;
-    installed = true;
-    /* The guest calls finishLaunching but never runs NSApplication's own
-       loop, and AppKit's quit handler did not fire for a Dock quit under the
-       bridge; register one directly with the Apple event manager. */
-    static LP32QuitEventHandler *quit_handler;
-    quit_handler = [[LP32QuitEventHandler alloc] init];
-    [[NSAppleEventManager sharedAppleEventManager]
-        setEventHandler:quit_handler
-            andSelector:@selector(handleQuit:withReplyEvent:)
-          forEventClass:kCoreEventClass
-             andEventID:kAEQuitApplication];
-    [[NSNotificationCenter defaultCenter]
-        addObserverForName:NSApplicationWillTerminateNotification
-                    object:NSApp
-                     queue:nil
-                usingBlock:^(NSNotification *note) {
-        (void)note;
-        fprintf(stderr, "compat32: AppKit termination requested (Dock quit "
-                "or quit Apple event); exiting\n");
-        compat_runtime32_heap_report("AppKit-will-terminate");
-        fflush(NULL);
-        _Exit(EXIT_SUCCESS);
-    }];
-}
 
 static void activate_game_application(void)
 {
@@ -2598,7 +2766,7 @@ static NSOpenGLPixelFormat *legacy_pixel_format(void)
     }
     if (!logged_first_frame) {
         NSWindow *window = [self window];
-        install_termination_handler();
+        app_termination_install();
         [self applyGuestDisplayMode];
         if (window && !background_test_mode()) {
             activate_game_application();
@@ -6310,6 +6478,27 @@ static int objc_bridge32_dispatch_body(const char *import_name,
      * a mode switch becomes the emulated mode (see guest_display_mode) that
      * the GL surface is rendered at and that later queries report back.
      */
+    if (LP32_NAME_IS(import_name, import_length, "_CGDisplayRegisterReconfigurationCallback")) {
+        if (!arguments[0]) { *result = kCGErrorIllegalArgument; return 1; }
+        struct guest_display_callback *callback = calloc(1, sizeof(*callback));
+        if (!callback) { *result = kCGErrorFailure; return 1; }
+        callback->function = arguments[0]; callback->user_data = arguments[1]; callback->active = true;
+        pthread_mutex_lock(&guest_display_callback_lock);
+        callback->next = guest_display_callbacks; guest_display_callbacks = callback;
+        pthread_mutex_unlock(&guest_display_callback_lock);
+        *result = CGDisplayRegisterReconfigurationCallback(guest_display_reconfigured, callback);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGDisplayRemoveReconfigurationCallback")) {
+        pthread_mutex_lock(&guest_display_callback_lock);
+        struct guest_display_callback *callback = guest_display_callbacks;
+        while (callback && (!callback->active || callback->function != arguments[0] || callback->user_data != arguments[1])) callback = callback->next;
+        if (callback) callback->active = false;
+        pthread_mutex_unlock(&guest_display_callback_lock);
+        // Keep the small context alive for an already queued OS callback.
+        *result = callback ? CGDisplayRemoveReconfigurationCallback(guest_display_reconfigured, callback) : kCGErrorIllegalArgument;
+        return 1;
+    }
     if (LP32_NAME_IS(import_name, import_length, "_CGDisplaySwitchToMode")) {
         NSDictionary *mode = object_for_argument(arguments[1]);
         NSSize requested = NSMakeSize([[mode objectForKey:@"Width"] doubleValue],
@@ -8303,6 +8492,33 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         return 1;
     }
 
+    if (LP32_NAME_IS(import_name, import_length, "_objc_setProperty") ||
+        LP32_NAME_IS(import_name, import_length, "_objc_getProperty")) {
+        id owner = object_for_receiver(arguments[0]);
+        const struct legacy_class32 *cls = owner ? legacy_class_for_host(object_getClass(owner)) : NULL;
+        uint32_t offset = arguments[2];
+        if (!cls || offset < 4 || offset > cls->instance_size - 4) return 0;
+        uint32_t *slot = (void *)(uintptr_t)(arguments[0] + offset);
+        static char property_owners_key;
+        @synchronized (owner) {
+            if (LP32_NAME_IS(import_name, import_length, "_objc_setProperty")) {
+                id value = object_for_argument(arguments[3]);
+                if (arguments[5] == 1) value = [[value copy] autorelease];
+                else if (arguments[5] == 2) value = [[value mutableCopy] autorelease];
+                NSMutableDictionary *properties = objc_getAssociatedObject(owner, &property_owners_key);
+                if (!properties) {
+                    properties = [NSMutableDictionary dictionary];
+                    objc_setAssociatedObject(owner, &property_owners_key, properties, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                }
+                if (value) properties[@(offset)] = value;
+                else [properties removeObjectForKey:@(offset)];
+                *slot = proxy_for_object(value);
+                *result = 0;
+            } else *result = *slot;
+        }
+        return 1;
+    }
+
     if (LP32_NAME_IS(import_name, import_length, "_objc_msgSendSuper")) {
         const uint32_t *sup = (const void *)(uintptr_t)arguments[0];
         id receiver = sup ? object_for_receiver(sup[0]) : nil;
@@ -8310,6 +8526,27 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         const char *name = (const char *)(uintptr_t)arguments[1];
         if (!receiver || !parent || !name) return 0;
         SEL selector = sel_registerName(name);
+        const struct legacy_method32 *guest_method = legacy_method_for_class(parent, selector);
+        if (guest_method) {
+            // A generic native trampoline would redispatch to the child's
+            // override, recursively calling the same initializer. Super must
+            // enter the implementation found on the requested parent.
+            NSMethodSignature *sig = [NSMethodSignature signatureWithObjCTypes:
+                (const char *)(uintptr_t)guest_method->types];
+            size_t count = 2;
+            for (NSUInteger i = 2; i < [sig numberOfArguments]; ++i)
+                count += guest_words_for_type([sig getArgumentTypeAtIndex:i]);
+            if (count > 10) return 0;
+            uint32_t words[10] = {sup[0], guest_method->name};
+            memcpy(words + 2, arguments + 2, (count - 2) * 4);
+            char type = *[sig methodReturnType];
+            uint64_t bits = compat_runtime32_call_result(guest_method->imp, words, count,
+                type == 'f' ? 1 : type == 'd' ? 2 : 0);
+            if (type == 'f') { float value; uint32_t low = bits; memcpy(&value, &low, 4); *result = compat_runtime32_return_float(value); }
+            else if (type == 'd') { double value; memcpy(&value, &bits, 8); *result = compat_runtime32_return_double(value); }
+            else *result = bits;
+            return 1;
+        }
         struct objc_super super = {receiver, parent};
         Method method = class_getInstanceMethod(parent, selector);
         if (!method) return 0;
@@ -8332,6 +8569,35 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         LP32_NAME_IS(import_name, import_length, "_objc_msgSend_fpret")) {
         id receiver = object_for_receiver(arguments[0]);
         const char *selector_name = (const char *)(uintptr_t)arguments[1];
+        if (lp32_profile()->title == LP32_TITLE_TFU && selector_name) {
+            if (receiver == [NSBundle class] && !strcmp(selector_name, "mainBundle")) {
+                *result = proxy_for_object(carbon_bridge32_game_bundle()); return 1;
+            }
+            if (receiver == [NSUserDefaults class] && !strcmp(selector_name, "standardUserDefaults")) {
+                *result = proxy_for_object(carbon_bridge32_user_defaults()); return 1;
+            }
+        }
+        if (selector_name && (receiver == [NSDictionary class] || receiver == [NSMutableDictionary class]) &&
+            !strcmp(selector_name, "dictionaryWithObjectsAndKeys:")) {
+            NSMutableDictionary *dictionary = [NSMutableDictionary dictionary];
+            unsigned word = 2;
+            for (; word < 130 && arguments[word]; word += 2) {
+                id value = object_for_argument(arguments[word]), key = object_for_argument(arguments[word + 1]);
+                if (!value || !key) return 0;
+                dictionary[key] = value;
+            }
+            if (word == 130) return 0;
+            *result = proxy_for_object(receiver == [NSMutableDictionary class] ? dictionary : [[dictionary copy] autorelease]);
+            return 1;
+        }
+        if (selector_name && (receiver == [NSString class] || receiver == [NSMutableString class]) &&
+            !strcmp(selector_name, "stringWithFormat:")) {
+            CFStringRef formatted = cf_format32((CFStringRef)object_for_argument(arguments[2]), NULL, arguments + 3);
+            if (!formatted) return 0;
+            *result = proxy_for_object(receiver == [NSMutableString class] ? [[(id)formatted mutableCopy] autorelease] : (id)formatted);
+            CFRelease(formatted);
+            return 1;
+        }
         if (getenv("LP32_TRACE_EVENTS") && selector_name && [receiver isKindOfClass:[NSEvent class]])
             fprintf(stderr, "compat32: event %p handle=%08x type=%lu selector=%s\n", (void *)receiver,
                 arguments[0], (unsigned long)[(NSEvent *)receiver type], selector_name);
@@ -8340,7 +8606,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
              receiver == [NSAutoreleasePool class] || [receiver isKindOfClass:[LP32GuestAutoreleasePool class]]))
             fprintf(stderr, "compat32: date/pool %s receiver=%s\n", selector_name,
                 receiver ? class_getName(object_getClass(receiver)) : "nil");
-        if (lp32_profile()->title == LP32_TITLE_PORTAL2 && selector_name) {
+        if ((lp32_profile()->title == LP32_TITLE_PORTAL2 || lp32_profile()->title == LP32_TITLE_TFU) && selector_name) {
             /* A guest pool spans import calls, while each host dispatch has
                its own nested pool. Creating an actual NSAutoreleasePool here
                would let the dispatch pop destroy the guest's pool early. */
@@ -8430,6 +8696,115 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             strcmp(selector_name, "windowRef") == 0 &&
             [receiver isKindOfClass:[NSWindow class]]) {
             *result = arguments[0];
+            return 1;
+        }
+        if (lp32_profile()->title == LP32_TITLE_TFU &&
+            strcmp(selector_name, "windowRef") == 0 &&
+            [receiver isKindOfClass:[NSWindow class]]) {
+            void *ref = ((void *(*)(id, SEL))objc_msgSend)(receiver, sel_registerName("windowRef"));
+            *result = carbon_native32_handle(ref);
+            return 1;
+        }
+        if (lp32_profile()->title == LP32_TITLE_TFU &&
+            strcmp(selector_name, "initWithWindowRef:") == 0 &&
+            [receiver isKindOfClass:[NSWindow class]]) {
+            /* Steam wraps its Carbon keybinding dialog in Cocoa. WindowRef
+               is an opaque mapped handle, not a 32-bit native pointer. */
+            [receiver release];
+            /* A modern NSCarbonWindow cannot create its drawing context.
+               Keep the native Carbon dialog opaque and run its own modal
+               loop below instead of constructing that obsolete wrapper. */
+            /* init returns an owned object. The Carbon handle itself is
+               borrowed; give the guest a separate retain for its release. */
+            bool valid = carbon_native32_pointer(arguments[2]) != NULL;
+            if (valid) [object_for_argument(arguments[2]) retain];
+            *result = valid ? arguments[2] : 0;
+            return 1;
+        }
+        if (lp32_profile()->title == LP32_TITLE_TFU && tfu_carbon_modal_window &&
+            [receiver isKindOfClass:[NSApplication class]] &&
+            (!strcmp(selector_name, "stopModal") || !strcmp(selector_name, "stopModalWithCode:") ||
+             !strcmp(selector_name, "abortModal"))) {
+            tfu_carbon_modal_done = true;
+            *result = 0;
+            return 1;
+        }
+        if (lp32_profile()->title == LP32_TITLE_TFU && tfu_cocoa_modal_active &&
+            [receiver isKindOfClass:[NSApplication class]] &&
+            (!strcmp(selector_name, "stopModal") || !strcmp(selector_name, "stopModalWithCode:") ||
+             !strcmp(selector_name, "abortModal"))) {
+            tfu_cocoa_modal_done = true;
+            *result = 0;
+            return 1;
+        }
+        if (lp32_profile()->title == LP32_TITLE_TFU &&
+            strcmp(selector_name, "runModalForWindow:") == 0 &&
+            [receiver isKindOfClass:[NSApplication class]]) {
+            id window = object_for_argument(arguments[2]);
+            if (window && ![window isKindOfClass:[NSWindow class]] && carbon_native32_pointer(arguments[2])) {
+                uint32_t previous = tfu_carbon_modal_window;
+                bool previous_done = tfu_carbon_modal_done;
+                tfu_carbon_modal_window = arguments[2];
+                tfu_carbon_modal_done = false;
+                NSWindow *presentation = carbon_native32_binding_window(arguments[2], &tfu_carbon_modal_done);
+                if (!presentation) {
+                    tfu_carbon_modal_window = previous;
+                    tfu_carbon_modal_done = previous_done;
+                    fprintf(stderr, "compat32: cannot present Carbon keybindings\n");
+                    *result = (uint64_t)-1;
+                    return 1;
+                }
+                if (background_test_mode()) [presentation orderBack:nil];
+                else [presentation makeKeyAndOrderFront:nil];
+                NSModalSession session = [NSApp beginModalSessionForWindow:presentation];
+                while (!tfu_carbon_modal_done) {
+                    @autoreleasepool {
+                        [NSApp runModalSession:session];
+                        if (!tfu_carbon_modal_done) [[NSRunLoop currentRunLoop]
+                            runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:.01]];
+                    }
+                }
+                [NSApp endModalSession:session];
+                [presentation close];
+                [presentation release];
+                /* The guest's command handler hides/disposes this window. */
+                tfu_carbon_modal_window = previous;
+                tfu_carbon_modal_done = previous_done;
+                *result = 0;
+                return 1;
+            }
+            if (![window isKindOfClass:[NSWindow class]]) return 0;
+            /* Steam's Carbon main initializes Cocoa with NSApplicationLoad,
+               then opens GameGuide before entering the Carbon event loop.
+               There is no NSApplicationMain/-run to complete AppKit launch
+               first. Complete it before the modal loop so activation and
+               accessibility requests can reach the launcher's controls. */
+            static bool completed_modal_launch;
+            if (!completed_modal_launch) {
+                completed_modal_launch = true;
+                [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+                carbon_native32_finish_appkit_launch();
+            }
+            if (!background_test_mode()) [NSApp activateIgnoringOtherApps:YES];
+            /* Do not install a Cocoa-only modal session: the guest opens a
+               native Carbon child dialog from this launcher. Such a session
+               rejects that child's activation and control events. Preserve
+               the synchronous guest call with a normal AppKit event loop. */
+            bool previous_active = tfu_cocoa_modal_active;
+            bool previous_done = tfu_cocoa_modal_done;
+            tfu_cocoa_modal_active = true;
+            tfu_cocoa_modal_done = false;
+            while (!tfu_cocoa_modal_done) {
+                @autoreleasepool {
+                    NSEvent *event = [NSApp nextEventMatchingMask:NSEventMaskAny
+                        untilDate:[NSDate dateWithTimeIntervalSinceNow:.05]
+                        inMode:NSDefaultRunLoopMode dequeue:YES];
+                    if (event) [NSApp sendEvent:event];
+                }
+            }
+            tfu_cocoa_modal_active = previous_active;
+            tfu_cocoa_modal_done = previous_done;
+            *result = 0;
             return 1;
         }
         if (strcmp(selector_name, "terminate:") == 0 &&
@@ -8680,6 +9055,9 @@ uint32_t objc_bridge32_pointer_import(const char *import_name)
     }
     if (LP32_NAME_IS(import_name, import_length, "_NSDefaultRunLoopMode")) {
         return proxy_for_object(NSDefaultRunLoopMode);
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_NSForegroundColorAttributeName")) {
+        return proxy_for_object(NSForegroundColorAttributeName);
     }
     if (LP32_NAME_IS(import_name, import_length, "_NSLinkAttributeName")) {
         return proxy_for_object(NSLinkAttributeName);

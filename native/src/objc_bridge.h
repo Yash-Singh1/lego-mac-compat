@@ -10,6 +10,8 @@ int objc_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
 /* Direct handler for a hot OpenGL import, or NULL to keep using the chain. */
 lp32_fast_import_fn objc_bridge32_fast_import(const char *import_name);
 uint32_t objc_bridge32_pointer_import(const char *import_name);
+int objc_bridge32_register_main_image(void);
+int objc_bridge32_tfu_classes_self_test(void);
 int objc_bridge32_register_legacy_module(uint32_t address, uint32_t size);
 void *objc_bridge32_host_object(uint32_t handle);
 uint32_t objc_bridge32_guest_object(void *object);

@@ -4,6 +4,7 @@
 #include "guest_dyld.h"
 #include "carbon_bridge.h"
 #include "tfu_input.h"
+#include "tfu_steam.h"
 #include "tfu_movie_end.h"
 #include "crash_trace.h"
 #include "movie_bridge.h"
@@ -281,20 +282,23 @@ static int write_guest_code(uintptr_t address, const void *bytes, size_t length,
 static int install_tfu_movie_end_patch(void)
 {
     if (lp32_profile()->title != LP32_TITLE_TFU) return 0;
+    const struct lp32_tfu_layout *layout = lp32_profile()->tfu;
+    uint8_t expected[8] = {0x89, 0x1c, 0x24, 0xe8};
+    int32_t target = (int32_t)(layout->movie_next_frame - (layout->movie_hook + 8));
+    memcpy(expected + 4, &target, 4);
     /* The startup-latch stub page is unused by TFU. Verify both the call
        site and the manager's existing non-loop completion check. */
     if (lp32_profile()->startup_latch ||
-        memcmp((void *)(uintptr_t)TFU_MOVIE_END_HOOK, tfu_movie_end_expected,
-               sizeof(tfu_movie_end_expected)) ||
-        memcmp((void *)(uintptr_t)0x734be2, tfu_movie_end_completion,
+        memcmp((void *)(uintptr_t)layout->movie_hook, expected, sizeof(expected)) ||
+        memcmp((void *)(uintptr_t)layout->movie_completion, tfu_movie_end_completion,
                sizeof(tfu_movie_end_completion))) {
         fprintf(stderr, "compat32: TFU movie end guard signature mismatch\n");
         return -1;
     }
     uint8_t code[28], hook[8];
-    tfu_movie_end_code(code, hook);
+    tfu_movie_end_code_at(code, hook, layout->movie_hook, layout->movie_next_frame);
     if (write_guest_code(TFU_MOVIE_END_STUB, code, sizeof(code), "TFU movie end stub") ||
-        write_guest_code(TFU_MOVIE_END_HOOK, hook, sizeof(hook), "TFU movie end hook")) return -1;
+        write_guest_code(layout->movie_hook, hook, sizeof(hook), "TFU movie end hook")) return -1;
     fprintf(stderr, "compat32: TFU non-looping movie EOF wrap guard enabled\n");
     return 0;
 }
@@ -732,7 +736,10 @@ int main(int argc, char **argv)
     }
     char image_path_buffer[PATH_MAX];
     const char *image_path = NULL;
-    if (argc >= 2 && argv[1][0] != '-') {
+    bool validate_tfu = argc == 3 && !strcmp(argv[1], "--validate-tfu");
+    if (validate_tfu) {
+        image_path = argv[2];
+    } else if (argc >= 2 && argv[1][0] != '-') {
         image_path = argv[1];
     } else {
         image_path = default_image_path(argv[0], image_path_buffer,
@@ -747,6 +754,11 @@ int main(int argc, char **argv)
     if (lp32_profile_select(&image) != 0) {
         macho_image32_unload(&image);
         return EXIT_FAILURE;
+    }
+    if (validate_tfu) {
+        int status = lp32_profile()->title == LP32_TITLE_TFU ? EXIT_SUCCESS : EXIT_FAILURE;
+        macho_image32_unload(&image);
+        return status;
     }
     open_guest_diagnostic_log(argc > 0 ? argv[0] : NULL);
     /* TFU can terminate with SIGILL under the translated guest runtime.
@@ -893,6 +905,11 @@ int main(int argc, char **argv)
         return initialization_trapped ? EXIT_FAILURE : EXIT_SUCCESS;
     }
     if (initialization_trapped) return EXIT_FAILURE;
+    /* Some Aspyr builds populate fragile Objective-C metadata in their C++
+       initializers. Register those classes after metadata is initialized. */
+    if (lp32_profile()->title == LP32_TITLE_TFU && objc_bridge32_register_main_image()) return EXIT_FAILURE;
+    if (getenv("LP32_TFU_COCOA_SELFTEST")) return objc_bridge32_tfu_classes_self_test() ? EXIT_FAILURE : EXIT_SUCCESS;
+    tfu_steam32_start();
 
     if (!initialization_trapped) {
         printf("initializers completed: %" PRIu32 "/%" PRIu32 "\n",

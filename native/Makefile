@@ -34,11 +34,12 @@ ICON := $(SOURCE_CONTENTS)/Resources/game.icns
 ICON_NAME := game.icns
 else ifeq ($(GAME),tfu)
 BUNDLE := $(BUILD_DIR)/TFU-Compat.app
-SOURCE_APP := /Volumes/Storage/games/mac/tfu/Star Wars The Force Unleashed/Star Wars The Force Unleashed.app
+# Prefer the installed Steam Mac copy, while retaining the retail fallback.
+SOURCE_APP := $(shell if test -d "$(HOME)/Library/Application Support/Steam/steamapps/common/Star Wars The Force Unleashed/Star Wars The Force Unleashed.app"; then echo "$(HOME)/Library/Application Support/Steam/steamapps/common/Star Wars The Force Unleashed/Star Wars The Force Unleashed.app"; else echo "/Volumes/Storage/games/mac/tfu/Star Wars The Force Unleashed/Star Wars The Force Unleashed.app"; fi)
 SOURCE_CONTENTS := $(SOURCE_APP)/Contents
-ASSETS_DIR ?= $(SOURCE_APP)/../Assets
+ASSETS_DIR ?=
 IMAGE_SOURCE := $(SOURCE_CONTENTS)/MacOS/Star Wars The Force Unleashed
-IMAGE_PREREQ :=
+IMAGE_PREREQ := $(BUILD_DIR)/tfu_source
 IMAGE_NAME := TFU.image
 LOADER_NAME := TFUCompat
 INFO_PLIST := Info-TFU.plist
@@ -186,7 +187,7 @@ $(BUILD_DIR)/mode32_probe: src/mode32_probe.c src/mode32_switch.S src/address_sp
 	$(CLANG) $(CFLAGS) $(LDFLAGS) $^ -o $@
 	codesign --force --sign - $@
 
-$(BUILD_DIR)/game_loader: src/game_loader.c src/game_profile.c src/macho_loader.c src/macho_file.c src/guest_dyld.c src/guest_memory.c src/network_bridge.c src/font_bridge.m src/carbon_bridge.m src/carbon_ui.m src/carbon_native.m src/carbon_text.m src/carbon_files.m src/cf_format.c src/movie_bridge.m src/openal_bridge.m src/agl_bridge.m src/carbon_display.m src/xml_bridge.m src/gl_shader_bridge.c src/gl_misc_bridge.c src/gl_volume_bridge.c src/compat_runtime.c src/wide_format.c src/audio_bridge.c src/audio_queue_bridge.c src/controller_bridge.m src/tfu_controller.m src/tfu_input.c src/cursor_state.c src/objc_bridge.m src/arb_program_guard.c src/arb_sampler_usage.c src/mode32_switch.S src/import_gateway.S src/guest_context.S src/address_space_reserve.S src/tfu_timing.h | $(BUILD_DIR)
+$(BUILD_DIR)/game_loader: src/game_loader.c src/game_profile.c src/tfu_layout.c src/macho_loader.c src/macho_file.c src/guest_dyld.c src/guest_memory.c src/network_bridge.c src/font_bridge.m src/carbon_bridge.m src/carbon_ui.m src/carbon_native.m src/carbon_text.m src/carbon_files.m src/cf_format.c src/movie_bridge.m src/openal_bridge.m src/agl_bridge.m src/carbon_display.m src/xml_bridge.m src/gl_shader_bridge.c src/gl_misc_bridge.c src/gl_volume_bridge.c src/compat_runtime.c src/wide_format.c src/audio_bridge.c src/audio_queue_bridge.c src/controller_bridge.m src/tfu_controller.m src/tfu_input.c src/cursor_state.c src/objc_bridge.m src/arb_program_guard.c src/arb_sampler_usage.c src/mode32_switch.S src/import_gateway.S src/guest_context.S src/address_space_reserve.S src/tfu_timing.h | $(BUILD_DIR)
 	$(CLANG) $(CFLAGS) $(LDFLAGS) $(filter-out %.h,$^) -framework Cocoa -framework Carbon -framework OpenGL -framework ImageIO -framework CoreText -framework AudioToolbox -framework AudioUnit -framework CoreAudio -framework GameController -framework IOKit -framework AVFoundation -framework CoreVideo -framework CoreMedia -framework OpenAL -lexpat -liconv -o $@
 	codesign --force --sign - $@
 
@@ -267,10 +268,14 @@ $(BUILD_DIR)/LEGOPirates.unpacked.macbin: tools/unpack_securom.py $(UNPACK_PYTHO
 	$(UNPACK_PYTHON) tools/unpack_securom.py "$(PACKED_IMAGE)" "$@"
 
 bundle: $(BUILD_DIR)/game_loader $(IMAGE_PREREQ) $(INFO_PLIST)
+ifeq ($(GAME),tfu)
+	./$(BUILD_DIR)/tfu_source --validate "$(SOURCE_APP)" "$(ASSETS_DIR)"
+	arch -x86_64 ./$(BUILD_DIR)/game_loader --validate-tfu "$(IMAGE_SOURCE)"
+endif
 	test -d "$(SOURCE_CONTENTS)" || { echo "missing $(SOURCE_APP); pass SOURCE_APP=/path/to/the/game.app" >&2; exit 1; }
 	test -f "$(IMAGE_SOURCE)" || { echo "missing $(IMAGE_SOURCE)" >&2; exit 1; }
 ifneq ($(filter $(GAME),portal2 tfu),)
-	test -f "$(GUEST_RUNTIME_DIR)/libstdc++.6.dylib" -a -f "$(GUEST_RUNTIME_DIR)/libc++abi.dylib" || { echo "missing Portal 2 C++ runtime; run make portal2-runtime or set GUEST_RUNTIME_DIR" >&2; exit 1; }
+	test -f "$(GUEST_RUNTIME_DIR)/libstdc++.6.dylib" -a -f "$(GUEST_RUNTIME_DIR)/libc++abi.dylib" || { echo "missing i386 C++ runtime; run make $(GAME)-runtime or set GUEST_RUNTIME_DIR" >&2; exit 1; }
 endif
 	mkdir -p $(BUNDLE)/Contents/MacOS $(BUNDLE)/Contents/Resources $(BUNDLE)/Contents/SharedSupport $(BUNDLE)/Contents/Library/Frameworks
 	cp $(BUILD_DIR)/game_loader $(BUNDLE)/Contents/MacOS/$(LOADER_NAME)
@@ -280,9 +285,7 @@ ifeq ($(GAME),portal2)
 	ditto --noextattr --noqtn "$(SOURCE_CONTENTS)/MacOS" $(BUNDLE)/Contents/SharedSupport/Portal2
 	ditto --noextattr --noqtn "$(GUEST_RUNTIME_DIR)" $(BUNDLE)/Contents/SharedSupport/Portal2/compat-runtime
 else ifeq ($(GAME),tfu)
-	test -f "$(ASSETS_DIR)/PC_LevelSelectList.txt" -a -d "$(ASSETS_DIR)/LevelPacks" || { echo "missing TFU Assets beside source app; set ASSETS_DIR=/path/to/Assets" >&2; exit 1; }
-	ditto --noextattr --noqtn "$(SOURCE_APP)" "$(BUNDLE)/Contents/SharedSupport/TFU/Star Wars The Force Unleashed.app"
-	ditto --noextattr --noqtn "$(ASSETS_DIR)" "$(BUNDLE)/Contents/SharedSupport/TFU/Assets"
+	./$(BUILD_DIR)/tfu_source --copy "$(SOURCE_APP)" "$(BUNDLE)/Contents/SharedSupport/TFU" "$(ASSETS_DIR)"
 	ditto --noextattr --noqtn "$(GUEST_RUNTIME_DIR)" "$(BUNDLE)/Contents/SharedSupport/TFU/compat-runtime"
 else
 	for data in $(GAME_DATA); do cp "$(SOURCE_CONTENTS)/MacOS/$$data" $(BUNDLE)/Contents/MacOS/$$data; done
@@ -301,6 +304,8 @@ ifneq ($(filter $(GAME),portal2 tfu),)
 else
 	codesign --force --deep --sign - $(BUNDLE)
 endif
+
+	codesign --verify --deep --strict "$(BUNDLE)"
 
 # Update only the compatibility runtime when the external source-data volume
 # is unavailable. The existing bundle's game data and resources are retained.
@@ -328,3 +333,61 @@ $(BUILD_DIR)/mkicon: icons/mkicon.swift | $(BUILD_DIR)
 clean:
 	rm -f $(BUILD_DIR)/mode32_probe $(BUILD_DIR)/game_loader $(BUILD_DIR)/controller_probe $(BUILD_DIR)/mkicon
 	rm -f $(BUILD_DIR)/converter-arm64 $(BUILD_DIR)/converter-x86_64 $(BUILD_DIR)/test_portal2_converter
+
+# TFU adaptation of the converter from portal2 a06456f. The Swift discovery
+# and copy implementation is also used by `make GAME=tfu bundle`.
+TFU_CONVERTER_APP := $(BUILD_DIR)/TFU-Converter.app
+TFU_CONVERTER_CORE := tfu-converter/Conversion.swift tfu-converter/Source.swift
+TFU_CONVERTER_SOURCES := $(TFU_CONVERTER_CORE) tfu-converter/App.swift tfu-converter/main.swift
+
+$(BUILD_DIR)/tfu-converter-arm64: $(TFU_CONVERTER_SOURCES) | $(BUILD_DIR)
+	$(SWIFTC) -O -swift-version 5 -warnings-as-errors -target arm64-apple-macosx11.0 -sdk $(SDK) $^ -o $@
+
+$(BUILD_DIR)/tfu-converter-x86_64: $(TFU_CONVERTER_SOURCES) | $(BUILD_DIR)
+	$(SWIFTC) -O -swift-version 5 -warnings-as-errors -target x86_64-apple-macosx11.0 -sdk $(SDK) $^ -o $@
+
+$(BUILD_DIR)/tfu_source: $(TFU_CONVERTER_CORE) tools/tfu_source.swift | $(BUILD_DIR)
+	$(SWIFTC) -O -swift-version 5 -warnings-as-errors -target $(shell uname -m)-apple-macosx11.0 -sdk $(SDK) $^ -o $@
+
+.PHONY: tfu-converter
+tfu-converter: $(BUILD_DIR)/tfu-converter-arm64 $(BUILD_DIR)/tfu-converter-x86_64 $(BUILD_DIR)/game_loader tfu-converter/Info.plist Info-TFU.plist
+	mkdir -p "$(TFU_CONVERTER_APP)/Contents/MacOS" "$(TFU_CONVERTER_APP)/Contents/Resources"
+	lipo -create $(BUILD_DIR)/tfu-converter-arm64 $(BUILD_DIR)/tfu-converter-x86_64 -output "$(TFU_CONVERTER_APP)/Contents/MacOS/TFUConverter"
+	cp tfu-converter/Info.plist "$(TFU_CONVERTER_APP)/Contents/Info.plist"
+	cp $(BUILD_DIR)/game_loader Info-TFU.plist "$(TFU_CONVERTER_APP)/Contents/Resources/"
+	codesign --force --sign - "$(TFU_CONVERTER_APP)/Contents/Resources/game_loader"
+	codesign --force --sign - "$(TFU_CONVERTER_APP)"
+	codesign --verify --deep --strict "$(TFU_CONVERTER_APP)"
+
+$(BUILD_DIR)/test_tfu_converter: $(TFU_CONVERTER_CORE) tests/test_tfu_converter.swift | $(BUILD_DIR)
+	$(SWIFTC) -O -swift-version 5 -warnings-as-errors -target $(shell uname -m)-apple-macosx11.0 -sdk $(SDK) $^ -o $@
+
+.PHONY: test-tfu-converter test-tfu-layout
+test-tfu-converter: $(BUILD_DIR)/test_tfu_converter
+	./$(BUILD_DIR)/test_tfu_converter
+
+test-tfu-layout:
+	python3 tests/test_tfu_layout.py
+
+$(BUILD_DIR)/game_loader: src/tfu_layout.h src/game_profile.h src/tfu_movie_end.h src/objc_bridge.h src/carbon_native.h src/carbon_bridge.h src/compat_runtime.h
+$(BUILD_DIR)/game_loader: src/carbon_dialog.m
+$(BUILD_DIR)/game_loader: src/tfu_steam.m src/tfu_steam.h
+
+$(BUILD_DIR)/game_loader: src/app_termination.m src/app_termination.h
+
+$(BUILD_DIR)/test_app_termination: tests/test_app_termination.m src/app_termination.m src/app_termination.h | $(BUILD_DIR)
+	$(CLANG) $(CFLAGS) -Isrc $(filter-out %.h,$^) -framework Cocoa -framework Carbon -o $@
+
+.PHONY: test-app-termination
+test-app-termination: $(BUILD_DIR)/test_app_termination
+	./$(BUILD_DIR)/test_app_termination
+
+$(BUILD_DIR)/test_tfu_steam: tests/test_tfu_steam.m src/tfu_steam.m src/tfu_steam.h | $(BUILD_DIR)
+	$(CLANG) $(CFLAGS) -Isrc $(filter-out %.h,$^) -framework Cocoa -o $@
+
+.PHONY: test-tfu-steam
+test-tfu-steam: $(BUILD_DIR)/test_tfu_steam
+	./$(BUILD_DIR)/test_tfu_steam missing
+	./$(BUILD_DIR)/test_tfu_steam retail
+	./$(BUILD_DIR)/test_tfu_steam headless
+	./$(BUILD_DIR)/test_tfu_steam background

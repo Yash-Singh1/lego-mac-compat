@@ -1,3 +1,7 @@
+Steam and retail bundling and the standalone converter are documented in
+[tfu-converter/README.md](tfu-converter/README.md). TFU patch locations are now
+resolved from unique instruction patterns, not per-version addresses.
+
 # Star Wars: The Force Unleashed
 
 This branch is an unfinished port of the Aspyr 1.2 Mac release. It uses the
@@ -1001,3 +1005,81 @@ Frames also appear in the session log. `tests/test_tfu_crash_diagnostics.py`
 passed actual SIGILL/SIGSEGV tests under Rosetta, a worker-thread SIGILL,
 a corrupted-frame-pointer trap, offline caller symbolication, and preservation
 of an existing crash report. These tests launch no game or GPU context.
+
+
+September 9 Steam production settings and visibility follow-up: the GUI-converted
+Steam copy defaulted to 1024x768, low detail and keyboard/mouse because its
+preferences domain differs from retail. The user's Steam preferences were backed
+up and their existing 1920x1200/controller/advanced settings restored; the
+launcher UI and fullscreen surface report both verified the resolution, and
+DUALSHOCK 4 polling and controller menu prompts were observed. This is a local
+settings migration, not a hardcoded converter default.
+
+Carbon focus recovery now checks WindowServer onscreen status as well as AppKit
+flags; the original invisible process had all AppKit flags set but no onscreen
+window. GetWindowGroupOfClass/GetWindowGroup/GetWindowGroupParent are bridged
+for the Steam activation path. Windowed presentation and fullscreen 1920x1200
+were observed with the revised loader. Automated Cmd+Tab did not conclusively
+verify return activation. The fullscreen diagnostic later hit the known caulk
+maybe_create_free_node SIGILL during AudioConverterNew. Its stack and focus
+history are in build/steam-tfu-audit/final-display-launch.log and
+final-display.jsonl; this audio allocator crash is still unresolved.
+
+The movie EOF emulation check now resolves patch sites from the executable and
+decodes external calls instead of assuming retail addresses. It passes 34
+boundary cases each on the Steam and retained retail images.
+
+
+September 9 Steam process tracking and external quit follow-up:
+All 10,672 original Steam app files are retained with matching sizes; all
+98 files outside GameData (including executable, Info.plist and resources)
+were compared byte-for-byte. No Steam library was stripped. The standalone
+converted app lacked a Steam launch relationship or client connection.
+`tfu_steam.m` now connects Steam-distribution TFU to the installed client's
+versioned SteamClient020 interface and verifies SteamUtils010.GetAppID=32430.
+No SDK/client binary is bundled; retail and diagnostic runs stay independent.
+The actual production PID 54987 appeared as AppID 32430 in gameprocess_log.txt,
+and the Steam library visibly showed Running, Stop and updating play time.
+This provides process tracking, not achievements, overlay, or a replacement
+for the original Steam Play-button launch target.
+
+The native quit handler previously installed only on the NSOpenGLView path;
+TFU presents through Carbon/AGL. It is now shared in app_termination.m and
+installed by TFU's Carbon event pump, which also drains pending Apple events.
+The inactive-process quit-event regression test passes. The UI tool cannot
+retain Cmd across an app-switcher selection, so that exact physical gesture
+has not been independently verified. The ordinary game quit also exposed an
+unhandled __Exit import; that now uses the existing process-exit bridge.
+Evidence: build/steam-presence-audit/. No saves or original Steam files changed.
+
+## Open issues and regression watchlist (September 9)
+
+- The intermittent native caulk audio allocator SIGILL remains unresolved.
+  Native crash stacks now make it diagnosable; they do not prevent it.
+- Production Cmd+Tab return needs a conclusive physical app-switch test,
+  including intro playback, fullscreen Spaces, and another display. Earlier
+  successful focus tests did not cover all subsequently reported failures.
+  The external quit-event test passes, but the precise app-switcher Q gesture
+  has not been independently verified.
+- Doorway reflections and the invisible standing blade have capture evidence
+  for their fixes. The exact original pull-out platform view and white saber
+  strips in Grip training still need visual confirmation; related shader
+  probes or other rooms do not close those reports.
+- First-use shader compilation can still hitch. Comprehensive shader prewarming
+  is not implemented, and the reported sub-half-second stutter was not
+  conclusively attributed to the longer background gaps in the logs.
+- Steam is optional: absent/unavailable Steam logs a diagnostic and launch
+  continues. The missing-client, retail, headless, and background checks pass
+  without opening UI or changing Steam IDs. Tracking uses versioned installed
+  client interfaces, so Steam updates remain a compatibility risk. There is
+  no reconnect when Steam starts or restarts after TFU, and Steam's original
+  Play target is not redirected to the converted app.
+- Retail and Steam use different save locations and preference domains. This
+  user's data/settings were migrated separately; conversion does not perform
+  that migration automatically. Other users may initially see default graphics
+  and keyboard/mouse settings or need to copy their existing save.
+- Signature discovery is tested against the available retail and Steam Mac
+  images, including relocated code. Other builds are accepted only when their
+  required signatures match uniquely; arbitrary CD builds are not verified.
+  Shared Objective-C/Carbon bridge changes also have broader regression scope
+  than the TFU checks; other games have not been fully revalidated here.

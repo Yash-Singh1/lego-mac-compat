@@ -3981,7 +3981,7 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
      * those quarantined legacy audio objects and does not run incompatible
      * host/guest teardown callbacks.
      */
-    if (import_is(name, "_exit") || import_is(name, "__exit")) {
+    if (import_is(name, "_exit") || import_is(name, "__exit") || import_is(name, "__Exit")) {
         if (lp32_profile()->title == LP32_TITLE_TFU && import_is(name, "_exit")) {
             const uint32_t finalize_arguments[] = {0};
             compat_runtime32_dispatch_import("___cxa_finalize", finalize_arguments);
@@ -5316,8 +5316,9 @@ static bool acquire_guest_stack_slot(void)
     return true;
 }
 
-uint32_t compat_runtime32_call(uint32_t function, const uint32_t *arguments,
-                               size_t argument_count)
+extern uint64_t run_compat32_capture(uint32_t eip, uint32_t esp, uint16_t cs32, unsigned kind);
+static uint64_t guest_call_result(uint32_t function, const uint32_t *arguments,
+                                  size_t argument_count, int kind)
 {
     const uintptr_t stack_slice_size = 0x10000;
     if (guest_thread_slot == UINT32_MAX && !acquire_guest_stack_slot()) {
@@ -5351,10 +5352,21 @@ uint32_t compat_runtime32_call(uint32_t function, const uint32_t *arguments,
     lp32_leave_guest = 0;
     ++guest_call_depth;
     lp32_guest_execution_enter();
-    uint32_t result = run_compat32(lp32_landing32, (uint32_t)sp, lp32_cs32);
+    uint64_t result = kind < 0 ? run_compat32(lp32_landing32, (uint32_t)sp, lp32_cs32) :
+        run_compat32_capture(lp32_landing32, (uint32_t)sp, lp32_cs32, (unsigned)kind);
     lp32_guest_execution_leave();
     --guest_call_depth;
     return result;
+}
+
+uint32_t compat_runtime32_call(uint32_t function, const uint32_t *arguments, size_t count)
+{
+    return (uint32_t)guest_call_result(function, arguments, count, -1);
+}
+uint64_t compat_runtime32_call_result(uint32_t function, const uint32_t *arguments,
+                                     size_t count, unsigned kind)
+{
+    return guest_call_result(function, arguments, count, (int)kind);
 }
 
 int compat_runtime32_last_call_trapped(void)

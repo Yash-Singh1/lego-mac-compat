@@ -6,6 +6,7 @@
 #include <dlfcn.h>
 #include "carbon_native.h"
 #include "objc_bridge.h"
+#include "app_termination.h"
 #include "compat_runtime.h"
 #include "carbon_text.h"
 #include "game_profile.h"
@@ -43,6 +44,10 @@ void *carbon_native32_symbol(const char *name) {
     return symbol;
 }
 static id object(uint32_t h) { return objc_bridge32_host_object(h); }
+void carbon_native32_finish_appkit_launch(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ [NSApp finishLaunching]; });
+}
 void *carbon_native32_pointer(uint32_t h) {
     id value = object(h);
     return [value isKindOfClass:[NSValue class]] && !strcmp([value objCType], @encode(void *)) ? [value pointerValue] : NULL;
@@ -99,6 +104,16 @@ static ControlPartCode pane_track(ControlRef control, Point point, ControlAction
 }
 @end
 static void restore_game_window(void);
+static BOOL window_server_visible(NSWindow *window) {
+    CFArrayRef entries = CGWindowListCopyWindowInfo(kCGWindowListOptionIncludingWindow,
+                                                   (CGWindowID)window.windowNumber);
+    BOOL visible = NO;
+    for (NSDictionary *entry in (NSArray *)entries)
+        if ([entry[(id)kCGWindowNumber] unsignedIntValue] == (CGWindowID)window.windowNumber)
+            visible = [entry[(id)kCGWindowIsOnscreen] boolValue];
+    if (entries) CFRelease(entries);
+    return visible;
+}
 static BOOL game_process_is_foreground(void) {
     /* NSWorkspace.frontmostApplication is notification-backed and can stay
        stale while the guest drives Carbon instead of NSApplication.run.
@@ -209,7 +224,8 @@ static void restore_game_window(void) {
            produce an order-out/order-in loop during gameplay. */
         BOOL stale_identity = [NSApp isActive] &&
             (([NSApp keyWindow] == window && ![window isKeyWindow]) ||
-             ([NSApp mainWindow] == window && ![window isMainWindow]));
+             ([NSApp mainWindow] == window && ![window isMainWindow]) ||
+             !window_server_visible(window));
         if (stale_identity) {
             NSTimeInterval now = GetCurrentEventTime();
             if (!window->focusMismatchSince) window->focusMismatchSince = now;
@@ -300,7 +316,8 @@ static void reconcile_game_activation(void) {
         if (!window->hasPresented || !window->logicalVisible || window->auxiliaryBackdrop || [window isMiniaturized]) continue;
         if (returned || ![NSApp isActive] || [NSApp isHidden] || ![window isVisible] ||
             ![window isKeyWindow] || ![window isMainWindow] || ![window isOnActiveSpace] ||
-            (window->fullscreenPresentation && [window level] != NSFloatingWindowLevel))
+            (window->fullscreenPresentation && [window level] != NSFloatingWindowLevel) ||
+            !window_server_visible(window))
             restore_game_window();
         break;
     }
@@ -323,6 +340,7 @@ void carbon_native32_pump_appkit_events(void) {
        even while the guest drives Carbon's ReceiveNextEvent loop. Leave
        keyboard, mouse and controller input in the Carbon queue. */
     pumping = YES;
+    app_termination_pump();
     carbon_bridge32_service_keyboard_layout();
     for (unsigned i = 0; i < 32; ++i) {
         NSEvent *event = [NSApp nextEventMatchingMask:NSEventMaskAppKitDefined
@@ -385,6 +403,7 @@ void carbon_native32_report_windows(void) {
         LP32CarbonGameWindow *window = (id)candidate;
         NSRect frame = [window frame];
         [report addObject:@{@"backdrop": @(window->auxiliaryBackdrop), @"visible": @([window isVisible]),
+            @"windowServerVisible": @(window_server_visible(window)),
             @"windowNumber": @([window windowNumber]), @"logicalVisible": @(window->logicalVisible),
             @"presented": @(window->hasPresented), @"minimized": @([window isMiniaturized]),
             @"key": @([window isKeyWindow]), @"main": @([window isMainWindow]), @"active": @([NSApp isActive]),
@@ -460,6 +479,9 @@ int32_t carbon_native32_event_parameter(void *event, const uint32_t *a) {
     if (!get) return unimpErr;
     uint32_t type = 0; ByteCount native_size = 0;
     OSStatus status = get(event, a[1], a[2], &type, 0, &native_size, NULL);
+    if (getenv("LP32_TRACE_CARBON_EVENTS") && a[2] == 'hcmd')
+        fprintf(stderr, "Carbon command parameter query status=%d type=%08x native-size=%lu guest-size=%u\n",
+            (int)status, type, (unsigned long)native_size, a[4]);
     if (status) return status;
     uint8_t converted[64]; size_t size = native_size;
     if (pointer_event_type(type) || cf_event_type(type) || type == 'void') {
@@ -471,6 +493,9 @@ int32_t carbon_native32_event_parameter(void *event, const uint32_t *a) {
     } else if (type == 'hcmd') {
         HICommandExtended command = {0};
         status = get(event, a[1], type, NULL, sizeof(command), NULL, &command);
+        if (getenv("LP32_TRACE_CARBON_EVENTS"))
+            fprintf(stderr, "Carbon command parameter read status=%d command=%08x host-size=%zu\n",
+                (int)status, (unsigned)command.commandID, sizeof(command));
         memset(converted, 0, sizeof(converted));
         memcpy(converted, &command.attributes, 4); memcpy(converted + 4, &command.commandID, 4);
         uint32_t handle = carbon_native32_handle(command.source.menu.menuRef);
@@ -520,6 +545,7 @@ int carbon_native32_dispatch(const char *name, const uint32_t *a, uint64_t *resu
 #define RETURN(v) do { *result = (uint64_t)(v); return 1; } while (0)
 #define FN(ret, sig) ((ret (*)sig)function)
     if (carbon_text32_dispatch(name, a, result)) return 1;
+    if (carbon_dialog32_dispatch(name, a, result)) return 1;
     if (getenv("LP32_TRACE_CARBON_NATIVE")) fprintf(stderr, "carbon-native: %s %08x %08x %08x %08x\n", name, a[0], a[1], a[2], a[3]);
     void *function = name[0] == '_' ? carbon_native32_symbol(name + 1) : NULL;
     if (IS("CGContextRelease")) { CGContextRelease(REF(0)); RETURN(0); }
@@ -533,6 +559,11 @@ int carbon_native32_dispatch(const char *name, const uint32_t *a, uint64_t *resu
         OSStatus (*get)(void *, int16_t, uint32_t, Size, void *, Size *) = carbon_native32_symbol("GetControlData");
         OSStatus status = get(REF(0), 0, 'mhan', sizeof(menu), &menu, NULL);
         RETURN(status ? 0 : carbon_native32_handle(menu));
+    }
+    if (IS("GetControlID") && !function) {
+        OSStatus (*get)(void *, void *) = carbon_native32_symbol("HIViewGetID");
+        if (!get) return 0;
+        RETURN((uint32_t)get(REF(0), PTR(1)));
     }
     if (IS("SetControlMaximum") && !function) {
         void (*set)(void *, int32_t) = carbon_native32_symbol("HIViewSetMaximum");
@@ -656,6 +687,9 @@ int carbon_native32_dispatch(const char *name, const uint32_t *a, uint64_t *resu
         RETURN(carbon_native32_handle(FN(void *, (void))( )));
     }
     if (IS("GetNextWindow")) RETURN(carbon_native32_handle(FN(void *, (void *))(REF(0))));
+    if (IS("GetWindowGroupOfClass")) RETURN(carbon_native32_handle(FN(void *, (uint32_t))(a[0])));
+    if (IS("GetWindowGroup") || IS("GetWindowGroupParent"))
+        RETURN(carbon_native32_handle(FN(void *, (void *))(REF(0))));
     if (IS("CreateWindowGroup") || IS("HIScrollViewCreate")) {
         void *value = NULL; OSStatus status = FN(OSStatus, (uint32_t, void **))(a[0], &value);
         if (a[1]) *(uint32_t *)PTR(1) = carbon_native32_handle(value); RETURN((uint32_t)status);
@@ -705,8 +739,7 @@ int carbon_native32_dispatch(const char *name, const uint32_t *a, uint64_t *resu
                         [window applicationActivationChanged:[NSNotification notificationWithName:NSApplicationDidBecomeActiveNotification object:NSApp]];
                     } else {
                     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
-                    static dispatch_once_t finishOnce;
-                    dispatch_once(&finishOnce, ^{ [NSApp finishLaunching]; });
+                    carbon_native32_finish_appkit_launch();
                     [NSApp activateIgnoringOtherApps:YES];
                     [window makeKeyWindow];
                     if ([NSApp isActive]) [window applicationActivationChanged:
@@ -880,7 +913,7 @@ int carbon_native32_dispatch(const char *name, const uint32_t *a, uint64_t *resu
         void *menu = NULL; OSStatus status = FN(OSStatus, (void *, uint32_t, uint32_t, void **, uint16_t *))(REF(0), a[1], a[2], &menu, PTR(4));
         if (a[3]) *(uint32_t *)PTR(3) = carbon_native32_handle(menu); RETURN((uint32_t)status);
     }
-    if (IS("DisableMenuCommand")) { FN(void, (void *, uint32_t))(REF(0), a[1]); RETURN(0); }
+    if (IS("DisableMenuCommand") || IS("EnableMenuCommand")) { FN(void, (void *, uint32_t))(REF(0), a[1]); RETURN(0); }
     if (IS("CountMenuItems") && REF(0)) RETURN(FN(uint16_t, (void *))(REF(0)));
     if (IS("SetMenuItemTextWithCFString") && REF(0)) RETURN((uint32_t)FN(OSStatus, (void *, uint16_t, CFStringRef))(REF(0), a[1], (CFStringRef)OBJ(2)));
     if (IS("CopyMenuItemTextAsCFString") && REF(0)) {

@@ -141,9 +141,9 @@ int tfu_controller32_dispatch(const char *name,const uint32_t *a,uint64_t *resul
 int tfu_controller32_install(void) {
     if(lp32_profile()->title!=LP32_TITLE_TFU || installed)return 0;
     struct hook {uint32_t address;uint8_t expected[6];unsigned length;const char *name;uint32_t thunk;} hooks[]={
-        {0x8a930,{0x55,0x89,0xe5,0x83,0xec,0x28},6,"_lp32_tfu_xinput_state",0},
-        {0x8a720,{0x55,0x89,0xe5,0x56,0x53},5,"_lp32_tfu_xinput_caps",0},
-        {0x8a888,{0x55,0x89,0xe5,0x56,0x53},5,"_lp32_tfu_xinput_vibration",0},
+        {lp32_profile()->tfu->xinput_state,{0x55,0x89,0xe5,0x83,0xec,0x28},6,"_lp32_tfu_xinput_state",0},
+        {lp32_profile()->tfu->xinput_caps,{0x55,0x89,0xe5,0x56,0x53},5,"_lp32_tfu_xinput_caps",0},
+        {lp32_profile()->tfu->xinput_vibration,{0x55,0x89,0xe5,0x56,0x53},5,"_lp32_tfu_xinput_vibration",0},
     };
     for(unsigned i=0;i<3;++i) {
         if(memcmp(pointer(hooks[i].address),hooks[i].expected,hooks[i].length)) {
@@ -152,15 +152,16 @@ int tfu_controller32_install(void) {
         hooks[i].thunk=compat_runtime32_guest_callback(hooks[i].name);if(!hooks[i].thunk)return -1;
     }
     uintptr_t page_size=(uintptr_t)getpagesize();
-    uintptr_t page=hooks[0].address&~(page_size-1);
-    if(mprotect((void *)page,page_size,PROT_READ|PROT_WRITE|PROT_EXEC))return -1;
     for(unsigned i=0;i<3;++i) {
+        uintptr_t page=hooks[i].address&~(page_size-1);
+        size_t span=((hooks[i].address+hooks[i].length+page_size-1)&~(page_size-1))-page;
+        if(mprotect((void *)page,span,PROT_READ|PROT_WRITE|PROT_EXEC))return -1;
         uint8_t patch[6]={0xe9,0,0,0,0,0x90};
         int32_t offset=(int32_t)(hooks[i].thunk-hooks[i].address-5);memcpy(patch+1,&offset,4);
         memcpy(pointer(hooks[i].address),patch,hooks[i].length);
         __builtin___clear_cache(pointer(hooks[i].address),(char *)pointer(hooks[i].address)+hooks[i].length);
+        if(mprotect((void *)page,span,PROT_READ|PROT_EXEC))return -1;
     }
-    if(mprotect((void *)page,page_size,PROT_READ|PROT_EXEC))return -1;
     installed=true;
     /* Carbon can own foreground input without updating Cocoa's active state.
        GameController's own foreground filter can then suppress physical
@@ -175,37 +176,37 @@ int tfu_controller32_self_test(void) {
     uint32_t memory=compat_runtime32_allocate(64,1);if(!memory)return -1;
     int status=-1;self_testing=true;test_connected=true;test_foreground_pid=getpid();
     test_sample=(struct pad_sample){.lx=1,.ly=-1,.rx=-.5,.ry=.5,.lt=.25,.rt=1,.buttons=0x1010,.pov=4500};
-    uint32_t result=compat_runtime32_call(0x8a930,(uint32_t[]){0,memory},2);
+    uint32_t result=compat_runtime32_call(lp32_profile()->tfu->xinput_state,(uint32_t[]){0,memory},2);
     struct xinput_state first=*(struct xinput_state *)pointer(memory);
     if(result || compat_runtime32_last_call_trapped() || first.pad.lx!=32767 || first.pad.ly!=-32768 ||
        first.pad.rx!=-16384 || first.pad.ry!=16384 || first.pad.lt!=64 || first.pad.rt!=255 || first.pad.buttons!=0x1019)goto done;
-    if(compat_runtime32_call(0x8a930,(uint32_t[]){0,memory},2) || ((struct xinput_state *)pointer(memory))->packet!=first.packet)goto done;
+    if(compat_runtime32_call(lp32_profile()->tfu->xinput_state,(uint32_t[]){0,memory},2) || ((struct xinput_state *)pointer(memory))->packet!=first.packet)goto done;
     /* Leave every physical control held across a focus loss. The guest must
        receive a neutral packet while another app owns input, then the held
        state again on return. This also runs with Cocoa inactive headlessly. */
     test_foreground_pid=0;
-    if(compat_runtime32_call(0x8a930,(uint32_t[]){0,memory},2))goto done;
+    if(compat_runtime32_call(lp32_profile()->tfu->xinput_state,(uint32_t[]){0,memory},2))goto done;
     struct xinput_state inactive=*(struct xinput_state *)pointer(memory);
     struct xinput_gamepad zero={0};
     if(memcmp(&inactive.pad,&zero,sizeof(zero)) || inactive.packet==first.packet)goto done;
-    if(compat_runtime32_call(0x8a720,(uint32_t[]){0,0,memory},3))goto done;
+    if(compat_runtime32_call(lp32_profile()->tfu->xinput_caps,(uint32_t[]){0,0,memory},3))goto done;
     test_foreground_pid=getpid();
-    if(compat_runtime32_call(0x8a930,(uint32_t[]){0,memory},2))goto done;
+    if(compat_runtime32_call(lp32_profile()->tfu->xinput_state,(uint32_t[]){0,memory},2))goto done;
     struct xinput_state reactivated=*(struct xinput_state *)pointer(memory);
     if(memcmp(&reactivated.pad,&first.pad,sizeof(first.pad)) || reactivated.packet==inactive.packet)goto done;
     test_sample=(struct pad_sample){.pov=-1};
-    if(compat_runtime32_call(0x8a930,(uint32_t[]){0,memory},2))goto done;
+    if(compat_runtime32_call(lp32_profile()->tfu->xinput_state,(uint32_t[]){0,memory},2))goto done;
     struct xinput_state neutral=*(struct xinput_state *)pointer(memory);
     if(memcmp(&neutral.pad,&zero,sizeof(zero)) || neutral.packet==first.packet)goto done;
-    if(compat_runtime32_call(0x8a720,(uint32_t[]){0,0,memory},3) || ((struct xinput_caps *)pointer(memory))->subtype!=1 ||
+    if(compat_runtime32_call(lp32_profile()->tfu->xinput_caps,(uint32_t[]){0,0,memory},3) || ((struct xinput_caps *)pointer(memory))->subtype!=1 ||
        ((struct xinput_caps *)pointer(memory))->flags!=0)goto done;
-    if(compat_runtime32_call(0x8a888,(uint32_t[]){0,memory},2))goto done;
+    if(compat_runtime32_call(lp32_profile()->tfu->xinput_vibration,(uint32_t[]){0,memory},2))goto done;
     test_connected=false;
-    if(compat_runtime32_call(0x8a930,(uint32_t[]){0,memory},2)!=kDisconnected ||
+    if(compat_runtime32_call(lp32_profile()->tfu->xinput_state,(uint32_t[]){0,memory},2)!=kDisconnected ||
        memcmp(&((struct xinput_state *)pointer(memory))->pad,&zero,sizeof(zero)))goto done;
     test_connected=true;
-    if(compat_runtime32_call(0x8a930,(uint32_t[]){1,memory},2)!=kDisconnected ||
-       compat_runtime32_call(0x8a930,(uint32_t[]){0,0},2)!=kInvalidArgument)goto done;
+    if(compat_runtime32_call(lp32_profile()->tfu->xinput_state,(uint32_t[]){1,memory},2)!=kDisconnected ||
+       compat_runtime32_call(lp32_profile()->tfu->xinput_state,(uint32_t[]){0,0},2)!=kInvalidArgument)goto done;
     status=0;
  done:
     self_testing=false;compat_runtime32_deallocate(memory);

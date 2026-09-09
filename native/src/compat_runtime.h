@@ -11,6 +11,9 @@ int compat_runtime32_initialize(struct macho_image32 *image);
 const struct macho_image32 *compat_runtime32_image(void);
 uint32_t compat_runtime32_call(uint32_t function, const uint32_t *arguments,
                                size_t argument_count);
+/* Captured i386 method results: 0=EDX:EAX, 1=x87 float bits, 2=x87 double bits. */
+uint64_t compat_runtime32_call_result(uint32_t function, const uint32_t *arguments,
+                                     size_t count, unsigned kind);
 int compat_runtime32_last_call_trapped(void);
 uint32_t compat_runtime32_copy_cstring(const char *string);
 uint32_t compat_runtime32_allocate(size_t size, int clear);

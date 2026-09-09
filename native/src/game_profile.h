@@ -153,6 +153,13 @@ struct lp32_activator_layout {
     uint32_t activate_online;
 };
 
+/* Verified Aspyr executable variants share the same input/movie object ABI. */
+struct lp32_tfu_layout {
+    uint32_t xinput_state, xinput_caps, xinput_vibration;
+    uint32_t input_update, input_tail, input_evaluator;
+    uint32_t movie_hook, movie_next_frame, movie_completion;
+};
+
 struct lp32_game_profile {
     enum lp32_title title;
     const char *name;               /* short identifier, e.g. "LEGOPirates" */
@@ -162,6 +169,7 @@ struct lp32_game_profile {
     uint32_t entry_eip;             /* detection key */
     uint32_t image_end;             /* detection key (max_address) */
     uint32_t main_address;          /* 0 = derive from the crt start stub */
+    const struct lp32_tfu_layout *tfu;
     const struct lp32_startup_latch_patch *startup_latch;
     const struct lp32_controller_layout *controller;
     const struct lp32_button_font_layout *button_font; /* NULL = Xbox glyphs only */

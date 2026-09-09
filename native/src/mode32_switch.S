@@ -23,3 +23,30 @@ _run_compat32:
     xchgq %r14, %rsp
     ljmp *(%r14)
     ud2
+
+/* Capture non-EAX guest results before host C code can clobber EDX or ST(0).
+   kind: 0 = EDX:EAX, 1 = x87 float, 2 = x87 double. Normal calls retain the
+   original run_compat32 path. Used for embedded Cocoa method return values. */
+.p2align 4, 0x90
+.globl _run_compat32_capture
+_run_compat32_capture:
+    pushq %rbx
+    subq $16, %rsp
+    movl %ecx, %ebx
+    call _run_compat32
+    cmpl $1, %ebx
+    je 1f
+    cmpl $2, %ebx
+    je 2f
+    movl %eax, %eax
+    shlq $32, %rdx
+    orq %rdx, %rax
+    jmp 3f
+1:  fstps (%rsp)
+    movl (%rsp), %eax
+    jmp 3f
+2:  fstpl (%rsp)
+    movq (%rsp), %rax
+3:  addq $16, %rsp
+    popq %rbx
+    ret

@@ -87,6 +87,14 @@ static CFStringRef preferences_application(uint32_t value)
     return application;
 }
 
+void *carbon_bridge32_game_bundle(void) { return game_bundle; }
+void *carbon_bridge32_user_defaults(void)
+{
+    static NSUserDefaults *defaults;
+    if (!defaults) defaults = [[NSUserDefaults alloc] initWithSuiteName:(NSString *)preferences_application(0)];
+    return defaults;
+}
+
 /* Keep native MP IDs opaque and stable across repeated CurrentTaskID calls. */
 static uint32_t mp_handle(void *pointer)
 {
@@ -524,6 +532,9 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a, uint64_t *resu
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
     }
+    // The Steam Mac build explicitly initializes Cocoa before its Carbon UI.
+    // Forward the no-argument BOOL call instead of entering an i386 AppKit stub.
+    if (IS("NSApplicationLoad")) RETURN(NSApplicationLoad() ? 1 : 0);
     if (IS("CGCaptureAllDisplays")) {
         // AGL fullscreen is presented through the window compositor. Do not
         // take exclusive ownership of the user's other displays.

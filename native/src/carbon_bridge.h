@@ -2,6 +2,8 @@
 #define LP32_CARBON_BRIDGE_H
 #include <stdint.h>
 void carbon_bridge32_draw_user_pane(uint32_t function, uint32_t control, int32_t part, void *context);
+void *carbon_bridge32_game_bundle(void);
+void *carbon_bridge32_user_defaults(void);
 int carbon_bridge32_configure(const char *image_path);
 void carbon_bridge32_service_keyboard_layout(void);
 int carbon_bridge32_keyboard_self_test(void);
