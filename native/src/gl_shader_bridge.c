@@ -11,6 +11,35 @@
 static int tfu_compat;
 void gl_shader_bridge32_enable_tfu_compat(void) { tfu_compat = 1; }
 
+/* The generated HDR pass clamps its logarithmic shoulder at mHDRkneeLow,
+   but selects that shoulder for every positive input when the exposure-range
+   minimum is zero. All darker colors then become the same gray, erasing
+   material and reflection detail. Retain exposed linear RGB below the knee,
+   independently per channel, and keep the existing shoulder and bloom above
+   it. Match the captured instruction sequence, not a transient shader ID.
+   The caller's 4x source allocation has room for these two replacements. */
+static unsigned repair_tfu_hdr_toe(char *source)
+{
+    if (getenv("LP32_KEEP_TFU_GLSL_HDR") || strstr(source, "lp32_hdr_linear")) return 0;
+    const char *prepare = "r2.xyz = vec3(r0.yzww * r0.xxxx + (-(mHDRkneeLow)).xxxx);";
+    const char *select = "r0.xyz = vec3(cmp((-(r0)).xxxx, r0.yzww, r2.xyww));";
+    char *start = strstr(source, prepare), *end = strstr(source, select);
+    if (!start || !end || start >= end ||
+        !strstr(source, "uniform vec4 mHDRkneeLow;") ||
+        !strstr(source, "uniform vec4 mBloomScale;")) return 0;
+    const char *linear = "vec3 lp32_hdr_linear = r0.yzw * r0.x;\n";
+    const char *fixed =
+        "r0.xyz = vec3("
+        "lp32_hdr_linear.x <= mHDRkneeLow.x ? lp32_hdr_linear.x : r2.x, "
+        "lp32_hdr_linear.y <= mHDRkneeLow.x ? lp32_hdr_linear.y : r2.y, "
+        "lp32_hdr_linear.z <= mHDRkneeLow.x ? lp32_hdr_linear.z : r2.w);";
+    memmove(end + strlen(fixed), end + strlen(select), strlen(end + strlen(select)) + 1);
+    memcpy(end, fixed, strlen(fixed));
+    memmove(start + strlen(linear), start, strlen(start) + 1);
+    memcpy(start, linear, strlen(linear));
+    return 1;
+}
+
 /* Aspyr translates D3D9 bytecode to GLSL. D3D9 RSQ takes abs(src), and CMP
    selects a value without doing arithmetic on its unselected input. The
    original translation can therefore spread NaNs from an unused normal-map
@@ -93,11 +122,12 @@ static void repair_tfu_shader(GLuint shader)
         } else *out++ = *cursor++;
     }
     *out = 0;
-    if (rsq || cmp || logarithm || nrm) {
+    unsigned hdr = repair_tfu_hdr_toe(fixed);
+    if (rsq || cmp || logarithm || nrm || hdr) {
         const GLchar *text = fixed;
         glShaderSource(shader, 1, &text, NULL);
         if (getenv("LP32_DUMP_GLSL"))
-            fprintf(stderr, "compat32: TFU GLSL shader %u repaired rsq=%u cmp=%u log=%u nrm=%u\n", shader, rsq, cmp, logarithm, nrm);
+            fprintf(stderr, "compat32: TFU GLSL shader %u repaired rsq=%u cmp=%u log=%u nrm=%u hdr=%u\n", shader, rsq, cmp, logarithm, nrm, hdr);
     }
     free(source); free(fixed);
 }

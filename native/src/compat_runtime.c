@@ -4,6 +4,7 @@
 #include "audio_bridge.h"
 #include "controller_bridge.h"
 #include "tfu_controller.h"
+#include "tfu_input.h"
 #include "game_profile.h"
 #include "guest_dyld.h"
 #include "guest_memory.h"
@@ -3959,6 +3960,7 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
     if (!strncmp(name, "_lp32_tfu_", 10)) {
         uint64_t result;
         if (tfu_controller32_dispatch(name, arguments, &result)) return result;
+        if (tfu_input32_dispatch(name, arguments, &result)) return result;
     }
     if (import_is(name, kControllerGlyphCallbackName)) {
         controller_bridge32_button_glyph(arguments[0],

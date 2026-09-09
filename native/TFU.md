@@ -176,6 +176,16 @@ The Portal 2 GUI converter remains specific to Portal 2.
   as the initial previous-display sentinel, causing its first renderer to
   reuse a nonexistent mode list. The checked patch changes that sentinel
   to UINT32_MAX. Both attached displays reach the rendered main menu.
+- In keyboard/mouse gameplay, **F** is an additional hold/release binding for
+  Force Grip. Right mouse and the configured primary binding still work;
+  holding both inputs keeps Grip active until both are released. Saved
+  bindings and their displayed prompts are unchanged, as are controller
+  mappings. The TFU 1.2 signature-checked hook runs the original binding
+  evaluator, then merges F from the game's keyboard snapshot into Grip's
+  action state. The fixed menu map is excluded. `make GAME=tfu
+  test-tfu-grip-alias` exercises the actual guest update/evaluator, including
+  both release orders, unrelated actions, and menu exclusion. The controller
+  regression test and an isolated fullscreen intro startup also passed.
 - GameController.framework feeds the game's built-in Xbox 360 adapter.
   Select **Xbox 360 Controller** in TFU's input options and connect an Xbox,
   DualShock 4, or DualSense supported by macOS. Cross/Circle/Square/Triangle
@@ -900,3 +910,94 @@ reloaded through Continue. [TFU's manual](https://shared.akamai.steamstatic.com/
 and periodic checkpoints; completing the whole first level is not required.
 Continue restores the last autosave, not necessarily the position where the
 application was closed. The pause menu also offers Save Game.
+
+### HDR shadow detail (September 8, 2026)
+
+The pull-out-platform investigation found a second source of flat dark patches,
+separate from the earlier nonfinite reflection pixels. A float probe in the
+latest checkpoint doorway retained RGB `{0.0517883,0.0447083,0.0445557}` in
+scene target 8, but HDR program 19 converted it to
+`{0.0901961,0.0901961,0.0901961}` in target 26. Subsequent passes retained that
+constant gray. The generated HDR shader selects its logarithmic shoulder for
+every positive input when `mAutoExposureRangeMin` is zero. Its shoulder clamps
+all values below `mHDRkneeLow` to the knee, losing texture detail and hue.
+
+The TFU-only source repair now uses exposed linear RGB below the knee, per
+channel, and retains the existing logarithmic shoulder and bloom composition.
+It matches the captured instruction sequence rather than shader object numbers.
+`LP32_KEEP_TFU_GLSL_HDR=1` disables only this correction. The same probe now
+produces `{0.054902,0.0470588,0.0470588}`, and the doorway retains its dark
+material detail. No depth, geometry, shadow, fog, or buffer-upload experiment
+is included in the fix.
+
+Evidence: `build/platform-shader/hdr-evidence.json`, the baseline/corrected
+float-pass logs, and `hdr-toe.png`. GPU regression covers black, sub-knee
+colors, mixed channels, exposure, the knee boundary, unchanged highlights,
+bloom, and repeated source submission. A 90-second latest-checkpoint replay
+and an earlier reflection-hallway replay completed using isolated save copies.
+The original pull-out platform camera state was lost at restart; that exact
+view has not been visually reverified. The user's save remains unchanged.
+
+The promoted bundle also passed a normal-logo startup and Continue replay
+(`build/platform-shader/packaged-startup-run.log`), and its ad-hoc signature
+passed `codesign --verify --deep --strict`. The final GPU run is recorded in
+`build/platform-shader/final-shader-regression.log`.
+
+## Intermittent cutscene replay: EOF frame-counter wrap
+
+The recurring intro and in-game replay report exposed a guest-side completion
+race. The earlier normal intro test did not fix this path. TFU's movie render
+routine at `0x7346d0` first calls the QuickTime adapter's wait routine
+(`0x9f808`), then its frame routine (`0x9f8de`). If EOF arrives between those
+two checks, the frame routine sets `FrameNum` (`decoder+0xc`) to `Frames`
+(`decoder+8`). The unconditional NextFrame call at `0x734834` then increments
+past that value and rewinds, resetting FrameNum to zero. The non-looping
+manager's completion check at `0x734be2` consequently misses the end. This
+matches the saved trace's GoToBeginningOfMovie calls after 515 delivered intro
+frames without a new movie open or StopMovie.
+
+The TFU-only patch guards that final NextFrame call when the manager's loop
+flag (`manager+0xd`) is clear and FrameNum has reached Frames. It leaves the
+original frame advancement, intentional loops, and explicit seek APIs intact.
+The loader checks the original call-site and completion-check bytes before
+installing the stub on TFU's otherwise unused startup-latch page. It does not
+alter the source game image or the shared AVFoundation transport.
+
+`make GAME=tfu test-tfu-movie-end` uses Unicorn and the actual guest image to
+reproduce the EOF wrap and verify its correction, with 34 frame-boundary cases
+including zero/one-frame movies, deliberate loops, and register/stack
+preservation. It compiles the production C patch emitter rather than carrying
+a separate copy of the patch bytes. Locking and the AVPlayer rewind are stubbed;
+the guest frame arithmetic and completion check execute unchanged. This test
+does not open a player, window, or GPU context. Full cutscene playback has not
+been rerun while the user is playing; the fix takes effect on the next launch.
+
+## Native audio-crash stack capture
+
+PID 29712 crashed on September 8 at 20:43:31 at the same caulk audio-allocator
+UD2 (`0x7ff819ef70ed`) as PID 21932. The old handler recorded the fault registers
+but omitted stack contents above the guest address range. There was no fresh
+macOS .ips report. Evidence and the timing of the preceding bundle update are
+preserved in `build/crash-29712/`; the origin of the allocator failure remains
+unresolved.
+
+TFU now captures up to 64 frame-pointer frames starting at the faulting
+thread's saved RIP/RSP/RBP, including native worker stacks above 4 GiB. Kernel
+memory reads validate each frame without dereferencing damaged pointers.
+The trace stops on invalid/nonascending/unreadable frames or its fixed limit;
+128 raw stack words provide separately labelled fallback evidence where a
+library omits frame pointers or the chain crosses a guest gateway. This is a
+bounded frame-pointer trace, not a guarantee of complete mixed-mode unwinding.
+
+Image paths, load addresses, text ranges, and Mach-O UUIDs are cached during
+normal dyld image-load callbacks. The fatal path writes these records for
+offline symbolication without calling backtrace, dladdr, a heap allocator,
+stdio, or a mutex. It runs before the older detailed register logger so that
+an allocator-related failure in that logger cannot erase the new trace.
+
+Each crash writes `~/Library/Logs/TFUCompat/crash-<pid>-<launch-time>.log`,
+created exclusively with permissions 0600. A later launch cannot truncate it.
+Frames also appear in the session log. `tests/test_tfu_crash_diagnostics.py`
+passed actual SIGILL/SIGSEGV tests under Rosetta, a worker-thread SIGILL,
+a corrupted-frame-pointer trap, offline caller symbolication, and preservation
+of an existing crash report. These tests launch no game or GPU context.

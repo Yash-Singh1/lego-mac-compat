@@ -3,6 +3,9 @@
 #include "game_profile.h"
 #include "guest_dyld.h"
 #include "carbon_bridge.h"
+#include "tfu_input.h"
+#include "tfu_movie_end.h"
+#include "crash_trace.h"
 #include "movie_bridge.h"
 #include "openal_bridge.h"
 #include "agl_bridge.h"
@@ -20,6 +23,8 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <time.h>
+#include <pthread.h>
 #include <unistd.h>
 
 static uintptr_t guest_breakpoint_address;
@@ -57,6 +62,11 @@ static void open_guest_diagnostic_log(const char *executable_path)
         perror("compat32: create diagnostic log directory");
         return;
     }
+    /* Dedicated immutable crash artifact; the next launch truncates only
+       last-run.log. No paths or image metadata are discovered at crash time. */
+    snprintf(path, sizeof(path), "%s/crash-%ld-%llu.log", directory,
+             (long)getpid(), (unsigned long long)time(NULL));
+    crash_trace_set_path(path);
     const char *override = getenv("LP32_DIAGNOSTIC_LOG");
     length = override ? snprintf(path, sizeof(path), "%s", override) :
         snprintf(path, sizeof(path), "%s/last-run.log", directory);
@@ -265,6 +275,27 @@ static int write_guest_code(uintptr_t address, const void *bytes, size_t length,
         fprintf(stderr, "compat32: protect %s: %s\n", what, strerror(errno));
         return -1;
     }
+    return 0;
+}
+
+static int install_tfu_movie_end_patch(void)
+{
+    if (lp32_profile()->title != LP32_TITLE_TFU) return 0;
+    /* The startup-latch stub page is unused by TFU. Verify both the call
+       site and the manager's existing non-loop completion check. */
+    if (lp32_profile()->startup_latch ||
+        memcmp((void *)(uintptr_t)TFU_MOVIE_END_HOOK, tfu_movie_end_expected,
+               sizeof(tfu_movie_end_expected)) ||
+        memcmp((void *)(uintptr_t)0x734be2, tfu_movie_end_completion,
+               sizeof(tfu_movie_end_completion))) {
+        fprintf(stderr, "compat32: TFU movie end guard signature mismatch\n");
+        return -1;
+    }
+    uint8_t code[28], hook[8];
+    tfu_movie_end_code(code, hook);
+    if (write_guest_code(TFU_MOVIE_END_STUB, code, sizeof(code), "TFU movie end stub") ||
+        write_guest_code(TFU_MOVIE_END_HOOK, hook, sizeof(hook), "TFU movie end hook")) return -1;
+    fprintf(stderr, "compat32: TFU non-looping movie EOF wrap guard enabled\n");
     return 0;
 }
 
@@ -520,6 +551,9 @@ static void guest_crash_diagnostic(int signal_number, siginfo_t *info,
             return;
         }
     }
+    crash_trace_capture(signal_number, rip, rsp,
+                        context->uc_mcontext->__ss.__rbp,
+                        context->uc_mcontext->__ss.__cs);
     GUEST_DIAGNOSTIC(
             "compat32: signal %d code=%d address=%p "
             "rip=0x%016llx rsp=0x%016llx\n",
@@ -653,15 +687,43 @@ static const char *default_image_path(const char *argv0, char *buffer,
     return NULL;
 }
 
+__attribute__((noinline)) static int crash_diagnostic_test_leaf(int kind)
+{
+    if (kind == 2) {
+        /* A damaged frame pointer must not cause a second exception in the
+           logger. It must still retain the fault PC and raw stack words. */
+        __asm__ volatile("movq $1, %%rbp; ud2" ::: "memory");
+    }
+    if (kind) __builtin_trap();
+    raise(SIGSEGV);
+    return kind;
+}
+__attribute__((noinline)) static int crash_diagnostic_test_middle(int kind)
+{
+    static volatile int result;
+    result = crash_diagnostic_test_leaf(kind);
+    return result + 1;
+}
+__attribute__((noinline)) static void *crash_diagnostic_test_worker(void *kind)
+{
+    return (void *)(intptr_t)crash_diagnostic_test_middle((int)(intptr_t)kind);
+}
+
 int main(int argc, char **argv)
 {
     const char *crash_selftest = getenv("LP32_CRASH_DIAGNOSTIC_SELFTEST");
-    bool illegal_selftest = crash_selftest && !strcmp(crash_selftest, "SIGILL");
+    bool illegal_selftest = crash_selftest && strcmp(crash_selftest, "1");
     install_guest_crash_diagnostics(illegal_selftest);
     compat_runtime32_set_diagnostic_sink(runtime_diagnostic_line);
     if (crash_selftest) {
-        if (illegal_selftest) __builtin_trap();
-        raise(SIGSEGV);
+        crash_trace_init();
+        crash_trace_set_path(getenv("LP32_CRASH_REPORT_SELFTEST_PATH"));
+        int kind = !strcmp(crash_selftest, "BAD_FP") ? 2 : illegal_selftest;
+        if (!strcmp(crash_selftest, "WORKER_SIGILL")) {
+            pthread_t thread;
+            if (pthread_create(&thread, NULL, crash_diagnostic_test_worker, (void *)(intptr_t)kind)) return EXIT_FAILURE;
+            pthread_join(thread, NULL);
+        } else crash_diagnostic_test_middle(kind);
         return EXIT_FAILURE;
     }
     if (getenv("LP32_OBJC_PROXY_SELFTEST")) {
@@ -690,8 +752,10 @@ int main(int argc, char **argv)
     /* TFU can terminate with SIGILL under the translated guest runtime.
        Preserve the faulting instruction address/registers in our own log;
        macOS does not always produce an .ips report for these exits. */
-    if (lp32_profile()->title == LP32_TITLE_TFU)
+    if (lp32_profile()->title == LP32_TITLE_TFU) {
+        crash_trace_init();
         install_guest_crash_diagnostics(true);
+    }
     if (lp32_profile()->title == LP32_TITLE_TFU &&
         (guest_dyld32_initialize(image_path) || carbon_bridge32_configure(image_path))) return EXIT_FAILURE;
     if (lp32_profile()->title == LP32_TITLE_PORTAL2) {
@@ -776,6 +840,10 @@ int main(int argc, char **argv)
         macho_image32_unload(&image);
         return EXIT_FAILURE;
     }
+    if (tfu_input32_install()) return EXIT_FAILURE;
+    if (install_tfu_movie_end_patch()) return EXIT_FAILURE;
+    if (getenv("LP32_TFU_GRIP_ALIAS_SELFTEST"))
+        return tfu_input32_self_test() ? EXIT_FAILURE : EXIT_SUCCESS;
     if (getenv("LP32_CONTROLLER_SELFTEST")) {
         int result = controller_bridge32_run_self_test();
         macho_image32_unload(&image);

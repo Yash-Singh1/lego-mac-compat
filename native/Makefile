@@ -186,7 +186,7 @@ $(BUILD_DIR)/mode32_probe: src/mode32_probe.c src/mode32_switch.S src/address_sp
 	$(CLANG) $(CFLAGS) $(LDFLAGS) $^ -o $@
 	codesign --force --sign - $@
 
-$(BUILD_DIR)/game_loader: src/game_loader.c src/game_profile.c src/macho_loader.c src/macho_file.c src/guest_dyld.c src/guest_memory.c src/network_bridge.c src/font_bridge.m src/carbon_bridge.m src/carbon_ui.m src/carbon_native.m src/carbon_text.m src/carbon_files.m src/cf_format.c src/movie_bridge.m src/openal_bridge.m src/agl_bridge.m src/carbon_display.m src/xml_bridge.m src/gl_shader_bridge.c src/gl_misc_bridge.c src/gl_volume_bridge.c src/compat_runtime.c src/wide_format.c src/audio_bridge.c src/audio_queue_bridge.c src/controller_bridge.m src/tfu_controller.m src/cursor_state.c src/objc_bridge.m src/arb_program_guard.c src/arb_sampler_usage.c src/mode32_switch.S src/import_gateway.S src/guest_context.S src/address_space_reserve.S src/tfu_timing.h | $(BUILD_DIR)
+$(BUILD_DIR)/game_loader: src/game_loader.c src/game_profile.c src/macho_loader.c src/macho_file.c src/guest_dyld.c src/guest_memory.c src/network_bridge.c src/font_bridge.m src/carbon_bridge.m src/carbon_ui.m src/carbon_native.m src/carbon_text.m src/carbon_files.m src/cf_format.c src/movie_bridge.m src/openal_bridge.m src/agl_bridge.m src/carbon_display.m src/xml_bridge.m src/gl_shader_bridge.c src/gl_misc_bridge.c src/gl_volume_bridge.c src/compat_runtime.c src/wide_format.c src/audio_bridge.c src/audio_queue_bridge.c src/controller_bridge.m src/tfu_controller.m src/tfu_input.c src/cursor_state.c src/objc_bridge.m src/arb_program_guard.c src/arb_sampler_usage.c src/mode32_switch.S src/import_gateway.S src/guest_context.S src/address_space_reserve.S src/tfu_timing.h | $(BUILD_DIR)
 	$(CLANG) $(CFLAGS) $(LDFLAGS) $(filter-out %.h,$^) -framework Cocoa -framework Carbon -framework OpenGL -framework ImageIO -framework CoreText -framework AudioToolbox -framework AudioUnit -framework CoreAudio -framework GameController -framework IOKit -framework AVFoundation -framework CoreVideo -framework CoreMedia -framework OpenAL -lexpat -liconv -o $@
 	codesign --force --sign - $@
 
@@ -197,6 +197,16 @@ $(BUILD_DIR)/test_gl_shader_bridge: tests/test_gl_shader_bridge.c src/gl_shader_
 	$(CLANG) $(CFLAGS) -Wl,-no_pie,-pagezero_size,0x1000 -Isrc tests/test_gl_shader_bridge.c src/gl_shader_bridge.c -framework OpenGL -o $@
 
 .PHONY: test-gl-shader-bridge
+.PHONY: test-tfu-grip-alias
+.PHONY: test-tfu-movie-end
+test-tfu-movie-end:
+	python3 tests/test_tfu_movie_end.py
+
+$(BUILD_DIR)/game_loader: src/tfu_movie_end.h src/crash_trace.c src/crash_trace.h
+
+test-tfu-grip-alias: $(BUILD_DIR)/game_loader
+	env LP32_HEADLESS=1 LP32_TFU_GRIP_ALIAS_SELFTEST=1 arch -x86_64 ./$(BUILD_DIR)/game_loader "$(BUILD_DIR)/TFU-Compat.app/Contents/SharedSupport/TFU.image"
+
 .PHONY: test-tfu-keyboard
 test-tfu-keyboard: $(BUILD_DIR)/game_loader
 	env LP32_TFU_KEYBOARD_SELFTEST=1 arch -x86_64 ./$(BUILD_DIR)/game_loader "$(BUILD_DIR)/TFU-Compat.app/Contents/SharedSupport/TFU.image"

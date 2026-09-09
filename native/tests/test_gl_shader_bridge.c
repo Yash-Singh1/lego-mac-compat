@@ -36,6 +36,85 @@ static GLuint shader(GLenum type, const char *text)
     assert(*(GLint *)(guest + 64));
     return object;
 }
+
+static void test_hdr_toe(GLuint vertex)
+{
+    /* Arithmetic from the captured HDR pass, with texture samples supplied
+       as uniforms. The original shader loses both detail and hue below its
+       knee when mAutoExposureRangeMin is zero. */
+    const char *source =
+        "// D3DPS_VERSION(3,0)\n"
+        "uniform vec4 values; uniform vec4 bloom;\n"
+        "uniform vec4 mHDRkneeLow;\n"
+        "uniform vec4 mHDRkneeF;\n"
+        "uniform vec4 mBloomScale;\n"
+        "uniform vec4 mAutoExposureRangeMin;\n"
+        "const vec4 c0 = vec4(0.5,0.0,1.0,0.693147);\n"
+        "vec4 cmp(vec4 a,vec4 b,vec4 c) { return vec4(a.x>=0.0?b.x:c.x,"
+        "a.y>=0.0?b.y:c.y,a.z>=0.0?b.z:c.z,a.w>=0.0?b.w:c.w); }\n"
+        "void main(void) { vec4 r0,r1,r2,r3;\n"
+        "r0.x=values.w; r0.yzw=values.xyz+bloom.xyz*mBloomScale.xyz;\n"
+        "r1.xyz=bloom.xyz*mBloomScale.w;\n"
+        "r2.xyz = vec3(r0.yzww * r0.xxxx + (-(mHDRkneeLow)).xxxx);\n"
+        "r3.xyz=vec3(max(r2,c0.yyyy)); r2.z=c0.z;\n"
+        "r2.xyw=(r3.xyzz*mHDRkneeF.xxxx+r2.zzzz).xyw;\n"
+        "r3.x=log2(abs(r2.x)); r3.y=log2(abs(r2.y)); r3.z=log2(abs(r2.w));\n"
+        "r2.xyw=(r3.xyzz*c0.wwww).xyw; r0.x=1.0/mHDRkneeF.x;\n"
+        "r2.xyw=(r2*r0.xxxx+mHDRkneeLow.xxxx).xyw;\n"
+        "r3.xyz=vec3(cmp(vec4(-r0.yzw+mAutoExposureRangeMin.xyz,0.0),c0.yyyy,c0.zzzz));\n"
+        "r0.x=dot(r3.xyz,r3.xyz);\n"
+        "r0.xyz = vec3(cmp((-(r0)).xxxx, r0.yzww, r2.xyww));\n"
+        "r0.w=1.0-mBloomScale.w; gl_FragColor=vec4(r0.xyz*r0.w+r1.xyz,1.0); }\n";
+    const GLfloat knee = .0883883461f, shoulder = .952796817f;
+    const GLfloat colors[][4] = {
+        {0,0,0,1.05257988f}, {.0517883f,.0447083f,.0445557f,1.05257988f},
+        {.001f,.02f,.07f,1.05257988f}, {0,.01f,.5f,1.05257988f},
+        {.2f,1,4,1.05257988f}, {.0883783461f,.0883883461f,.0883983461f,1},
+        {.01f,.2f,1,2}, {.005f,.006f,.007f,.5f}
+    };
+    for (int repaired = 0; repaired < 2; ++repaired) {
+        if (!repaired) setenv("LP32_KEEP_TFU_GLSL_HDR", "1", 1);
+        else unsetenv("LP32_KEEP_TFU_GLSL_HDR");
+        GLuint fs = shader(GL_FRAGMENT_SHADER, source), p = glCreateProgram();
+        if (repaired) {
+            GLint length=0; glGetShaderiv(fs,GL_SHADER_SOURCE_LENGTH,&length);
+            assert(length>0 && length<4096-256);
+            glGetShaderSource(fs,length,NULL,(GLchar *)(guest+256));
+            *(uint32_t *)guest=address(256);
+            call("glShaderSourceARB",fs,1,address(0),0);
+        }
+        call("glCompileShader", fs, 0, 0, 0);
+        GLint ok = 0; glGetShaderiv(fs, GL_COMPILE_STATUS, &ok); assert(ok);
+        glAttachShader(p, vertex); glAttachShader(p, fs); glLinkProgram(p);
+        glGetProgramiv(p, GL_LINK_STATUS, &ok); assert(ok); glUseProgram(p);
+        glUniform4f(glGetUniformLocation(p,"mHDRkneeLow"),knee,knee,knee,knee);
+        glUniform4f(glGetUniformLocation(p,"mHDRkneeF"),shoulder,shoulder,shoulder,shoulder);
+        glUniform4f(glGetUniformLocation(p,"mAutoExposureRangeMin"),0,0,0,0);
+        for (unsigned bloom_on=0; bloom_on<2; ++bloom_on) {
+            GLfloat weight=bloom_on?.2f:0, glow=bloom_on?.015f:0;
+            glUniform4f(glGetUniformLocation(p,"mBloomScale"),1.2f,1.2f,1.2f,weight);
+            glUniform4f(glGetUniformLocation(p,"bloom"),glow,glow,glow,1);
+            for (unsigned i=0; i<sizeof(colors)/sizeof(colors[0]); ++i) {
+                glUniform4fv(glGetUniformLocation(p,"values"),1,colors[i]);
+                glBegin(GL_QUADS);
+                glVertex2f(-1,-1); glVertex2f(1,-1); glVertex2f(1,1); glVertex2f(-1,1);
+                glEnd();
+                GLfloat pixel[4]; glReadPixels(2,2,1,1,GL_RGBA,GL_FLOAT,pixel);
+                for (unsigned c=0;c<3;++c) {
+                    GLfloat linear=(colors[i][c]+glow*1.2f)*colors[i][3];
+                    GLfloat expected=linear<=knee?linear:knee+log1pf((linear-knee)*shoulder)/shoulder;
+                    expected=expected*(1-weight)+glow*weight;
+                    if (repaired || linear>knee) assert(isfinite(pixel[c]) && fabsf(pixel[c]-expected)<.00003f);
+                    if (!repaired && i==1 && !bloom_on) assert(fabsf(pixel[c]-knee)<.00001f);
+                }
+                assert(pixel[3]==1);
+            }
+        }
+        assert(glGetError()==GL_NO_ERROR);
+        glUseProgram(0); glDeleteProgram(p); glDeleteShader(fs);
+    }
+    puts("TFU HDR: PASS (shadow detail, hue, black, knee continuity, exposure, shoulder and bloom)");
+}
 int main(void)
 {
     guest = mmap((void *)0x20000000, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -181,6 +260,7 @@ int main(void)
         assert(glGetError() == GL_NO_ERROR);
         glUseProgram(0); glDeleteProgram(normal_program); glDeleteShader(normal_shader);
     }
+    test_hdr_toe(vertex);
     call("glUseProgram", 0, 0, 0, 0);
     call("glDetachObjectARB", program, vertex, 0, 0);
     call("glDeleteShader", vertex, 0, 0, 0);
