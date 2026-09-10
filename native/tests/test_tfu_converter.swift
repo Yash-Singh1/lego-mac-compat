@@ -107,6 +107,56 @@ struct ConverterTests {
         try fm.removeItem(at: linked)
         print("PASS: Steam/retail discovery, missing assets, containment, private copy, links rejected")
 
+        // Read-only Steam HID resources appear both in the outer bundle and
+        // the private original app. Exercise the production finishing path,
+        // including real metadata cleanup and strict signature verification.
+        let readonlySource = temp.appendingPathComponent("HID_cookie_strings.plist")
+        let plistData = Data("<?xml version=\"1.0\"?><plist version=\"1.0\"><dict/></plist>".utf8)
+        try plistData.write(to: readonlySource)
+        try converter.run("/usr/bin/xattr", ["-w", "org.32bitgoofy.permission-test", "retained-source", readonlySource.path])
+        try fm.setAttributes([.posixPermissions: 0o444], ofItemAtPath: readonlySource.path)
+        let permissionApp = temp.appendingPathComponent("PermissionTest.app")
+        let contents = permissionApp.appendingPathComponent("Contents")
+        let macOS = contents.appendingPathComponent("MacOS")
+        try fm.createDirectory(at: macOS, withIntermediateDirectories: true)
+        let executable = macOS.appendingPathComponent("PermissionTest")
+        try fm.copyItem(atPath: "/usr/bin/true", toPath: executable.path)
+        try fm.setAttributes([.posixPermissions: 0o555], ofItemAtPath: executable.path)
+        let info = ["CFBundleExecutable": "PermissionTest", "CFBundleIdentifier": "org.32bitgoofy.permission-test", "CFBundlePackageType": "APPL"]
+        try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
+            .write(to: contents.appendingPathComponent("Info.plist"))
+        var copiedPlists: [URL] = []
+        for path in ["Resources/English.lproj", "SharedSupport/TFU/Star Wars The Force Unleashed.app/Contents/Resources/English.lproj"] {
+            let directory = contents.appendingPathComponent(path)
+            try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+            let copy = directory.appendingPathComponent(readonlySource.lastPathComponent)
+            try fm.copyItem(at: readonlySource, to: copy)
+            copiedPlists.append(copy)
+            try fm.setAttributes([.posixPermissions: 0o555], ofItemAtPath: directory.path)
+        }
+        func mode(_ path: URL) throws -> Int {
+            (try fm.attributesOfItem(atPath: path.path)[.posixPermissions] as! NSNumber).intValue & 0o777
+        }
+        try expect(try mode(copiedPlists[0]) == 0o444, "fixture preserves read-only source mode")
+        try converter.finishApp(permissionApp)
+        for copy in copiedPlists {
+            try expect(try mode(copy) == 0o644 && mode(copy.deletingLastPathComponent()) == 0o755, "only owner permissions added")
+            try expect(try Data(contentsOf: copy) == plistData, "resource contents preserved")
+            try expect(try converter.run("/usr/bin/xattr", [copy.path]).isEmpty, "copied metadata cleared")
+        }
+        try expect(try mode(executable) == 0o755, "executable permission preserved")
+        try expect(try mode(readonlySource) == 0o444 && Data(contentsOf: readonlySource) == plistData, "source bytes and permissions unchanged")
+        try expect(try converter.run("/usr/bin/xattr", ["-p", "org.32bitgoofy.permission-test", readonlySource.path]).trimmingCharacters(in: .whitespacesAndNewlines) == "retained-source", "source metadata unchanged")
+        let escape = temp.appendingPathComponent("permission-link")
+        try fm.createSymbolicLink(at: escape, withDestinationURL: readonlySource)
+        try rejects("permission repair through symlink") { try converter.prepareCopiedPermissions(in: escape) }
+        try expect(try mode(readonlySource) == 0o444, "symlink target permissions unchanged")
+        let cancelledFinisher = Converter(resources: resources) { _, _ in }
+        cancelledFinisher.cancellation.cancel()
+        try rejects("cancelled permission repair") { try cancelledFinisher.prepareCopiedPermissions(in: readonlySource) }
+        try expect(try mode(readonlySource) == 0o444, "cancellation happens before mutation")
+        print("PASS: read-only copies prepared, metadata cleared, app signed; source, executable bits, links, cancellation preserved")
+
         let existing = destination.appendingPathComponent("TFU-Compat.app")
         try fm.createDirectory(at: existing, withIntermediateDirectories: false)
         let save = existing.appendingPathComponent("SAVE")

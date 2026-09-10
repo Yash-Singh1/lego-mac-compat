@@ -263,6 +263,38 @@ final class Converter {
         return runtime
     }
 
+    // Copies can retain read-only source modes (including Steam's HID plists).
+    // Some destination filesystems require write access to remove extended
+    // attributes. Repair only the private staging tree, retaining executable
+    // bits and never following a link back into the original installation.
+    func prepareCopiedPermissions(in item: URL) throws {
+        try cancellation.check()
+        let attributes = try fm.attributesOfItem(atPath: item.path)
+        let type = attributes[.type] as? FileAttributeType
+        guard type == .typeDirectory || type == .typeRegular else {
+            throw ConversionError.message("The copied app contains an unsupported file at \(item.path). Choose an original, complete installation.")
+        }
+        let mode = (attributes[.posixPermissions] as? NSNumber)?.intValue ?? 0
+        let writable = mode | (type == .typeDirectory ? 0o700 : 0o600)
+        if mode != writable {
+            try fm.setAttributes([.posixPermissions: writable], ofItemAtPath: item.path)
+        }
+        if type == .typeDirectory {
+            for child in try fm.contentsOfDirectory(at: item, includingPropertiesForKeys: nil) {
+                try prepareCopiedPermissions(in: child)
+            }
+        }
+    }
+
+    func finishApp(_ app: URL) throws {
+        try prepareCopiedPermissions(in: app)
+        // Keep cleanup/signing failures fatal; an unsigned or metadata-damaged
+        // bundle must not be published as a successful conversion.
+        try run("/usr/bin/xattr", ["-cr", app.path])
+        try run("/usr/bin/codesign", ["--force", "--sign", "-", app.path])
+        try run("/usr/bin/codesign", ["--verify", "--deep", "--strict", app.path])
+    }
+
     func convert(source: URL, destination: URL) throws -> URL {
         let source = source.resolvingSymlinksInPath().standardizedFileURL
         let destination = destination.resolvingSymlinksInPath().standardizedFileURL
@@ -304,10 +336,7 @@ final class Converter {
         try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: output.appendingPathComponent("MacOS/TFUCompat").path)
         try fm.copyItem(at: resources.appendingPathComponent("Info-TFU.plist"), to: output.appendingPathComponent("Info.plist"))
         progress("Finishing your app…", "Preparing The Force Unleashed to open from Finder.")
-        // Strip legacy Finder/resource-fork metadata from the new copy only.
-        try run("/usr/bin/xattr", ["-cr", app.path])
-        try run("/usr/bin/codesign", ["--force", "--sign", "-", app.path])
-        try run("/usr/bin/codesign", ["--verify", "--deep", "--strict", app.path])
+        try finishApp(app)
         try cancellation.check()
         return try publish(app, in: destination)
     }

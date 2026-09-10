@@ -34,7 +34,14 @@ verifies its SHA-256, and extracts two i386 C++ libraries into a private cache.
 Later conversions reuse the verified libraries. Nothing is installed systemwide.
 
 Conversion creates a separate app and leaves the original installation and
-existing converted copies untouched. TFU uses its distribution's existing save location: retail uses
+existing converted copies untouched. Before metadata cleanup and signing, the
+converter gives the owner read/write access to copied files and access to copied
+directories, retaining executable bits. This handles read-only source resources
+(such as Steam's HID plists) on destination filesystems that require write access
+for extended-attribute removal. Only the private staging tree is changed; source
+permissions and metadata are preserved, and links are rejected. Cleanup and
+signature errors still stop conversion rather than publishing an unfinished app.
+TFU uses its distribution's existing save location: retail uses
 `~/Documents/Aspyr/Star Wars The Force Unleashed`, while Steam uses
 `~/Library/Application Support/Star Wars The Force Unleashed`. No save is bundled,
 migrated, overwritten, or deleted by the converter. Copied game files cannot be symlinks to external source files.
