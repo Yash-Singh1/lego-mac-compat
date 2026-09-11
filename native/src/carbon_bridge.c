@@ -1,4 +1,5 @@
 #include "carbon_bridge.h"
+#include "agl_pixel_format.h"
 #include "focus_policy.h"
 #include "carbon_text.h"
 #include "carbon_ui.h"
@@ -6,10 +7,12 @@
 #include "objc_bridge.h"
 #include "resource_bridge.h"
 #include "hitch_recorder.h"
+#include "game_profile.h"
 #include <Carbon/Carbon.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <math.h>
+#include <mach/mach_time.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -24,10 +27,20 @@ struct carbon_ref {
   void *host;
   void *callback;
   uint32_t token;
+  int32_t guest_refcon;
+  uint16_t background_color[3];
+  uint16_t foreground_color[3];
+  EventHandlerRef background_handler;
+  CGImageRef background_image;
+  uint32_t agl_drawable;
+  uint32_t port_pixmap;
+  bool display_port;
   bool legacy_window_coordinates;
   struct carbon_ref *next;
 };
 static struct carbon_ref *references;
+/* Classic file APIs expose signed 16-bit IDs; modern FSIORefNum is 32-bit. */
+static FSIORefNum classic_files[1024];
 static uint32_t next_token = 0x74000000;
 #pragma pack(push, 2)
 struct alert_params32 {
@@ -291,6 +304,28 @@ static void *unwrap(uint32_t token) {
   struct carbon_ref *r = reference(token);
   return r ? r->host : objc_bridge32_host_object(token);
 }
+static OSStatus draw_window_background(EventHandlerCallRef call, EventRef event, void *data) {
+  (void)call;
+  struct carbon_ref *window = data;
+  CGContextRef context = NULL;
+  if (GetEventParameter(event, kEventParamCGContextRef, typeCGContextRef, NULL,
+                        sizeof(context), NULL, &context) || !context) return eventNotHandledErr;
+  Rect bounds;
+  int32_t (*get_bounds)(void *, uint16_t, Rect *) = symbol("_GetWindowBounds");
+  if (get_bounds(window->host, kWindowContentRgn, &bounds)) return eventNotHandledErr;
+  CGContextSaveGState(context);
+  CGContextSetRGBFillColor(context, window->background_color[0] / 65535.0,
+      window->background_color[1] / 65535.0, window->background_color[2] / 65535.0, 1);
+  CGContextFillRect(context, CGRectMake(0, 0, bounds.right - bounds.left, bounds.bottom - bounds.top));
+  if (window->background_image) {
+    CGContextTranslateCTM(context, 0, bounds.bottom - bounds.top);
+    CGContextScaleCTM(context, 1, -1);
+    CGContextDrawImage(context, CGRectMake(0, 0, bounds.right - bounds.left,
+                                         bounds.bottom - bounds.top), window->background_image);
+  }
+  CGContextRestoreGState(context);
+  return noErr;
+}
 int carbon_bridge32_region_bounds(uint32_t region, void *rect) {
   void *host = unwrap(region);
   if (!host)
@@ -398,8 +433,20 @@ struct apple_handler_entry {
   struct apple_handler_entry *next;
 };
 static struct apple_handler_entry *apple_handlers;
+static void record_mouse_event(EventRef event) {
+  if (!event || GetEventClass(event) != kEventClassMouse) return;
+  Point position;
+  if (!GetEventParameter(event, kEventParamMouseLocation, typeQDPoint, NULL,
+                         sizeof(position), NULL, &position))
+    objc_bridge32_record_mouse_position(position.h, position.v);
+}
 static int32_t event_handler(void *call, void *event, void *raw) {
   struct handler32 *h = raw;
+  carbon_ui_sync_focus();
+  if (lp32_suppress_background_input() &&
+      (GetEventClass(event) == kEventClassMouse || GetEventClass(event) == kEventClassKeyboard))
+    return eventNotHandledErr;
+  record_mouse_event(event);
   uint32_t a[] = {wrap(call), wrap(event), h->data};
   return (int32_t)compat_runtime32_call(h->callback, a, 3);
 }
@@ -562,6 +609,14 @@ static int agl_dispatch(const char *name, const uint32_t *a, uint64_t *out) {
     return 1;
   }
   if (IS("_aglSetDrawable")) {
+    if (lp32_profile()->title == LP32_TITLE_COD4 || lp32_profile()->title == LP32_TITLE_COD4_MP) {
+      void *cgl = NULL;
+      uint8_t (*get)(void *, void **) = dlsym(agl, "aglGetCGLContext");
+      *out = get && get(unwrap(a[0]), &cgl) && carbon_ui_bind_gl(unwrap(a[0]), cgl, unwrap(a[1]));
+      struct carbon_ref *context = reference(a[0]);
+      if (*out && context) context->agl_drawable = a[1];
+      return 1;
+    }
     uint8_t (*set)(void *, void *) = dlsym(agl, "aglSetWindowRef");
     *out = set ? set(unwrap(a[0]), unwrap(a[1])) : 0;
     if (*out && a[1]) {
@@ -571,12 +626,21 @@ static int agl_dispatch(const char *name, const uint32_t *a, uint64_t *out) {
     return 1;
   }
   if (IS("_aglGetDrawable")) {
+    struct carbon_ref *context = reference(a[0]);
+    if (context && context->agl_drawable) { *out = context->agl_drawable; return 1; }
     void *(*get)(void *) = dlsym(agl, "aglGetWindowRef");
     *out = get ? wrap(get(unwrap(a[0]))) : 0;
     return 1;
   }
   if (!function)
     return 0;
+  if (IS("_aglUpdateContext") && carbon_ui_update_gl(unwrap(a[0]))) { *out = 1; return 1; }
+  if (IS("_aglSwapBuffers") && carbon_ui_swap_gl(unwrap(a[0]))) { *out = 0; return 1; }
+  if (IS("_aglDestroyContext")) carbon_ui_release_gl(unwrap(a[0]));
+  if (IS("_aglGetCurrentContext")) {
+    *out = wrap(F(void *, void)());
+    return 1;
+  }
   if (IS("_aglGetCGLContext") || IS("_aglGetCGLPixelFormat")) {
     void *pointer = NULL;
     *out = F(uint8_t, void *, void **)(unwrap(a[0]), &pointer);
@@ -585,7 +649,11 @@ static int agl_dispatch(const char *name, const uint32_t *a, uint64_t *out) {
     return 1;
   }
   if (IS("_aglChoosePixelFormat")) {
-    *out = wrap(F(void *, const void *, int, const int *)(NULL, 0, P(2)));
+    const int *attributes=P(2);int window_attributes[128];
+    if ((lp32_profile()->title == LP32_TITLE_COD4 || lp32_profile()->title == LP32_TITLE_COD4_MP) &&
+        lp32_agl_window_attributes(attributes,128,window_attributes,128))
+      attributes=window_attributes;
+    *out = wrap(F(void *, const void *, int, const int *)(NULL, 0, attributes));
     return 1;
   }
   if (IS("_aglCreateContext")) {
@@ -640,6 +708,276 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
   }
   if (agl_dispatch(name, a, out))
     return 1;
+  if (IS("_FSpOpenDF")) {
+    FSRef ref;
+    int16_t status = ref_from_spec(P(0), &ref);
+    unsigned slot;
+    for (slot = 1; slot < 1024 && classic_files[slot]; ++slot) {}
+    if (!a[2]) status = paramErr;
+    if (!status && slot == 1024) status = tmfoErr;
+    FSIORefNum file = 0;
+    if (!status) status = ((OSErr (*)(const FSRef *, UniCharCount, const UniChar *, SInt8, FSIORefNum *))symbol("_FSOpenFork"))(&ref, 0, NULL, (int8_t)a[1], &file);
+    if (!status) classic_files[slot] = file;
+    if (a[2]) *(int16_t *)P(2) = status ? 0 : (int16_t)slot;
+    *out = (uint32_t)(int32_t)status;
+    return 1;
+  }
+  if (IS("_FSClose") || IS("_FSRead") || IS("_GetFPos") || IS("_SetFPos")) {
+    unsigned slot = (uint16_t)a[0];
+    if (!slot || slot >= 1024 || !classic_files[slot]) { *out = (uint32_t)rfNumErr; return 1; }
+  }
+  if (IS("_FSClose")) {
+    *out = (uint32_t)(int32_t)((OSErr (*)(FSIORefNum))symbol("_FSCloseFork"))(classic_files[(uint16_t)a[0]]);
+    if (!*out) classic_files[(uint16_t)a[0]] = 0;
+    return 1;
+  }
+  if (IS("_FSRead")) {
+    if (!a[1] || *(int32_t *)P(1) < 0) { *out = (uint32_t)paramErr; return 1; }
+    ByteCount actual = 0;
+    *out = (uint32_t)(int32_t)((OSErr (*)(FSIORefNum, UInt16, SInt64, ByteCount, void *, ByteCount *))symbol("_FSReadFork"))(classic_files[(uint16_t)a[0]], fsAtMark, 0,
+        *(uint32_t *)P(1), P(2), &actual);
+    *(uint32_t *)P(1) = (uint32_t)actual;
+    return 1;
+  }
+  if (IS("_GetFPos")) {
+    SInt64 position = 0;
+    OSStatus status = ((OSErr (*)(FSIORefNum, SInt64 *))symbol("_FSGetForkPosition"))(classic_files[(uint16_t)a[0]], &position);
+    if (!status && position > INT32_MAX) status = posErr;
+    if (!status && a[1]) *(int32_t *)P(1) = (int32_t)position;
+    *out = (uint32_t)status;
+    return 1;
+  }
+  if (IS("_SetFPos")) {
+    *out = (uint32_t)(int32_t)((OSErr (*)(FSIORefNum, UInt16, SInt64))symbol("_FSSetForkPosition"))(classic_files[(uint16_t)a[0]], (uint16_t)a[1], (int32_t)a[2]);
+    return 1;
+  }
+  if (IS("_GetScriptVariable")) {
+    *out = (uint32_t)((long (*)(int16_t,int16_t))symbol("_GetScriptVariable"))((int16_t)a[0], (int16_t)a[1]);
+    return 1;
+  }
+  if (IS("_KBGetLayoutType")) {
+    *out = ((uint32_t (*)(int16_t))symbol("_KBGetLayoutType"))((int16_t)a[0]);
+    return 1;
+  }
+  if (IS("_AbsoluteToNanoseconds") || IS("_NanosecondsToAbsolute")) {
+    mach_timebase_info_data_t scale;
+    mach_timebase_info(&scale);
+    uint64_t value = (uint64_t)a[0] | (uint64_t)a[1] << 32;
+    *out = IS("_AbsoluteToNanoseconds") ?
+        (uint64_t)((__uint128_t)value * scale.numer / scale.denom) :
+        (uint64_t)((__uint128_t)value * scale.denom / scale.numer);
+    return 1;
+  }
+  if (IS("_QDLocalToGlobalRect") || IS("_QDGlobalToLocalRect") ||
+      IS("_QDLocalToGlobalPoint") || IS("_QDGlobalToLocalPoint")) {
+    struct carbon_ref *port = reference(a[0]);
+    if (!port || !a[1]) { *out = (uint32_t)paramErr; return 1; }
+    unsigned points = strstr(name, "Rect") ? 2 : 1;
+    if (carbon_ui_convert_game_point(port->host, P(1), strstr(name, "GlobalToLocal") != NULL)) {
+      if (points == 2) carbon_ui_convert_game_point(port->host, (int16_t *)P(1) + 2, strstr(name, "GlobalToLocal") != NULL);
+      *out = 0; return 1;
+    }
+    Rect bounds;
+    *out = (uint32_t)((int32_t (*)(void *, uint32_t, Rect *))symbol("_GetWindowBounds"))(
+        port->host, kWindowContentRgn, &bounds);
+    if (!*out) {
+      int direction = strstr(name, "GlobalToLocal") ? -1 : 1;
+      int16_t *point = P(1);
+      unsigned count = strstr(name, "Rect") ? 2 : 1;
+      if (getenv("LP32_TRACE_INPUT")) {
+        static unsigned samples;
+        if (!(samples++ % 120)) fprintf(stderr, "compat32: QD convert %s point=%d,%d bounds=%d,%d,%d,%d port=%08x\n", name, point[1], point[0], bounds.left, bounds.top, bounds.right, bounds.bottom, a[0]);
+      }
+      for (unsigned i = 0; i < count; ++i) {
+        point[i * 2] += direction * bounds.top;
+        point[i * 2 + 1] += direction * bounds.left;
+      }
+    }
+    return 1;
+  }
+  if (IS("_CreateNewPortForCGDisplayID")) {
+    int32_t size[2];
+    objc_bridge32_display_size(a[0], size);
+    if (size[0] <= 0 || size[1] <= 0 || size[0] > 16384 || size[1] > 16384) { *out = 0; return 1; }
+    Rect bounds = {0, 0, (int16_t)size[1], (int16_t)size[0]};
+    void *window = NULL;
+    int32_t status = ((int32_t (*)(uint32_t, uint32_t, const Rect *, void **))symbol("_CreateNewWindow"))(
+        13, kWindowCompositingAttribute, &bounds, &window);
+    *out = status ? 0 : wrap(window);
+    if (!status) {
+      reference((uint32_t)*out)->display_port = true;
+      carbon_ui_fullscreen(window, a[0], size[0], size[1]);
+    }
+    return 1;
+  }
+  if (IS("_GetPortPixMap")) {
+    struct carbon_ref *port = reference(a[0]);
+    if (!port) return 0;
+    if (!port->port_pixmap) {
+      port->port_pixmap = compat_runtime32_allocate(4 + sizeof(struct pixmap32), 1);
+      if (port->port_pixmap) {
+        *(uint32_t *)(uintptr_t)port->port_pixmap = port->port_pixmap + 4;
+        struct pixmap32 *map = (void *)(uintptr_t)(port->port_pixmap + 4);
+        Rect bounds;
+        ((int32_t (*)(void *, uint32_t, Rect *))symbol("_GetWindowBounds"))(port->host, kWindowContentRgn, &bounds);
+        map->bounds = (Rect){0, 0, bounds.bottom - bounds.top, bounds.right - bounds.left};
+        map->row_bytes = (int16_t)(0x8000 | (map->bounds.right * 4 & 0x3fff));
+        map->pixel_type = 16; map->pixel_size = 32; map->components = 3; map->component_size = 8;
+        map->hres = map->vres = 72 << 16;
+      }
+    }
+    *out = port->port_pixmap;
+    return 1;
+  }
+  if (IS("_DisposePort")) {
+    struct carbon_ref *port = reference(a[0]);
+    if (!port || !port->display_port) return 0;
+    carbon_ui_dispose(port->host);
+    ((void (*)(void *))symbol("_DisposeWindow"))(port->host);
+    if (port->port_pixmap) compat_runtime32_deallocate(port->port_pixmap);
+    port->host = NULL; port->port_pixmap = 0;
+    if (current_port == a[0]) current_port = 0;
+    *out = 0;
+    return 1;
+  }
+  struct carbon_ref *port = reference(current_port);
+  if (port && IS("_ForeColor")) {
+    uint32_t rgb;
+    switch (a[0]) {
+      case 30: rgb = 0xffffff; break;
+      case 33: rgb = 0; break;
+      case 69: rgb = 0xffff00; break;
+      case 137: rgb = 0xff00ff; break;
+      case 205: rgb = 0xff0000; break;
+      case 273: rgb = 0x00ffff; break;
+      case 341: rgb = 0x00ff00; break;
+      case 409: rgb = 0x0000ff; break;
+      default: return 0;
+    }
+    for (unsigned i = 0; i < 3; ++i) port->foreground_color[i] = ((rgb >> (16 - i * 8)) & 255) * 257;
+    *out = 0;
+    return 1;
+  }
+  if (port && (IS("_PaintRect") || IS("_EraseRect")) && a[0]) {
+    uint32_t scratch = compat_runtime32_allocate(4, 1);
+    uint32_t context_args[] = {current_port, scratch};
+    if (!scratch) { *out = (uint32_t)memFullErr; return 1; }
+    carbon_bridge32_dispatch("_QDBeginCGContext", context_args, out);
+    if (!*out) {
+      CGContextRef context = objc_bridge32_host_object(*(uint32_t *)(uintptr_t)scratch);
+      const Rect *rect = P(0);
+      const uint16_t *color = IS("_EraseRect") ? port->background_color : port->foreground_color;
+      CGContextSetRGBFillColor(context, color[0] / 65535.0, color[1] / 65535.0, color[2] / 65535.0, 1);
+      CGContextFillRect(context, CGRectMake(rect->left, CGBitmapContextGetHeight(context) - rect->bottom,
+          rect->right - rect->left, rect->bottom - rect->top));
+      carbon_bridge32_dispatch("_QDEndCGContext", context_args, out);
+    }
+    compat_runtime32_deallocate(scratch);
+    return 1;
+  }
+  if (IS("_QDBeginCGContext") || IS("_QDEndCGContext")) {
+    /* QuickDraw ports no longer exist. Keep the window's Quartz contents in
+       a bitmap and redraw them through its compositing HIView. */
+    struct carbon_ref *window = reference(a[0]);
+    if (!window || !a[1]) { *out = (uint32_t)paramErr; return 1; }
+    uint32_t *guest_context = P(1);
+    if (IS("_QDBeginCGContext")) {
+      Rect bounds;
+      *out = (uint32_t)((int32_t (*)(void *, uint32_t, Rect *))symbol("_GetWindowBounds"))(
+          window->host, kWindowContentRgn, &bounds);
+      if (*out) return 1;
+      size_t width = bounds.right - bounds.left, height = bounds.bottom - bounds.top;
+      if (!width || !height || width > 16384 || height > 16384) {
+        *out = (uint32_t)paramErr; return 1;
+      }
+      CGColorSpaceRef colors = CGColorSpaceCreateDeviceRGB();
+      CGContextRef context = CGBitmapContextCreate(NULL, width, height, 8, width * 4,
+          colors, kCGImageAlphaPremultipliedLast);
+      CGColorSpaceRelease(colors);
+      if (context && window->background_image)
+        CGContextDrawImage(context, CGRectMake(0, 0, width, height), window->background_image);
+      *guest_context = objc_bridge32_guest_object(context);
+      if (context) CGContextRelease(context);
+      *out = context ? 0 : (uint32_t)memFullErr;
+    } else {
+      CGContextRef context = objc_bridge32_host_object(*guest_context);
+      if (!context) { *out = (uint32_t)paramErr; return 1; }
+      if (window->background_image) CGImageRelease(window->background_image);
+      window->background_image = CGBitmapContextCreateImage(context);
+      uint64_t ignored;
+      objc_bridge32_dispatch("_CGContextRelease", guest_context, &ignored);
+      *guest_context = 0;
+      void *root = ((void *(*)(void *))symbol("_HIViewGetRoot"))(window->host);
+      if (!window->background_handler) {
+        EventTypeSpec type = {kEventClassControl, kEventControlDraw};
+        EventTargetRef target = ((EventTargetRef (*)(void *))symbol("_GetControlEventTarget"))(root);
+        InstallEventHandler(target, draw_window_background, 1, &type, window,
+                            &window->background_handler);
+      }
+      if (lp32_profile()->title == LP32_TITLE_COD4 || lp32_profile()->title == LP32_TITLE_COD4_MP)
+        carbon_ui_paint(window->host, window->background_image);
+      else carbon_ui_use_native(window->host);
+      ((int32_t (*)(void *, bool))symbol("_HIViewSetNeedsDisplay"))(root, true);
+      *out = 0;
+    }
+    return 1;
+  }
+  if (IS("_SetWindowContentColor") && !symbol(name)) {
+    struct carbon_ref *window = reference(a[0]);
+    if (!window || !a[1]) { *out = (uint32_t)paramErr; return 1; }
+    memcpy(window->background_color, P(1), 6);
+    if (!window->background_handler) {
+      EventTypeSpec type = {kEventClassControl, kEventControlDraw};
+      void *root = ((void *(*)(void *))symbol("_HIViewGetRoot"))(window->host);
+      EventTargetRef target = ((EventTargetRef (*)(void *))symbol("_GetControlEventTarget"))(root);
+      *out = (uint32_t)InstallEventHandler(target, draw_window_background, 1, &type,
+                                         window, &window->background_handler);
+    } else *out = 0;
+    return 1;
+  }
+  if (IS("_SetWRefCon") || IS("_GetWRefCon")) {
+    struct carbon_ref *window = reference(a[0]);
+    if (!window) { *out = 0; return 1; }
+    if (IS("_SetWRefCon")) window->guest_refcon = (int32_t)a[1];
+    *out = IS("_GetWRefCon") ? (uint32_t)window->guest_refcon : 0;
+    return 1;
+  }
+  if (IS("_NewMenu")) {
+    void *menu = NULL;
+    int32_t (*create)(int16_t, uint32_t, void **) = symbol("_CreateNewMenu");
+    int32_t status = create((int16_t)a[0], 0, &menu);
+    if (!status && a[1]) {
+      CFStringRef title = CFStringCreateWithPascalString(NULL, P(1), kCFStringEncodingMacRoman);
+      ((int32_t (*)(void *, CFStringRef))symbol("_SetMenuTitleWithCFString"))(menu, title);
+      if (title) CFRelease(title);
+    }
+    *out = status ? 0 : wrap(menu);
+    return 1;
+  }
+  if (IS("_InvalMenuBar")) {
+    ((void (*)(void))symbol("_DrawMenuBar"))();
+    *out = 0;
+    return 1;
+  }
+  if (IS("_GetCurrentEventKeyModifiers")) {
+    *out = (getenv("LP32_BACKGROUND_TEST") || lp32_suppress_background_input()) ?
+        0 : GetCurrentKeyModifiers();
+    return 1;
+  }
+  if (IS("_EventAvail") && a[0] == 0) {
+    /* A zero event mask only initializes/queries the legacy event system;
+       it must not remove events from Carbon's application queue. */
+    if (a[1]) {
+      unsigned char record[16] = {0};
+      uint32_t ticks = (uint32_t)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 16666667);
+      uint16_t modifiers = (uint16_t)GetCurrentKeyModifiers();
+      memcpy(record + 6, &ticks, 4);
+      memcpy(record + 14, &modifiers, 2);
+      memcpy(P(1), record, sizeof(record));
+    }
+    *out = 0;
+    return 1;
+  }
   if (IS("_ShowSheetWindow")) {
     *out = (uint32_t)carbon_ui_show_sheet(unwrap(a[0]), unwrap(a[1]));
     return 1;
@@ -860,6 +1198,27 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
           *out = displays[i].handle;
     return 1;
   }
+  if (IS("_GetAvailableWindowPositioningBounds")) {
+    /* The GDHandle API is absent in 64-bit Carbon. Translate our guest
+       display handle and use its display-ID/CGRect replacement. */
+    initialize_displays();
+    CGDirectDisplayID display = CGMainDisplayID();
+    bool found = a[0] == 0;
+    for (uint32_t i = 0; i < display_count; ++i) {
+      if (displays[i].handle == a[0]) { display = displays[i].id; found = true; break; }
+    }
+    *out = (uint32_t)paramErr;
+    if (!found || !a[1]) return 1;
+    CGRect bounds;
+    int32_t (*get_bounds)(CGDirectDisplayID, uint32_t, CGRect *) =
+        symbol("_HIWindowGetAvailablePositioningBounds");
+    if (!get_bounds) return 1;
+    int32_t status = get_bounds(display, kHICoordSpaceScreenPixel, &bounds);
+    if (!status) *(Rect *)P(1) = (Rect){(int16_t)CGRectGetMinY(bounds),
+        (int16_t)CGRectGetMinX(bounds), (int16_t)CGRectGetMaxY(bounds), (int16_t)CGRectGetMaxX(bounds)};
+    *out = (uint32_t)status;
+    return 1;
+  }
   if (IS("_GetNextDevice") || IS("_DMGetNextScreenDevice")) {
     *out = 0;
     for (uint32_t i = 0; i + 1 < display_count; ++i)
@@ -937,6 +1296,52 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
           capacity < sizeof(converted) ? capacity : sizeof(converted);
       memcpy((void *)(uintptr_t)destination, converted, count);
       memcpy(pb + 40, &count, 4);
+    }
+    memcpy(pb + 16, &status, 2);
+    *out = (uint32_t)(int32_t)status;
+    return 1;
+  }
+  if (IS("_PBGetCatInfoSync")) {
+    unsigned char *pb = P(0);
+    if (!pb) { *out = (uint32_t)paramErr; return 1; }
+    struct spec32 spec = {0};
+    uint32_t name;
+    int16_t index;
+    memcpy(&name, pb + 18, 4);
+    memcpy(&spec.volume, pb + 22, 2);
+    memcpy(&index, pb + 28, 2);
+    memcpy(&spec.parent, pb + 48, 4);
+    int16_t status = index > 0 ? unimpErr : noErr;
+    if (!index && name) {
+      const unsigned char *text = (void *)(uintptr_t)name;
+      if (text[0] > 63) status = bdNamErr;
+      else memcpy(spec.name, text, text[0] + 1);
+    }
+    FSRef ref, parent;
+    FSCatalogInfo info = {0};
+    HFSUniStr255 leaf;
+    if (!status) status = ref_from_spec(&spec, &ref);
+    if (!status) {
+      int16_t (*get)(const FSRef *, uint32_t, void *, void *, void *, void *) = symbol("_FSGetCatalogInfo");
+      status = get(&ref, kFSCatInfoGettableInfo, &info, &leaf, NULL, &parent);
+    }
+    if (!status) {
+      bool directory = (info.nodeFlags & kFSNodeIsDirectoryMask) != 0;
+      pb[30] = directory ? 0x10 : 0;
+      memcpy(pb + 32, info.finderInfo, 16);
+      memcpy(pb + 48, &info.nodeID, 4);
+      memcpy(pb + 100, &info.parentDirID, 4);
+      if (directory) {
+        uint16_t count = info.valence > UINT16_MAX ? UINT16_MAX : (uint16_t)info.valence;
+        memcpy(pb + 52, &count, 2);
+        remember_directory(info.volume, info.nodeID, &ref);
+      }
+      remember_directory(info.volume, info.parentDirID, &parent);
+      if (name && index < 0) {
+        CFStringRef text = CFStringCreateWithCharacters(NULL, leaf.unicode, leaf.length);
+        if (!CFStringGetPascalString(text, (void *)(uintptr_t)name, 256, kCFStringEncodingMacRoman)) status = bdNamErr;
+        CFRelease(text);
+      }
     }
     memcpy(pb + 16, &status, 2);
     *out = (uint32_t)(int32_t)status;
@@ -1035,6 +1440,8 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
     return 1;
   }
   if (IS("_InitCursor") || IS("_ShowCursor") || IS("_HideCursor")) {
+    if (lp32_profile()->title == LP32_TITLE_COD4 || lp32_profile()->title == LP32_TITLE_COD4_MP)
+      return objc_bridge32_dispatch(name, a, out);
     if (!getenv("LP32_BACKGROUND_TEST")) {
       void (*cursor)(void) = symbol(name);
       if (cursor)
@@ -1452,6 +1859,12 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
     return 1;
   }
   if (IS("_CreateStandardAlert") || IS("_CreateStandardSheet")) {
+    char title[1024] = {0}, message[2048] = {0};
+    CFStringRef title_string = objc_bridge32_host_object(a[1]);
+    CFStringRef message_string = objc_bridge32_host_object(a[2]);
+    if (title_string) CFStringGetCString(title_string, title, sizeof(title), kCFStringEncodingUTF8);
+    if (message_string) CFStringGetCString(message_string, message, sizeof(message), kCFStringEncodingUTF8);
+    fprintf(stderr, "compat32: Carbon alert: %s | %s\n", title, message);
     AlertStdCFStringAlertParamRec params = {0}, *pointer = NULL;
     if (a[3]) {
       const struct alert_params32 *guest = P(3);
@@ -1918,6 +2331,35 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
     *out = (uint32_t)r;
     return 1;
   }
+  if (IS("_SetWindowContentColor")) {
+    *out = (uint32_t)F(int32_t, void *, const void *)(unwrap(a[0]), P(1));
+    return 1;
+  }
+  if (IS("_CreateNibReferenceWithCFBundle")) {
+    CFBundleRef bundle = carbon_ui_copy_bundle(objc_bridge32_host_object(a[0]));
+    void *nib = NULL;
+    int32_t status = bundle ? F(int32_t, CFBundleRef, CFStringRef, void **)(
+        bundle, objc_bridge32_host_object(a[1]), &nib) : paramErr;
+    if (bundle)
+      CFRelease(bundle);
+    if (a[2])
+      *(uint32_t *)P(2) = wrap(nib);
+    *out = (uint32_t)status;
+    return 1;
+  }
+  if (IS("_CreateWindowFromNib")) {
+    void *window = NULL;
+    *out = (uint32_t)F(int32_t, void *, CFStringRef, void **)(
+        unwrap(a[0]), objc_bridge32_host_object(a[1]), &window);
+    if (a[2])
+      *(uint32_t *)P(2) = wrap(window);
+    return 1;
+  }
+  if (IS("_DisposeNibReference")) {
+    F(void, void *)(unwrap(a[0]));
+    *out = 0;
+    return 1;
+  }
   if (IS("_CreateNewWindow")) {
     void *window = NULL;
     /* Modern Carbon windows require compositing; the legacy QuickDraw
@@ -1937,6 +2379,12 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
   }
   if (IS("_ShowWindow") || IS("_HideWindow") || IS("_DisposeWindow") ||
       IS("_SelectWindow")) {
+    if (IS("_SelectWindow") &&
+        (lp32_profile()->title == LP32_TITLE_COD4 || lp32_profile()->title == LP32_TITLE_COD4_MP) &&
+        carbon_ui_select(unwrap(a[0]))) {
+      *out = 0;
+      return 1;
+    }
     if (IS("_ShowWindow")) {
       place_test_window(unwrap(a[0]));
       carbon_ui_show(unwrap(a[0]));
@@ -1947,6 +2395,17 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
       carbon_ui_hide(unwrap(a[0]));
     if (IS("_DisposeWindow"))
       carbon_ui_dispose(unwrap(a[0]));
+    if (IS("_DisposeWindow")) {
+      struct carbon_ref *window = reference(a[0]);
+      if (window && window->background_handler) {
+        RemoveEventHandler(window->background_handler);
+        window->background_handler = NULL;
+      }
+      if (window && window->background_image) {
+        CGImageRelease(window->background_image);
+        window->background_image = NULL;
+      }
+    }
     if (!IS("_SelectWindow") || !getenv("LP32_BACKGROUND_TEST"))
       F(void, void *)(unwrap(a[0]));
     *out = 0;
@@ -1961,8 +2420,14 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
     return 1;
   }
   if (IS("_GetWindowBounds") || IS("_SetWindowBounds")) {
+    if (getenv("LP32_TRACE_CARBON") && IS("_SetWindowBounds") && a[2]) {
+      const Rect *r = P(2);
+      fprintf(stderr, "compat32: SetWindowBounds %#x region=%u rect=%d,%d,%d,%d\n",
+              a[0], a[1], r->left, r->top, r->right, r->bottom);
+    }
     *out = (uint32_t)F(int32_t, void *, uint32_t, void *)(unwrap(a[0]), a[1],
                                                           P(2));
+    if (!*out && IS("_SetWindowBounds")) carbon_ui_geometry_changed(unwrap(a[0]));
     return 1;
   }
   if (IS("_GetWindowPortBounds")) {
@@ -1979,8 +2444,12 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
     *out = (uint32_t)F(int32_t, void *, void *)(unwrap(a[0]), P(1));
     return 1;
   }
-  if (IS("_IsWindowVisible") || IS("_IsWindowActive") ||
+  if (IS("_IsWindowVisible") || IS("_IsWindowActive") || IS("_IsWindowHilited") ||
       IS("_IsWindowCollapsed") || IS("_IsWindowCollapsable")) {
+    if (IS("_IsWindowActive") || IS("_IsWindowHilited")) {
+      int active = carbon_ui_is_active(unwrap(a[0]));
+      if (active >= 0) { *out = active; return 1; }
+    }
     if (IS("_IsWindowVisible")) {
       int visible = carbon_ui_is_visible(unwrap(a[0]));
       if (visible >= 0) {
@@ -2008,9 +2477,12 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
     return 1;
   }
   if (IS("_MoveWindow") || IS("_SizeWindow")) {
+    if (getenv("LP32_TRACE_CARBON"))
+      fprintf(stderr, "compat32: %s %#x x=%d y=%d flag=%u\n", name, a[0], (int16_t)a[1], (int16_t)a[2], a[3]);
     F(void, void *, int16_t, int16_t,
       bool)(unwrap(a[0]), (int16_t)a[1], (int16_t)a[2],
             a[3] != 0 && !getenv("LP32_BACKGROUND_TEST"));
+    carbon_ui_geometry_changed(unwrap(a[0]));
     *out = 0;
     return 1;
   }
@@ -2045,10 +2517,6 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
   if (IS("_SetThemeWindowBackground")) {
     *out = (uint32_t)F(int32_t, void *, uint32_t, bool)(unwrap(a[0]), a[1],
                                                         a[2] != 0);
-    return 1;
-  }
-  if (IS("_GetAvailableWindowPositioningBounds")) {
-    *out = (uint32_t)F(int32_t, uint32_t, Rect *)(a[0], P(1));
     return 1;
   }
   if (IS("_HIObjectCreate")) {
@@ -2118,11 +2586,14 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
     return 1;
   }
   if (IS("_ReceiveNextEvent")) {
+    carbon_ui_sync_focus();
     double timeout;
     memcpy(&timeout, a + 2, 8);
     void *event = NULL;
     int32_t r = F(int32_t, uint32_t, const void *, double, bool,
                   void **)(a[0], P(1), timeout, a[4] != 0, &event);
+    carbon_ui_sync_focus();
+    if (!r) record_mouse_event(event);
     if (a[5])
       *(uint32_t *)P(5) = wrap(event);
     *out = (uint32_t)r;
@@ -2195,6 +2666,13 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
     return 1;
   }
   if (IS("_DrawMenuBar") || IS("_HideMenuBar") || IS("_ShowMenuBar")) {
+    if ((lp32_profile()->title == LP32_TITLE_COD4 || lp32_profile()->title == LP32_TITLE_COD4_MP) &&
+        !IS("_DrawMenuBar")) {
+      /* Persist the guest request across native AppKit activation changes. */
+      carbon_ui_set_menu_bar_visible(IS("_ShowMenuBar"));
+      *out = 0;
+      return 1;
+    }
     if (!getenv("LP32_BACKGROUND_TEST"))
       F(void, void)();
     *out = 0;
@@ -2202,6 +2680,11 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
   }
   if (IS("_GetMBarHeight")) {
     *out = (uint32_t)(int32_t)F(int16_t, void)();
+    return 1;
+  }
+  if (IS("_InsertMenu")) {
+    F(void, void *, int16_t)(unwrap(a[0]), (int16_t)a[1]);
+    *out = 0;
     return 1;
   }
   if (IS("_CreateNewMenu")) {
@@ -2312,6 +2795,18 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
       *out = (uint32_t)F(int32_t, const void *, void *)(P(0), P(1));
     return 1;
   }
+  if (IS("_UpTime")) { *out = F(uint64_t, void)(); return 1; }
+  if (IS("_AddDurationToAbsolute")) {
+    *out = F(uint64_t, int32_t, uint64_t)((int32_t)a[0], (uint64_t)a[1] | (uint64_t)a[2] << 32);
+    return 1;
+  }
+  if (IS("_MPDelayUntil")) { *out = (uint32_t)F(int32_t, const void *)(P(0)); return 1; }
+  if (IS("_Microseconds")) { F(void, void *)(P(0)); *out = 0; return 1; }
+  if (IS("_FlushEventQueue")) { *out = (uint32_t)F(int32_t, void *)(unwrap(a[0])); return 1; }
+  if (IS("_GetNextProcess")) {
+    *out = (uint32_t)F(int32_t, void *)(P(0));
+    return 1;
+  }
   if (IS("_GetProcessInformation")) {
     uint32_t *guest = P(1);
     if (!guest || guest[0] < 60) {
@@ -2361,8 +2856,13 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
   if (IS("_FSGetCatalogInfo")) {
     int16_t status = F(int16_t, const void *, uint32_t, void *, void *, void *,
                        void *)(P(0), a[1], P(2), P(3), NULL, P(5));
-    if (!status && a[4])
-      status = spec_from_ref(P(0), P(4));
+    if (!status) {
+      /* Legacy callers can query only a parent ID, then use that ID in a
+         later parameter-block call without ever requesting an FSSpec. */
+      struct spec32 ignored;
+      int16_t converted = spec_from_ref(P(0), a[4] ? P(4) : &ignored);
+      if (a[4]) status = converted;
+    }
     *out = (uint32_t)(int32_t)status;
     return 1;
   }
@@ -2814,6 +3314,49 @@ int carbon_bridge32_run_dispatch_self_test(void) {
   return 0;
 }
 
+/* Exercise the packed classic API against a real temporary file. */
+int carbon_bridge32_run_file_self_test(void) {
+  char path[] = "/tmp/lp32-carbon-file-XXXXXX";
+  int fd = mkstemp(path);
+  if (fd < 0) return -1;
+  int passed = -1;
+  uint32_t memory = compat_runtime32_allocate(256, 1);
+  uint32_t a[4] = {0}; uint64_t out = 0;
+  int16_t handle = 0;
+  if (!memory || write(fd, "abcdef", 6) != 6) goto done;
+  close(fd); fd = -1;
+  FSRef ref;
+  if (((OSErr (*)(const UInt8 *, FSRef *, Boolean *))symbol("_FSPathMakeRef"))((UInt8 *)path, &ref, NULL) ||
+      spec_from_ref(&ref, (void *)(uintptr_t)memory)) goto done;
+  unsigned char *bytes = (void *)(uintptr_t)memory;
+  memset(bytes+80, 0xcc, 8);
+  a[0]=memory;a[1]=fsRdPerm;a[2]=memory+80;
+  if (!carbon_bridge32_dispatch("_FSpOpenDF",a,&out) || out || bytes[82]!=0xcc) goto done;
+  memcpy(&handle,bytes+80,2);
+  a[0]=(uint16_t)handle;a[1]=memory+88;a[2]=memory+96;
+  *(uint32_t *)(bytes+88)=4;*(uint32_t *)(bytes+92)=0x12345678;
+  if (!carbon_bridge32_dispatch("_FSRead",a,&out) || out || memcmp(bytes+96,"abcd",4) ||
+      *(uint32_t *)(bytes+88)!=4 || *(uint32_t *)(bytes+92)!=0x12345678) goto done;
+  a[1]=memory+88;
+  if (!carbon_bridge32_dispatch("_GetFPos",a,&out) || out || *(uint32_t *)(bytes+88)!=4) goto done;
+  a[1]=fsFromStart;a[2]=2;
+  if (!carbon_bridge32_dispatch("_SetFPos",a,&out) || out) goto done;
+  a[1]=memory+88;a[2]=memory+96;*(uint32_t *)(bytes+88)=8;
+  if (!carbon_bridge32_dispatch("_FSRead",a,&out) || (int32_t)out!=eofErr ||
+      *(uint32_t *)(bytes+88)!=4 || memcmp(bytes+96,"cdef",4)) goto done;
+  if (!carbon_bridge32_dispatch("_FSClose",a,&out) || out) goto done;
+  handle=0;
+  if (!carbon_bridge32_dispatch("_GetFPos",a,&out) || (int32_t)out!=rfNumErr) goto done;
+  passed=0;
+done:
+  if(handle){a[0]=(uint16_t)handle;carbon_bridge32_dispatch("_FSClose",a,&out);}
+  if(memory)compat_runtime32_deallocate(memory);
+  if(fd>=0)close(fd);
+  unlink(path);
+  fprintf(stderr,"carbon-file-selftest: %s (open, read, seek, EOF, close, packed outputs)\n",passed?"FAIL":"PASS");
+  return passed;
+}
+
 /* Uses hidden native windows to verify the guest coordinate contract. */
 int carbon_bridge32_run_geometry_self_test(void) {
   uint32_t memory = compat_runtime32_allocate(128, 1);
@@ -2822,6 +3365,22 @@ int carbon_bridge32_run_geometry_self_test(void) {
   Rect *rect = (void *)(uintptr_t)memory;
   uint32_t *handles = (void *)(uintptr_t)(memory + 64);
   int result = -1;
+  {
+    uint64_t out;
+    uint32_t args[] = {0, memory};
+    uint32_t *guard = (void *)(uintptr_t)(memory + sizeof(Rect));
+    *guard = 0x1234abcd;
+    if (!carbon_bridge32_dispatch("_GetAvailableWindowPositioningBounds", args, &out) ||
+        out || rect->right <= rect->left || rect->bottom <= rect->top || *guard != 0x1234abcd) goto done;
+    Rect main_bounds = *rect;
+    if (!carbon_bridge32_dispatch("_GetMainDevice", args, &out) || !out) goto done;
+    args[0] = (uint32_t)out;
+    if (!carbon_bridge32_dispatch("_GetAvailableWindowPositioningBounds", args, &out) ||
+        out || memcmp(rect, &main_bounds, sizeof(Rect)) || *guard != 0x1234abcd) goto done;
+    args[0] = UINT32_MAX;
+    if (!carbon_bridge32_dispatch("_GetAvailableWindowPositioningBounds", args, &out) ||
+        (int32_t)out != paramErr || memcmp(rect, &main_bounds, sizeof(Rect))) goto done;
+  }
   for (unsigned composited = 0; composited < 2; ++composited) {
     uint64_t out = 0;
     uint32_t args[8] = {0};

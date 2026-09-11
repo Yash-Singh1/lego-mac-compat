@@ -17,6 +17,7 @@ static void *worker(void *unused)
 {
     (void)unused;
     hitch_note(HITCH_SHADER, "cgCreateProgram", 0x1234, end, end + 9000000, 0);
+    hitch_count_runtime(); /* Worker calls must not change render-frame counts. */
     return NULL;
 }
 int main(void)
@@ -35,6 +36,12 @@ int main(void)
     assert(hitch_classify("_glProgramStringARB") == HITCH_SHADER);
     assert(hitch_classify("_cgCreateProgram") == HITCH_SHADER);
     assert(hitch_classify("_fread") == HITCH_IO);
+    assert(hitch_classify("_FSReadFork") == HITCH_IO);
+    assert(hitch_classify("_PBReadForkAsync") == HITCH_IO);
+    assert(hitch_classify("_MPWaitOnSemaphore") == HITCH_WAIT);
+    assert(hitch_classify("_MPWaitOnQueue") == HITCH_WAIT);
+    assert(hitch_classify("_MPDelayUntil") == HITCH_WAIT);
+    assert(hitch_classify("_usleep") == HITCH_WAIT);
     assert(hitch_classify("_lp32_steam_4_0") == HITCH_IO);
     assert(hitch_classify("_lp32_steam_4_16") == HITCH_IO);
     assert(hitch_classify("_lp32_steam_1_0") == HITCH_RUNTIME);
@@ -42,10 +49,20 @@ int main(void)
     assert(hitch_classify("_glProgramEnvParameters4fvEXT") == HITCH_GL_STATE);
     assert(hitch_classify("_objc_msgSend") == HITCH_OBJC);
     assert(hitch_classify("_AudioUnitRender") == HITCH_AUDIO);
+    assert(hitch_classify("_strlen") == HITCH_COUNTED_RUNTIME);
+    assert(hitch_classify("___tolower") == HITCH_COUNTED_RUNTIME);
+    assert(hitch_classify("_memcpy") == HITCH_COUNTED_RUNTIME);
+    assert(hitch_classify("_pthread_self") == HITCH_COUNTED_RUNTIME);
+    assert(hitch_classify("_malloc") == HITCH_RUNTIME);
+    assert(hitch_classify("_free") == HITCH_RUNTIME);
     assert(!hitch_recorder_enabled);
     char path[128];
     snprintf(path, sizeof(path), "/tmp/lp32-hitch-test-%ld.log", (long)getpid());
     assert(!hitch_start(path, 25));
+    const char *full = getenv("LP32_HITCH_FULL_IMPORTS");
+    assert(!!hitch_full_imports == !!(full && full[0] && strcmp(full, "0")));
+    assert(hitch_classify("_strlen") == (hitch_full_imports ? HITCH_RUNTIME : HITCH_COUNTED_RUNTIME));
+    assert(hitch_classify("_pthread_mutex_lock") == HITCH_WAIT);
     /* Warm-up, ring wrap, intentional 30 FPS, and inactive frames are quiet. */
     for (int i = 0; i < 50; ++i) frame(16666667, 16666667, true);
     for (int i = 0; i < 40; ++i) frame(33333333, 33333333, true);
@@ -53,6 +70,7 @@ int main(void)
     pthread_t thread;
     assert(!pthread_create(&thread, NULL, worker, NULL));
     pthread_join(thread, NULL);
+    for (int i = 0; i < 17; ++i) hitch_count_runtime();
     struct hitch_scope outer, inner, presentation;
     hitch_scope_begin(&outer, end);
     hitch_scope_begin(&inner, end + 2000000);
@@ -91,6 +109,8 @@ int main(void)
     assert(strstr(text, " frame=139 "));
     assert(strstr(text, "present=45.000 work=43.000 flush=1.000 pace=1.000"));
     assert(strstr(text, "draw=1/40.000"));
+    assert(strstr(text, " counted_runtime=17\n"));
+    assert(!strstr(text, " counted_runtime=18\n"));
     assert(strstr(text, "glstate=1/6.000 objc=0/0.000 runtime=1/4.000"));
     assert(!strstr(text, "objc=1/"));
     assert(!strstr(text, "name=presentation"));

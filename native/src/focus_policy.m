@@ -5,6 +5,12 @@
 #include <strings.h>
 #include <string.h>
 
+static int managed_input_state = -1;
+void lp32_set_managed_input_active(int active)
+{
+    __atomic_store_n(&managed_input_state, !!active, __ATOMIC_RELEASE);
+}
+
 int lp32_focus_setting(const char *environment, int bundle_default)
 {
     if (!environment) return !!bundle_default;
@@ -32,8 +38,11 @@ int lp32_ignore_guest_focus_loss(void)
 
 int lp32_suppress_background_input(void)
 {
-    /* Scripted tests already isolate their input. Native AppKit retains the
-       real activation state even when guest focus queries return true. */
-    return lp32_continue_when_inactive() && !getenv("LP32_BACKGROUND_TEST") &&
-        ![NSApp isActive];
+    /* Scripted tests already isolate their input. */
+    int managed = __atomic_load_n(&managed_input_state, __ATOMIC_ACQUIRE);
+    if (getenv("LP32_BACKGROUND_TEST")) return 0;
+    /* Carbon's event loop does not maintain NSApplication.isActive reliably.
+       Its presenter supplies the process activation state instead. */
+    if (managed >= 0) return !managed;
+    return lp32_continue_when_inactive() && ![NSApp isActive];
 }

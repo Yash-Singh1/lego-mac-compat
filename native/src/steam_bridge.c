@@ -178,6 +178,9 @@ static int interface_call(unsigned which, unsigned slot, const uint32_t *a, uint
             *result = compat_runtime32_copy_cstring(CALL0(const char *)); return 1;
         }
         if (slot == 6 || slot == 7) { *result = CALL1(bool, uint32_t, a[1]); return 1; }
+        /* ISteamApps::RequestAppProofOfPurchaseKey(AppId_t). COD4 asks the
+           original SDK to deliver its license through callback 1013. */
+        if (slot == 14) { CALL1(void, uint32_t, a[1]); *result = 0; return 1; }
     } else if (which == STEAM_UTILS) {
         if (slot == 9) { *result = CALL0(uint32_t); return 1; } /* GetAppID */
     } else if (which == STEAM_STATS) {

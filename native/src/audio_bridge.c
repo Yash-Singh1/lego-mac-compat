@@ -22,6 +22,7 @@
 enum {
     kGuestGraphHandleBase = 0x7f050000,
     kGuestUnitHandleBase = 0x7f060000,
+    kGuestComponentHandleBase = 0x7f090000,
     kGuestAudioHandleStride = 16,
     kGuestAudioHandleCapacity = 4096,
     kAudioCallbackCapacity = 256,
@@ -34,6 +35,8 @@ static AudioUnit unit_objects[kGuestAudioHandleCapacity];
 static AUGraph unit_owner_graphs[kGuestAudioHandleCapacity];
 static uint32_t graph_object_count;
 static uint32_t unit_object_count;
+static AudioComponent component_objects[128];
+static uint32_t component_count;
 static pthread_mutex_t audio_object_lock = PTHREAD_MUTEX_INITIALIZER;
 
 struct guest_audio_buffer {
@@ -46,14 +49,18 @@ struct audio_callback_context {
     uint32_t callback_index;
     const char *callback_kind;
     AUGraph owner_graph;
+    AudioUnit owner_unit;
     AUNode callback_node;
     UInt32 callback_bus;
+    AudioUnitScope callback_scope;
     bool in_use;
     bool callback_attached;
     /* Set when the guest has stopped or disposed the owning graph but the
        host teardown is still pending; the callback then renders silence
        without entering guest code. */
     bool muted;
+    /* A replaced unit callback stays alive until its last host render exits. */
+    bool retired;
     uint32_t guest_function;
     uint32_t guest_refcon;
     uint32_t guest_flags;
@@ -66,6 +73,7 @@ struct audio_callback_context {
     pthread_cond_t response_condition;
     bool request_pending;
     bool response_ready;
+    bool host_call_active;
     bool host_has_buffer_list;
     uint32_t bus;
     uint32_t frame_count;
@@ -103,6 +111,20 @@ static uint64_t hold_total_ns;
 static struct audio_callback_context *audio_callbacks[kAudioCallbackCapacity];
 static uint32_t audio_callback_count;
 static pthread_mutex_t audio_callback_registry_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Track the currently installed callback independently of the render lock.
+   The guest may hold its own sound mutex while replacing a callback whose
+   worker is waiting for that very mutex. Never wait for a render here. */
+struct unit_input_binding {
+    AudioUnit unit;
+    AudioUnitPropertyID property;
+    AudioUnitScope scope;
+    AudioUnitElement element;
+    struct audio_callback_context *context;
+};
+static struct unit_input_binding unit_input_bindings[kAudioCallbackCapacity];
+static pthread_mutex_t unit_input_binding_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t unit_input_update_lock = PTHREAD_MUTEX_INITIALIZER;
 
 struct audio_callback_job {
     struct audio_callback_context *context;
@@ -249,6 +271,8 @@ static UInt32 guest_audio_buffer_list_size(uint32_t buffer_count)
                     buffer_count * sizeof(struct guest_audio_buffer));
 }
 
+static _Thread_local struct audio_callback_context *current_audio_callback;
+
 static void *audio_callback_worker(void *opaque)
 {
     (void)opaque;
@@ -272,9 +296,11 @@ static void *audio_callback_worker(void *opaque)
             context->frame_count,
             context->host_has_buffer_list ? context->guest_buffer_list : 0,
         };
+        current_audio_callback = context;
         context->guest_status = (int32_t)compat_runtime32_call(
             context->guest_function, guest_arguments,
             sizeof(guest_arguments) / sizeof(guest_arguments[0]));
+        current_audio_callback = NULL;
         if (compat_runtime32_last_call_trapped()) {
             fprintf(stderr,
                     "compat32: guest audio callback 0x%08x escaped\n",
@@ -282,7 +308,7 @@ static void *audio_callback_worker(void *opaque)
             context->guest_status = kAudio_ParamError;
         }
         context->response_ready = true;
-        pthread_cond_signal(&context->response_condition);
+        pthread_cond_broadcast(&context->response_condition);
         pthread_mutex_unlock(&context->lock);
     }
 }
@@ -401,11 +427,13 @@ static struct audio_callback_context *new_audio_callback(uint32_t function,
         if (!context->in_use) {
             context->callback_kind = kind;
             context->owner_graph = owner_graph;
+            context->owner_unit = NULL;
             context->callback_node = callback_node;
             context->callback_bus = callback_bus;
             __atomic_store_n(&context->in_use, true, __ATOMIC_RELEASE);
             context->callback_attached = true;
             context->muted = false;
+            __atomic_store_n(&context->retired, false, __ATOMIC_RELEASE);
             context->guest_function = function;
             context->guest_refcon = refcon;
             context->guest_status = noErr;
@@ -443,6 +471,7 @@ static struct audio_callback_context *new_audio_callback(uint32_t function,
     context->callback_index = index;
     context->callback_kind = kind;
     context->owner_graph = owner_graph;
+    context->owner_unit = NULL;
     context->callback_node = callback_node;
     context->callback_bus = callback_bus;
     __atomic_store_n(&context->in_use, true, __ATOMIC_RELEASE);
@@ -480,13 +509,16 @@ static struct audio_callback_context *new_audio_callback(uint32_t function,
     return context;
 }
 
-static void release_audio_callback(struct audio_callback_context *context)
+static void clear_audio_callback_locked(struct audio_callback_context *context)
 {
-    if (!context) return;
-    pthread_mutex_lock(&context->lock);
-    context->in_use = false;
+    pthread_mutex_lock(&unit_input_binding_lock);
+    for (unsigned i = 0; i < kAudioCallbackCapacity; ++i)
+        if (unit_input_bindings[i].context == context)
+            memset(&unit_input_bindings[i], 0, sizeof(unit_input_bindings[i]));
+    pthread_mutex_unlock(&unit_input_binding_lock);
     context->callback_attached = false;
     context->owner_graph = NULL;
+    context->owner_unit = NULL;
     context->callback_node = 0;
     context->callback_bus = 0;
     context->guest_function = 0;
@@ -494,6 +526,24 @@ static void release_audio_callback(struct audio_callback_context *context)
     context->request_pending = false;
     context->response_ready = false;
     context->host_has_buffer_list = false;
+    __atomic_store_n(&context->retired, false, __ATOMIC_RELEASE);
+    __atomic_store_n(&context->in_use, false, __ATOMIC_RELEASE);
+}
+
+static void release_audio_callback(struct audio_callback_context *context)
+{
+    if (!context) return;
+    pthread_mutex_lock(&context->lock);
+    while (context->host_call_active) pthread_cond_wait(&context->response_condition, &context->lock);
+    clear_audio_callback_locked(context);
+    pthread_mutex_unlock(&context->lock);
+}
+
+static void finish_retired_audio_callback(struct audio_callback_context *context)
+{
+    if (!context || pthread_mutex_trylock(&context->lock)) return;
+    if (__atomic_load_n(&context->retired, __ATOMIC_ACQUIRE) && !context->host_call_active)
+        clear_audio_callback_locked(context);
     pthread_mutex_unlock(&context->lock);
 }
 
@@ -505,16 +555,8 @@ static uint32_t release_audio_callbacks_for_graph(AUGraph graph)
         struct audio_callback_context *context = audio_callbacks[index];
         pthread_mutex_lock(&context->lock);
         if (context->in_use && context->owner_graph == graph) {
-            context->in_use = false;
-            context->callback_attached = false;
-            context->owner_graph = NULL;
-            context->callback_node = 0;
-            context->callback_bus = 0;
-            context->guest_function = 0;
-            context->guest_refcon = 0;
-            context->request_pending = false;
-            context->response_ready = false;
-            context->host_has_buffer_list = false;
+            while (context->host_call_active) pthread_cond_wait(&context->response_condition, &context->lock);
+            clear_audio_callback_locked(context);
             ++released;
         }
         pthread_mutex_unlock(&context->lock);
@@ -613,13 +655,21 @@ static OSStatus host_audio_callback(void *refcon,
     struct audio_callback_context *context = refcon;
     if (!context) return kAudio_ParamError;
     pthread_mutex_lock(&context->lock);
+    bool is_input_callback = strcmp(context->callback_kind, "render-notify") != 0;
+    /* A pre-render notification runs before the unit prepares its buffers.
+       Its list can still contain pointers from the previous IO cycle. Reading
+       or silencing those pointers can overwrite the audio allocator's free
+       list after a format change. Only input renders and successful post-
+       render notifications have sample storage to bridge. */
+    if (!is_input_callback && (!flags || !(*flags & kAudioUnitRenderAction_PostRender) ||
+        (*flags & kAudioUnitRenderAction_PostRenderError))) host_list = NULL;
     bool held = false;
     if (context->in_use && context->guest_function &&
         !__atomic_load_n(&context->muted, __ATOMIC_ACQUIRE)) {
         /* The guest is never entered while held, so its stream positions and
            one-shot progress stand still with the frozen picture. */
         held = audio_hold_active();
-        if (held && strcmp(context->callback_kind, "render-notify") != 0) {
+        if (held && is_input_callback) {
             __atomic_fetch_add(&hold_renders, 1, __ATOMIC_RELAXED);
             if (timestamp && (timestamp->mFlags & kAudioTimeStampSampleTimeValid)) {
                 /* Silence still occupies host sample time; don't report the
@@ -631,8 +681,10 @@ static OSStatus host_audio_callback(void *refcon,
     }
     if (!context->in_use || !context->guest_function || held ||
         __atomic_load_n(&context->muted, __ATOMIC_ACQUIRE)) {
+        if (__atomic_load_n(&context->retired, __ATOMIC_ACQUIRE) && !context->host_call_active)
+            clear_audio_callback_locked(context);
         pthread_mutex_unlock(&context->lock);
-        if (host_list) {
+        if (is_input_callback && host_list) {
             for (UInt32 index = 0; index < host_list->mNumberBuffers; ++index) {
                 AudioBuffer *host_buffer = &host_list->mBuffers[index];
                 if (host_buffer->mData && host_buffer->mDataByteSize) {
@@ -694,6 +746,7 @@ static OSStatus host_audio_callback(void *refcon,
     context->frame_count = frame_count;
     context->host_has_buffer_list = host_list != NULL;
     context->response_ready = false;
+    context->host_call_active = true;
     struct audio_callback_job job = {
         .context = context,
         .next = NULL,
@@ -715,7 +768,6 @@ static OSStatus host_audio_callback(void *refcon,
         __atomic_store_n(&render_callback_max_ns, round_trip_ns, __ATOMIC_RELAXED);
     }
 
-    bool is_input_callback = strcmp(context->callback_kind, "render-notify") != 0;
     if (is_input_callback) {
         uint64_t requested = __atomic_exchange_n(&context->start_requested_ns, 0,
                                                  __ATOMIC_ACQ_REL);
@@ -806,7 +858,7 @@ static OSStatus host_audio_callback(void *refcon,
 
     /* Keep the complete guest audio path running during unattended tests,
        while ensuring that it cannot interrupt the user's system audio. */
-    if (mute_audio_output() && host_list) {
+    if (is_input_callback && mute_audio_output() && host_list) {
         for (uint32_t index = 0; index < buffer_count; ++index) {
             AudioBuffer *host_buffer = &host_list->mBuffers[index];
             if (host_buffer->mData && host_buffer->mDataByteSize) {
@@ -815,6 +867,10 @@ static OSStatus host_audio_callback(void *refcon,
         }
     }
 
+    context->host_call_active = false;
+    if (__atomic_load_n(&context->retired, __ATOMIC_ACQUIRE))
+        clear_audio_callback_locked(context);
+    pthread_cond_broadcast(&context->response_condition);
     pthread_mutex_unlock(&context->lock);
     return status;
 }
@@ -832,8 +888,13 @@ static uint32_t detach_audio_callbacks_for_graph(AUGraph graph,
             context->owner_graph == graph) {
             OSStatus status;
             if (strcmp(context->callback_kind, "render-notify") == 0) {
-                status = AUGraphRemoveRenderNotify(
-                    graph, host_audio_callback, context);
+                status = context->owner_unit ? AudioUnitRemoveRenderNotify(
+                    context->owner_unit, host_audio_callback, context) :
+                    AUGraphRemoveRenderNotify(graph, host_audio_callback, context);
+            } else if (context->owner_unit && !strcmp(context->callback_kind,"unit-input")) {
+                AURenderCallbackStruct callback={NULL,NULL};
+                status=AudioUnitSetProperty(context->owner_unit,(AudioUnitPropertyID)context->callback_node,
+                    context->callback_scope,context->callback_bus,&callback,sizeof(callback));
             } else {
                 status = AUGraphDisconnectNodeInput(
                     graph, context->callback_node, context->callback_bus);
@@ -892,6 +953,7 @@ enum deferred_graph_kind {
        queued: the mixer rejects parameters until it is initialized, so the
        write rides the queue behind Initialize instead of failing. */
     kDeferredUnitSetParameter,
+    kDeferredUnitRemoveRenderNotify,
     /* Builds one pre-opened graph for the pool (graph is NULL). */
     kDeferredPoolRefill,
     /* Teardown steps every later operation on the graph must wait for. */
@@ -975,6 +1037,7 @@ static const char *deferred_graph_kind_name(enum deferred_graph_kind kind)
     case kDeferredGraphStart: return "AUGraphStart";
     case kDeferredGraphStop: return "AUGraphStop";
     case kDeferredUnitSetParameter: return "AudioUnitSetParameter";
+    case kDeferredUnitRemoveRenderNotify: return "AudioUnitRemoveRenderNotify";
     case kDeferredPoolRefill: return "pool refill";
     case kDeferredGraphUninitialize: return "AUGraphUninitialize";
     case kDeferredGraphClose: return "AUGraphClose";
@@ -1014,6 +1077,11 @@ static void perform_graph_op(const struct deferred_graph_op *op)
     case kDeferredGraphStop:
         status = AUGraphStop(graph);
         if (trace_audio()) trace_audio_status("AUGraphStop(deferred)", status);
+        return;
+    case kDeferredUnitRemoveRenderNotify:
+        status = AudioUnitRemoveRenderNotify(op->unit, host_audio_callback, op->context);
+        if (!status) release_audio_callback(op->context);
+        if (trace_audio()) trace_audio_status("AudioUnitRemoveRenderNotify(deferred)", status);
         return;
     case kDeferredUnitSetParameter:
         status = AudioUnitSetParameter(op->unit, op->parameter, op->scope,
@@ -1135,7 +1203,9 @@ static bool graph_has_deferred_work_locked(AUGraph graph, bool teardown_only)
 
 static void drain_deferred_graph_work(AUGraph graph, bool teardown_only)
 {
-    if (!graph || !__atomic_load_n(&deferred_graph_outstanding, __ATOMIC_SEQ_CST)) return;
+    /* A callback may query its unit after requesting its own removal. The
+       teardown worker cannot finish releasing it until this callback returns. */
+    if (current_audio_callback || !graph || !__atomic_load_n(&deferred_graph_outstanding, __ATOMIC_SEQ_CST)) return;
     pthread_mutex_lock(&deferred_graph_lock);
     while (graph_has_deferred_work_locked(graph, teardown_only)) {
         pthread_cond_wait(&deferred_graph_done, &deferred_graph_lock);
@@ -1553,6 +1623,100 @@ int audio_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
                             uint64_t *result)
 {
     const size_t import_length = strlen(import_name);
+    if (LP32_NAME_IS(import_name, import_length, "_AUGraphUpdate")) {
+        AUGraph graph = synchronized_graph_for_guest(arguments[0]);
+        *result = (uint32_t)(graph ? AUGraphUpdate(graph, (Boolean *)(uintptr_t)arguments[1]) : kAudio_ParamError);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_AUGraphGetCPULoad")) {
+        AUGraph graph = synchronized_graph_for_guest(arguments[0]);
+        *result = (uint32_t)(graph ? AUGraphGetCPULoad(graph, (Float32 *)(uintptr_t)arguments[1]) : kAudio_ParamError);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_AUGraphNewNode")) {
+        if (arguments[2] || arguments[3]) { *result = (uint32_t)kAudio_ParamError; return 1; }
+        const uint32_t modern[] = {arguments[0], arguments[1], arguments[4]};
+        return audio_bridge32_dispatch("_AUGraphAddNode", modern, result);
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_AUGraphGetNodeInfo")) {
+        const uint32_t modern[] = {arguments[0], arguments[1], arguments[2], arguments[5]};
+        int handled = audio_bridge32_dispatch("_AUGraphNodeInfo", modern, result);
+        if (handled && !*result) {
+            if (arguments[3]) *(uint32_t *)(uintptr_t)arguments[3] = 0;
+            if (arguments[4]) *(uint32_t *)(uintptr_t)arguments[4] = 0;
+        }
+        return handled;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_FindNextComponent")) {
+        pthread_mutex_lock(&audio_object_lock);
+        uint32_t index = arguments[0] - kGuestComponentHandleBase;
+        AudioComponent previous = arguments[0] && index < component_count ? component_objects[index] : NULL;
+        AudioComponent component = AudioComponentFindNext(previous,
+            (const AudioComponentDescription *)(uintptr_t)arguments[1]);
+        *result = 0;
+        if (component) {
+            unsigned slot;
+            for (slot = 0; slot < component_count; ++slot) if (component_objects[slot] == component) break;
+            if (slot < 128) {
+                if (slot == component_count) component_objects[component_count++] = component;
+                *result = kGuestComponentHandleBase + slot;
+            }
+        }
+        pthread_mutex_unlock(&audio_object_lock);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_OpenAComponent") ||
+        LP32_NAME_IS(import_name, import_length, "_OpenComponent")) {
+        uint32_t index = arguments[0] - kGuestComponentHandleBase;
+        AudioUnit unit = NULL;
+        OSStatus status = index < component_count ? AudioComponentInstanceNew(component_objects[index], &unit) : kAudio_ParamError;
+        uint32_t handle = unit ? guest_handle_for_unit(unit, NULL) : 0;
+        if (unit && !handle) { AudioComponentInstanceDispose(unit); status = kAudio_MemFullError; }
+        if (LP32_NAME_IS(import_name, import_length, "_OpenComponent")) *result = handle;
+        else {
+            if (arguments[1]) *(uint32_t *)(uintptr_t)arguments[1] = handle;
+            *result = (uint32_t)status;
+        }
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_GetComponentVersion") ||
+        LP32_NAME_IS(import_name, import_length, "_CloseComponent")) {
+        AudioUnit unit = synchronized_unit_for_guest(arguments[0]);
+        if (!unit) return 0; /* Other bridges own graphics/movie components. */
+        if (LP32_NAME_IS(import_name, import_length, "_GetComponentVersion")) {
+            UInt32 version = 0;
+            OSStatus status = AudioComponentGetVersion(AudioComponentInstanceGetComponent(unit), &version);
+            *result = status ? (uint32_t)status : version;
+        } else {
+            *result = (uint32_t)AudioComponentInstanceDispose(unit);
+            if (!*result) {
+                uint32_t count = __atomic_load_n(&audio_callback_count, __ATOMIC_ACQUIRE);
+                for (uint32_t i = 0; i < count; ++i)
+                    if (audio_callbacks[i]->owner_unit == unit)
+                        release_audio_callback(audio_callbacks[i]);
+                pthread_mutex_lock(&audio_object_lock);
+                for (unsigned i = 0; i < unit_object_count; ++i)
+                    if (unit_objects[i] == unit) unit_objects[i] = NULL;
+                pthread_mutex_unlock(&audio_object_lock);
+            }
+        }
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_AudioUnitInitialize") ||
+        LP32_NAME_IS(import_name, import_length, "_AudioUnitUninitialize") ||
+        LP32_NAME_IS(import_name, import_length, "_AudioOutputUnitStart") ||
+        LP32_NAME_IS(import_name, import_length, "_AudioOutputUnitStop")) {
+        AudioUnit unit = synchronized_unit_for_guest(arguments[0]);
+        OSStatus status = kAudio_ParamError;
+        if (unit) {
+            if (LP32_NAME_IS(import_name, import_length, "_AudioUnitInitialize")) status = AudioUnitInitialize(unit);
+            else if (LP32_NAME_IS(import_name, import_length, "_AudioUnitUninitialize")) status = AudioUnitUninitialize(unit);
+            else if (LP32_NAME_IS(import_name, import_length, "_AudioOutputUnitStart")) status = AudioOutputUnitStart(unit);
+            else status = AudioOutputUnitStop(unit);
+        }
+        *result = (uint32_t)status;
+        return 1;
+    }
     if (LP32_NAME_IS(import_name, import_length, "_NewAUGraph")) {
         AUGraph graph = NULL;
         OSStatus status = NewAUGraph(&graph);
@@ -1860,6 +2024,79 @@ int audio_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
         *result = (uint32_t)status;
         return 1;
     }
+    if (LP32_NAME_IS(import_name, import_length, "_AudioUnitAddRenderNotify") ||
+        LP32_NAME_IS(import_name, import_length, "_AudioUnitRemoveRenderNotify")) {
+        AUGraph graph = NULL;
+        AudioUnit unit = unit_for_guest(arguments[0], &graph);
+        if (unit && !current_audio_callback) drain_deferred_graph_work(graph, false);
+        OSStatus status = kAudio_ParamError;
+        if (unit && arguments[1]) {
+            if (LP32_NAME_IS(import_name, import_length, "_AudioUnitAddRenderNotify")) {
+                struct audio_callback_context *context = new_audio_callback(
+                    arguments[1], arguments[2], "render-notify", graph, 0, 0);
+                if (context) {
+                    context->owner_unit = unit;
+                    status = AudioUnitAddRenderNotify(unit, host_audio_callback, context);
+                    if (status) release_audio_callback(context);
+                } else status = kAudio_MemFullError;
+            } else {
+                status = noErr;
+                uint32_t count = __atomic_load_n(&audio_callback_count, __ATOMIC_ACQUIRE);
+                for (uint32_t i = 0; i < count; ++i) {
+                    struct audio_callback_context *context = audio_callbacks[i];
+                    bool self = context == current_audio_callback;
+                    if (!self) pthread_mutex_lock(&context->lock);
+                    bool matches = context->in_use && context->owner_unit == unit &&
+                        !strcmp(context->callback_kind,"render-notify") &&
+                        context->guest_function == arguments[1] &&
+                        context->guest_refcon == arguments[2];
+                    if (!self) pthread_mutex_unlock(&context->lock);
+                    if (matches) {
+                        if (current_audio_callback) {
+                            /* A native render is waiting for this worker. Removing
+                               its notify synchronously would wait for ourselves. */
+                            struct deferred_graph_op *op = new_deferred_graph_op(graph, kDeferredUnitRemoveRenderNotify);
+                            if (!op) status = kAudio_MemFullError;
+                            else {
+                                __atomic_store_n(&context->muted, true, __ATOMIC_RELEASE);
+                                op->unit = unit; op->context = context;
+                                pthread_mutex_lock(&deferred_graph_lock);
+                                append_deferred_graph_op_locked(op);
+                                pthread_mutex_unlock(&deferred_graph_lock);
+                            }
+                        } else {
+                            status = AudioUnitRemoveRenderNotify(unit, host_audio_callback, context);
+                            if (!status) release_audio_callback(context);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        *result = (uint32_t)status;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_AudioUnitRender")) {
+        AudioUnit unit=synchronized_unit_for_guest(arguments[0]);
+        uint32_t *guest=(void *)(uintptr_t)arguments[5];
+        if(!unit || !arguments[1] || !arguments[2] || !guest || *guest>kAudioCallbackBufferCapacity) { *result=(uint32_t)kAudio_ParamError;return 1; }
+        struct { UInt32 count; AudioBuffer buffers[kAudioCallbackBufferCapacity]; } host;
+        uint32_t count=*guest;host.count=count;
+        struct guest_audio_buffer *buffers=(void *)(guest+1);
+        for(uint32_t i=0;i<count;++i)host.buffers[i]=(AudioBuffer){buffers[i].channels,buffers[i].byte_size,(void *)(uintptr_t)buffers[i].data};
+        OSStatus status=AudioUnitRender(unit,(AudioUnitRenderActionFlags *)(uintptr_t)arguments[1],
+            (const AudioTimeStamp *)(uintptr_t)arguments[2],arguments[3],arguments[4],(AudioBufferList *)&host);
+        if(host.count>count)status=kAudio_ParamError;
+        else for(uint32_t i=0;i<host.count;++i){
+            if(host.buffers[i].mData!=(void *)(uintptr_t)buffers[i].data) {
+                if(!buffers[i].data || !host.buffers[i].mData || host.buffers[i].mDataByteSize>buffers[i].byte_size) {status=kAudio_ParamError;break;}
+                memcpy((void *)(uintptr_t)buffers[i].data,host.buffers[i].mData,host.buffers[i].mDataByteSize);
+            }
+            buffers[i].channels=host.buffers[i].mNumberChannels;buffers[i].byte_size=host.buffers[i].mDataByteSize;
+        }
+        if(!status)*guest=host.count;
+        *result=(uint32_t)status;return 1;
+    }
     if (LP32_NAME_IS(import_name, import_length, "_AudioUnitGetProperty")) {
         AudioUnit unit = synchronized_unit_for_guest(arguments[0]);
         OSStatus status = unit ? AudioUnitGetProperty(
@@ -1880,10 +2117,72 @@ int audio_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
     }
     if (LP32_NAME_IS(import_name, import_length, "_AudioUnitSetProperty")) {
         AudioUnit unit = synchronized_unit_for_guest(arguments[0]);
+        if (arguments[1] == kAudioUnitProperty_SetRenderCallback ||
+            arguments[1] == kAudioOutputUnitProperty_SetInputCallback) {
+            OSStatus status = kAudio_ParamError;
+            if (!unit || !arguments[4] || arguments[5] != 8) { *result=(uint32_t)status;return 1; }
+            if (current_audio_callback) {
+                *result=(uint32_t)kAudioUnitErr_CannotDoInCurrentContext;return 1;
+            }
+            AUGraph owner_graph=NULL;(void)unit_for_guest(arguments[0],&owner_graph);
+            const uint32_t *guest=(void *)(uintptr_t)arguments[4];
+            struct audio_callback_context *context=guest[0] ? new_audio_callback(
+                guest[0],guest[1],"unit-input",owner_graph,(AUNode)arguments[1],arguments[3]) : NULL;
+            if (guest[0] && !context) { *result=(uint32_t)kAudio_MemFullError;return 1; }
+            if(context){context->owner_unit=unit;context->callback_scope=arguments[2];}
+            AURenderCallbackStruct callback={context ? host_audio_callback : NULL,context};
+            struct audio_callback_context *old = NULL;
+            pthread_mutex_lock(&unit_input_update_lock);
+            pthread_mutex_lock(&unit_input_binding_lock);
+            struct unit_input_binding *binding = NULL, *empty = NULL;
+            for (unsigned i = 0; i < kAudioCallbackCapacity; ++i) {
+                struct unit_input_binding *candidate = &unit_input_bindings[i];
+                if (!candidate->context) { if (!empty) empty = candidate; continue; }
+                if (candidate->unit == unit && candidate->property == arguments[1] &&
+                    candidate->scope == arguments[2] && candidate->element == arguments[3]) {
+                    binding = candidate;
+                    break;
+                }
+            }
+            if (!binding) binding = empty;
+            pthread_mutex_unlock(&unit_input_binding_lock);
+            /* CoreAudio may synchronize with its IO thread. That thread must
+               remain free to finish and clear a retired binding. */
+            status = !binding && context ? kAudio_MemFullError :
+                AudioUnitSetProperty(unit,arguments[1],arguments[2],arguments[3],&callback,sizeof(callback));
+            pthread_mutex_lock(&unit_input_binding_lock);
+            if (!status && binding) {
+                old = binding->context;
+                *binding = (struct unit_input_binding){unit, arguments[1], arguments[2], arguments[3], context};
+                if (old) {
+                    __atomic_store_n(&old->muted, true, __ATOMIC_RELEASE);
+                    __atomic_store_n(&old->retired, true, __ATOMIC_RELEASE);
+                }
+            }
+            pthread_mutex_unlock(&unit_input_binding_lock);
+            pthread_mutex_unlock(&unit_input_update_lock);
+            if (status) release_audio_callback(context);
+            else finish_retired_audio_callback(old);
+            *result=(uint32_t)status;return 1;
+        }
         OSStatus status = unit ? AudioUnitSetProperty(
             unit, arguments[1], arguments[2], arguments[3],
             (const void *)(uintptr_t)arguments[4], arguments[5])
             : kAudio_ParamError;
+        /* The modern 3D mixer has a fixed stereo output and rejects its old
+           channel-layout property. An explicit stereo request is already
+           satisfied when the native stream format confirms two channels. */
+        if (status == kAudioUnitErr_InvalidProperty &&
+            arguments[1] == kAudioUnitProperty_AudioChannelLayout && arguments[4] &&
+            arguments[5] >= offsetof(AudioChannelLayout, mChannelDescriptions)) {
+            const AudioChannelLayout *layout = (const void *)(uintptr_t)arguments[4];
+            AudioStreamBasicDescription format;
+            UInt32 size = sizeof(format);
+            if (layout->mChannelLayoutTag == kAudioChannelLayoutTag_Stereo &&
+                !AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat,
+                    arguments[2], arguments[3], &format, &size) && format.mChannelsPerFrame == 2)
+                status = noErr;
+        }
         if (trace_audio()) {
             fprintf(stderr,
                     "compat32: audio SetProperty unit=0x%08x id=%u scope=%u "
@@ -2020,6 +2319,29 @@ int audio_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
                 (void *)(uintptr_t)arguments[5]);
         }
         trace_audio_status("AudioDeviceGetProperty", status);
+        *result = (uint32_t)status;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_AudioDeviceSetProperty")) {
+        OSStatus status = kAudioHardwareUnsupportedOperationError;
+        /* These property payloads have identical i386 and x86_64 layouts.
+           Pointer-bearing properties require their own conversion. */
+        switch (arguments[4]) {
+        case kAudioDevicePropertyVolumeScalar:
+        case kAudioDevicePropertyMute:
+        case kAudioDevicePropertyBufferFrameSize:
+        case kAudioDevicePropertyNominalSampleRate:
+        case kAudioDevicePropertyStreamFormat:
+            if (!(arguments[3] && mute_audio_output())) {
+                status = AudioDeviceSetProperty(arguments[0],
+                    (const AudioTimeStamp *)(uintptr_t)arguments[1],
+                    arguments[2], (Boolean)arguments[3], arguments[4],
+                    arguments[5], (const void *)(uintptr_t)arguments[6]);
+            }
+            break;
+        default: break;
+        }
+        trace_audio_status("AudioDeviceSetProperty", status);
         *result = (uint32_t)status;
         return 1;
     }

@@ -12,4 +12,5 @@ void objc_legacy32_register_classes(void);
 void *objc_legacy32_application_class(void);
 int objc_legacy32_super_message(void *, void *, const uint32_t *, uint64_t *);
 int objc_legacy32_run_lifetime_self_test(void);
+int objc_legacy32_run_download_self_test(void);
 #endif

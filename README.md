@@ -7,6 +7,10 @@ segment to run it, and bridges the OS, OpenGL, Cg, CoreAudio and controller
 interfaces the game expects. No SIP changes, kernel extensions, VMs or Wine.
 You need your own copy of the game.
 
+This branch also adds experimental support for the Steam Mac release of
+[Call of Duty 4: Modern Warfare](native/COD4.md), with separate single-player
+and multiplayer bundles. See that guide for build instructions and validation status.
+
 Support for the original 32-bit Mac releases:
 
 | Game | Mac release | Status |
@@ -31,6 +35,20 @@ Support for the original 32-bit Mac releases:
 \* Not verified with a 100% run yet, report any bugs or problems in the issues tab.
 
 ## Building
+
+For a Finder-based COD4 conversion, build the standalone app once:
+
+```sh
+make -C native cod4-converter
+```
+
+Open `native/build/COD4-Converter.app`, choose **Campaign** or **Multiplayer**,
+then click **Find in Steam** or drop in the original Steam Mac app/game folder.
+Choose an output folder to create a separate compatibility app. The converter
+includes the current loader and prepares its private runtime automatically;
+using it requires no Python, Make, Xcode, or checkout. Existing converted apps
+are preserved by giving new copies numbered names. See the
+[COD4 guide](native/COD4.md#converter-app) for requirements and details.
 
 Requirements: macOS 11 or later, Xcode command-line tools (`xcode-select
 --install`), Rosetta 2 on Apple Silicon (`softwareupdate --install-rosetta`),

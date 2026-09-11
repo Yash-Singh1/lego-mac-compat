@@ -14,6 +14,7 @@ struct stream32 {
 };
 struct stream {
     z_stream native;
+    int compressing;
     uint32_t allocate, release, opaque, message;
 };
 _Static_assert(sizeof(struct stream32) == 56, "i386 z_stream layout");
@@ -44,17 +45,50 @@ static void sync_out(struct stream32 *g, struct stream *s) {
     if (s->message) compat_runtime32_deallocate(s->message);
     g->msg = s->message = compat_runtime32_copy_cstring(s->native.msg);
 }
+/* Checkpoint restore can issue hundreds of thousands of small inflate calls.
+ * Both ordinary dispatch and its memoized handler use this same ABI adapter. */
+static uint64_t run_stream(const uint32_t *a, int compressing) {
+    struct stream32 *g = (void *)(uintptr_t)a[0];
+    struct stream *s = state(g);
+    if (!s || s->compressing != compressing) return (uint32_t)Z_STREAM_ERROR;
+    s->native.next_in = (void *)(uintptr_t)g->next_in;
+    s->native.avail_in = g->avail_in;
+    s->native.next_out = (void *)(uintptr_t)g->next_out;
+    s->native.avail_out = g->avail_out;
+    int result = compressing ? deflate(&s->native, (int)a[1]) : inflate(&s->native, (int)a[1]);
+    sync_out(g, s);
+    return (uint32_t)result;
+}
+uint64_t zlib_bridge32_inflate(const uint32_t *a, uint32_t caller) {
+    (void)caller;
+    return run_stream(a, 0);
+}
+uint64_t zlib_bridge32_deflate(const uint32_t *a, uint32_t caller) {
+    (void)caller;
+    return run_stream(a, 1);
+}
 int zlib_bridge32_dispatch(const char *name, const uint32_t *a, uint64_t *out) {
-    int init = !strcmp(name, "_inflateInit2_");
-    int run = !strcmp(name, "_inflate");
-    int end = !strcmp(name, "_inflateEnd");
-    if (!init && !run && !end) return 0;
+    if (!strcmp(name, "_inflate")) { *out = zlib_bridge32_inflate(a, 0); return 1; }
+    if (!strcmp(name, "_deflate")) { *out = zlib_bridge32_deflate(a, 0); return 1; }
+    if (!strcmp(name, "_inflateInit_")) {
+        const uint32_t modern[] = {a[0], MAX_WBITS, a[1], a[2]};
+        return zlib_bridge32_dispatch("_inflateInit2_", modern, out);
+    }
+    if (!strcmp(name, "_deflateInit_")) {
+        const uint32_t modern[] = {a[0], a[1], Z_DEFLATED, MAX_WBITS, 8, Z_DEFAULT_STRATEGY, a[2], a[3]};
+        return zlib_bridge32_dispatch("_deflateInit2_", modern, out);
+    }
+    int compressing = !strncmp(name, "_deflate", 8);
+    int init = !strcmp(name, "_inflateInit2_") || !strcmp(name, "_deflateInit2_");
+    int end = !strcmp(name, "_inflateEnd") || !strcmp(name, "_deflateEnd");
+    int reset = !strcmp(name, "_inflateReset") || !strcmp(name, "_deflateReset");
+    if (!init && !end && !reset) return 0;
     *out = (uint32_t)Z_STREAM_ERROR;
     struct stream32 *g = (void *)(uintptr_t)a[0];
     if (!g) return 1;
     if (init) {
-        const char *version = (void *)(uintptr_t)a[2];
-        if (a[3] != sizeof(*g) || !version || version[0] != ZLIB_VERSION[0]) {
+        const char *version = (void *)(uintptr_t)a[compressing ? 6 : 2];
+        if (a[compressing ? 7 : 3] != sizeof(*g) || !version || version[0] != ZLIB_VERSION[0]) {
             *out = (uint32_t)Z_VERSION_ERROR; return 1;
         }
         struct stream *s = calloc(1, sizeof(*s));
@@ -68,23 +102,20 @@ int zlib_bridge32_dispatch(const char *name, const uint32_t *a, uint64_t *out) {
         s->native.opaque = s;
         s->native.zalloc = s->allocate ? allocate : NULL;
         s->native.zfree = s->release ? release : NULL;
-        int result = inflateInit2(&s->native, (int)a[1]);
+        s->compressing = compressing;
+        int result = compressing ? deflateInit2(&s->native, (int)a[1], (int)a[2], (int)a[3], (int)a[4], (int)a[5]) : inflateInit2(&s->native, (int)a[1]);
         *out = (uint32_t)result;
         if (result != Z_OK) { compat_runtime32_deallocate(token); free(s); return 1; }
         memcpy((void *)(uintptr_t)token, &s, sizeof(s));
         g->state = token; sync_out(g, s); return 1;
     }
     struct stream *s = state(g);
-    if (!s) return 1;
-    if (run) {
-        s->native.next_in = (void *)(uintptr_t)g->next_in;
-        s->native.avail_in = g->avail_in;
-        s->native.next_out = (void *)(uintptr_t)g->next_out;
-        s->native.avail_out = g->avail_out;
-        *out = (uint32_t)inflate(&s->native, (int)a[1]);
+    if (!s || s->compressing != compressing) return 1;
+    if (reset) {
+        *out = (uint32_t)(compressing ? deflateReset(&s->native) : inflateReset(&s->native));
         sync_out(g, s);
     } else {
-        *out = (uint32_t)inflateEnd(&s->native);
+        *out = (uint32_t)(compressing ? deflateEnd(&s->native) : inflateEnd(&s->native));
         if (s->message) compat_runtime32_deallocate(s->message);
         compat_runtime32_deallocate(g->state);
         g->state = g->msg = 0; free(s);

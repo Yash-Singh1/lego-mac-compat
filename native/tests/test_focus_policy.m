@@ -40,6 +40,16 @@ int main(int argc, const char **argv)
     assert(!lp32_suppress_background_input());
     setenv("LP32_TEST_FOCUS_LOSS", "1,2", 1);
     assert(lp32_ignore_guest_focus_loss() == expected);
+    unsetenv("LP32_BACKGROUND_TEST");
+    lp32_set_managed_input_active(0);
+    mock.active = YES; /* WillResign fires before isActive changes. */
+    assert(lp32_suppress_background_input());
+    lp32_set_managed_input_active(1);
+    assert(!lp32_suppress_background_input());
+    mock.active = NO;
+    assert(!lp32_suppress_background_input()); /* Carbon process is active. */
+    lp32_set_managed_input_active(0);
+    assert(lp32_suppress_background_input());
     NSApp = saved;
     [mock release];
     puts("focus policy PASS (default, overrides, guest focus, inactive input, test isolation)");

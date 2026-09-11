@@ -42,4 +42,8 @@ struct macho_image32 {
 int macho_image32_load(const char *path, struct macho_image32 *image);
 void macho_image32_unload(const struct macho_image32 *image);
 
+int macho_image32_bind_import(const struct macho_import32 *import, uint32_t target);
+int macho_image32_bind_external_relocations(const struct macho_image32 *image,
+    uint32_t (*resolve)(const char *, void *), void *context);
+
 #endif

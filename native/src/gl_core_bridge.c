@@ -759,6 +759,35 @@ static const struct {const char *name; lp32_fast_import_fn call;} table[] = {
     {"glVertexPointer",call_glVertexPointer},
     {"glViewportArrayv",call_glViewportArrayv},
 };
+/* Compatibility-profile operations used by COD4. Keep these outside the
+ * indexed generated table so its stable symbol indices remain unchanged. */
+extern void glMaterialf(uint32_t, uint32_t, float);
+extern void glActiveStencilFaceEXT(uint32_t);
+extern void glDeleteVertexArraysAPPLE(int32_t, const uint32_t *);
+extern void glPointParameterfARB(uint32_t, float);
+extern void glPushClientAttrib(uint32_t);
+extern void glPopClientAttrib(void);
+static uint64_t extra_glMaterialf(const uint32_t *a, uint32_t site) {
+    (void)site; glMaterialf(a[0], a[1], f32(a[2])); return 0;
+}
+static uint64_t extra_glActiveStencilFaceEXT(const uint32_t *a, uint32_t site) {
+    (void)site; glActiveStencilFaceEXT(a[0]); return 0;
+}
+static uint64_t extra_glDeleteVertexArraysAPPLE(const uint32_t *a, uint32_t site) {
+    (void)site; glDeleteVertexArraysAPPLE((int32_t)a[0], (const void *)(uintptr_t)a[1]); return 0;
+}
+static uint64_t extra_glPointParameterfARB(const uint32_t *a, uint32_t site) {
+    (void)site; glPointParameterfARB(a[0], f32(a[1])); return 0;
+}
+static uint64_t extra_glPointSize(const uint32_t *a, uint32_t site) {
+    (void)site; glPointSize(f32(a[0])); return 0;
+}
+static uint64_t extra_glPushClientAttrib(const uint32_t *a, uint32_t site) {
+    (void)site; glPushClientAttrib(a[0]); return 0;
+}
+static uint64_t extra_glPopClientAttrib(const uint32_t *a, uint32_t site) {
+    (void)site; (void)a; glPopClientAttrib(); return 0;
+}
 static uint64_t extra_glPixelStorei(const uint32_t *a,uint32_t site){
     (void)site;glPixelStorei(a[0],(int32_t)a[1]);return 0;
 }
@@ -798,6 +827,13 @@ static pthread_once_t once=PTHREAD_ONCE_INIT;
 static void initialize(void){for(unsigned i=0;i<sizeof(table)/sizeof(table[0]);++i)symbols[i]=dlsym(RTLD_DEFAULT,table[i].name);}
 lp32_fast_import_fn gl_core_bridge32_fast_import(const char *name){
     if(*name=='_')++name; if(strncmp(name,"gl",2))return NULL;
+    if(!strcmp(name,"glMaterialf"))return extra_glMaterialf;
+    if(!strcmp(name,"glActiveStencilFaceEXT"))return extra_glActiveStencilFaceEXT;
+    if(!strcmp(name,"glDeleteVertexArraysAPPLE"))return extra_glDeleteVertexArraysAPPLE;
+    if(!strcmp(name,"glPointParameterfARB"))return extra_glPointParameterfARB;
+    if(!strcmp(name,"glPointSize"))return extra_glPointSize;
+    if(!strcmp(name,"glPushClientAttrib"))return extra_glPushClientAttrib;
+    if(!strcmp(name,"glPopClientAttrib"))return extra_glPopClientAttrib;
     if(!strcmp(name,"glPixelStorei"))return extra_glPixelStorei;
     if(!strcmp(name,"glGetBooleanv"))return extra_glGetBooleanv;
     if(!strcmp(name,"glGetBufferSubData"))return extra_glGetBufferSubData;

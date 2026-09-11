@@ -8,6 +8,7 @@
 #include "hitch_recorder.h"
 #include "host_diagnostics.h"
 #include "steam_bridge.h"
+#include "guest_dyld.h"
 
 #include <errno.h>
 #include <dlfcn.h>
@@ -332,6 +333,96 @@ static int install_save_worker_patch(void)
         return -1;
     }
     fprintf(stderr, "compat32: installed single SaveCore thread patch\n");
+    return 0;
+}
+
+/* SV_InitGameProgs can compile scripts and spawn entities for nearly a second
+   without reaching SCR_UpdateLoadScreen. The database worker keeps advancing,
+   but the cinematic badge and progress bar retain the previous frame.
+
+   Yield at script-load/entity-parse entry and at the VM's existing loop timer
+   check. These are main-thread boundaries outside string/database locks, not
+   arbitrary libc imports inside a critical section. Loading already permits
+   SCR_UpdateLoadScreen from DB_FindXAssetHeader while resolving script assets.
+   Keep the game's redraw guard, 33 ms throttle, cinematic timing, and real
+   progress counters. Never draw gameplay from inside script execution. */
+static int install_loading_screen_patch(void)
+{
+    const struct lp32_loading_screen_patch *layout = lp32_profile()->loading_screen;
+    if (!layout) return 0;
+
+    /* Unused tail of the i386 landing-pad page: after e000/e040, before the
+       guest context routines at f000. Do not place i386 code on the d000
+       page containing the 64-bit gateway landing pads. */
+    enum { kStubAddress = 0x7f00e800, kStubStride = 128 };
+    const struct lp32_code_signature *signatures[] = {
+        &layout->redraw, &layout->is_main_thread, &layout->milliseconds,
+        &layout->entry_points[0], &layout->entry_points[1],
+    };
+    unsigned char original_call[5] = {0xe8};
+    int32_t relative = (int32_t)(layout->milliseconds.address -
+                                 (layout->vm_loop_timer_call + 5));
+    memcpy(original_call + 1, &relative, sizeof(relative));
+    /* Validate the entire layout before modifying any guest instructions. */
+    for (size_t i = 0; i < sizeof(signatures) / sizeof(signatures[0]); ++i) {
+        const struct lp32_code_signature *signature = signatures[i];
+        if (signature->length != 6 ||
+            memcmp((void *)(uintptr_t)signature->address, signature->expected, 6)) {
+            fprintf(stderr, "compat32: loading screen patch signature mismatch at %08x\n",
+                    signature->address);
+            return -1;
+        }
+    }
+    if (memcmp((void *)(uintptr_t)layout->vm_loop_timer_call, original_call, 5)) {
+        fprintf(stderr, "compat32: loading screen VM timer signature mismatch\n");
+        return -1;
+    }
+
+    for (unsigned i = 0; i < 3; ++i) {
+        bool entry = i < 2;
+        const struct lp32_code_signature *point = entry ? &layout->entry_points[i] : NULL;
+        uint32_t site = entry ? point->address : layout->vm_loop_timer_call;
+        uint32_t base = kStubAddress + i * kStubStride;
+        unsigned char code[kStubStride];
+        size_t offset = 0;
+        /* cdecl frame: leave the original stack arguments untouched and align
+           esp to 16 bytes before calling the no-argument guest functions. */
+        const unsigned char prologue[] = {0x55, 0x89, 0xe5, 0x83, 0xec, 0x08};
+        memcpy(code, prologue, sizeof(prologue)); offset += sizeof(prologue);
+        emit_u8(code, &offset, 0xa1); /* mov eax, [cls pointer] */
+        emit_u32(code, &offset, layout->client_state_pointer);
+        emit_u8(code, &offset, 0x85); emit_u8(code, &offset, 0xc0); /* test eax, eax */
+        emit_u8(code, &offset, 0x74);
+        size_t null_jump = offset; emit_u8(code, &offset, 0);
+        emit_u8(code, &offset, 0x83); emit_u8(code, &offset, 0x78);
+        emit_u8(code, &offset, 0x0c); emit_u8(code, &offset, 3); /* cmp [eax+12], 3 */
+        emit_u8(code, &offset, 0x75);
+        size_t state_jump = offset; emit_u8(code, &offset, 0);
+        emit_u8(code, &offset, 0xe8);
+        emit_rel32(code, &offset, base, layout->is_main_thread.address);
+        emit_u8(code, &offset, 0x84); emit_u8(code, &offset, 0xc0); /* test al, al */
+        emit_u8(code, &offset, 0x74);
+        size_t thread_jump = offset; emit_u8(code, &offset, 0);
+        emit_u8(code, &offset, 0xe8);
+        emit_rel32(code, &offset, base, layout->redraw.address);
+        code[null_jump] = (uint8_t)(offset - null_jump - 1);
+        code[state_jump] = (uint8_t)(offset - state_jump - 1);
+        code[thread_jump] = (uint8_t)(offset - thread_jump - 1);
+        emit_u8(code, &offset, 0xc9); /* leave: original stack and ebp */
+        if (entry) {
+            memcpy(code + offset, point->expected, point->length);
+            offset += point->length;
+        }
+        emit_u8(code, &offset, 0xe9);
+        emit_rel32(code, &offset, base, entry ? site + point->length :
+                                              layout->milliseconds.address);
+        if (write_guest_code(base, code, offset, "loading screen redraw stub")) return -1;
+        unsigned char hook[6] = {entry ? 0xe9 : 0xe8, 0, 0, 0, 0, 0x90};
+        relative = (int32_t)(base - (site + 5));
+        memcpy(hook + 1, &relative, sizeof(relative));
+        if (write_guest_code(site, hook, entry ? 6 : 5, "loading screen redraw hook")) return -1;
+    }
+    fprintf(stderr, "compat32: installed cooperative mission loading screen redraws\n");
     return 0;
 }
 
@@ -680,7 +771,7 @@ static void runtime_diagnostic_line(const char *line)
 static const char *default_image_path(const char *argv0, char *buffer,
                                       size_t size)
 {
-    static const char *const candidates[] = {"LEGOPirates", "LEGOCloneWars", "LEGOMarvel", "LEGOCompleteSaga"};
+    static const char *const candidates[] = {"LEGOPirates", "LEGOCloneWars", "LEGOMarvel", "LEGOCompleteSaga", "COD4", "COD4MP"};
     const char *slash = strrchr(argv0, '/');
     size_t directory_length = slash ? (size_t)(slash - argv0) : 0;
     for (size_t index = 0; index < sizeof(candidates) / sizeof(candidates[0]); ++index) {
@@ -777,6 +868,44 @@ int main(int argc, char **argv)
         macho_image32_unload(&image);
         return EXIT_FAILURE;
     }
+    if (getenv("LP32_DYLD_FIXTURE_SELFTEST")) {
+        int result = guest_dyld32_initialize(image_path);
+        if (!result) result = guest_dyld32_self_test();
+        macho_image32_unload(&image);
+        return result ? EXIT_FAILURE : EXIT_SUCCESS;
+    }
+    if (lp32_profile()->title == LP32_TITLE_COD4 || lp32_profile()->title == LP32_TITLE_COD4_MP) {
+        /* The renderer accepts only an exact 24-bit depth-buffer capability.
+           Current Apple GPUs offer 32-bit depth. Accept both; the original
+           AGL request still chooses a real format with at least 24 bits. */
+        const struct lp32_code_signature *check = &lp32_profile()->depth_capability_check;
+        uint8_t *code = (void *)(uintptr_t)check->address;
+        if (memcmp(code, check->expected, check->length) ||
+            mprotect((void *)(uintptr_t)(check->address & ~4095u), 4096, PROT_READ | PROT_WRITE | PROT_EXEC)) {
+            fprintf(stderr, "game_loader: COD4 depth capability signature mismatch or protection error\n");
+            return EXIT_FAILURE;
+        }
+        code[check->length - 1] = 0x18;
+        flush_guest_instruction(check->address);
+        if (guest_dyld32_initialize(image_path) || guest_dyld32_bind_main_cxx(&image))
+            return EXIT_FAILURE;
+        char bink_path[PATH_MAX];
+        int length = snprintf(bink_path, sizeof(bink_path), "%s/libBinkMachOx86.dylib", guest_dyld32_game_root());
+        uint32_t bink = length > 0 && (size_t)length < sizeof(bink_path) ? guest_dyld32_open(bink_path, RTLD_NOW) : 0;
+        if (!bink) {
+            fprintf(stderr, "game_loader: cannot load original Bink library: %s\n", (char *)(uintptr_t)guest_dyld32_error());
+            return EXIT_FAILURE;
+        }
+        unsigned bound = 0;
+        for (unsigned i = 0; i < image.import_count; ++i) {
+            const struct macho_import32 *import = &image.imports[i];
+            if (strncmp(import->name, "_Bink", 5)) continue;
+            uint32_t address = guest_dyld32_symbol(bink, import->name + 1);
+            if (!address || macho_image32_bind_import(import, address)) return EXIT_FAILURE;
+            ++bound;
+        }
+        fprintf(stderr, "compat32: bound %u Bink imports to the original i386 library\n", bound);
+    }
     if (getenv("LP32_OBJC_LIFETIME_SELFTEST")) {
         int result=objc_legacy32_run_lifetime_self_test();
         macho_image32_unload(&image);
@@ -789,6 +918,11 @@ int main(int argc, char **argv)
     }
     if (getenv("LP32_CARBON_GEOMETRY_SELFTEST")) {
         int result = carbon_bridge32_run_geometry_self_test();
+        macho_image32_unload(&image);
+        return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (getenv("LP32_CARBON_INPUT_SELFTEST")) {
+        int result = objc_bridge32_run_carbon_input_self_test();
         macho_image32_unload(&image);
         return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
@@ -822,6 +956,9 @@ int main(int argc, char **argv)
         macho_image32_unload(&image);
         return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
+    if (getenv("LP32_CARBON_FILE_SELFTEST")) {
+        return carbon_bridge32_run_file_self_test() ? EXIT_FAILURE : EXIT_SUCCESS;
+    }
     if (getenv("LP32_CARBON_DISPATCH_SELFTEST")) {
         int result = carbon_bridge32_run_dispatch_self_test();
         macho_image32_unload(&image);
@@ -829,6 +966,11 @@ int main(int argc, char **argv)
     }
     if (getenv("LP32_IMPORT_RETURN_SELFTEST")) {
         int result = compat_runtime32_run_import_return_self_test();
+        macho_image32_unload(&image);
+        return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (getenv("LP32_COD4_DOWNLOAD_SELFTEST")) {
+        int result = objc_legacy32_run_download_self_test();
         macho_image32_unload(&image);
         return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
@@ -877,15 +1019,24 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
+    if (install_loading_screen_patch() != 0) {
+        macho_image32_unload(&image);
+        return EXIT_FAILURE;
+    }
+
     if (objc_bridge32_prepare_shader_cache() != 0) {
         macho_image32_unload(&image);
         return EXIT_FAILURE;
     }
 
-    /* Automatic only for Marvel; no full import profiling or draw dumps. */
+    /* Lightweight, bounded reports; no full import profiling or draw dumps.
+       COD4 deliberately redraws some loading screens at 30 Hz, so its default
+       threshold is 50 ms rather than treating each loading frame as a hitch. */
+    bool cod4_hitches = lp32_profile()->title == LP32_TITLE_COD4 ||
+                       lp32_profile()->title == LP32_TITLE_COD4_MP;
     const char *hitch_option = getenv("LP32_HITCH_LOG");
     if ((hitch_option && strcmp(hitch_option, "0")) ||
-        (!hitch_option && lp32_profile()->title == LP32_TITLE_MARVEL)) {
+        (!hitch_option && (lp32_profile()->title == LP32_TITLE_MARVEL || cod4_hitches))) {
         char path[PATH_MAX];
         const char *home = getenv("HOME");
         int length = snprintf(path, sizeof(path), "%s/Library/Logs/%s/hitches-%ld-%llu.log",
@@ -895,7 +1046,8 @@ int main(int argc, char **argv)
                                   hitch_option : path;
         const char *threshold = getenv("LP32_HITCH_MS");
         if (length > 0 && (size_t)length < sizeof(path) &&
-            hitch_start(destination, threshold ? strtod(threshold, NULL) : 25.0) == 0) {
+            hitch_start(destination, threshold ? strtod(threshold, NULL) :
+                        (cod4_hitches ? 50.0 : 25.0)) == 0) {
             GUEST_DIAGNOSTIC("compat32: automatic hitch recorder: %s\n", destination);
         } else {
             perror("compat32: hitch recorder unavailable");
@@ -924,6 +1076,10 @@ int main(int argc, char **argv)
     if (!initialization_trapped) {
         printf("initializers completed: %" PRIu32 "/%" PRIu32 "\n",
                image.initializer_count, image.initializer_count);
+        if (getenv("LP32_INITIALIZERS_SELFTEST")) {
+            macho_image32_unload(&image);
+            return EXIT_SUCCESS;
+        }
 
         char host_executable_path[PATH_MAX];
         uint32_t host_executable_path_size = sizeof(host_executable_path);
@@ -936,6 +1092,11 @@ int main(int argc, char **argv)
         uint32_t executable_path =
             compat_runtime32_copy_cstring(host_executable_path);
         const char *extra_argument_text = getenv("LP32_GUEST_EXTRA_ARGUMENT");
+        /* Aspyr's documented-in-code -g option enters the game directly
+           instead of opening the obsolete embedded Game Guide browser. */
+        if (!extra_argument_text && (lp32_profile()->title == LP32_TITLE_COD4 ||
+                                     lp32_profile()->title == LP32_TITLE_COD4_MP))
+            extra_argument_text = "-g";
         uint32_t extra_argument = extra_argument_text && extra_argument_text[0] ?
             compat_runtime32_copy_cstring(extra_argument_text) : 0;
         uint32_t guest_argc = extra_argument ? 2 : 1;
@@ -968,7 +1129,8 @@ int main(int argc, char **argv)
             sizeof(main_arguments) / sizeof(main_arguments[0]));
         printf("game main returned/escaped: 0x%08" PRIx32 " trapped=%d\n",
                result, compat_runtime32_last_call_trapped());
+        initialization_trapped = compat_runtime32_last_call_trapped();
     }
     macho_image32_unload(&image);
-    return EXIT_SUCCESS;
+    return initialization_trapped ? EXIT_FAILURE : EXIT_SUCCESS;
 }

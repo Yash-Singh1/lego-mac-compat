@@ -27,10 +27,28 @@ int main(void)
         assert(profile->thread_argument_is_direct == (i >= 2));
         assert(profile->callee_pops_struct_return == (i == 2 || i == 5));
         assert((profile->steam_achievement_guard != NULL) == (i == 2));
+        assert(!profile->loading_screen);
         assert(profile->steam_app_id == (i == 2 ? 249130u : 0u));
         if (profile->title != LP32_TITLE_COMPLETE_SAGA)
             assert(profile->controller && profile->display);
     }
+    const char *cod_names[] = {"cod4", "cod4mp"};
+    for (unsigned i = 0; i < 2; ++i) {
+        const struct lp32_game_profile *p = lp32_profile_named(cod_names[i]);
+        assert(p && p->steam_app_id == 7940 && p->callee_pops_struct_return);
+        assert(!p->controller && !p->startup_latch && !p->steam_achievement_guard);
+        assert((p->loading_screen != NULL) == (i == 0));
+        struct macho_image32 image = {.entry_eip = p->entry_eip, .max_address = p->image_end};
+        assert(lp32_profile_select(&image) == 0 && lp32_profile() == p);
+        ++image.max_address;
+        assert(lp32_profile_select(&image) == -1);
+        --image.max_address;
+        ++image.entry_eip;
+        assert(lp32_profile_select(&image) == -1);
+        assert(p->depth_capability_check.length == 7);
+    }
+    assert(lp32_profile_named("cod") == lp32_profile_named("cod4"));
+    assert(lp32_profile_named("cod4-mp") == lp32_profile_named("cod4mp"));
     assert(lp32_profile_named("LEGOMARVEL") == lp32_profile_named("marvel"));
     assert(lp32_profile_named("lsw3") == lp32_profile_named("clonewars"));
     assert(lp32_profile_named("lswc") == lp32_profile_named("saga"));

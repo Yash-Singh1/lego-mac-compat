@@ -2,6 +2,7 @@
 #define ARB_PROGRAM_GUARD_H
 
 #include <stddef.h>
+char *arb_program_normalize_line_endings(const void *, size_t, size_t *);
 
 char *arb_program_guard_undefined_math(const void *source, size_t source_size,
                                        size_t *output_size,
@@ -11,5 +12,8 @@ char *arb_program_guard_undefined_math(const void *source, size_t source_size,
 char *arb_program_plain_shadow_targets(const void *source, size_t source_size,
                                        size_t *output_size,
                                        size_t *rewrite_count);
+
+char *arb_program_expand_output_aliases(const void *source, size_t source_size,
+                                        size_t *output_size);
 
 #endif

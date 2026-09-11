@@ -2,6 +2,7 @@
 #include "host_diagnostics.h"
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -21,6 +22,7 @@ struct event {
 };
 struct frame {
     uint64_t swap, end, work, flush, pace, present;
+    uint64_t counted_runtime;
     uint64_t count[HITCH_KIND_COUNT], ns[HITCH_KIND_COUNT];
     struct event top[TOP];
     bool active;
@@ -32,8 +34,9 @@ struct report {
     uint64_t trigger;
 };
 int hitch_recorder_enabled;
+int hitch_full_imports;
 static FILE *output;
-static pthread_t render_thread, writer;
+static pthread_t writer;
 static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t ready = PTHREAD_COND_INITIALIZER;
 static bool stopping, queued;
@@ -46,6 +49,7 @@ static uint64_t previous_end, last_trigger, threshold_ns;
 static _Thread_local uint32_t vertex_program, fragment_program;
 static _Thread_local struct hitch_scope *active_scope;
 static _Thread_local uint64_t frame_generation;
+static _Thread_local bool is_render_thread;
 
 static mach_timebase_info_data_t hitch_timebase;
 __attribute__((constructor)) static void initialize_hitch_clock(void)
@@ -64,6 +68,16 @@ uint64_t hitch_now(void)
 unsigned hitch_classify(const char *name)
 {
     if (*name == '_') ++name;
+    /* Timing millions of tiny libc calls can itself extend a loading frame
+       by hundreds of milliseconds. Count these separately by default;
+       LP32_HITCH_FULL_IMPORTS=1 restores per-call timings for diagnosis.
+       Keep allocation, locks, file access, graphics and audio fully timed. */
+    if (!strcmp(name, "strlen") || !strcmp(name, "strcmp") ||
+        !strcmp(name, "memcmp") || !strcmp(name, "strcpy") ||
+        !strcmp(name, "strncpy") || !strcmp(name, "memcpy") ||
+        !strcmp(name, "memmove") || !strcmp(name, "memset") ||
+        !strcmp(name, "__tolower") || !strcmp(name, "pthread_self"))
+        return hitch_full_imports ? HITCH_RUNTIME : HITCH_COUNTED_RUNTIME;
     /* Steam RemoteStorage uses generated C++ vtable thunks rather than libc
      * file imports, so include these in I/O attribution too. */
     if (!strncmp(name, "lp32_steam_4_", 13)) return HITCH_IO;
@@ -80,14 +94,20 @@ unsigned hitch_classify(const char *name)
         !strncmp(name, "read$", 5) || !strcmp(name, "read") ||
         !strncmp(name, "pread", 5) || !strncmp(name, "pwrite", 6) ||
         !strcmp(name, "write") || !strncmp(name, "write$", 6) ||
-        !strcmp(name, "fopen") || !strcmp(name, "fclose")) return HITCH_IO;
+        !strcmp(name, "fopen") || !strcmp(name, "fclose") ||
+        !strcmp(name, "FSReadFork") || !strcmp(name, "FSWriteFork") ||
+        !strcmp(name, "FSRead") || !strcmp(name, "FSWrite") ||
+        !strcmp(name, "PBReadForkAsync") || !strcmp(name, "PBReadForkSync")) return HITCH_IO;
     if (!strncmp(name, "pthread_mutex_lock", 18) ||
         !strncmp(name, "pthread_cond_wait", 17) ||
         !strncmp(name, "pthread_cond_timedwait", 22) ||
         !strcmp(name, "glFinish") || !strcmp(name, "glFlush") ||
-        strstr(name, "WaitSync")) return HITCH_WAIT;
+        strstr(name, "WaitSync") || !strcmp(name, "MPWaitOnSemaphore") ||
+        !strcmp(name, "MPWaitOnQueue") || !strcmp(name, "MPDelayUntil") ||
+        !strcmp(name, "usleep") || !strcmp(name, "nanosleep")) return HITCH_WAIT;
     if (!strncmp(name, "AudioUnit", 9) || !strncmp(name, "AudioConverter", 14) ||
-        !strncmp(name, "AudioFile", 9) || !strncmp(name, "ExtAudioFile", 12)) return HITCH_AUDIO;
+        !strncmp(name, "AudioFile", 9) || !strncmp(name, "ExtAudioFile", 12) ||
+        !strncmp(name, "Snd", 3)) return HITCH_AUDIO;
     if (!strncmp(name, "gl", 2) || !strncmp(name, "CGL", 3)) return HITCH_GL_STATE;
     if (!strncmp(name, "objc_", 5)) return HITCH_OBJC;
     return HITCH_RUNTIME;
@@ -107,10 +127,10 @@ static void write_report(const struct report *r)
         fprintf(output, " frame=%llu end=%.3f active=%d present=%.3f work=%.3f flush=%.3f pace=%.3f",
                 (unsigned long long)f->swap, f->end / 1e9, f->active,
                 f->present / 1e6, f->work / 1e6, f->flush / 1e6, f->pace / 1e6);
-        static const char *names[] = {"unknown", "none", "draw", "upload", "shader", "io", "wait", "audio", "glstate", "objc", "runtime"};
+        static const char *names[] = {"unknown", "none", "counted_runtime", "draw", "upload", "shader", "io", "wait", "audio", "glstate", "objc", "runtime"};
         for (unsigned k = HITCH_DRAW; k < HITCH_KIND_COUNT; ++k)
             fprintf(output, " %s=%llu/%.3f", names[k], (unsigned long long)f->count[k], f->ns[k] / 1e6);
-        fputc('\n', output);
+        fprintf(output, " counted_runtime=%llu\n", (unsigned long long)f->counted_runtime);
         for (unsigned j = 0; j < TOP; ++j)
             if (f->top[j].name) write_event("call", &f->top[j]);
     }
@@ -160,13 +180,16 @@ int hitch_start(const char *path, double threshold_ms)
     fchmod(fileno(output), 0600);
     threshold_ns = (threshold_ms >= 1 && threshold_ms <= 10000) ?
         (uint64_t)(threshold_ms * 1e6) : 25000000;
-    render_thread = pthread_self();
-    fprintf(output, "hitch-recorder v2 pid=%ld wall=%lld monotonic=%.3f threshold_ms=%.3f history=%d after=%d limit=%d\n"
+    is_render_thread = true;
+    const char *full = getenv("LP32_HITCH_FULL_IMPORTS");
+    hitch_full_imports = full && full[0] && strcmp(full, "0");
+    fprintf(output, "hitch-recorder v3 pid=%ld wall=%lld monotonic=%.3f threshold_ms=%.3f history=%d after=%d limit=%d full_imports=%d\n"
         "CPU wall timings only; draw time can include driver compilation or waiting, not GPU execution time.\n"
         "Category values are call-count/exclusive-ms. Work includes untimed guest work and gateway overhead; flush excludes pacing.\n"
         "Nested imports are excluded from parent timings; calls spanning presentation are omitted.\n",
         (long)getpid(), (long long)time(NULL), hitch_now() / 1e9, threshold_ns / 1e6,
-        HISTORY, AFTER, REPORT_LIMIT);
+        HISTORY, AFTER, REPORT_LIMIT, hitch_full_imports);
+    fprintf(output, "counted_runtime contains untimed libc/string/thread-ID calls; their time remains in work and any enclosing timed import.\n");
     char host[768]; lp32_host_description(host, sizeof(host));
     fprintf(output, "%s\n", host);
     fflush(output);
@@ -188,6 +211,7 @@ void hitch_stop(void)
     fprintf(output, "end reports=%u skipped=%u\n", reports, skipped);
     fclose(output);
     hitch_recorder_enabled = 0;
+    is_render_thread = false;
 }
 void hitch_program(uint32_t target, uint32_t program)
 {
@@ -215,7 +239,7 @@ void hitch_note(unsigned kind, const char *name, uint32_t caller,
     if (!hitch_recorder_enabled || kind < HITCH_DRAW || kind >= HITCH_KIND_COUNT) return;
     uint64_t ns = end - start;
     struct event e = {name, start, ns, caller, vertex_program, fragment_program, draw_count};
-    if (!pthread_equal(pthread_self(), render_thread)) {
+    if (!is_render_thread) {
         if (ns < 2000000 || kind == HITCH_WAIT) return;
         pthread_mutex_lock(&mutex);
         workers[worker_next++ % WORKERS] = e;
@@ -230,6 +254,10 @@ void hitch_note(unsigned kind, const char *name, uint32_t caller,
             current.top[i] = e; break;
         }
     }
+}
+void hitch_count_runtime(void)
+{
+    if (hitch_recorder_enabled && is_render_thread) ++current.counted_runtime;
 }
 void hitch_frame(uint64_t swap, uint64_t work_end, uint64_t flush_end,
                  uint64_t present_end, uint64_t target_ns, bool active)

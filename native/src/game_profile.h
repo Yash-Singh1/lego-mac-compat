@@ -21,6 +21,8 @@ enum lp32_title {
     LP32_TITLE_CLONE_WARS,
     LP32_TITLE_MARVEL,
     LP32_TITLE_COMPLETE_SAGA,
+    LP32_TITLE_COD4,
+    LP32_TITLE_COD4_MP,
 };
 
 /* Splash-dismiss repeat latch (see game_loader.c). */
@@ -120,6 +122,18 @@ struct lp32_texture_bind_guard {
     uint32_t resume;                 /* the jnz that follows the test */
 };
 
+/* Cooperative redraws during COD4 SP's synchronous mission initialization.
+   Both entry points are cdecl, with only integer/pointer stack arguments.
+   The timer call is a completed script-loop boundary, outside engine locks. */
+struct lp32_loading_screen_patch {
+    uint32_t client_state_pointer; /* cls indirection; connection state at +12 */
+    struct lp32_code_signature redraw;
+    struct lp32_code_signature is_main_thread;
+    struct lp32_code_signature milliseconds;
+    struct lp32_code_signature entry_points[2]; /* script load, entity parse */
+    uint32_t vm_loop_timer_call;
+};
+
 /* Marvel can keep running after Steam startup requested a relaunch. Its
    achievement submitter, unlike its stats polling code, assumes stats exist. */
 struct lp32_steam_achievement_guard {
@@ -176,11 +190,15 @@ struct lp32_game_profile {
     uint8_t callee_pops_struct_return; /* Clang i386 sret ABI (Marvel) */
     uint32_t main_address;          /* 0 = derive from the crt start stub */
     uint32_t steam_app_id;          /* relocated Steam bundle identity, 0 = none */
+    struct lp32_code_signature depth_capability_check;
+    struct lp32_code_signature server_name_compare; /* ctype regression only */
+    uint32_t license_log_return_address; /* omit the original SDK key's puts */
     const struct lp32_startup_latch_patch *startup_latch;
     const struct lp32_controller_layout *controller;
     const struct lp32_button_font_layout *button_font; /* NULL = Xbox glyphs only */
     const struct lp32_save_worker_patch *save_worker;  /* NULL = single init */
     const struct lp32_texture_bind_guard *texture_bind_guard; /* NULL = none */
+    const struct lp32_loading_screen_patch *loading_screen; /* NULL = none */
     const struct lp32_steam_achievement_guard *steam_achievement_guard;
     const struct lp32_display_layout *display;
     const struct lp32_render_pool *render_pool;

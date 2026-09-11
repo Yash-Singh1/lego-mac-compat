@@ -7,6 +7,7 @@
 #include <string.h>
 #include <sys/mman.h>
 static uint64_t call(const char *name,const uint32_t *args){uint64_t out=0;assert(gl_core_bridge32_dispatch(name,args,&out));return out;}
+extern void glGetMaterialfv(uint32_t, uint32_t, float *);
 int main(void){
     uint8_t *memory=mmap((void *)0x10000000,4096,PROT_READ|PROT_WRITE,MAP_ANON|MAP_PRIVATE|MAP_FIXED,-1,0);
     assert(memory==(void *)0x10000000);
@@ -50,5 +51,27 @@ int main(void){
     assert(glGetError()==GL_NO_ERROR);
     call("_glDeleteProgram",&program);for(unsigned i=0;i<2;++i)call("_glDeleteShader",&shaders[i]);
     glDeleteVertexArrays(1,&vao);glDeleteFramebuffers(1,&fbo);glDeleteTextures(1,&texture);CGLSetCurrentContext(NULL);CGLDestroyContext(context);
-    puts("Core GL bridge PASS (guest shader sources, compile/link, uniforms, VAO, rendered pixels)");
+    CGLPixelFormatAttribute legacy[] = {kCGLPFAAccelerated, 0};
+    assert(CGLChoosePixelFormat(legacy, &format, &count) == kCGLNoError);
+    assert(CGLCreateContext(format, NULL, &context) == kCGLNoError);
+    CGLDestroyPixelFormat(format);
+    assert(CGLSetCurrentContext(context) == kCGLNoError);
+    float shininess = 12.5f, observed = 0;
+    uint32_t material[] = {0x0408, 0x1601, 0};
+    memcpy(material + 2, &shininess, 4);
+    call("_glMaterialf", material);
+    glGetMaterialfv(0x0404, 0x1601, &observed);
+    assert(observed == shininess);
+    uint32_t point_size; shininess = 3.5f; memcpy(&point_size, &shininess, 4);
+    call("_glPointSize", &point_size);
+    glGetFloatv(GL_POINT_SIZE, &observed); assert(observed == shininess);
+    glPixelStorei(GL_PACK_ALIGNMENT, 8);
+    uint32_t mask = 1; /* GL_CLIENT_PIXEL_STORE_BIT */
+    call("_glPushClientAttrib", &mask);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    call("_glPopClientAttrib", NULL);
+    GLint restored; glGetIntegerv(GL_PACK_ALIGNMENT, &restored); assert(restored == 8);
+    assert(glGetError() == GL_NO_ERROR);
+    CGLSetCurrentContext(NULL); CGLDestroyContext(context);
+    puts("Core GL bridge PASS (rendered pixels, shader ABI, legacy material/point floats, client state restoration)");
 }

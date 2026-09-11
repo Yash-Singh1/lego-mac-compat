@@ -2,6 +2,7 @@
 #include "objc_bridge.h"
 #include "focus_policy.h"
 #include "compat_runtime.h"
+#include "game_profile.h"
 #import <AppKit/AppKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -151,6 +152,13 @@ static void forward(id self,SEL command,NSInvocation *inv){
             size_t bytes=guest_size(guest_type);if(!bytes||n+bytes/4>128)return;memcpy(a+n,&value,bytes);n+=bytes/4;
         }
     }
+    if (lp32_profile()->title == LP32_TITLE_COD4_MP &&
+        !strcmp(class_getName(object_getClass(self)), "DownloadDelegate") &&
+        !strcmp(selector, "download:didFailWithError:")) {
+        NSError *error = objc_bridge32_host_object(a[3]);
+        fprintf(stderr, "compat32: mod download failed: %s\n",
+                error.description.UTF8String);
+    }
     if(getenv("LP32_TRACE_OBJC_SELECTORS"))fprintf(stderr,"CALLBACK ENTER %s tid=%u imp=%08x self=%08x\n",selector,pthread_mach_thread_np(pthread_self()),m->imp,a[0]);
     if(getenv("LP32_TRACE_EVENTS") && !strcmp(selector,"sendEvent:")) {
         NSEvent *e=objc_bridge32_host_object(a[2]);
@@ -243,6 +251,20 @@ int objc_legacy32_message(const uint32_t *a,uint64_t *out){
     id object=objc_bridge32_host_object(a[0]);if(!object)return 0;
     bool meta=class_isMetaClass(object_getClass(object));
     const char *sel=str(a[1]);struct method32 *m=method(meta?(Class)object:object_getClass(object),meta,sel);if(!m)return 0;
+    if (!meta && lp32_profile()->title == LP32_TITLE_COD4_MP &&
+        !strcmp(sel, "progress:") &&
+        !strcmp(class_getName(object_getClass(object)), "DownloadDelegate")) {
+        /* NSURLDownload schedules its delegate in the creating thread's
+         * default run loop. COD4 polls progress from a Carbon game loop,
+         * which can starve both byte-count and terminal callbacks. Service
+         * ready callbacks here without waiting or consuming game input. */
+        static _Thread_local bool pumping_download;
+        if (!pumping_download) {
+            pumping_download = true;
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, true);
+            pumping_download = false;
+        }
+    }
     NSMethodSignature *sig=[NSMethodSignature signatureWithObjCTypes:str(m->types)];unsigned n=2;
     for(NSUInteger i=2;i<sig.numberOfArguments;++i){size_t bytes=guest_size(type([sig getArgumentTypeAtIndex:i]));if(!bytes)return 0;n+=(unsigned)(bytes/4);}
     uint32_t args[128];if(n>128)return 0;memcpy(args,a,n*4);args[0]=objc_bridge32_guest_object(object);
@@ -326,4 +348,45 @@ int objc_legacy32_run_lifetime_self_test(void) {
     compat_runtime32_deallocate(guest->name);compat_runtime32_deallocate(metadata);
     if(valid)puts("Legacy Objective-C lifetime self-test: PASS (identity map permits deallocation)");
     return valid?0:-1;
+}
+
+/* Exercise the shipped i386 DownloadDelegate, including its native callbacks
+ * and progress pointer, against the local HTTP fixture in the test runner. */
+int objc_legacy32_run_download_self_test(void) {
+    const char *url = getenv("LP32_COD4_DOWNLOAD_TEST_URL");
+    const char *path = getenv("LP32_COD4_DOWNLOAD_TEST_PATH");
+    Class cls = objc_legacy32_class("DownloadDelegate");
+    if (!url || !path || !cls) return -1;
+    id delegate = [[cls alloc] init];
+    uint32_t token = objc_bridge32_guest_object(delegate);
+    uint32_t guest_url = compat_runtime32_copy_cstring(url);
+    uint32_t guest_path = compat_runtime32_copy_cstring(path);
+    uint32_t bytes = compat_runtime32_allocate(4, 1);
+    uint32_t start[] = {token, objc_legacy32_selector("start:path:"), guest_url, guest_path};
+    uint64_t result = 0;
+    int status = -1;
+    uint32_t pending_bytes = 0;
+    bool started = guest_url && guest_path && bytes &&
+        objc_legacy32_message(start, &result) && result;
+    if (started) {
+        uint32_t progress[] = {token, objc_legacy32_selector("progress:"), bytes};
+        NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:10];
+        status = 0;
+        while (!status && deadline.timeIntervalSinceNow > 0) {
+            if (!objc_legacy32_message(progress, &result)) break;
+            status = (int32_t)result;
+            if (!status) pending_bytes = *(uint32_t *)(uintptr_t)bytes;
+            /* Deliberately no Cocoa run-loop pump: use the game's poll. */
+            if (!status) [NSThread sleepForTimeInterval:0.001];
+        }
+    }
+    printf("cod4-download-selftest: status=%d bytes=%u pendingBytes=%u\n", status,
+           bytes ? *(uint32_t *)(uintptr_t)bytes : 0, pending_bytes);
+    uint32_t stop[] = {token, objc_legacy32_selector("stop")};
+    objc_legacy32_message(stop, &result);
+    [delegate release];
+    compat_runtime32_deallocate(guest_url);
+    compat_runtime32_deallocate(guest_path);
+    compat_runtime32_deallocate(bytes);
+    return started && status ? 0 : -1;
 }

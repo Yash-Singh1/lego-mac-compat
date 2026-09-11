@@ -25,6 +25,11 @@ static unsigned forget_calls;
 static bool forget(void *self,const char *name){assert(self==interfaces[STEAM_STORAGE].host&&!strcmp(name,"slot"));++forget_calls;return true;}
 static bool quota(void *self,int32_t *total,int32_t *available){assert(self==interfaces[STEAM_STORAGE].host);*total=200;*available=100;return true;}
 static bool hooked;
+static unsigned proof_requests;
+static void request_proof(void *self, uint32_t app_id) {
+    assert(self == interfaces[STEAM_APPS].host && app_id == 7940);
+    ++proof_requests;
+}
 static void hook(void *self,bool enabled){assert(self==interfaces[STEAM_SCREENSHOTS].host);hooked=enabled;}
 static bool stats_success = true;
 static unsigned request_calls, set_calls, store_calls;
@@ -65,6 +70,11 @@ int main(void){
     assert(forget_calls==2);
     void *screen_table[64]={0},**screen=screen_table;screen_table[3]=hook;interfaces[STEAM_SCREENSHOTS].host=&screen;a[1]=1;
     assert(interface_call(STEAM_SCREENSHOTS,3,a,&out)&&hooked);
+    void *apps_table[16] = {0}, **apps = apps_table;
+    apps_table[14] = request_proof;
+    interfaces[STEAM_APPS].host = &apps;
+    a[1] = 7940;
+    assert(interface_call(STEAM_APPS, 14, a, &out) && out == 0 && proof_requests == 1);
     void *stats_table[16]={0}, **stats=stats_table;
     stats_table[0]=request_stats;stats_table[7]=set_achievement;stats_table[10]=store_stats;
     interfaces[STEAM_STATS].host=&stats;

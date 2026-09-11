@@ -1,9 +1,29 @@
 #include "arb_program_guard.h"
 
 #include <stdint.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+char *arb_program_normalize_line_endings(const void *raw, size_t size, size_t *output_size)
+{
+    const char *source = raw;
+    if (output_size) *output_size = size;
+    if (!source || size == SIZE_MAX || !memchr(source, '\r', size)) return NULL;
+    char *output = malloc(size + 1);
+    if (!output) return NULL;
+    size_t used = 0;
+    for (size_t i = 0; i < size; ++i) {
+        if (source[i] == '\r') {
+            output[used++] = '\n';
+            if (i + 1 < size && source[i + 1] == '\n') ++i;
+        } else output[used++] = source[i];
+    }
+    output[used] = 0;
+    if (output_size) *output_size = used;
+    return output;
+}
 
 static int is_arb_program(const char *source, size_t size)
 {
@@ -117,8 +137,9 @@ char *arb_program_guard_undefined_math(const void *raw_source,
         while (option < option_limit && (*option == ' ' || *option == '\t')) {
             ++option;
         }
-        if ((size_t)(option_limit - option) < 7 ||
-            memcmp(option, "OPTION ", 7) != 0) {
+        bool blank_or_comment = option == option_limit || *option == '#';
+        if (!blank_or_comment && ((size_t)(option_limit - option) < 7 ||
+            memcmp(option, "OPTION ", 7) != 0)) {
             break;
         }
         header_size = option_end < source_size ? option_end + 1 : option_end;
@@ -261,5 +282,97 @@ char *arb_program_plain_shadow_targets(const void *raw_source,
         return NULL;
     }
     *output_size = used;
+    return output;
+}
+
+static int arb_identifier(unsigned char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '_';
+}
+static int arb_space(unsigned char c) {
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+/* Apple's legacy ARB compiler can misroute varyings when named OUTPUT
+ * aliases include unused outputs. Inline their result.* bindings. This is
+ * lexical substitution only: instructions, masks, and input bindings retain
+ * their semantics. Comments and identifier substrings are not rewritten. */
+char *arb_program_expand_output_aliases(const void *raw_source, size_t size,
+                                        size_t *output_size) {
+    const char *source = raw_source;
+    struct alias { size_t start, end, name, name_size, target, target_size; } aliases[64];
+    size_t count = 0;
+    if (output_size) *output_size = size;
+    if (!source || !is_arb_program(source, size)) return NULL;
+    for (size_t i = 0; i < size;) {
+        if (source[i] == '#') {
+            while (i < size && source[i] != '\n' && source[i] != '\r') ++i;
+        } else if (arb_identifier((unsigned char)source[i])) {
+            size_t start = i;
+            while (i < size && arb_identifier((unsigned char)source[i])) ++i;
+            if (i - start != 6 || memcmp(source + start, "OUTPUT", 6)) continue;
+            if (count == sizeof(aliases) / sizeof(*aliases)) return NULL;
+            struct alias a = {.start = start};
+            while (i < size && arb_space((unsigned char)source[i])) ++i;
+            a.name = i;
+            while (i < size && arb_identifier((unsigned char)source[i])) ++i;
+            a.name_size = i - a.name;
+            if (!a.name_size) return NULL;
+            while (i < size && arb_space((unsigned char)source[i])) ++i;
+            if (i == size || source[i++] != '=') return NULL;
+            while (i < size && arb_space((unsigned char)source[i])) ++i;
+            a.target = i;
+            while (i < size && source[i] != ';') {
+                unsigned char c = source[i++];
+                if (!arb_identifier(c) && !arb_space(c) && c != '.' && c != '[' && c != ']') return NULL;
+            }
+            if (i == size) return NULL;
+            size_t end = i;
+            while (end > a.target && arb_space((unsigned char)source[end - 1])) --end;
+            a.target_size = end - a.target;
+            if (a.target_size < 8 || memcmp(source + a.target, "result.", 7)) return NULL;
+            a.end = ++i;
+            for (size_t j = 0; j < count; ++j)
+                if (a.name_size == aliases[j].name_size &&
+                    !memcmp(source + a.name, source + aliases[j].name, a.name_size)) return NULL;
+            aliases[count++] = a;
+        } else ++i;
+    }
+    if (!count) return NULL;
+    char *output = NULL;
+    size_t total = 0;
+    for (unsigned pass = 0; pass < 2; ++pass) {
+        size_t written = 0, declaration = 0;
+        for (size_t i = 0; i < size;) {
+            if (declaration < count && i == aliases[declaration].start) {
+                i = aliases[declaration++].end;
+                continue;
+            }
+            size_t start = i;
+            const char *text = source + i;
+            if (source[i] == '#') {
+                while (i < size && source[i] != '\n' && source[i] != '\r') ++i;
+            } else if (arb_identifier((unsigned char)source[i])) {
+                while (i < size && arb_identifier((unsigned char)source[i])) ++i;
+            } else ++i;
+            size_t length = i - start;
+            if (source[start] != '#' && (start == 0 || source[start - 1] != '.')) {
+                for (size_t j = 0; j < count; ++j) {
+                    if (length == aliases[j].name_size &&
+                        !memcmp(text, source + aliases[j].name, length)) {
+                        text = source + aliases[j].target;
+                        length = aliases[j].target_size;
+                        break;
+                    }
+                }
+            }
+            if (length > SIZE_MAX - written - 1) { free(output); return NULL; }
+            if (pass) memcpy(output + written, text, length);
+            written += length;
+        }
+        if (!pass) { total = written; output = malloc(total + 1); if (!output) return NULL; }
+    }
+    output[total] = '\0';
+    if (output_size) *output_size = total;
     return output;
 }

@@ -353,6 +353,52 @@ static const struct lp32_game_profile unknown_profile = {
     .image_file = "game.image",
 };
 
+static const struct lp32_loading_screen_patch cod4_loading_screen = {
+    .client_state_pointer = 0x00407130,
+    .redraw = {0x000bb720, {0x55, 0x89, 0xe5, 0x83, 0xec, 0x08}, 6},
+    .is_main_thread = {0x00324e50, {0x55, 0x89, 0xe5, 0x83, 0xec, 0x08}, 6},
+    .milliseconds = {0x00032fb0, {0x55, 0x89, 0xe5, 0x83, 0xec, 0x08}, 6},
+    .entry_points = {
+        {0x00262e90, {0x55, 0x89, 0xe5, 0x57, 0x56, 0x53}, 6}, /* Scr_LoadScriptInternal */
+        {0x00148550, {0x55, 0x89, 0xe5, 0x57, 0x56, 0x53}, 6}, /* G_ParseSpawnVars */
+    },
+    .vm_loop_timer_call = 0x0027e141,
+};
+
+static const struct lp32_game_profile cod4_profile = {
+    .title = LP32_TITLE_COD4,
+    .name = "COD4",
+    .display_name = "Call of Duty 4: Modern Warfare",
+    .log_directory = "COD4Compat",
+    .image_file = "COD4.image",
+    .callee_pops_struct_return = 1,
+    .depth_capability_check = {0x0001423a, {0xf6, 0x85, 0xbd, 0xfb, 0xff, 0xff, 0x08}, 7},
+    .license_log_return_address = 0x0002ad85,
+    .entry_eip = 0x000116a4,
+    .image_end = 0x0201b000,
+    .main_address = 0x0002b0f0,
+    .steam_app_id = 7940,
+    .thread_argument_is_direct = 1,
+    .loading_screen = &cod4_loading_screen,
+};
+
+static const struct lp32_game_profile cod4_mp_profile = {
+    .title = LP32_TITLE_COD4_MP,
+    .name = "COD4MP",
+    .display_name = "Call of Duty 4: Modern Warfare Multiplayer",
+    .log_directory = "COD4MPCompat",
+    .image_file = "COD4MP.image",
+    .callee_pops_struct_return = 1,
+    .depth_capability_check = {0x000147fa, {0xf6, 0x85, 0xbd, 0xfb, 0xff, 0xff, 0x08}, 7},
+    .server_name_compare = {0x000c80c0, {0x55, 0x89, 0xe5, 0x57, 0x56, 0x53, 0x83, 0xec}, 8},
+    .license_log_return_address = 0x0002b375,
+    .entry_eip = 0x00011644,
+    .image_end = 0x0d7da000,
+    .main_address = 0x0002b6e0,
+    .steam_app_id = 7940,
+    .thread_argument_is_direct = 1,
+};
+
 static const struct lp32_game_profile *const known_profiles[] = {
     &pirates_profile,
     &clone_wars_profile,
@@ -360,6 +406,8 @@ static const struct lp32_game_profile *const known_profiles[] = {
     &saga_profile,
     &saga_10_profile,
     &saga_steam_profile,
+    &cod4_profile,
+    &cod4_mp_profile,
 };
 
 static const struct lp32_game_profile *current_profile = &unknown_profile;
@@ -372,6 +420,8 @@ const struct lp32_game_profile *lp32_profile(void)
 const struct lp32_game_profile *lp32_profile_named(const char *name)
 {
     if (!name) return NULL;
+    if (!strcasecmp(name, "cod") || !strcasecmp(name, "cod4")) return &cod4_profile;
+    if (!strcasecmp(name, "cod4mp") || !strcasecmp(name, "cod4-mp")) return &cod4_mp_profile;
     for (size_t index = 0; index < sizeof(known_profiles) / sizeof(known_profiles[0]); ++index) {
         if (strcasecmp(known_profiles[index]->name, name) == 0) {
             return known_profiles[index];

@@ -149,8 +149,8 @@ static bool enumerate_guest(id collection,const uint32_t *args,uint64_t *result)
 
 /* Section ranges of the loaded guest image (class-name refs, CF constants). */
 #define bridge_image (compat_runtime32_image())
-static GLuint trace_vertex_program;
-static GLuint trace_fragment_program;
+static _Thread_local GLuint trace_vertex_program;
+static _Thread_local GLuint trace_fragment_program;
 
 struct gl_frame_diagnostics {
     uint64_t draw_calls;
@@ -417,7 +417,8 @@ static bool repair_unbound_fragment_samplers(
         return false;
     }
 
-    GLint program = (GLint)trace_fragment_program;
+    GLint program = 0;
+    glGetProgramivARB(GL_FRAGMENT_PROGRAM_ARB, GL_PROGRAM_BINDING_ARB, &program);
     struct arb_sampler_usage usage;
     if (program <= 0 ||
         !fragment_program_sampler_usage((GLuint)program, &usage) ||
@@ -1391,6 +1392,18 @@ static bool invoke_simple_message(id receiver, const char *selector_name,
         switch (*type) {
             case '@': case '#': {
                 id value = object_for_argument(guest_arguments[word]);
+                if (index == 2 && lp32_profile()->title == LP32_TITLE_COD4_MP &&
+                    !strcmp(selector_name, "initWithRequest:delegate:") &&
+                    [receiver isKindOfClass:NSClassFromString(@"NSURLDownload")] &&
+                    [value isKindOfClass:[NSURLRequest class]] &&
+                    ![(NSURLRequest *)value valueForHTTPHeaderField:@"User-Agent"]) {
+                    /* Aspyr leaves this header to Foundation. Some COD4 mod
+                     * hosts reject the CFNetwork default, so identify the
+                     * actual client explicitly. Preserve supplied headers. */
+                    NSMutableURLRequest *request = [[value mutableCopy] autorelease];
+                    [request setValue:@"COD4MPCompat/1.7.2" forHTTPHeaderField:@"User-Agent"];
+                    value = request;
+                }
                 [invocation setArgument:&value atIndex:index];
                 break;
             }
@@ -3684,6 +3697,12 @@ static NSDictionary *legacy_current_mode_for_display(CGDirectDisplayID display)
     return match;
 }
 
+void objc_bridge32_display_size(uint32_t display, int32_t size[2]) {
+    NSDictionary *mode = legacy_current_mode_for_display(display);
+    size[0] = [[mode objectForKey:@"Width"] intValue];
+    size[1] = [[mode objectForKey:@"Height"] intValue];
+}
+
 static GLenum buffer_binding_for_target(GLenum target)
 {
     switch (target) {
@@ -3834,7 +3853,8 @@ static bool trace_gl_buffer_call(void)
         const char *value = getenv("LP32_TRACE_GL_BUFFERS");
         if (value) {
             first_swap = strtoull(value, NULL, 0);
-            remaining = 1000;
+            const char *limit = getenv("LP32_TRACE_GL_BUFFERS_LIMIT");
+            remaining = limit ? (unsigned)strtoul(limit, NULL, 0) : 1000;
         }
         initialized = true;
     }
@@ -3890,6 +3910,13 @@ static void arm_pending_gl_trace(void)
         "compat32: GL render trace armed at swap %llu for %u calls\n",
         (unsigned long long)objc_bridge_swap_count,
         gl_render_trace_remaining);
+}
+
+void objc_bridge32_note_agl_frame(void) {
+    static bool initialized;
+    ++objc_bridge_swap_count;
+    if (!initialized) { initialize_gl_trace_output(); install_gl_trace_signal(); initialized = true; }
+    arm_pending_gl_trace();
 }
 
 static bool trace_gl_render_call(void)
@@ -4018,12 +4045,9 @@ static void maybe_dump_gl_program(GLenum target, GLsizei length,
         }
     }
 
-    GLuint identifier = 0;
-    if (target == GL_VERTEX_PROGRAM_ARB) {
-        identifier = trace_vertex_program;
-    } else if (target == GL_FRAGMENT_PROGRAM_ARB) {
-        identifier = trace_fragment_program;
-    }
+    GLint bound = 0;
+    glGetProgramivARB(target, GL_PROGRAM_BINDING_ARB, &bound);
+    GLuint identifier = (GLuint)bound;
 
     char path[1024];
     int path_length = snprintf(path, sizeof(path),
@@ -5071,6 +5095,9 @@ static void trace_draw_call(const char *kind, GLenum mode, GLint first,
 {
     ++gl_frame_diagnostics.draw_calls;
     if (!trace_gl_render_call()) return;
+    GLint actual_vp = 0, actual_fp = 0;
+    glGetProgramivARB(GL_VERTEX_PROGRAM_ARB, GL_PROGRAM_BINDING_ARB, &actual_vp);
+    glGetProgramivARB(GL_FRAGMENT_PROGRAM_ARB, GL_PROGRAM_BINDING_ARB, &actual_fp);
     GLint framebuffer = 0;
     GLint array_buffer = 0;
     GLint element_buffer = 0;
@@ -5130,7 +5157,7 @@ static void trace_draw_call(const char *kind, GLenum mode, GLint first,
         "depthFunc=%04x cull=%d cullMode=%04x\n",
         kind, (unsigned long long)objc_bridge_swap_count, mode, first, count,
         framebuffer, framebuffer_status, array_buffer, element_buffer,
-        trace_vertex_program, trace_fragment_program,
+        (GLuint)actual_vp, (GLuint)actual_fp,
         glIsEnabled(GL_VERTEX_PROGRAM_ARB),
         glIsEnabled(GL_FRAGMENT_PROGRAM_ARB), glIsEnabled(GL_BLEND),
         blend_source, blend_destination, blend_equation,
@@ -5321,6 +5348,7 @@ FAST_GL(glVertexAttribPointer)
             (unsigned long long)objc_bridge_swap_count, arguments[0],
             (GLint)arguments[1], arguments[2], arguments[3],
             (GLsizei)arguments[4], arguments[5], array_buffer);
+
     }
     glVertexAttribPointer(arguments[0], (GLint)arguments[1], arguments[2],
                           (GLboolean)arguments[3], (GLsizei)arguments[4],
@@ -5756,6 +5784,95 @@ static void release_provider_data(void *raw,const void *data,size_t size) {
     (void)data;(void)size;struct lp32_provider_data *p=raw;
     if(p->release){uint32_t args[]={p->info,p->data,p->size};compat_runtime32_call(p->release,args,3);}free(p);
 }
+static CFStringRef cod4_preferences_application(uint32_t value)
+{
+    const char *domain = getenv("LP32_COD4_PREFERENCES_ID");
+    if (domain && domain[0] && (lp32_profile()->title == LP32_TITLE_COD4 ||
+                              lp32_profile()->title == LP32_TITLE_COD4_MP))
+        return (CFStringRef)[NSString stringWithUTF8String:domain];
+    return (CFStringRef)object_for_argument(value);
+}
+static uint32_t cod4_cursor_hides;
+static bool cod4_cursor_hidden_on_host;
+static bool cod4_mouse_associated = true, cod4_mouse_associated_on_host = true;
+static bool cod4_mouse_warp_valid, cod4_mouse_position_valid;
+static CGPoint cod4_mouse_warp;
+static int16_t cod4_mouse_position[2];
+
+static bool carbon_mouse_event_valid;
+static NSPoint carbon_mouse_event_baseline;
+static int16_t carbon_mouse_event_point[2];
+
+static void cod4_apply_pointer_state(void) {
+    bool allow = !background_test_mode() && !lp32_suppress_background_input();
+    bool hide = allow && cod4_cursor_hides;
+    if (hide != cod4_cursor_hidden_on_host) {
+        if (hide) [NSCursor hide]; else [NSCursor unhide];
+        cod4_cursor_hidden_on_host = hide;
+    }
+    bool associated = !allow || cod4_mouse_associated;
+    if (associated != cod4_mouse_associated_on_host &&
+        !CGAssociateMouseAndMouseCursorPosition(associated))
+        cod4_mouse_associated_on_host = associated;
+}
+
+void objc_bridge32_carbon_focus_changed(int active) {
+    carbon_mouse_event_valid = false;
+    if (!active && !cod4_mouse_position_valid) {
+        NSPoint point = [NSEvent mouseLocation];
+        CGFloat top = NSMaxY([[[NSScreen screens] firstObject] frame]);
+        cod4_mouse_position[0] = (int16_t)(top - point.y);
+        cod4_mouse_position[1] = (int16_t)point.x;
+        cod4_mouse_position_valid = true;
+    }
+    cod4_apply_pointer_state();
+    if (active && !background_test_mode() && !lp32_suppress_background_input() &&
+        cod4_mouse_warp_valid && (cod4_cursor_hides || !cod4_mouse_associated)) {
+        CGWarpMouseCursorPosition(cod4_mouse_warp);
+        cod4_mouse_position[0] = (int16_t)cod4_mouse_warp.y;
+        cod4_mouse_position[1] = (int16_t)cod4_mouse_warp.x;
+        cod4_mouse_position_valid = true;
+    }
+}
+
+void objc_bridge32_record_mouse_position(int16_t horizontal, int16_t vertical) {
+    if (lp32_suppress_background_input()) return;
+    if (lp32_profile()->title != LP32_TITLE_COD4 && lp32_profile()->title != LP32_TITLE_COD4_MP) return;
+    carbon_mouse_event_baseline = [NSEvent mouseLocation];
+    carbon_mouse_event_point[0] = vertical;
+    carbon_mouse_event_point[1] = horizontal;
+    carbon_mouse_event_valid = true;
+    if (getenv("LP32_TRACE_INPUT")) fprintf(stderr, "compat32: mouse event %d,%d\n", horizontal, vertical);
+}
+
+int objc_bridge32_run_carbon_input_self_test(void) {
+    lp32_set_managed_input_active(0);
+    uint32_t point = compat_runtime32_allocate(4, 1);
+    if (!point) return 1;
+    float warp[2] = {320, 240};
+    uint32_t args[2], zero = 0, one = 1;
+    memcpy(args, warp, sizeof(args));
+    uint64_t result;
+    int failed = 0;
+    for (unsigned i = 0; i < 20; ++i) {
+        objc_bridge32_dispatch("_CGWarpMouseCursorPosition", args, &result);
+        objc_bridge32_dispatch("_HideCursor", &zero, &result);
+        objc_bridge32_dispatch("_CGAssociateMouseAndMouseCursorPosition", &zero, &result);
+        objc_bridge32_record_mouse_position(999, 888);
+        objc_bridge32_dispatch("_GetGlobalMouse", &point, &result);
+        int16_t *position = (int16_t *)(uintptr_t)point;
+        if (position[0] != 240 || position[1] != 320 ||
+            cod4_cursor_hidden_on_host || !cod4_mouse_associated_on_host ||
+            carbon_mouse_event_valid) failed = 1;
+        objc_bridge32_carbon_focus_changed(0);
+        objc_bridge32_dispatch("_ShowCursor", &zero, &result);
+        objc_bridge32_dispatch("_CGAssociateMouseAndMouseCursorPosition", &one, &result);
+    }
+    compat_runtime32_deallocate(point);
+    fprintf(stderr, "compat32: Carbon inactive pointer self-test %s\n", failed ? "FAIL" : "PASS");
+    return failed;
+}
+
 int objc_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
                            uint64_t *result)
 {
@@ -5828,6 +5945,17 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                                        const uint32_t *arguments,
                                        uint64_t *result)
 {
+    if ((lp32_profile()->title == LP32_TITLE_COD4 || lp32_profile()->title == LP32_TITLE_COD4_MP) &&
+        (!strcmp(import_name, "_HideCursor") || !strcmp(import_name, "_ShowCursor") ||
+         !strcmp(import_name, "_InitCursor") || !strcmp(import_name, "_CGCursorIsVisible") ||
+         !strcmp(import_name, "_CGDisplayHideCursor") || !strcmp(import_name, "_CGDisplayShowCursor"))) {
+        if (strstr(import_name, "HideCursor")) { if (cod4_cursor_hides < UINT32_MAX) ++cod4_cursor_hides; }
+        else if (strstr(import_name, "ShowCursor")) { if (cod4_cursor_hides) --cod4_cursor_hides; }
+        else if (!strcmp(import_name, "_InitCursor")) cod4_cursor_hides = 0;
+        cod4_apply_pointer_state();
+        *result = !strcmp(import_name, "_CGCursorIsVisible") ? !cod4_cursor_hides : 0;
+        return 1;
+    }
     if (LP32_NAME_IS(import_name, import_length, "_objc_msgSendSuper")) {
         const uint32_t *super = (const void *)(uintptr_t)arguments[0];
         id receiver = object_for_argument(super[0]);
@@ -6214,6 +6342,45 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         *result = preferred_game_display_id();
         return 1;
     }
+    if (LP32_NAME_IS(import_name, import_length, "_CGDataProviderCreateWithURL")) {
+        CGDataProviderRef provider = CGDataProviderCreateWithURL((CFURLRef)object_for_argument(arguments[0]));
+        *result = proxy_for_object((id)provider);
+        if (provider) CGDataProviderRelease(provider);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGImageCreateWithPNGDataProvider")) {
+        CGFloat decode[8];
+        const float *guest = (const void *)(uintptr_t)arguments[1];
+        CGDataProviderRef provider = (CGDataProviderRef)object_for_argument(arguments[0]);
+        CGImageRef image = CGImageCreateWithPNGDataProvider(provider, NULL, arguments[2] != 0, arguments[3]);
+        if (guest && image) {
+            size_t count = CGColorSpaceGetNumberOfComponents(CGImageGetColorSpace(image)) * 2;
+            if (count <= 8) {
+                for (size_t i = 0; i < count; ++i) decode[i] = guest[i];
+                CGImageRelease(image);
+                image = CGImageCreateWithPNGDataProvider(provider, decode, arguments[2] != 0, arguments[3]);
+            }
+        }
+        *result = proxy_for_object((id)image);
+        if (image) CGImageRelease(image);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGRectEqualToRect") ||
+        LP32_NAME_IS(import_name, import_length, "_CGRectIsEmpty") ||
+        LP32_NAME_IS(import_name, import_length, "_CGRectGetWidth") ||
+        LP32_NAME_IS(import_name, import_length, "_CGRectGetHeight")) {
+        const float *r = (const void *)arguments;
+        CGRect first = CGRectMake(r[0], r[1], r[2], r[3]);
+        if (LP32_NAME_IS(import_name, import_length, "_CGRectEqualToRect"))
+            *result = CGRectEqualToRect(first, CGRectMake(r[4], r[5], r[6], r[7]));
+        else if (LP32_NAME_IS(import_name, import_length, "_CGRectIsEmpty")) *result = CGRectIsEmpty(first);
+        else *result = compat_runtime32_return_double(LP32_NAME_IS(import_name, import_length, "_CGRectGetWidth") ? CGRectGetWidth(first) : CGRectGetHeight(first));
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGDisplayBitsPerPixel")) {
+        *result = [[legacy_current_mode_for_display(arguments[0]) objectForKey:@"BitsPerPixel"] unsignedIntValue];
+        return 1;
+    }
     if (LP32_NAME_IS(import_name, import_length, "_CGDisplayBounds")) {
         CGRect bounds = CGDisplayBounds(arguments[1]);
         float rect[] = {bounds.origin.x, bounds.origin.y, bounds.size.width, bounds.size.height};
@@ -6322,7 +6489,8 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         *result = kCGErrorSuccess;
         return 1;
     }
-    if (LP32_NAME_IS(import_name, import_length, "_CGDisplayRelease")) {
+    if (LP32_NAME_IS(import_name, import_length, "_CGDisplayRelease") ||
+        LP32_NAME_IS(import_name, import_length, "_CGReleaseAllDisplays")) {
         /* Releasing the captured display restores the desktop mode. */
         set_guest_display_mode(NSZeroSize);
         [presenting_view applyGuestDisplayMode];
@@ -6330,6 +6498,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CGDisplayCapture") ||
+        LP32_NAME_IS(import_name, import_length, "_CGCaptureAllDisplays") ||
         LP32_NAME_IS(import_name, import_length, "_CGDisplayHideCursor") ||
         LP32_NAME_IS(import_name, import_length, "_CGDisplayShowCursor") ||
         LP32_NAME_IS(import_name, import_length, "_CGDisplayFade") ||
@@ -6355,11 +6524,18 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         *result = (uint32_t)CGShieldingWindowLevel();
         return 1;
     }
-    if (LP32_NAME_IS(import_name, import_length, "_CGDisplayBestModeForParameters")) {
+    if (LP32_NAME_IS(import_name, import_length, "_CGDisplayBestModeForParameters") ||
+        LP32_NAME_IS(import_name, import_length, "_CGDisplayBestModeForParametersAndRefreshRate") ||
+        LP32_NAME_IS(import_name, import_length, "_CGDisplayBestModeForParametersAndRefreshRateWithProperty")) {
         materialize_automatic_display_mode();
         uint32_t width = arguments[2];
         uint32_t height = arguments[3];
-        uint32_t *exact_match = (void *)(uintptr_t)arguments[4];
+        bool with_refresh = strstr(import_name, "AndRefreshRate") != NULL;
+        bool with_property = strstr(import_name, "WithProperty") != NULL;
+        double refresh = 0;
+        if (with_refresh) memcpy(&refresh, arguments + 4, sizeof(refresh));
+        NSString *property = with_property ? object_for_argument(arguments[6]) : nil;
+        uint32_t *exact_match = (void *)(uintptr_t)arguments[with_property ? 7 : with_refresh ? 6 : 4];
         NSDictionary *best = nil;
         /* First launch (no pcconfig.txt yet): the binary's built-in 1024x768
            only stood in for the resolution Feral's launcher dialog chose, and
@@ -6368,7 +6544,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
            as the launcher would have proposed.  Later launches honour the
            file (and the in-game Options). */
         static bool applied_first_launch_default;
-        bool first_launch = compat_runtime32_game_config_missing() &&
+        bool first_launch = lp32_profile()->display && compat_runtime32_game_config_missing() &&
             !applied_first_launch_default && !getenv("LP32_KEEP_DEFAULT_RESOLUTION");
         if (first_launch) {
             applied_first_launch_default = true;
@@ -6391,7 +6567,10 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         for (NSDictionary *candidate in legacy_modes_for_display(arguments[0])) {
             if (first_launch) break;
             if ([[candidate objectForKey:@"Width"] unsignedIntValue] == width &&
-                [[candidate objectForKey:@"Height"] unsignedIntValue] == height) {
+                [[candidate objectForKey:@"Height"] unsignedIntValue] == height &&
+                [[candidate objectForKey:@"BitsPerPixel"] unsignedIntValue] == arguments[1] &&
+                (!refresh || fabs([[candidate objectForKey:@"RefreshRate"] doubleValue] - refresh) < 1.0) &&
+                (!property || [[candidate objectForKey:property] boolValue])) {
                 best = candidate;
                 break;
             }
@@ -6704,7 +6883,12 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                     buffer, arguments[1], arguments[2],
                     state ? state->flush_on_unmap : -1);
         }
-        glBufferParameteriAPPLE(arguments[0], arguments[1], arguments[2]);
+        /* These hints describe the guest mapping, which lives in our staging
+           storage. Native buffers are updated with glBufferSubData and must
+           retain its ordinary synchronization when staging slots are reused. */
+        if (arguments[1] != GL_BUFFER_FLUSHING_UNMAP_APPLE &&
+            arguments[1] != GL_BUFFER_SERIALIZED_MODIFY_APPLE)
+            glBufferParameteriAPPLE(arguments[0], arguments[1], arguments[2]);
         *result = 0; return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "glMapBuffer") ||
@@ -6853,6 +7037,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                                              mapping->access,
                     mapping->range_mapping, upload_all);
         }
+        if (upload_all) glFlush();
         deactivate_buffer_mapping(mapping);
         *result = GL_TRUE;
         return 1;
@@ -6872,6 +7057,11 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             glBufferSubData(mapping->target, (GLintptr)offset,
                             (GLsizeiptr)size,
                             (const void *)(uintptr_t)(mapping->storage + offset));
+
+            /* Guest flushes publish CPU-mapped writes. Our equivalent is a
+               queued upload, which must reach shared rendering contexts even
+               when the loading context never swaps a drawable. */
+            glFlush();
         }
         if (trace_gl_buffer_call()) {
             fprintf(stderr,
@@ -6899,6 +7089,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                             (GLintptr)(mapping->mapped_offset + offset),
                             (GLsizeiptr)size,
                             (const void *)(uintptr_t)(mapping->storage + offset));
+            glFlush();
         }
         if (trace_gl_buffer_call()) {
             fprintf(stderr,
@@ -7245,6 +7436,22 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         GLsizei source_size = (GLsizei)arguments[2];
         const void *source = (const void *)(uintptr_t)arguments[3];
         maybe_dump_gl_program(arguments[0], source_size, source);
+        char *expanded_outputs = NULL;
+        char *normalized_lines = NULL;
+        if ((lp32_profile()->title == LP32_TITLE_COD4 || lp32_profile()->title == LP32_TITLE_COD4_MP) &&
+            arguments[1] == GL_PROGRAM_FORMAT_ASCII_ARB && source_size > 0) {
+            const char *vendor = (const char *)glGetString(GL_VENDOR);
+            if (vendor && strstr(vendor, "Apple")) {
+                size_t normalized_size = 0;
+                normalized_lines = arb_program_normalize_line_endings(source, (size_t)source_size, &normalized_size);
+                if (normalized_lines) { source=normalized_lines;source_size=(GLsizei)normalized_size; }
+                size_t expanded_size = 0;
+                expanded_outputs = arb_program_expand_output_aliases(source, (size_t)source_size, &expanded_size);
+                if (expanded_outputs && expanded_size <= INT_MAX) {
+                    source = expanded_outputs; source_size = (GLsizei)expanded_size;
+                } else { free(expanded_outputs); expanded_outputs = NULL; }
+            }
+        }
         char *plain_targets = NULL;
         if (arguments[0] == GL_FRAGMENT_PROGRAM_ARB && source_size > 0 &&
             arguments[1] == GL_PROGRAM_FORMAT_ASCII_ARB &&
@@ -7270,7 +7477,8 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             }
         }
         if (arguments[0] == GL_FRAGMENT_PROGRAM_ARB && source_size > 0) {
-            GLint program = (GLint)trace_fragment_program;
+            GLint program = 0;
+            glGetProgramivARB(GL_FRAGMENT_PROGRAM_ARB, GL_PROGRAM_BINDING_ARB, &program);
             if (program > 0) {
                 remember_fragment_program_samplers(
                     (GLuint)program, source, (size_t)source_size);
@@ -7304,6 +7512,8 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         }
         free(guarded);
         report_arb_program_load_failure(arguments[0], source, source_size);
+        free(expanded_outputs);
+        free(normalized_lines);
         free(plain_targets);
         *result = 0; return 1;
     }
@@ -7353,10 +7563,12 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         if (trace_gl_render_call()) {
             GLint framebuffer = 0;
             glGetIntegerv(GL_FRAMEBUFFER_BINDING, &framebuffer);
+            GLboolean depth_mask;GLdouble clear_depth;GLint scissor[4];
+            glGetBooleanv(GL_DEPTH_WRITEMASK,&depth_mask);glGetDoublev(GL_DEPTH_CLEAR_VALUE,&clear_depth);glGetIntegerv(GL_SCISSOR_BOX,scissor);
             fprintf(stderr,
-                    "compat32: glClear swap=%llu mask=%04x fbo=%d\n",
+                    "compat32: glClear swap=%llu mask=%04x fbo=%d depthMask=%d clearDepth=%g scissorEnabled=%d scissor={%d,%d,%d,%d}\n",
                     (unsigned long long)objc_bridge_swap_count,
-                    arguments[0], framebuffer);
+                    arguments[0], framebuffer,depth_mask,clear_depth,glIsEnabled(GL_SCISSOR_TEST),scissor[0],scissor[1],scissor[2],scissor[3]);
         }
         glClear(arguments[0]); *result = 0; return 1;
     }
@@ -7587,7 +7799,72 @@ static int objc_bridge32_dispatch_body(const char *import_name,
 
     /* The original updater would replace the compatibility executable with
      * an unsupported i386 download. Keep automatic update checks disabled. */
-    if (LP32_NAME_IS(import_name, import_length, "_SUSparkleCallNSApplicationLoad")) {
+    if (LP32_NAME_IS(import_name, import_length, "_gluCheckExtension")) {
+        const char *name = (const void *)(uintptr_t)arguments[0];
+        const char *extensions = (const void *)(uintptr_t)arguments[1];
+        size_t length = name ? strlen(name) : 0;
+        *result = 0;
+        if (!length || strchr(name, ' ') || !extensions) return 1;
+        for (const char *p = extensions; (p = strstr(p, name)); p += length) {
+            if ((p == extensions || p[-1] == ' ') && (!p[length] || p[length] == ' ')) {
+                *result = 1; break;
+            }
+        }
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_GetGlobalMouse")) {
+        if (arguments[0]) {
+            bool cod4 = lp32_profile()->title == LP32_TITLE_COD4 || lp32_profile()->title == LP32_TITLE_COD4_MP;
+            if (cod4 && lp32_suppress_background_input()) {
+                memcpy((void *)(uintptr_t)arguments[0], cod4_mouse_position, sizeof(cod4_mouse_position));
+                *result = 0;
+                return 1;
+            }
+            NSPoint mouse = [NSEvent mouseLocation];
+            CGFloat top = NSMaxY([[[NSScreen screens] firstObject] frame]);
+            int16_t point[] = {(int16_t)(top - mouse.y), (int16_t)mouse.x};
+            if (carbon_mouse_event_valid) {
+                if (NSEqualPoints(mouse, carbon_mouse_event_baseline))
+                    memcpy(point, carbon_mouse_event_point, sizeof(point));
+                else carbon_mouse_event_valid = false;
+            }
+            memcpy((void *)(uintptr_t)arguments[0], point, sizeof(point));
+            if (cod4) { memcpy(cod4_mouse_position, point, sizeof(point)); cod4_mouse_position_valid = true; }
+            if (getenv("LP32_TRACE_INPUT")) {
+                static unsigned samples;
+                if (!(samples++ % 120)) fprintf(stderr, "compat32: global mouse %d,%d\n", point[1], point[0]);
+            }
+        }
+        *result = 0;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_GetCursor")) {
+        /* Classic system cursor resources 1..4 (I-beam, crosshair, plus,
+           watch). Preserve the relocatable Handle indirection in i386. */
+        static uint32_t cursors[5];
+        unsigned index = arguments[0];
+        if (index > 4) { *result = 0; return 1; }
+        if (!cursors[index]) {
+            cursors[index] = compat_runtime32_allocate(72, 1);
+            if (cursors[index]) {
+                uint32_t *p = (void *)(uintptr_t)cursors[index];
+                p[0] = cursors[index] + 4;
+                p[1] = 0x43555200 | index;
+            }
+        }
+        *result = cursors[index]; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_SetCursor")) {
+        if (arguments[0] && !getenv("LP32_BACKGROUND_TEST")) {
+            uint32_t marker = *(uint32_t *)(uintptr_t)arguments[0];
+            NSCursor *cursor = marker == 0x43555201 ? [NSCursor IBeamCursor] :
+                (marker == 0x43555202 || marker == 0x43555203) ? [NSCursor crosshairCursor] : [NSCursor arrowCursor];
+            [cursor set];
+        }
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_SUSparkleCallNSApplicationLoad") ||
+        LP32_NAME_IS(import_name, import_length, "_NSApplicationLoad")) {
         *result = NSApplicationLoad(); return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_SUSparkleWillCheckForUpdates") ||
@@ -7597,6 +7874,11 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         *result = 0; return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CGAssociateMouseAndMouseCursorPosition")) {
+        if (lp32_profile()->title == LP32_TITLE_COD4 || lp32_profile()->title == LP32_TITLE_COD4_MP) {
+            cod4_mouse_associated = arguments[0] != 0;
+            cod4_apply_pointer_state();
+            *result = 0; return 1;
+        }
         *result = (background_test_mode() || (lp32_suppress_background_input() && !arguments[0])) ? 0 : CGAssociateMouseAndMouseCursorPosition(arguments[0] != 0); return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CGEventSourceKeyState")) {
@@ -7606,6 +7888,13 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     }
     if (LP32_NAME_IS(import_name, import_length, "_CGWarpMouseCursorPosition")) {
         const float *xy = (const void *)arguments;
+        carbon_mouse_event_valid = false;
+        if (lp32_profile()->title == LP32_TITLE_COD4 || lp32_profile()->title == LP32_TITLE_COD4_MP) {
+            cod4_mouse_warp = CGPointMake(xy[0], xy[1]);
+            cod4_mouse_warp_valid = true;
+            cod4_mouse_position[0] = (int16_t)xy[1]; cod4_mouse_position[1] = (int16_t)xy[0];
+            cod4_mouse_position_valid = true;
+        }
         *result = (background_test_mode() || lp32_suppress_background_input()) ? kCGErrorSuccess : CGWarpMouseCursorPosition(CGPointMake(xy[0], xy[1]));
         return 1;
     }
@@ -7751,7 +8040,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         if(error)CFRelease(error);if(value)CFRelease(value);return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFPreferencesCopyAppValue")) {
-        CFPropertyListRef value=CFPreferencesCopyAppValue((CFStringRef)object_for_argument(arguments[0]),(CFStringRef)object_for_argument(arguments[1]));
+        CFPropertyListRef value=CFPreferencesCopyAppValue((CFStringRef)object_for_argument(arguments[0]),cod4_preferences_application(arguments[1]));
         *result=proxy_for_object((id)value);if(value)CFRelease(value);return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFPreferencesGetAppBooleanValue")) {
@@ -7765,11 +8054,11 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFPreferencesSetAppValue")) {
         CFPreferencesSetAppValue((CFStringRef)object_for_argument(arguments[0]),
-            (CFPropertyListRef)object_for_argument(arguments[1]),(CFStringRef)object_for_argument(arguments[2]));
+            (CFPropertyListRef)object_for_argument(arguments[1]),cod4_preferences_application(arguments[2]));
         *result=0;return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFPreferencesAppSynchronize")) {
-        *result=CFPreferencesAppSynchronize((CFStringRef)object_for_argument(arguments[0]));return 1;
+        *result=CFPreferencesAppSynchronize(cod4_preferences_application(arguments[0]));return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFPreferencesSynchronize")) {
         *result=CFPreferencesSynchronize((CFStringRef)object_for_argument(arguments[0]),
@@ -8444,6 +8733,40 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         CFTypeRef object=(CFTypeRef)object_for_argument(arguments[0]);
         CFStringRef description=object?CFCopyDescription(object):NULL;
         *result=proxy_for_object((id)description);if(description)CFRelease(description);return 1;
+    }
+
+    if (LP32_NAME_IS(import_name, import_length, "_KLGetCurrentKeyboardLayout")) {
+        if (!arguments[0]) { *result = (uint32_t)paramErr; return 1; }
+        TISInputSourceRef source = TISCopyCurrentKeyboardLayoutInputSource();
+        *(uint32_t *)(uintptr_t)arguments[0] = proxy_for_object((id)source);
+        *result = source ? noErr : (uint32_t)paramErr;
+        if (source) CFRelease(source);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_KLGetKeyboardLayoutProperty")) {
+        TISInputSourceRef source = (TISInputSourceRef)object_for_argument(arguments[0]);
+        if (!source || !arguments[2]) { *result = (uint32_t)paramErr; return 1; }
+        CFArrayRef languages = TISGetInputSourceProperty(source, kTISPropertyInputSourceLanguages);
+        CFStringRef language = languages && CFArrayGetCount(languages) ? CFArrayGetValueAtIndex(languages, 0) : NULL;
+        uint32_t value = 0; OSStatus status = noErr;
+        switch (arguments[1]) {
+        case 4: case 5:
+            value = proxy_for_object((id)TISGetInputSourceProperty(source, kTISPropertyLocalizedName)); break;
+        case 6: {
+            char locale[128]; LangCode lang; RegionCode region; TextEncoding encoding; ScriptCode script;
+            if (!language || !CFStringGetCString(language, locale, sizeof(locale), kCFStringEncodingUTF8)) status = paramErr;
+            else status = LocaleStringToLangAndRegionCodes(locale, &lang, &region);
+            if (!status) status = UpgradeScriptInfoToTextEncoding(kTextScriptDontCare, lang, region, NULL, &encoding);
+            if (!status) status = RevertTextEncodingToScriptInfo(encoding, &script, NULL, NULL);
+            if (!status) value = (uint32_t)(int32_t)script;
+            break;
+        }
+        case 7: value = kKLuchrKind; break;
+        case 9: value = proxy_for_object((id)language); break;
+        default: status = paramErr; break;
+        }
+        if (!status) *(uint32_t *)(uintptr_t)arguments[2] = value;
+        *result = (uint32_t)status; return 1;
     }
 
     if (LP32_NAME_IS(import_name, import_length, "_TISCopyCurrentKeyboardInputSource") ||
@@ -9387,6 +9710,33 @@ int objc_bridge32_run_gl_buffer_self_test(void)
             goto cleanup;
         }
     }
+
+    /* A loading context may never present. Mapped writes must nevertheless
+       be visible to another context sharing the buffer after publication. */
+    CGLContextObj producer = NULL;
+    if (CGLCreateContext(CGLGetPixelFormat(context), context, &producer) != kCGLNoError) {
+        status = -1; goto cleanup;
+    }
+    CGLSetCurrentContext(producer);
+    glBindBuffer(GL_ARRAY_BUFFER, buffers[1]);
+    glBufferData(GL_ARRAY_BUFFER, 2 * 1024 * 1024, NULL, GL_STATIC_DRAW);
+    uint32_t hint[] = {GL_ARRAY_BUFFER, GL_BUFFER_FLUSHING_UNMAP_APPLE, GL_FALSE};
+    objc_bridge32_dispatch("glBufferParameteriAPPLE", hint, &dispatch_result);
+    objc_bridge32_dispatch("glMapBuffer", map_arguments, &dispatch_result);
+    uint32_t shared_mapping = (uint32_t)dispatch_result;
+    if (shared_mapping) {
+        memset((void *)(uintptr_t)shared_mapping, 0x59, 2 * 1024 * 1024);
+        uint32_t flush[] = {GL_ARRAY_BUFFER, 0, 2 * 1024 * 1024};
+        objc_bridge32_dispatch("glFlushMappedBufferRangeAPPLE", flush, &dispatch_result);
+        objc_bridge32_dispatch("glUnmapBuffer", unmap_arguments, &dispatch_result);
+        memset((void *)(uintptr_t)shared_mapping, 0xcc, 2 * 1024 * 1024);
+    } else status = -1;
+    CGLSetCurrentContext(context);
+    glBindBuffer(GL_ARRAY_BUFFER, buffers[1]);
+    glGetBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(actual), actual);
+    for (unsigned i = 0; i < sizeof(actual); ++i) if (actual[i] != 0x59) status = -1;
+    CGLDestroyContext(producer);
+    if (status) fputs("gl-buffer-selftest: shared loading-context publication failed\n", stderr);
 
 cleanup:
     {

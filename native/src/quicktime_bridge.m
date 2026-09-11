@@ -74,6 +74,7 @@ static uint32_t next_world = 0x75000000;
 static NSMutableDictionary *movies, *movie_files;
 static uint32_t next_movie = 0x75100000;
 static uint16_t next_file = 1;
+static struct { uint32_t function, scale, flags, refcon; } task_callbacks[16];
 static LP32Movie *movie(uint32_t token) {
   return [movies objectForKey:@(token)];
 }
@@ -111,6 +112,11 @@ static uint32_t new_movie(NSString *path) {
   next_movie += 16;
   [movies setObject:m forKey:@(token)];
   [m release];
+  for (unsigned i = 0; i < 16; ++i) {
+    if (!task_callbacks[i].function) continue;
+    uint32_t args[] = {0, 0, task_callbacks[i].refcon};
+    compat_runtime32_call(task_callbacks[i].function, args, 3);
+  }
   return token;
 }
 static void movie_task(uint32_t token) {
@@ -442,8 +448,109 @@ int quicktime_bridge32_dispatch(const char *name, const uint32_t *a,
       *out = 0;
       return 1;
     }
+    if (IS("_GetCompressionInfo")) {
+      /* Sound Manager's packed 20-byte CompressionInfo record. COD4 asks
+         about uncompressed stereo PCM during platform initialization. */
+      struct __attribute__((packed)) {
+        uint32_t size, format;
+        int16_t compression;
+        uint16_t samples, packet_bytes, frame_bytes, sample_bytes, reserved;
+      } info = {0};
+      if (!a[4] || *(uint32_t *)P(4) < sizeof(info) || !a[2] || a[2] > 32 ||
+          !a[3] || a[3] > 32 || (a[3] & 7)) {
+        *out = (uint32_t)paramErr; return 1;
+      }
+      if (a[0] || a[1] != 'NONE') { *out = (uint32_t)unimpErr; return 1; }
+      info.size = sizeof(info);
+      info.format = a[1];
+      info.samples = 1;
+      info.packet_bytes = info.sample_bytes = a[3] / 8;
+      info.frame_bytes = info.sample_bytes * a[2];
+      memcpy(P(4), &info, sizeof(info));
+      *out = 0; return 1;
+    }
+    if (IS("_QTGetTimeUntilNextTask")) {
+      if (!a[0] || (int32_t)a[1] <= 0) { *out = (uint32_t)paramErr; return 1; }
+      /* AVFoundation decodes asynchronously; MoviesTask presents its frames. */
+      *(int32_t *)P(0) = [movies count] ? (int32_t)(((uint64_t)a[1] + 59) / 60) : (int32_t)a[1];
+      *out = 0;
+      return 1;
+    }
+    if (IS("_QTInstallNextTaskNeededSoonerCallback")) {
+      if (!a[0] || (int32_t)a[1] <= 0) { *out = (uint32_t)paramErr; return 1; }
+      for (unsigned i = 0; i < 16; ++i) {
+        if (task_callbacks[i].function && (task_callbacks[i].function != a[0] || task_callbacks[i].refcon != a[3])) continue;
+        task_callbacks[i].function = a[0]; task_callbacks[i].scale = a[1];
+        task_callbacks[i].flags = a[2]; task_callbacks[i].refcon = a[3];
+        *out = 0;
+        return 1;
+      }
+      *out = (uint32_t)memFullErr;
+      return 1;
+    }
+    if (IS("_QTUninstallNextTaskNeededSoonerCallback")) {
+      for (unsigned i = 0; i < 16; ++i)
+        if (task_callbacks[i].function == a[0] && task_callbacks[i].refcon == a[1])
+          memset(&task_callbacks[i], 0, sizeof(task_callbacks[i]));
+      *out = 0;
+      return 1;
+    }
     if (IS("_EnterMovies") || IS("_ExitMovies")) {
       *out = 0;
+      return 1;
+    }
+    if (IS("_QTNewDataReferenceFromFSRef")) {
+      if (!a[0] || !a[2] || !a[3]) { *out = (uint32_t)paramErr; return 1; }
+      UInt8 path[PATH_MAX]; OSStatus status = FSRefMakePath(P(0), path, sizeof(path));
+      if (!status) {
+        NSString *url = [[NSURL fileURLWithPath:[NSString stringWithUTF8String:(char *)path]] absoluteString];
+        const char *bytes = url.UTF8String; uint32_t size = (uint32_t)strlen(bytes) + 1;
+        uint64_t handle = 0; resource_bridge32_dispatch("_NewHandle", &size, &handle);
+        if (!handle) status = memFullErr;
+        else {
+          memcpy((void *)(uintptr_t)*(uint32_t *)(uintptr_t)handle, bytes, size);
+          *(uint32_t *)P(2) = (uint32_t)handle; *(uint32_t *)P(3) = 0x75726c20; /* url */
+        }
+      }
+      *out = (uint32_t)status; return 1;
+    }
+    if (IS("_NewMovieFromDataRef")) {
+      if (!a[0] || !a[3] || a[4] != 0x75726c20) { *out = (uint32_t)paramErr; return 1; }
+      uint64_t size = 0; resource_bridge32_dispatch("_GetHandleSize", a+3, &size);
+      const char *bytes = (const void *)(uintptr_t)*(uint32_t *)P(3);
+      NSURL *url = bytes && size && memchr(bytes, 0, size) ? [NSURL URLWithString:[NSString stringWithUTF8String:bytes]] : nil;
+      uint32_t token = url.isFileURL ? new_movie(url.path) : 0;
+      *(uint32_t *)P(0) = token;
+      if (a[2]) *(int16_t *)P(2) = 0;
+      *out = token ? 0 : (uint32_t)-2048; return 1;
+    }
+    if (IS("_GetTrackMedia") || IS("_GetMediaHandler") || IS("_GetMediaSampleDescription") ||
+        IS("_SetTrackVolume") || IS("_MediaSetSoundBalance") || IS("_GetMediaDuration")) {
+      uint32_t parent = a[0] & ~15u; LP32Movie *owner = movie(parent);
+      unsigned kind = a[0] & 15u;
+      if (!owner) { *out=(uint32_t)paramErr;return 1; }
+      AVAssetTrack *track = kind == 1 ? [[owner->asset tracksWithMediaType:AVMediaTypeAudio] firstObject] :
+                           kind == 2 ? [[owner->asset tracksWithMediaType:AVMediaTypeVideo] firstObject] : nil;
+      if (!owner || !track) { *out = (uint32_t)paramErr; return 1; }
+      if (IS("_GetTrackMedia") || IS("_GetMediaHandler")) *out = a[0];
+      else if (IS("_SetTrackVolume")) { owner->player.volume = fmaxf(0,fminf(1,(int16_t)a[1]/256.0f)); *out=0; }
+      else if (IS("_MediaSetSoundBalance")) *out = (int16_t)a[1] ? (uint32_t)unimpErr : 0;
+      else if (IS("_GetMediaDuration")) *out = (uint32_t)CMTimeConvertScale(track.timeRange.duration,track.naturalTimeScale,kCMTimeRoundingMethod_Default).value;
+      else {
+        if (kind != 1 || a[1] != 1 || !a[2]) { *out=(uint32_t)paramErr;return 1; }
+        CMAudioFormatDescriptionRef format = (CMAudioFormatDescriptionRef)[[track formatDescriptions] firstObject];
+        const AudioStreamBasicDescription *asbd = format ? CMAudioFormatDescriptionGetStreamBasicDescription(format) : NULL;
+        if (!asbd || !isfinite(asbd->mSampleRate) || asbd->mSampleRate < 0 || asbd->mSampleRate >= 65536) { *out=(uint32_t)paramErr;return 1; }
+        uint32_t resize[]={a[2],36};uint64_t ignored;resource_bridge32_dispatch("_SetHandleSize",resize,&ignored);
+        resource_bridge32_dispatch("_GetHandleSize",resize,&ignored);
+        if ((int32_t)ignored < 36) { *out=(uint32_t)memFullErr;return 1; }
+        unsigned char *description=(void *)(uintptr_t)*(uint32_t *)P(2);
+        if(!description){*out=(uint32_t)memFullErr;return 1;}
+        memset(description,0,36);uint32_t size=36,type=asbd->mFormatID,rate=(uint32_t)(asbd->mSampleRate*65536.0);
+        uint16_t channels=(uint16_t)asbd->mChannelsPerFrame,bits=(uint16_t)(asbd->mBitsPerChannel?asbd->mBitsPerChannel:16),ref=1;
+        memcpy(description,&size,4);memcpy(description+4,&type,4);memcpy(description+14,&ref,2);
+        memcpy(description+24,&channels,2);memcpy(description+26,&bits,2);memcpy(description+32,&rate,4);*out=0;
+      }
       return 1;
     }
     if (IS("_OpenMovieFile")) {
@@ -488,7 +595,8 @@ int quicktime_bridge32_dispatch(const char *name, const uint32_t *a,
       return 1;
     }
     if (IS("_MoviesTask")) {
-      movie_task(a[0]);
+      if (a[0]) movie_task(a[0]);
+      else for (NSNumber *token in [movies allKeys]) movie_task([token unsignedIntValue]);
       *out = 0;
       return 1;
     }
@@ -600,6 +708,15 @@ int quicktime_bridge32_dispatch(const char *name, const uint32_t *a,
       *out = 0;
       return 1;
     }
+    if (IS("_GetMovieIndTrackType")) {
+      unsigned kind = a[2] == 0x65617273 || a[2] == 0x736f756e ? 1 : a[2] == 0x65796573 || a[2] == 0x76696465 ? 2 : 0;
+      NSArray *tracks = kind ? [m->asset tracksWithMediaType:kind == 1 ? AVMediaTypeAudio : AVMediaTypeVideo] : nil;
+      *out = a[1] == 1 && tracks.count ? a[0] + kind : 0; return 1;
+    }
+    if (IS("_GetMoviePreferredRate")) { *out=65536;return 1; }
+    if (IS("_GetMovieDuration")) { *out=(uint32_t)CMTimeConvertScale(m->asset.duration,600,kCMTimeRoundingMethod_Default).value;return 1; }
+    if (IS("_PrerollMovie")) { *out=m->player.status == AVPlayerStatusFailed ? (uint32_t)-2048 : 0;return 1; }
+    if (IS("_SetMovieRate")) { m->started = YES; m->player.rate = (int32_t)a[1]/65536.0f; *out=0;return 1; }
     if (IS("_StartMovie")) {
       m->started = YES;
       [m->player play];
