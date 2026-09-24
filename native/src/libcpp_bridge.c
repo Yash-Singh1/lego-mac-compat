@@ -32,8 +32,28 @@ static bool assign(uint32_t p,const void *source,uint32_t n,unsigned width,bool 
     void *dst=(void *)(uintptr_t)data(p,width);memcpy(dst,copy,(size_t)n*width);
     memset((char *)dst+(size_t)n*width,0,width);set_length(p,n);free(copy);return true;
 }
+/* Grow geometrically, as libc++ does. Building shader text one character at
+ * a time otherwise reallocated and copied the whole string on every call. */
+static bool grow(uint32_t p,uint32_t n,unsigned width){
+    uint32_t cap=capacity(p,width);
+    if(n<=cap)return true;
+    uint32_t doubled=cap<UINT32_MAX/4?cap*2:n;
+    return reserve(p,n>doubled?n:doubled,width);
+}
+/* Appends in place when the source is outside the string's own storage. */
+static bool append(uint32_t p,const void *source,uint32_t n,unsigned width){
+    uint32_t len=length(p);
+    if(n>UINT32_MAX/width-2-len)return false;
+    uintptr_t start=data(p,width),end=start+(uintptr_t)(capacity(p,width)+1)*width;
+    if(n && (uintptr_t)source<end && (uintptr_t)source+(size_t)n*width>start)return false;
+    if(!grow(p,len+n,width))return false;
+    char *d=(char *)(uintptr_t)data(p,width);
+    if(n)memcpy(d+(size_t)len*width,source,(size_t)n*width);
+    memset(d+(size_t)(len+n)*width,0,width);set_length(p,len+n);return true;
+}
 static bool replace(uint32_t p,uint32_t pos,uint32_t removed,const void *source,uint32_t n,unsigned width){
-    uint32_t len=length(p);if(pos>len)return false;if(removed>len-pos)removed=len-pos;
+    uint32_t len=length(p);
+    if(pos==len && !removed && append(p,source,n,width))return true;if(pos>len)return false;if(removed>len-pos)removed=len-pos;
     if(n>UINT32_MAX-len+removed)return false;uint32_t total=len-removed+n;
     void *buf=malloc((size_t)total*width+1);if(!buf)return false;
     const char *old=(void *)(uintptr_t)data(p,width);
@@ -128,4 +148,31 @@ int libcpp_bridge32_dispatch(const char *name,const uint32_t *a,uint64_t *out){
         return 1;
     }
     return 0;
+}
+
+/* Direct handlers for the string methods shader translation calls most; they
+ * skip the name comparisons in libcpp_bridge32_dispatch. */
+#define STRING_FAST(fn, body) \
+    static uint64_t fn(const uint32_t *a,uint32_t return_address){(void)return_address;uint32_t p=a[0];(void)p;body}
+STRING_FAST(fast_push_back,{replace(p,length(p),0,a+1,1,1);return 0;})
+STRING_FAST(fast_append_cstr,{replace(p,length(p),0,P(1),(uint32_t)strlen(P(1)),1);return p;})
+STRING_FAST(fast_append_n,{replace(p,length(p),0,P(1),a[2],1);return p;})
+STRING_FAST(fast_init_n,{assign(p,P(1),a[2],1,true,a[2]);return p;})
+STRING_FAST(fast_copy,{assign(p,(void *)(uintptr_t)data(a[1],1),length(a[1]),1,true,0);return p;})
+STRING_FAST(fast_assign_copy,{assign(p,(void *)(uintptr_t)data(a[1],1),length(a[1]),1,false,0);return p;})
+STRING_FAST(fast_destroy,{if(words(p)[0]&1)compat_runtime32_deallocate(words(p)[2]);memset(words(p),0,12);return p;})
+#undef STRING_FAST
+lp32_fast_import_fn libcpp_bridge32_fast_import(const char *name){
+    static const char prefix[]="__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE";
+    if(strncmp(name,prefix,sizeof(prefix)-1))return NULL;
+    static const struct{const char *method;lp32_fast_import_fn handler;}table[]={
+        {"9push_backEc",fast_push_back},{"6appendEPKc",fast_append_cstr},
+        {"6appendEPKcm",fast_append_n},{"6__initEPKcm",fast_init_n},
+        {"C1ERKS5_",fast_copy},{"C2ERKS5_",fast_copy},{"aSERKS5_",fast_assign_copy},
+        {"D1Ev",fast_destroy},{"D2Ev",fast_destroy},
+    };
+    const char *method=name+sizeof(prefix)-1;
+    for(size_t i=0;i<sizeof(table)/sizeof(table[0]);++i)
+        if(!strcmp(method,table[i].method))return table[i].handler;
+    return NULL;
 }

@@ -1,6 +1,7 @@
 #include "controller_bridge.h"
 #include "compat_runtime.h"
 #include "game_profile.h"
+#include "hid_bridge.h"
 
 #import <Foundation/Foundation.h>
 #import <GameController/GameController.h>
@@ -173,6 +174,16 @@ struct controller_slot {
 
 static struct controller_slot controller_slots[kMaximumControllers];
 static bool bridge_installed;
+static bool saga_semantic_installed;
+struct saga_semantic_slot {
+    GCController *controller;
+    uint32_t buttons;
+    int axes[6];
+    int hat;
+    bool initialized;
+    atomic_bool menu_edge;
+};
+static struct saga_semantic_slot saga_semantic_slots[4];
 static unsigned virtual_controller_count;
 static bool virtual_test_script;
 static uint64_t virtual_join_swap = 6000;
@@ -1345,11 +1356,137 @@ static void trace_game_controller_states(uint64_t swap_count)
     }
 }
 
+static int saga_axis(float value,bool invert,bool trigger)
+{
+    float normalized=trigger?value:(invert?-value:value);
+    if(trigger)return (int)lroundf(fmaxf(0.0f,fminf(1.0f,normalized))*255.0f);
+    return (int)lroundf((fmaxf(-1.0f,fminf(1.0f,normalized))+1.0f)*127.5f);
+}
+
+static bool saga_name_matches(GCController *controller,const char *hid_name)
+{
+    NSString *name=[controller vendorName];
+    NSString *hid=[NSString stringWithUTF8String:hid_name];
+    if(!name||!hid)return false;
+    return [name caseInsensitiveCompare:hid]==NSOrderedSame ||
+        [name rangeOfString:hid options:NSCaseInsensitiveSearch].location!=NSNotFound ||
+        [hid rangeOfString:name options:NSCaseInsensitiveSearch].location!=NSNotFound;
+}
+
+static bool saga_controller_used(GCController *controller,unsigned before)
+{
+    for(unsigned i=0;i<before;++i)
+        if(saga_semantic_slots[i].controller==controller)return true;
+    return false;
+}
+
+static void saga_poll_semantic_controllers(uint64_t swap_count)
+{
+    NSArray<GCController *> *connected=[GCController controllers];
+    unsigned count=hid_bridge32_saga_pad_count();
+    if(count>4)count=4;
+    for(unsigned index=0;index<count;++index){
+        struct saga_semantic_slot *slot=&saga_semantic_slots[index];
+        const char *hid_name=hid_bridge32_saga_pad_name(index);
+        if(!hid_name){
+            hid_bridge32_saga_set_semantic_active(index,0);
+            [[slot->controller extendedGamepad] setValueChangedHandler:nil];
+            [slot->controller release];
+            slot->controller=nil;
+            slot->initialized=false;
+            continue;
+        }
+        if(slot->controller && (![connected containsObject:slot->controller] ||
+                                !saga_name_matches(slot->controller,hid_name))){
+            hid_bridge32_saga_set_semantic_active(index,0);
+            [[slot->controller extendedGamepad] setValueChangedHandler:nil];
+            [slot->controller release];
+            slot->controller=nil;
+            slot->initialized=false;
+        }
+        if(!slot->controller){
+            for(GCController *candidate in connected){
+                if(saga_controller_used(candidate,index)||
+                   !saga_name_matches(candidate,hid_name)||
+                   ![candidate extendedGamepad])continue;
+                slot->controller=[candidate retain];
+                slot->initialized=false;
+                atomic_store(&slot->menu_edge,false);
+                [[candidate extendedGamepad]
+                    setValueChangedHandler:^(GCExtendedGamepad *changed,
+                                             GCControllerElement *element){
+                        if(element==[changed buttonMenu] &&
+                           pressed([changed buttonMenu]))
+                            atomic_store(&saga_semantic_slots[index].menu_edge,true);
+                    }];
+                fprintf(stderr,"compat32: Saga semantic input paired: %s\n",hid_name);
+                break;
+            }
+        }
+        hid_bridge32_saga_set_semantic_active(index,slot->controller!=nil);
+        GCExtendedGamepad *pad=[slot->controller extendedGamepad];
+        if(!pad)continue;
+        GCControllerButtonInput *buttons[]={
+            [pad buttonX],[pad buttonA],[pad buttonB],[pad buttonY],
+            [pad leftShoulder],[pad rightShoulder],[pad buttonOptions],
+            [pad buttonMenu],[pad leftThumbstickButton],[pad rightThumbstickButton]
+        };
+        const unsigned usages[]={1,2,3,4,5,6,9,10,11,12};
+        uint32_t mask=0;
+        for(unsigned i=0;i<10;++i)if(pressed(buttons[i]))mask|=1u<<i;
+        if(atomic_exchange(&slot->menu_edge,false))mask|=1u<<7;
+        if(index==0 && getenv("LP32_TEST_SAGA_SEMANTIC_MENU") &&
+           ((swap_count>=300 && swap_count<308)||
+            (swap_count>=900 && swap_count<908)))mask|=1u<<7;
+        for(unsigned i=0;i<10;++i){
+            uint32_t bit=1u<<i;
+            if(!slot->initialized || ((slot->buttons^mask)&bit))
+                hid_bridge32_saga_emit(index,9,usages[i],(mask&bit)!=0);
+        }
+        slot->buttons=mask;
+        GCControllerDirectionPad *left=[pad leftThumbstick];
+        GCControllerDirectionPad *right=[pad rightThumbstick];
+        int axes[]={
+            saga_axis([[left xAxis] value],false,false),
+            saga_axis([[left yAxis] value],true,false),
+            saga_axis([[right xAxis] value],false,false),
+            saga_axis([[pad leftTrigger] value],false,true),
+            saga_axis([[pad rightTrigger] value],false,true),
+            saga_axis([[right yAxis] value],true,false)
+        };
+        for(unsigned i=0;i<6;++i){
+            if(!slot->initialized||slot->axes[i]!=axes[i])
+                hid_bridge32_saga_emit(index,1,48+i,axes[i]);
+            slot->axes[i]=axes[i];
+        }
+        GCControllerDirectionPad *dpad=[pad dpad];
+        bool up=pressed([dpad up]),down=pressed([dpad down]);
+        bool leftward=pressed([dpad left]),rightward=pressed([dpad right]);
+        int hat=8;
+        if(up)hat=rightward?1:leftward?7:0;
+        else if(down)hat=rightward?3:leftward?5:4;
+        else if(rightward)hat=2;
+        else if(leftward)hat=6;
+        if(!slot->initialized||slot->hat!=hat)
+            hid_bridge32_saga_emit(index,1,57,hat);
+        slot->hat=hat;
+        slot->initialized=true;
+    }
+}
+
 int controller_bridge32_install(void)
 {
     if (bridge_installed) return 0;
     layout = lp32_profile()->controller;
     if (!layout) {
+        if(lp32_profile()->title==LP32_TITLE_COMPLETE_SAGA){
+            if(@available(macOS 11.3,*))
+                [GCController setShouldMonitorBackgroundEvents:YES];
+            [GCController startWirelessControllerDiscoveryWithCompletionHandler:nil];
+            saga_semantic_installed=true;
+            fprintf(stderr,"compat32: Saga semantic gamepad bridge ready\n");
+            return 0;
+        }
         fprintf(stderr,
                 "compat32: no controller layout for %s; legacy HID bridge "
                 "not installed\n", lp32_profile()->name);
@@ -1396,6 +1533,7 @@ int controller_bridge32_install(void)
 
 void controller_bridge32_poll(uint64_t swap_count)
 {
+    if(saga_semantic_installed){saga_poll_semantic_controllers(swap_count);return;}
     if (!bridge_installed) return;
     keep_glyph_provider();
     if (!virtual_controller_count) refresh_hardware_slots();

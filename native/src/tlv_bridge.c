@@ -68,8 +68,7 @@ int tlv_bridge32_initialize(const struct macho_image32 *image) {
     }
     return 0;
 }
-int tlv_bridge32_dispatch(const char *name,const uint32_t *a,uint64_t *out) {
-    if(strcmp(name,"_lp32_tlv_get_addr"))return 0;
+static int resolve_tlv(const uint32_t *a,uint64_t *out) {
     if(!template_base || !a[0])return 0;
     uint32_t offset=((const uint32_t *)(uintptr_t)a[0])[2];if(offset>=template_size)return 0;
     struct storage *s=pthread_getspecific(storage_key);
@@ -82,4 +81,11 @@ int tlv_bridge32_dispatch(const char *name,const uint32_t *a,uint64_t *out) {
         if(pthread_setspecific(storage_key,s)){destroy_storage(s);return 0;}
     }
     *out=s->base+offset;return 1;
+}
+uint64_t tlv_bridge32_fast_address(const uint32_t *a,uint32_t caller) {
+    (void)caller;uint64_t result=0;resolve_tlv(a,&result);return result;
+}
+int tlv_bridge32_dispatch(const char *name,const uint32_t *a,uint64_t *out) {
+    if(strcmp(name,"_lp32_tlv_get_addr"))return 0;
+    return resolve_tlv(a,out);
 }

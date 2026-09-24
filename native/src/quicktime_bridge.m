@@ -2,6 +2,7 @@
 #include "carbon_bridge.h"
 #include "compat_runtime.h"
 #include "resource_bridge.h"
+#include "objc_bridge.h"
 #import <AVFoundation/AVFoundation.h>
 #import <Carbon/Carbon.h>
 #import <CoreVideo/CoreVideo.h>
@@ -161,8 +162,70 @@ static void movie_task(uint32_t token) {
   CVPixelBufferUnlockBaseAddress(frame, kCVPixelBufferLock_ReadOnly);
   CVPixelBufferRelease(frame);
 }
+/* Core Media uses fixed-width time structures on both ABIs, but pointers
+ * and size_t outputs still need conversion. Borrowed payloads follow their
+ * sample/format owner, including pixel data accessed between lock/unlock. */
+static int core_media_dispatch(const char *name,const uint32_t *a,uint64_t *out) {
+#define M(s) (!strcmp(name,s))
+#define G(i) ((void *)(uintptr_t)a[i])
+#define O(i) objc_bridge32_host_object(a[i])
+    if(strncmp(name,"_CM",3)&&strncmp(name,"_CV",3))return 0;
+    *out=0;
+    if(M("_CMAudioFormatDescriptionGetStreamBasicDescription")) {
+        void *o=O(0);const AudioStreamBasicDescription *p=CMAudioFormatDescriptionGetStreamBasicDescription(o);
+        *out=objc_bridge32_borrowed_bytes(o,p,p?sizeof(*p):0,0);
+    } else if(M("_CMAudioFormatDescriptionGetMagicCookie")) {
+        void *o=O(0);size_t size=0;const void *p=CMAudioFormatDescriptionGetMagicCookie(o,&size);
+        if(a[1])*(uint32_t *)G(1)=(uint32_t)size;
+        *out=objc_bridge32_borrowed_bytes(o,p,size,1);
+    } else if(M("_CMSampleBufferGetAudioStreamPacketDescriptionsPtr")) {
+        void *o=O(0);size_t size=0;const AudioStreamPacketDescription *p=NULL;
+        *out=(uint32_t)CMSampleBufferGetAudioStreamPacketDescriptionsPtr(o,&p,&size);
+        if(a[1])*(uint32_t *)G(1)=objc_bridge32_borrowed_bytes(o,p,size,2);
+        if(a[2])*(uint32_t *)G(2)=(uint32_t)size;
+    } else if(M("_CMSampleBufferGetDataBuffer")) {
+        void *o=O(0);*out=objc_bridge32_borrowed_object(o,CMSampleBufferGetDataBuffer(o),0);
+    } else if(M("_CMSampleBufferGetImageBuffer")) {
+        void *o=O(0);*out=objc_bridge32_borrowed_object(o,CMSampleBufferGetImageBuffer(o),1);
+    } else if(M("_CMSampleBufferGetNumSamples"))*out=(uint32_t)CMSampleBufferGetNumSamples(O(0));
+    else if(M("_CMBlockBufferGetDataLength"))*out=(uint32_t)CMBlockBufferGetDataLength(O(0));
+    else if(M("_CMBlockBufferCopyDataBytes"))*out=(uint32_t)CMBlockBufferCopyDataBytes(O(0),a[1],a[2],G(3));
+    else if(M("_CMSampleBufferGetPresentationTimeStamp")) {
+        CMTime t=CMSampleBufferGetPresentationTimeStamp(O(1));memcpy(G(0),&t,sizeof(t));*out=a[0];
+    } else if(M("_CMTimeMakeWithSeconds")) {
+        double seconds;memcpy(&seconds,a+1,8);CMTime t=CMTimeMakeWithSeconds(seconds,(int32_t)a[3]);
+        memcpy(G(0),&t,sizeof(t));*out=a[0];
+    } else if(M("_CMTimeRangeMake")) {
+        CMTime start,duration;memcpy(&start,a+1,24);memcpy(&duration,a+7,24);
+        CMTimeRange range=CMTimeRangeMake(start,duration);memcpy(G(0),&range,sizeof(range));*out=a[0];
+    } else if(M("_CMTimeGetSeconds")) {
+        CMTime t;memcpy(&t,a,24);*out=compat_runtime32_return_double(CMTimeGetSeconds(t));
+    } else if(M("_CVPixelBufferGetTypeID"))*out=(uint32_t)CVPixelBufferGetTypeID();
+    else if(M("_CVPixelBufferGetBytesPerRow"))*out=(uint32_t)CVPixelBufferGetBytesPerRow(O(0));
+    else if(M("_CVPixelBufferLockBaseAddress"))*out=(uint32_t)CVPixelBufferLockBaseAddress(O(0),a[1]);
+    else if(M("_CVPixelBufferGetBaseAddress")) {
+        CVPixelBufferRef b=O(0);size_t size=CVPixelBufferGetBytesPerRow(b)*CVPixelBufferGetHeight(b);
+        if(CVPixelBufferIsPlanar(b))return 0;
+        *out=objc_bridge32_borrowed_bytes(b,CVPixelBufferGetBaseAddress(b),size,3);
+    } else if(M("_CVPixelBufferUnlockBaseAddress")) {
+        CVPixelBufferRef b=O(0);
+        if(!(a[1]&kCVPixelBufferLock_ReadOnly) && !CVPixelBufferIsPlanar(b))
+            objc_bridge32_commit_borrowed_bytes(b,CVPixelBufferGetBaseAddress(b),
+                CVPixelBufferGetBytesPerRow(b)*CVPixelBufferGetHeight(b),3);
+        *out=(uint32_t)CVPixelBufferUnlockBaseAddress(O(0),a[1]);
+        if(!*out)objc_bridge32_release_borrowed_bytes(b,3);
+    } else if(M("_CVImageBufferGetColorSpace")) {
+        void *o=O(0);*out=objc_bridge32_borrowed_object(o,CVImageBufferGetColorSpace(o),2);
+    } else return 0;
+    return 1;
+#undef M
+#undef G
+#undef O
+}
+
 int quicktime_bridge32_dispatch(const char *name, const uint32_t *a,
                                 uint64_t *out) {
+  if(core_media_dispatch(name,a,out))return 1;
 #define IS(s) (!strcmp(name, s))
 #define P(i) ((void *)(uintptr_t)a[i])
   if (name[0] != '_' || !strchr("CEGMNODQISLURPFB", name[1]))
@@ -660,4 +723,62 @@ int quicktime_bridge32_dispatch(const char *name, const uint32_t *a,
   return 0;
 #undef IS
 #undef P
+}
+
+int quicktime_bridge32_run_media_self_test(void) {
+    @autoreleasepool {
+        uint32_t memory=compat_runtime32_allocate(256,1);if(!memory)return -1;
+        uint32_t a[16]={memory};uint64_t result;
+        double seconds=2.5;memcpy(a+1,&seconds,8);a[3]=600;
+        if(!core_media_dispatch("_CMTimeMakeWithSeconds",a,&result))return -1;
+        CMTime *t=(void *)(uintptr_t)memory;if(t->value!=1500||t->timescale!=600)return -1;
+        memcpy(a+1,t,24);memcpy(a+7,t,24);
+        if(!core_media_dispatch("_CMTimeRangeMake",a,&result))return -1;
+        CMTimeRange *range=(void *)(uintptr_t)memory;
+        if(CMTimeGetSeconds(range->start)!=2.5||CMTimeGetSeconds(range->duration)!=2.5)return -1;
+        for(unsigned pass=0;pass<2;++pass) {
+            uint32_t make=compat_runtime32_copy_cstring(pass?"valueWithCMTimeRange:":"valueWithCMTime:");
+            uint32_t get=compat_runtime32_copy_cstring(pass?"CMTimeRangeValue":"CMTimeValue");
+            CMTimeRange expected=CMTimeRangeMake(CMTimeMake(1500,600),CMTimeMake(3000,600));
+            uint32_t call[16]={objc_bridge32_guest_object([NSValue class]),make};
+            size_t size=pass?sizeof(CMTimeRange):sizeof(CMTime);
+            memcpy(call+2,&expected,size);
+            if(!objc_bridge32_dispatch("_objc_msgSend",call,&result)||!result)return -1;
+            uint32_t get_args[]={memory,(uint32_t)result,get};
+            if(!objc_bridge32_dispatch("_objc_msgSend_stret",get_args,&result)||memcmp((void *)(uintptr_t)memory,&expected,size))return -1;
+            compat_runtime32_deallocate(make);compat_runtime32_deallocate(get);
+        }
+        uint32_t dictionary_selector=compat_runtime32_copy_cstring("dictionaryWithObjects:forKeys:count:");
+        uint32_t *entries=(void *)(uintptr_t)memory;
+        entries[0]=objc_bridge32_guest_object(@42);entries[1]=objc_bridge32_guest_object(@"pixel-format");
+        uint32_t saved_entries[2]={entries[0],entries[1]};
+        uint32_t dictionary_args[]={objc_bridge32_guest_object([NSDictionary class]),dictionary_selector,memory,memory+4,1};
+        if(!objc_bridge32_dispatch("_objc_msgSend",dictionary_args,&result)||
+           ![[(NSDictionary *)objc_bridge32_host_object((uint32_t)result) objectForKey:@"pixel-format"] isEqual:@42] ||
+           memcmp(entries,saved_entries,sizeof(saved_entries)))return -1;
+        compat_runtime32_deallocate(dictionary_selector);
+        AudioStreamBasicDescription format={.mSampleRate=48000,.mFormatID=kAudioFormatLinearPCM,
+            .mFormatFlags=kAudioFormatFlagIsSignedInteger|kAudioFormatFlagIsPacked,.mBytesPerPacket=2,.mFramesPerPacket=1,.mBytesPerFrame=2,.mChannelsPerFrame=1,.mBitsPerChannel=16};
+        CMAudioFormatDescriptionRef description=NULL;
+        if(CMAudioFormatDescriptionCreate(NULL,&format,0,NULL,0,NULL,NULL,&description))return -1;
+        uint32_t token=objc_bridge32_guest_owned_object((void *)description);CFRelease(description);
+        a[0]=token;
+        if(!core_media_dispatch("_CMAudioFormatDescriptionGetStreamBasicDescription",a,&result)||!result||memcmp((void *)(uintptr_t)result,&format,sizeof(format)))return -1;
+        a[1]=memory;
+        if(!core_media_dispatch("_CMAudioFormatDescriptionGetMagicCookie",a,&result)||result||*(uint32_t *)(uintptr_t)memory)return -1;
+        objc_bridge32_dispatch("_CFRelease",&token,&result);
+        CVPixelBufferRef pixel=NULL;
+        if(CVPixelBufferCreate(NULL,4,4,kCVPixelFormatType_32BGRA,NULL,&pixel))return -1;
+        token=objc_bridge32_guest_owned_object(pixel);CFRelease(pixel);a[0]=token;a[1]=0;
+        if(!core_media_dispatch("_CVPixelBufferLockBaseAddress",a,&result)||result)return -1;
+        memset(CVPixelBufferGetBaseAddress(pixel),0x35,CVPixelBufferGetBytesPerRow(pixel)*4);
+        if(!core_media_dispatch("_CVPixelBufferGetBaseAddress",a,&result)||!result)return -1;
+        unsigned char *bytes=(void *)(uintptr_t)result;if(bytes[0]!=0x35)return -1;bytes[0]=0x71;
+        if(!core_media_dispatch("_CVPixelBufferUnlockBaseAddress",a,&result)||result)return -1;
+        CVPixelBufferLockBaseAddress(pixel,kCVPixelBufferLock_ReadOnly);
+        if(*(unsigned char *)CVPixelBufferGetBaseAddress(pixel)!=0x71)return -1;
+        CVPixelBufferUnlockBaseAddress(pixel,kCVPixelBufferLock_ReadOnly);
+        objc_bridge32_dispatch("_CFRelease",&token,&result);compat_runtime32_deallocate(memory);
+        puts("Core Media bridge PASS (CMTime/CMTimeRange, borrowed PCM format, cookie size, readable/writable low-address pixels)");return 0;
+    }
 }

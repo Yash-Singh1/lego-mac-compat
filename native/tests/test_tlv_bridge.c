@@ -10,6 +10,7 @@ static void *worker(void *unused) {
     (void)unused;uint64_t value;assert(tlv_bridge32_dispatch("_lp32_tlv_get_addr",&descriptor,&value));
     uint32_t *p=(void *)(uintptr_t)value;assert(p[0]==123&&p[1]==0);p[0]=456;
     uint64_t again;assert(tlv_bridge32_dispatch("_lp32_tlv_get_addr",&descriptor,&again)&&again==value);
+    assert(tlv_bridge32_fast_address(&descriptor,0)==value);
     return (void *)(uintptr_t)value;
 }
 int main(void) {

@@ -177,7 +177,13 @@ static int interface_call(unsigned which, unsigned slot, const uint32_t *a, uint
         if (slot == 4 || slot == 5) {
             *result = compat_runtime32_copy_cstring(CALL0(const char *)); return 1;
         }
-        if (slot == 6 || slot == 7) { *result = CALL1(bool, uint32_t, a[1]); return 1; }
+        if (slot == 6 || slot == 7) {
+            *result = CALL1(bool, uint32_t, a[1]);
+            if (getenv("LP32_TRACE_STEAM"))
+                fprintf(stderr, "compat32: SteamApps slot=%u app=%u result=%llu\n",
+                        slot, a[1], (unsigned long long)*result);
+            return 1;
+        }
     } else if (which == STEAM_UTILS) {
         if (slot == 9) { *result = CALL0(uint32_t); return 1; } /* GetAppID */
     } else if (which == STEAM_STATS) {
@@ -378,6 +384,12 @@ int steam_bridge32_dispatch(const char *name, const uint32_t *args, uint64_t *re
         return 1;
     }
     if (strcmp(name, "_SteamAPI_RestartAppIfNecessary") == 0) {
+        /* The SDK relaunches through `open steam://run/<app>`, which brings
+           Steam to the front.  Unattended test runs must never do that. */
+        if (getenv("LP32_BACKGROUND_TEST")) {
+            *result = 0;
+            return 1;
+        }
         bool (*function)(uint32_t) = steam_symbol(name + 1);
         if (!function) return 0;
         *result = function(args[0]);

@@ -333,6 +333,33 @@ static const struct lp32_game_profile saga_profile = {
 };
 
 /* Steam 1.2.1 RC4 (124676.25672), Clang i386 with an LC_MAIN entry. */
+static const struct lp32_screen_aspect_patch saga_steam_aspect_patch = {
+    .mode_ratio_store = {
+        .address = 0x0010dfcd,
+        .expected = {0xf3, 0x0f, 0x11, 0x87, 0x30, 0x06, 0x00, 0x00},
+        .length = 8,
+    },
+    .hud_scale_load = {
+        .address = 0x0007dd0a,
+        .expected = {0xf3, 0x0f, 0x10, 0x96, 0x9f, 0x99, 0x86, 0x00},
+        .length = 8,
+    },
+    .panel_scale_select = {
+        .address = 0x000adf63,
+        .expected = {0xf3, 0x0f, 0x10, 0x84, 0x88, 0x38, 0x9a, 0x83},
+        .length = 8,
+    },
+    .renderer_pointer_slot = 0x00b2800c,
+    .option_pointer_slot = 0x00b28014,
+    .hud_default_scale_address = 0x008e768c,
+    .camera_pointer = 0x02b211c4,
+    .panel_scale_table = 0x008e7990,
+    .panel_scale_x = 0x02aeb6bc,
+    .panel_scale_y = 0x02aeb6c0,
+    .panel_coin_y = 0x00b58934,
+    .panel_heart_y = 0x00b58950,
+};
+
 static const struct lp32_game_profile saga_steam_profile = {
     .title = LP32_TITLE_COMPLETE_SAGA,
     .name = "LEGOCompleteSagaSteam",
@@ -343,6 +370,7 @@ static const struct lp32_game_profile saga_steam_profile = {
     .image_end = 0x02ed4640,
     .thread_argument_is_direct = 1,
     .callee_pops_struct_return = 1,
+    .screen_aspect_patch = &saga_steam_aspect_patch,
 };
 
 static const struct lp32_game_profile unknown_profile = {

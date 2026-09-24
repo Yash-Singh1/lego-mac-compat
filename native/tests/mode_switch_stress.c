@@ -33,7 +33,7 @@
 #include <time.h>
 #include <unistd.h>
 
-extern uint32_t run_compat32(uint32_t eip, uint32_t esp, uint16_t cs32);
+extern uint64_t run_compat32(uint32_t eip, uint32_t esp, uint16_t cs32);
 extern void stress_gateway_plain(void);
 extern void stress_gateway_guarded(void);
 uint16_t stress_cs32;

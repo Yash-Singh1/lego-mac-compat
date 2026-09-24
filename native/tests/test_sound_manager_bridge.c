@@ -46,6 +46,27 @@ int main(void) {
     command[0]=47;command[1]=0x10000040;*(uint32_t *)0x10000044=0xbeefcafe;
     assert(call("_SndDoImmediate",args)==0);
     assert(*(uint32_t *)0x10000040==0x800040 && *(uint32_t *)0x10000044==0xbeefcafe);
+    /* Pause, resume and stop return at once but stay ordered with later
+       getters and setters on the channel worker. */
+    command[0]=11;command[1]=0;assert(call("_SndDoImmediate",args)==0);
+    command[0]=86;command[1]=0x20000;assert(call("_SndDoImmediate",args)==0);
+    command[0]=12;command[1]=0;assert(call("_SndDoImmediate",args)==0);
+    command[0]=3;command[1]=0;assert(call("_SndDoImmediate",args)==0);
+    command[0]=4;command[1]=0;assert(call("_SndDoImmediate",args)==0);
+    command[0]=87;command[1]=0x10000040;assert(call("_SndDoImmediate",args)==0);
+    assert(*(uint32_t *)0x10000040==0x20000);
     uint32_t dispose[]={channel,1};assert(call("_SndDisposeChannel",dispose)==0);
-    puts("Sound Manager PASS (i386 channel, queued muted PCM, completion, volume, disposal)");
+    assert((int32_t)call("_SndDoImmediate",args)==-205);
+    assert((int32_t)call("_SndDisposeChannel",dispose)==-205);
+    /* A long play session may create more than 1,024 channels in total.
+       Disposed channels must not exhaust a lifetime creation limit. */
+    for(unsigned i=0;i<1030;++i) {
+        uint32_t guest=0x10000200+i*64;
+        *out=guest;
+        uint32_t next_create[]={0x10000000,5,0xc4,0};
+        assert(call("_SndNewChannel",next_create)==0 && *out==guest);
+        uint32_t next_dispose[]={guest,1};
+        assert(call("_SndDisposeChannel",next_dispose)==0);
+    }
+    puts("Sound Manager PASS (i386 channel, queued muted PCM, completion, volume, ordered async control, disposal, lifetime creation)");
 }

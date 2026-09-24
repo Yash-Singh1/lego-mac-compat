@@ -2266,7 +2266,7 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
     return 1;
   }
   if (IS("_GetKeys")) {
-    if (getenv("LP32_BACKGROUND_TEST")) {
+    if (getenv("LP32_BACKGROUND_TEST") || getenv("LP32_TEST_KEY_FIFO")) {
       memset(P(0), 0, 16);
       for(unsigned key=0;key<128;++key)
         if(objc_bridge32_test_key_down(key))((unsigned char *)P(0))[key/8]|=1u<<(key%8);
@@ -2536,6 +2536,9 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
     double delay, interval;
     memcpy(&delay, a + 1, 8);
     memcpy(&interval, a + 3, 8);
+    if (getenv("LP32_TRACE_CARBON_TIMERS"))
+      fprintf(stderr, "compat32: Carbon timer delay=%.3f interval=%.3f callback=%08x data=%08x\n",
+              delay, interval, a[5], a[6]);
     struct handler32 *h = malloc(sizeof(*h));
     if (!h) {
       *out = (uint32_t)-108;

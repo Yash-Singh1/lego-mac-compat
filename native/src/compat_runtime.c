@@ -56,7 +56,8 @@
 #include <wchar.h>
 #include <unistd.h>
 
-extern uint32_t run_compat32(uint32_t eip, uint32_t esp, uint16_t cs32);
+/* Returns the guest EDX:EAX pair (see emit_return64_pad). */
+extern uint64_t run_compat32(uint32_t eip, uint32_t esp, uint16_t cs32);
 extern void lp32_import_gateway(void);
 
 uint16_t lp32_cs32;
@@ -85,6 +86,7 @@ enum {
     kExitThunkOffset = 0x000,
     kExitFarPointerOffset = 0x010,
     kGatewayFarPointerOffset = 0x040,
+    kGuestStrcmpOffset = 0x100,
     kImportThunksOffset = 0x1000,
     kInlineImportCapacity = 1024,
     kOverflowImportBase = 0x7f020000,
@@ -1046,11 +1048,16 @@ static void emit_gateway64_pad(uint8_t *destination, uint32_t retry,
 }
 
 /* 64-bit pad reached from the exit thunk: restore the host ABI frame
-   established by run_compat32 and return to it with eax untouched. */
+   established by run_compat32 and return to it with the guest's EDX:EAX in
+   rax.  i386 returns 8-byte values (long long, and small structs such as
+   CGSize/NSPoint/NSRange from Objective-C methods) in that register pair. */
 static void emit_return64_pad(uint8_t *destination, uint32_t retry,
                               uint16_t cs64)
 {
     static const uint8_t return64[] = {
+        0x89, 0xc0,                   /* movl %eax, %eax */
+        0x48, 0xc1, 0xe2, 0x20,       /* shlq $32, %rdx */
+        0x48, 0x09, 0xd0,             /* orq %rdx, %rax */
         0x4c, 0x87, 0xf4,
         0x48, 0x83, 0xc4, 0x18,
         0x41, 0x5f,
@@ -1064,8 +1071,10 @@ static void emit_return64_pad(uint8_t *destination, uint32_t retry,
     uint8_t *p = destination;
     if (!mode_guards_disabled) {
         /* xorl %ecx,%ecx; inc-ecx-twice-or-inc-r9d; testl %ecx,%ecx; jnz */
+        /* jnz skips the return sequence to the recovery tail. */
         static const uint8_t probe[] = {0x31, 0xc9, 0x41, 0xff, 0xc1,
-                                        0x85, 0xc9, 0x75, 0x12};
+                                        0x85, 0xc9, 0x75, sizeof(return64)};
+        _Static_assert(sizeof(return64) < 0x80, "short jnz displacement");
         p = emit_bytes(p, probe, sizeof(probe));
     }
     p = emit_bytes(p, return64, sizeof(return64));
@@ -1273,6 +1282,28 @@ static int build_transition_bridge(void)
     emit_landing32(code + kLanding32Offset, kBridgeCodeBase + kLanding32AltOffset);
     emit_landing32(code + kLanding32AltOffset, 0);
 
+    /* strcmp is called hundreds of thousands of times while Feral translates
+       cutscene shaders. Keep the comparison in i386 mode so each call avoids
+       the 32-bit to 64-bit gateway. Return the unsigned-byte difference, as
+       libc strcmp does, and preserve the callee-saved EBX register. */
+    static const uint8_t guest_strcmp[] = {
+        0x53,                         /* push ebx */
+        0x8b, 0x54, 0x24, 0x08,       /* mov edx, [esp+8] */
+        0x8b, 0x4c, 0x24, 0x0c,       /* mov ecx, [esp+12] */
+        0x0f, 0xb6, 0x02,             /* loop: movzx eax, byte [edx] */
+        0x0f, 0xb6, 0x19,             /* movzx ebx, byte [ecx] */
+        0x29, 0xd8,                   /* sub eax, ebx */
+        0x75, 0x08,                   /* jne done */
+        0x85, 0xdb,                   /* test ebx, ebx */
+        0x74, 0x04,                   /* je done */
+        0x42, 0x41,                   /* inc edx; inc ecx */
+        0xeb, 0xee,                   /* jmp loop */
+        0x5b, 0xc3,                   /* done: pop ebx; ret */
+    };
+    _Static_assert(kGuestStrcmpOffset + sizeof(guest_strcmp) < kImportThunksOffset,
+                   "guest strcmp overlaps import thunks");
+    memcpy(code + kGuestStrcmpOffset, guest_strcmp, sizeof(guest_strcmp));
+
     for (uint32_t index = 0; index < current_image->import_count; ++index) {
         const struct macho_import32 *import = &current_image->imports[index];
         if (import->kind == MACHO_IMPORT32_POINTER && !import->target) continue;
@@ -1285,6 +1316,9 @@ static int build_transition_bridge(void)
                 (index - kInlineImportCapacity - kOverflowImportCapacity) * kImportThunkSize;
         if (import->target) {
             thunk = (void *)(uintptr_t)import->target;
+        } else if (!getenv("LP32_NO_GUEST_STRCMP") &&
+                   strcmp(import->name, "_strcmp") == 0) {
+            thunk = code + kGuestStrcmpOffset;
         } else {
             /* push $import_index; ljmp *gateway_far_pointer */
             thunk[0] = 0x68;
@@ -1331,7 +1365,9 @@ static int build_transition_bridge(void)
     for (uint32_t index = 0; index < current_image->import_count; ++index) {
         if (current_image->imports[index].target) continue;
         if (current_image->imports[index].kind != MACHO_IMPORT32_POINTER) continue;
-        if ((data_cells + 4) * sizeof(*data_cell) > kGuestRuneLocaleOffset) {
+        bool cm_time_zero = !strcmp(current_image->imports[index].name,"_kCMTimeZero");
+        size_t cell_words=cm_time_zero?8:4;
+        if ((data_cells + cell_words) * sizeof(*data_cell) > kGuestRuneLocaleOffset) {
             errno = ENOSPC;
             return runtime_error("i386 import data cells");
         }
@@ -1339,6 +1375,20 @@ static int build_transition_bridge(void)
                                 (uint32_t)(data_cells * sizeof(*data_cell));
         uint32_t *slot = (void *)(uintptr_t)current_image->imports[index].address;
         *slot = cell_address;
+        if(cm_time_zero) {
+            /* CMTime: value=0, timescale=1, flags=valid, epoch=0. */
+            data_cell[data_cells+2]=1;data_cell[data_cells+3]=1;
+            data_cells+=cell_words;continue;
+        }
+        if (!strcmp(current_image->imports[index].name, "_kCFAbsoluteTimeIntervalSince1970") ||
+            !strcmp(current_image->imports[index].name, "_kCFAbsoluteTimeIntervalSince1904")) {
+            double interval = !strcmp(current_image->imports[index].name,
+                                      "_kCFAbsoluteTimeIntervalSince1970") ?
+                kCFAbsoluteTimeIntervalSince1970 : kCFAbsoluteTimeIntervalSince1904;
+            memcpy(data_cell + data_cells, &interval, sizeof(interval));
+            data_cells += cell_words;
+            continue;
+        }
         if (strcmp(current_image->imports[index].name, "__DefaultRuneLocale") == 0) {
             *slot = kBridgeDataBase + kGuestRuneLocaleOffset;
             continue;
@@ -1373,6 +1423,8 @@ static int build_transition_bridge(void)
 
 static uint32_t guest_thunk_for_dynamic_symbol(const char *name)
 {
+    if (!getenv("LP32_NO_GUEST_STRCMP") && strcmp(name, "_strcmp") == 0)
+        return kBridgeCodeBase + kGuestStrcmpOffset;
     for (uint32_t index = 0; index < dynamic_symbol_count; ++index) {
         if (strcmp(dynamic_symbol_names[index], name) == 0) {
             return kBridgeCodeBase + kDynamicThunksOffset + index * kImportThunkSize;
@@ -3065,6 +3117,9 @@ static unsigned import_return_kind(const char *name)
         strcmp(name, "_CTFontGetBoundingRectsForGlyphs") == 0 ||
         strcmp(name, "_CTLineGetImageBounds") == 0 ||
         strcmp(name, "_CGDisplayBounds") == 0 ||
+        strcmp(name, "_CMTimeMakeWithSeconds") == 0 ||
+        strcmp(name, "_CMTimeRangeMake") == 0 ||
+        strcmp(name, "_CMSampleBufferGetPresentationTimeStamp") == 0 ||
         strcmp(name, "_objc_msgSend_stret") == 0) return kReturnStruct;
     /* Steam's user-ID call selects its ABI from the arguments and interface
        state. Cache only that it needs a dynamic check, never its result. */
@@ -3104,6 +3159,7 @@ static uint64_t dispatch_import_chained(uint32_t import_id, const char *name,
                                             return_address);
     if (fast_slot && !*fast_slot && !fast_imports_disabled) {
         lp32_fast_import_fn handler = runtime_fast_import(name);
+        if (!handler) handler = libcpp_bridge32_fast_import(name);
         if (!handler) handler = objc_bridge32_fast_import(name);
         *fast_slot = handler ? handler : kFastImportNone;
     }
@@ -3123,11 +3179,35 @@ static uint32_t *uncached_import_return_for_test(uint32_t *stack)
 
 int compat_runtime32_run_import_return_self_test(void)
 {
+    {
+        /* Guest calls must return i386 EDX:EAX: guest Objective-C methods
+           return CGSize/NSPoint/NSRange/long long in that register pair. */
+        uint8_t *code = mmap((void *)0x76100000, 4096,
+                             PROT_READ | PROT_WRITE | PROT_EXEC,
+                             MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (code == MAP_FAILED || (uintptr_t)code > UINT32_MAX) return -1;
+        /* movl $0x11223344,%eax; movl $0x55667788,%edx; ret */
+        static const uint8_t pair[] = {0xb8, 0x44, 0x33, 0x22, 0x11,
+                                       0xba, 0x88, 0x77, 0x66, 0x55, 0xc3};
+        memcpy(code, pair, sizeof(pair));
+        uint32_t function = (uint32_t)(uintptr_t)code;
+        uint64_t both = compat_runtime32_call64(function, NULL, 0);
+        uint32_t low = compat_runtime32_call(function, NULL, 0);
+        munmap(code, 4096);
+        if (both != UINT64_C(0x5566778811223344) || low != 0x11223344) {
+            fprintf(stderr, "import-return-selftest: guest EDX:EAX %016llx/%08x\n",
+                    (unsigned long long)both, low);
+            return -1;
+        }
+    }
     static const struct { const char *name; unsigned kind; } cases[] = {
         {"__ZNKSt3__18ios_base6getlocEv", kReturnStruct},
         {"_CFAbsoluteTimeGetGregorianDate", kReturnStruct},
         {"_CTFontGetBoundingBox", kReturnStruct},
         {"_CFUUIDGetUUIDBytes", kReturnStruct},
+        {"_CMTimeMakeWithSeconds", kReturnStruct},
+        {"_CMTimeRangeMake", kReturnStruct},
+        {"_CMSampleBufferGetPresentationTimeStamp", kReturnStruct},
         {"_CTFontGetBoundingRectsForGlyphs", kReturnStruct},
         {"_CTLineGetImageBounds", kReturnStruct},
         {"_CGDisplayBounds", kReturnStruct},
@@ -3175,7 +3255,94 @@ int compat_runtime32_run_import_return_self_test(void)
         fprintf(stderr, "import-return-selftest: %s %.1f ns/call\n",
                 pass ? "cached" : "uncached", (hitch_now() - start) / 1e6);
     }
-    puts("import-return-selftest: PASS (static/dynamic IDs, structure return stack, ordinary calls, Steam dynamic classification)");
+    /* Check signed C results through both the named fallback and actual
+       i386 gateway (first dispatch and cached fast dispatch). */
+    const char *strings[]={"", "a", "ab", "b", "\177", "\200", "\377"};
+    uint32_t texts[7],compare=compat_runtime32_guest_callback("_strcmp");
+    if(!compare)return -1;
+    if (!getenv("LP32_NO_GUEST_STRCMP")) {
+        if (compare != kBridgeCodeBase + kGuestStrcmpOffset) return -1;
+        for (uint32_t index = 0; index < current_image->import_count; ++index) {
+            const struct macho_import32 *import = &current_image->imports[index];
+            if (strcmp(import->name, "_strcmp") || import->target ||
+                import->kind == MACHO_IMPORT32_POINTER) continue;
+            uint32_t destination;
+            if (import->kind == MACHO_IMPORT32_STUB) {
+                const uint8_t *stub = (const void *)(uintptr_t)import->address;
+                if (stub[0] != 0xe9) return -1;
+                int32_t displacement;
+                memcpy(&displacement, stub + 1, sizeof(displacement));
+                destination = (uint32_t)(import->address + 5 + displacement);
+            } else {
+                destination = *(const uint32_t *)(uintptr_t)import->address;
+            }
+            if (destination != compare) return -1;
+        }
+    }
+    for(unsigned i=0;i<7;++i)texts[i]=compat_runtime32_copy_cstring(strings[i]);
+    for(unsigned i=0;i<7;++i)for(unsigned j=0;j<7;++j) {
+        uint32_t a[]={texts[i],texts[j]};int32_t expected=strcmp(strings[i],strings[j]);
+        if((int32_t)compat_runtime32_dispatch_import("_strcmp",a)!=expected)return -1;
+        for(unsigned pass=0;pass<2;++pass)
+            if((int32_t)compat_runtime32_call(compare,a,2)!=expected)return -1;
+    }
+    if (getenv("LP32_BENCH_STRCMP")) {
+        uint32_t word = compat_runtime32_copy_cstring("ShaderVariant_0123456789");
+        if (!word) return -1;
+        uint32_t args[] = {word, word};
+        uint64_t start = hitch_now();
+        for (unsigned i = 0; i < 200000; ++i)
+            if (compat_runtime32_call(compare, args, 2) != 0) return -1;
+        fprintf(stderr, "import-return-selftest: guest strcmp %.1f ns/call\n",
+                (hitch_now() - start) / 200000.0);
+        compat_runtime32_deallocate(word);
+    }
+    for(unsigned i=0;i<7;++i)compat_runtime32_deallocate(texts[i]);
+    /* Hot runtime imports: the first gateway call runs the named handler and
+       caches the fast one; the second uses the cache. Both must agree. */
+    uint32_t allocate=compat_runtime32_guest_callback("__Znwm");
+    uint32_t release=compat_runtime32_guest_callback("__ZdlPv");
+    uint32_t self=compat_runtime32_guest_callback("_pthread_self");
+    uint32_t equal=compat_runtime32_guest_callback("_pthread_equal");
+    uint32_t set=compat_runtime32_guest_callback("_pthread_setspecific");
+    uint32_t get=compat_runtime32_guest_callback("_pthread_getspecific");
+    if(!allocate||!release||!self||!equal||!set||!get)return -1;
+    for(unsigned pass=0;pass<2;++pass) {
+        uint32_t size[]={24};
+        uint32_t block=compat_runtime32_call(allocate,size,1);
+        if(!block)return -1;
+        memset((void *)(uintptr_t)block,0x5a,24);
+        uint32_t block_args[]={block};
+        compat_runtime32_call(release,block_args,1);
+        uint32_t token=compat_runtime32_call(self,NULL,0);
+        uint32_t same[]={token,token},different[]={token,token+1};
+        if(!token||compat_runtime32_call(equal,same,2)!=1||
+           compat_runtime32_call(equal,different,2)!=0)return -1;
+        uint32_t store[]={5,0x1234u+pass},load[]={5},bad[]={128,1};
+        if(compat_runtime32_call(set,store,2)!=0||
+           compat_runtime32_call(get,load,1)!=0x1234u+pass||
+           compat_runtime32_call(set,bad,2)!=(uint32_t)EINVAL)return -1;
+    }
+    {
+        /* Shader translation builds text with std::string push_back/append. */
+        uint32_t push=compat_runtime32_guest_callback("__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9push_backEc");
+        uint32_t append=compat_runtime32_guest_callback("__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKc");
+        uint32_t destroy=compat_runtime32_guest_callback("__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEED1Ev");
+        uint32_t string=compat_runtime32_allocate(12,1),word=compat_runtime32_copy_cstring("MAD r0, r1;\n");
+        if(!push||!append||!destroy||!string||!word)return -1;
+        uint64_t begin=hitch_now();
+        for(unsigned i=0;i<8000;++i){uint32_t args[]={string,(uint32_t)('a'+i%26)};compat_runtime32_call(push,args,2);}
+        for(unsigned i=0;i<1000;++i){uint32_t args[]={string,word};compat_runtime32_call(append,args,2);}
+        uint64_t elapsed=hitch_now()-begin;
+        const uint32_t *layout=(const void *)(uintptr_t)string;
+        const char *text=(const char *)(uintptr_t)layout[2];
+        if(!(layout[0]&1)||layout[1]!=8000+12000||text[0]!='a'||text[25]!='z'||
+           memcmp(text+8000,"MAD r0, r1;\n",12)||text[20000])return -1;
+        fprintf(stderr,"import-return-selftest: std::string push_back/append %.0f ns/call\n",elapsed/9000.0);
+        uint32_t args[]={string};compat_runtime32_call(destroy,args,1);
+        compat_runtime32_deallocate(string);compat_runtime32_deallocate(word);
+    }
+    puts("import-return-selftest: PASS (static/dynamic IDs, structure return stack, ordinary calls, Steam dynamic classification, hot runtime fast paths, std::string growth)");
     return 0;
 }
 
@@ -3397,6 +3564,13 @@ static uint64_t fast_memset(const uint32_t *arguments, uint32_t return_address)
     return arguments[0];
 }
 
+static uint64_t fast_strcmp(const uint32_t *arguments, uint32_t return_address)
+{
+    (void)return_address;
+    return (uint32_t)strcmp((const char *)(uintptr_t)arguments[0],
+                            (const char *)(uintptr_t)arguments[1]);
+}
+
 static uint64_t fast_logf(const uint32_t *arguments, uint32_t return_address)
 {
     (void)return_address;
@@ -3454,6 +3628,51 @@ static uint64_t fast_pthread_mutex_unlock(const uint32_t *arguments,
     return mutex ? (uint32_t)pthread_mutex_unlock(mutex) : (uint32_t)EINVAL;
 }
 
+/* Level loads and unloads make tens of thousands of these calls a frame.
+   Each has the same effect as its named handler in dispatch_named_import_body,
+   without walking the bridge chain by name. */
+static uint64_t fast_malloc(const uint32_t *arguments, uint32_t return_address)
+{
+    return guest_allocate_at(arguments[0], false, return_address);
+}
+
+static uint64_t fast_free(const uint32_t *arguments, uint32_t return_address)
+{
+    (void)return_address;
+    guest_deallocate(arguments[0]);
+    return 0;
+}
+
+static uint64_t fast_pthread_self(const uint32_t *arguments,
+                                  uint32_t return_address)
+{
+    (void)arguments; (void)return_address;
+    return guest_pthread_self();
+}
+
+static uint64_t fast_pthread_equal(const uint32_t *arguments,
+                                   uint32_t return_address)
+{
+    (void)return_address;
+    return arguments[0] == arguments[1];
+}
+
+static uint64_t fast_pthread_getspecific(const uint32_t *arguments,
+                                         uint32_t return_address)
+{
+    (void)return_address;
+    return arguments[0] < 128 ? guest_pthread_values[arguments[0]] : 0;
+}
+
+static uint64_t fast_pthread_setspecific(const uint32_t *arguments,
+                                         uint32_t return_address)
+{
+    (void)return_address;
+    if (arguments[0] >= 128) return (uint32_t)EINVAL;
+    guest_pthread_values[arguments[0]] = arguments[1];
+    return 0;
+}
+
 static lp32_fast_import_fn runtime_fast_import(const char *name)
 {
     static const struct {
@@ -3471,11 +3690,23 @@ static lp32_fast_import_fn runtime_fast_import(const char *name)
         {"___memcpy_chk", fast_memmove},
         {"_memset", fast_memset},
         {"___memset_chk", fast_memset},
+        {"_strcmp", fast_strcmp},
+        {"_lp32_tlv_get_addr", tlv_bridge32_fast_address},
         {"_logf", fast_logf},
         {"_expf", fast_expf},
         {"_pthread_mutex_lock", fast_pthread_mutex_lock},
         {"_pthread_mutex_trylock", fast_pthread_mutex_trylock},
         {"_pthread_mutex_unlock", fast_pthread_mutex_unlock},
+        {"_malloc", fast_malloc},
+        {"__Znwm", fast_malloc},
+        {"__Znam", fast_malloc},
+        {"_free", fast_free},
+        {"__ZdlPv", fast_free},
+        {"__ZdaPv", fast_free},
+        {"_pthread_self", fast_pthread_self},
+        {"_pthread_equal", fast_pthread_equal},
+        {"_pthread_getspecific", fast_pthread_getspecific},
+        {"_pthread_setspecific", fast_pthread_setspecific},
     };
     for (size_t index = 0; index < sizeof(table) / sizeof(table[0]); ++index) {
         if (strcmp(name, table[index].name) == 0) return table[index].handler;
@@ -3986,8 +4217,7 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
         return (uint32_t)strlen((const char *)(uintptr_t)arguments[0]);
     }
     if (import_is(name, "_strcmp")) {
-        return (uint32_t)strcmp((const char *)(uintptr_t)arguments[0],
-                                (const char *)(uintptr_t)arguments[1]);
+        return fast_strcmp(arguments, return_address);
     }
     if (import_is(name, "_strncmp")) {
         return (uint32_t)strncmp((const char *)(uintptr_t)arguments[0],
@@ -4439,10 +4669,13 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
         free(scratch);
         return (uint32_t)formatted;
     }
-    if (import_is(name, "_opendir$INODE64") || import_is(name, "_opendir") ||
+    if (import_is(name, "_opendir$INODE64$UNIX2003") ||
+        import_is(name, "_opendir$INODE64") || import_is(name, "_opendir") ||
         import_is(name, "_opendir$UNIX2003")) {
         const char *path = (const char *)(uintptr_t)arguments[0];
         DIR *directory = path ? opendir(path) : NULL;
+        if (getenv("LP32_TRACE_HID") && path && strstr(path,"InputDevices"))
+            fprintf(stderr,"compat32: opendir path=%s result=%p\n",path,directory);
         return guest_handle_for_directory(directory);
     }
     if (import_is(name, "_readdir") || import_is(name, "_readdir$INODE64")) {
@@ -5334,6 +5567,12 @@ static bool acquire_guest_stack_slot(void)
 uint32_t compat_runtime32_call(uint32_t function, const uint32_t *arguments,
                                size_t argument_count)
 {
+    return (uint32_t)compat_runtime32_call64(function, arguments, argument_count);
+}
+
+uint64_t compat_runtime32_call64(uint32_t function, const uint32_t *arguments,
+                                 size_t argument_count)
+{
     const uintptr_t stack_slice_size = 0x10000;
     if (guest_thread_slot == UINT32_MAX && !acquire_guest_stack_slot()) {
         last_call_trapped = 1;
@@ -5366,7 +5605,7 @@ uint32_t compat_runtime32_call(uint32_t function, const uint32_t *arguments,
     lp32_leave_guest = 0;
     ++guest_call_depth;
     lp32_guest_execution_enter();
-    uint32_t result = run_compat32(lp32_landing32, (uint32_t)sp, lp32_cs32);
+    uint64_t result = run_compat32(lp32_landing32, (uint32_t)sp, lp32_cs32);
     lp32_guest_execution_leave();
     --guest_call_depth;
     return result;

@@ -15,7 +15,7 @@ Support for the original 32-bit Mac releases:
 | LEGO Star Wars II: The Original Trilogy | Aspyr, 2006 | - |
 | LEGO Indiana Jones: The Original Adventures | 2008 | - |
 | LEGO Batman: The Videogame | Feral, 2009 | - |
-| LEGO Star Wars: The Complete Saga | Feral, Steam 1.2.1 | WIP; launcher, menus and new-game cantina verified |
+| LEGO Star Wars: The Complete Saga | Feral, Steam 1.2.1 | WIP; launcher, cantina and first-level entry verified |
 | LEGO Indiana Jones 2: The Adventure Continues | Feral, 2009 | - |
 | LEGO Harry Potter: Years 1-4 | Feral, 2011 | - |
 | LEGO Star Wars III: The Clone Wars | Feral, 2011 | ✓\* |
@@ -47,8 +47,11 @@ make GAME=saga      SOURCE_APP="/path/to/LEGO Star Wars Saga.app"         bundle
 ```
 
 Complete Saga's WIP build and current limitations are documented in
-[native/SAGA.md](native/SAGA.md). Short probes reach the new-game cantina;
-the full campaign and controllers remain unverified.
+[native/SAGA.md](native/SAGA.md). Muted probes reach the cantina and the first
+playable room of Negotiations. A connected DualShock 4's HID elements, with
+injected values, advanced through the title prompt and menus into New Game.
+Physical in-game controller play, save/reload and the full campaign remain
+unverified. The title, menus and cantina hold the 60 FPS cap on the test Mac.
 `GAME=saga` builds the Steam edition and requires an explicit `SOURCE_APP` path. Its output is
 `native/build/LEGOCompleteSaga-Steam-Compat.app`; keep the copied
 `LEGOStarWarsSagaData` directory beside it. The retail update is opt-in with
@@ -155,9 +158,11 @@ Marvel currently uses its shipped Xbox controller mapping and prompts.
 For silent testing, launch the bundle's executable with `LP32_MUTE_AUDIO=1`.
 This mutes only that process and does not change game settings or system volume.
 
-Marvel automatically records occasional frame hitches during normal play in
-`~/Library/Logs/LEGOMarvelCompat/hitches-<pid>-<timestamp>.log`. Relaunch after
-updating the loader to enable it. Each report contains 32 preceding frames,
+Marvel and Complete Saga automatically record occasional frame hitches during
+normal play. Reports go to `~/Library/Logs/LEGOMarvelCompat/` or
+`~/Library/Logs/LEGOCompleteSagaSteamCompat/` as
+`hitches-<pid>-<timestamp>.log`. Relaunch after updating the loader to enable
+recording. Each report contains 32 preceding frames,
 the slow frame, and 8 following frames, with draw counts, CPU time in draws,
 resource uploads, shader compilation, file I/O, waits, audio, GL state changes,
 Objective-C calls and other runtime imports. Nested imports count only toward
@@ -193,3 +198,8 @@ report. `LP32_HITCH_MS=35` changes the threshold; `LP32_HITCH_LOG=0` disables it
 or set `LP32_HITCH_LOG` to an unused absolute file path to redirect it. Other
 titles leave it disabled unless explicitly enabled.
 `make -C native test-hitch-recorder` runs synthetic timing tests without launching a game.
+`make -C native test-cf-import-coverage` compares all available compatibility
+app images' linked Core Foundation functions with the bridge's dispatch cases.
+The checked images currently have 43 linked calls in Clone Wars, 42 in Pirates,
+46 in Marvel, 146 in retail Complete Saga, and 234 in Steam Complete Saga.
+All have dispatch cases. This static check does not exercise every game path.

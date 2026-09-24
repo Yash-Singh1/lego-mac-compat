@@ -4,4 +4,5 @@
 #include <stdint.h>
 int tlv_bridge32_initialize(const struct macho_image32 *);
 int tlv_bridge32_dispatch(const char *,const uint32_t *,uint64_t *);
+uint64_t tlv_bridge32_fast_address(const uint32_t *,uint32_t);
 #endif

@@ -5,6 +5,7 @@
 #include "gl_core_bridge.h"
 #include "hid_bridge.h"
 #include "dispatch_bridge.h"
+#include "blocks_bridge.h"
 #include "objc_legacy_bridge.h"
 #include "carbon_bridge.h"
 #include "cfnetwork_bridge.h"
@@ -19,11 +20,13 @@
 
 #define GL_SILENCE_DEPRECATION 1
 #import <AppKit/AppKit.h>
+#import <AVFoundation/AVFoundation.h>
 #import <IOKit/pwr_mgt/IOPMLib.h>
 #import <Carbon/Carbon.h>
 #import <OpenGL/OpenGL.h>
 #import <OpenGL/gl.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <objc/objc-sync.h>
 #import <malloc/malloc.h>
 #import <dispatch/dispatch.h>
@@ -32,6 +35,8 @@
 #include <dlfcn.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,6 +48,7 @@
 #include <pthread.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <mach/mach_time.h>
 
@@ -88,6 +94,18 @@ struct proxy_entry {
 static _Thread_local bool creating_cf_object;
 static _Thread_local const char *proxy_origin;
 static struct proxy_entry proxies[kProxyCapacity];
+/* Publish canonical handles after retaining their objects. Lookups borrow
+ * the pointer, just as the locked path does; callers must hold ownership
+ * across use. Clear this slot before releasing or recycling an owned entry.
+ * This avoids a global mutex for every dispatch semaphore poll. */
+static uintptr_t published_proxy_objects[kProxyCapacity];
+static void publish_proxy(uint32_t slot) {
+    uint32_t canonical=slot<kInlineProxyCapacity?kProxyBase+slot*kProxyStride:
+        kOverflowProxyBase+(slot-kInlineProxyCapacity)*kProxyStride;
+    uintptr_t object=proxies[slot].handle==canonical ?
+        (uintptr_t)proxies[slot].object:0;
+    __atomic_store_n(&published_proxy_objects[slot],object,__ATOMIC_RELEASE);
+}
 static uint32_t proxy_count;
 static pthread_mutex_t proxy_mutex = PTHREAD_MUTEX_INITIALIZER;
 struct guest_autorelease_entry { uint32_t token; struct guest_autorelease_entry *next; };
@@ -114,6 +132,8 @@ static struct event_pool *event_pool(void) {
 #define current_proxy_event (event_pool()->current)
 static bool logged_proxy_exhaustion;
 static uint64_t objc_bridge_swap_count;
+@class OpenGLView;
+static OpenGLView *presenting_view;
 static NSScreen *preferred_game_screen(void);
 static void place_test_window(NSWindow *window)
 {
@@ -581,6 +601,7 @@ static uint32_t proxy_for_object(id object)
         if (proxies[index].object == object) {
             if (creating_cf_object) ++proxies[index].cf_owners;
             else proxies[index].pinned = true;
+            publish_proxy(index);
             uint32_t handle = proxies[index].handle;
             pthread_mutex_unlock(&proxy_mutex);
             return handle;
@@ -613,6 +634,7 @@ static uint32_t proxy_for_object(id object)
         (unsigned long long)objc_bridge_swap_count,slot,class_getName(object_getClass(object)),
         proxy_origin?proxy_origin:"bridge",creating_cf_object);
     if (proxy_object_is_retained(object)) [object retain];
+    publish_proxy(slot);
     if (slot == proxy_count) ++proxy_count;
     pthread_mutex_unlock(&proxy_mutex);
     return handle;
@@ -679,6 +701,30 @@ static uint32_t proxy_for_owned_object(id object)
     bool previous=creating_cf_object;creating_cf_object=true;
     uint32_t token=proxy_for_object(object);creating_cf_object=previous;
     return token;
+}
+uint32_t objc_bridge32_guest_owned_object(void *object) {
+    return proxy_for_owned_object((id)object);
+}
+@interface LP32BorrowedProxy : NSObject { @public uint32_t token; id value; }
+@end
+@implementation LP32BorrowedProxy
+- (void)dealloc {
+    uint64_t ignored;objc_bridge32_dispatch("_CFRelease",&token,&ignored);[super dealloc];
+}
+@end
+uint32_t objc_bridge32_borrowed_object(void *raw,void *object,unsigned slot)
+{
+    static char keys[3];id owner=(id)raw;
+    if(!owner || !object || slot>=3)return 0;
+    @synchronized(owner) {
+        LP32BorrowedProxy *entry=objc_getAssociatedObject(owner,&keys[slot]);
+        if(!entry || entry->value!=(id)object) {
+            entry=[[[LP32BorrowedProxy alloc] init] autorelease];
+            entry->value=(id)object;entry->token=proxy_for_owned_object((id)object);
+            objc_setAssociatedObject(owner,&keys[slot],entry,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        return entry->token;
+    }
 }
 static bool managed_string_init(id receiver,uint32_t token,const char *selector)
 {
@@ -832,6 +878,41 @@ static uint32_t guest_bytes_for_data(NSData *data)
     }
 }
 
+static char borrowed_bytes_keys[4];
+uint32_t objc_bridge32_borrowed_bytes(void *raw,const void *bytes,size_t length,unsigned slot)
+{
+    id owner=(id)raw;
+    if(!owner || !bytes || slot>=4 || length>UINT32_MAX)return 0;
+    @synchronized(owner) {
+        LP32DataBuffer *buffer=objc_getAssociatedObject(owner,&borrowed_bytes_keys[slot]);
+        if(!buffer){buffer=[[LP32DataBuffer alloc] init];
+            objc_setAssociatedObject(owner,&borrowed_bytes_keys[slot],buffer,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            [buffer release];}
+        if(buffer->capacity<(length?length:1)) {
+            uint32_t p=compat_runtime32_reallocate(buffer->guest,length?length:1);
+            if(!p)return 0;buffer->guest=p;buffer->capacity=length?length:1;
+        }
+        if(length)memcpy((void *)(uintptr_t)buffer->guest,bytes,length);
+        return buffer->guest;
+    }
+}
+void objc_bridge32_commit_borrowed_bytes(void *raw,void *bytes,size_t length,unsigned slot)
+{
+    id owner=(id)raw;if(!owner||!bytes||slot>=4)return;
+    @synchronized(owner) {
+        LP32DataBuffer *buffer=objc_getAssociatedObject(owner,&borrowed_bytes_keys[slot]);
+        if(buffer && length<=buffer->capacity)memcpy(bytes,(void *)(uintptr_t)buffer->guest,length);
+    }
+}
+void objc_bridge32_release_borrowed_bytes(void *raw,unsigned slot)
+{
+    id owner=(id)raw;if(!owner||slot>=4)return;
+    @synchronized(owner) {
+        objc_setAssociatedObject(owner,&borrowed_bytes_keys[slot],nil,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
 /* On the x86_64 host, exhausted register banks make va_arg consume this
  * widened overflow area. i386 arguments always arrive as stack words. */
 static CFStringRef format_cf_string32(CFStringRef format, const uint32_t *guest) {
@@ -869,6 +950,20 @@ static CFStringRef format_cf_string32(CFStringRef format, const uint32_t *guest)
     _Static_assert(sizeof(args) == sizeof(state), "x86_64 va_list layout");
     memcpy(args, &state, sizeof(state));
     return CFStringCreateWithFormatAndArguments(NULL, NULL, format, args);
+}
+
+/* A private test bundle must remain silent even when Launch Services starts
+ * it without the shell environment. Run before loading any guest code. */
+void objc_bridge32_initialize_test_mode(void)
+{
+    @autoreleasepool {
+        id value = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"LP32SilentTest"];
+        if ([value isKindOfClass:[NSNumber class]] && [value boolValue]) {
+            if (setenv("LP32_MUTE_AUDIO", "1", 1) ||
+                setenv("LP32_BACKGROUND_TEST", "1", 1)) abort();
+            fputs("compat32: silent test bundle: audio muted before guest initialization\n", stderr);
+        }
+    }
 }
 
 void *objc_bridge32_host_object(uint32_t token) { return object_for_argument(token); }
@@ -928,6 +1023,40 @@ int objc_bridge32_run_proxy_self_test(void)
             fputs("compat32: Objective-C proxy self-test could not create "
                   "persistent handle\n", stderr);
             return -1;
+        }
+        /* A pinned lookup must not need the mutable ownership-map lock. */
+        dispatch_semaphore_t looked_up=dispatch_semaphore_create(0);
+        __block id concurrent=nil;
+        pthread_mutex_lock(&proxy_mutex);
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT,0),^{
+            concurrent=object_for_receiver(persistent_handle);
+            dispatch_semaphore_signal(looked_up);
+        });
+        long blocked=dispatch_semaphore_wait(looked_up,dispatch_time(0,1000000000));
+        pthread_mutex_unlock(&proxy_mutex);
+        if(blocked)dispatch_semaphore_wait(looked_up,DISPATCH_TIME_FOREVER);
+        dispatch_release(looked_up);
+        if(blocked || concurrent!=persistent)return -1;
+
+        /* Owned semaphores use the same read path, including slot reuse.
+           Hold a guest reference while another thread resolves the token. */
+        for(unsigned pass=0;pass<3;++pass) {
+            uint32_t zero=0;uint64_t value=0;
+            if(!objc_bridge32_dispatch("_dispatch_semaphore_create",&zero,&value))return -1;
+            uint32_t token=(uint32_t)value;
+            id expected=object_for_receiver(token);
+            looked_up=dispatch_semaphore_create(0);concurrent=nil;
+            pthread_mutex_lock(&proxy_mutex);
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT,0),^{
+                concurrent=object_for_receiver(token);dispatch_semaphore_signal(looked_up);
+            });
+            blocked=dispatch_semaphore_wait(looked_up,dispatch_time(0,1000000000));
+            pthread_mutex_unlock(&proxy_mutex);
+            if(blocked)dispatch_semaphore_wait(looked_up,DISPATCH_TIME_FOREVER);
+            dispatch_release(looked_up);
+            if(blocked || !expected || concurrent!=expected)return -1;
+            objc_bridge32_dispatch("_dispatch_release",&token,&value);
+            if(object_for_receiver(token))return -1;
         }
 
         uint32_t before_cf_count = proxy_count;
@@ -1197,6 +1326,7 @@ static uint32_t register_proxy_with_handle(id object, uint32_t handle)
             proxies[index].object = object;
             proxies[index].handle = handle;
             proxies[index].pinned = true;
+            publish_proxy(index);
             pthread_mutex_unlock(&proxy_mutex);
             return handle;
         }
@@ -1215,6 +1345,7 @@ static uint32_t register_proxy_with_handle(id object, uint32_t handle)
     proxies[proxy_count].object = object;
     proxies[proxy_count].pinned = true;
     if (proxy_object_is_retained(object)) [object retain];
+    publish_proxy(proxy_count);
     ++proxy_count;
     pthread_mutex_unlock(&proxy_mutex);
     return handle;
@@ -1223,16 +1354,14 @@ static uint32_t register_proxy_with_handle(id object, uint32_t handle)
 static id object_for_receiver(uint32_t receiver)
 {
     if (!receiver) return nil;
-    id legacy = objc_legacy32_object(receiver);
-    if (legacy) return legacy;
+    /* Native/event handles occupy reserved ranges outside guest objects.
+       Resolve them before consulting the legacy instance identity map: that
+       unrelated map takes a contended mutex in Complete Saga's render loop. */
     if(receiver>=kEventProxyBase && receiver<kOverflowProxyBase) {
         uint32_t offset=(receiver-kEventProxyBase)/kProxyStride;
         struct proxy_entry *entry=&event_pools[offset/kEventProxyCapacity].entries[offset%kEventProxyCapacity];
         return entry->handle==receiver?entry->object:nil;
     }
-    pthread_mutex_lock(&proxy_mutex);
-    /* Ordinary proxy handles encode their slot. Avoid a linear search on
-     * every render-thread context lookup or semaphore operation. */
     uint32_t slot = UINT32_MAX;
     if (receiver >= kProxyBase && receiver < kProxyLimit &&
         (receiver - kProxyBase) % kProxyStride == 0)
@@ -1241,11 +1370,20 @@ static id object_for_receiver(uint32_t receiver)
              receiver < kOverflowProxyBase + (kProxyCapacity-kInlineProxyCapacity)*kProxyStride &&
              (receiver - kOverflowProxyBase) % kProxyStride == 0)
         slot = kInlineProxyCapacity + (receiver - kOverflowProxyBase) / kProxyStride;
-    if (slot < proxy_count && proxies[slot].handle == receiver) {
-        id object = proxies[slot].object;
+    if (slot != UINT32_MAX) {
+        id published=(id)__atomic_load_n(&published_proxy_objects[slot],__ATOMIC_ACQUIRE);
+        if(published)return published;
+        pthread_mutex_lock(&proxy_mutex);
+        if (slot < proxy_count && proxies[slot].handle == receiver) {
+            id object = proxies[slot].object;
+            pthread_mutex_unlock(&proxy_mutex);
+            return object;
+        }
         pthread_mutex_unlock(&proxy_mutex);
-        return object;
     }
+    id legacy = objc_legacy32_object(receiver);
+    if (legacy) return legacy;
+    pthread_mutex_lock(&proxy_mutex);
     for (uint32_t index = 0; index < proxy_count; ++index) {
         if (proxies[index].handle == receiver) {
             id object = proxies[index].object;
@@ -1253,9 +1391,9 @@ static id object_for_receiver(uint32_t receiver)
             return object;
         }
     }
-
     pthread_mutex_unlock(&proxy_mutex);
     /* Old 32-bit CF constant strings are four-word records in __DATA. */
+    if (!bridge_image) return nil;
     if (receiver >= bridge_image->cfstring_start &&
         receiver < bridge_image->cfstring_end) {
         const uint32_t *constant = (const void *)(uintptr_t)receiver;
@@ -1297,6 +1435,206 @@ static id object_for_argument(uint32_t value)
     return object_for_receiver(value);
 }
 
+/* An i386 @? argument is a guest block layout, not an Objective-C object
+ * token. AppKit copies and later invokes a native 64-bit block. Keep the
+ * guest captures alive until the monitor is removed. Local monitors run on
+ * the main event thread, including removal from inside their own callback. */
+@interface LP32GuestBlock : NSObject { @public uint32_t guestBlock; }
+@end
+@implementation LP32GuestBlock
+- (void)dealloc { blocks_bridge32_release(guestBlock); [super dealloc]; }
+@end
+struct cf_notification32 { uint32_t observer, callback; };
+static void cf_notification_callback(CFNotificationCenterRef center, void *raw,
+                                     CFNotificationName name, const void *object,
+                                     CFDictionaryRef user_info)
+{
+    const struct cf_notification32 *notification = raw;
+    uint32_t args[] = {objc_bridge32_guest_object((void *)center),
+                       notification->observer,
+                       objc_bridge32_guest_object((void *)name),
+                       objc_bridge32_guest_object((void *)object),
+                       objc_bridge32_guest_object((void *)user_info)};
+    compat_runtime32_call(notification->callback, args, 5);
+}
+static char event_monitor_owner_key;
+static id add_guest_event_monitor(NSEventMask mask, uint32_t block)
+{
+    LP32GuestBlock *owner=[[LP32GuestBlock alloc] init];
+    owner->guestBlock=blocks_bridge32_copy(block);
+    if (!owner->guestBlock) { [owner release]; return nil; }
+    id monitor=[NSEvent addLocalMonitorForEventsMatchingMask:mask handler:^NSEvent *(NSEvent *event) {
+        uint32_t copied=blocks_bridge32_copy(owner->guestBlock);
+        if (!copied) return event;
+        uint32_t token=event_proxy_for_object(event);
+        objc_bridge32_pin_event(token,1);
+        uint32_t args[]={copied,token};
+        uint32_t invoke=((const uint32_t *)(uintptr_t)copied)[3];
+        uint32_t returned=compat_runtime32_call(invoke,args,2);
+        NSEvent *result=object_for_argument(returned);
+        objc_bridge32_pin_event(token,0);
+        blocks_bridge32_release(copied);
+        return result;
+    }];
+    if (monitor) objc_setAssociatedObject(monitor,&event_monitor_owner_key,owner,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [owner release];
+    return monitor;
+}
+static void remove_guest_event_monitor(id monitor)
+{
+    [NSEvent removeMonitor:monitor];
+    LP32GuestBlock *owner=objc_getAssociatedObject(monitor,&event_monitor_owner_key);
+    if (owner) {
+        uint32_t block=owner->guestBlock; owner->guestBlock=0;
+        blocks_bridge32_release(block);
+        objc_setAssociatedObject(monitor,&event_monitor_owner_key,nil,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
+int objc_bridge32_run_event_monitor_self_test(void)
+{
+    @autoreleasepool {
+        [NSApplication sharedApplication];
+        unsigned char *code=mmap((void *)0x76000000,4096,PROT_READ|PROT_WRITE|PROT_EXEC,
+                                MAP_PRIVATE|MAP_ANON,-1,0);
+        if(code==MAP_FAILED || (uintptr_t)code>UINT32_MAX)return -1;
+        /* i386 block callbacks increment their copied capture, then either
+           return the event or consume it. Exercise AppKit's real observer. */
+        const unsigned char identity[]={0x8b,0x44,0x24,0x04,0xff,0x40,0x14,0x8b,0x44,0x24,0x08,0xc3};
+        const unsigned char consume[]={0x8b,0x44,0x24,0x04,0xff,0x40,0x14,0x31,0xc0,0xc3};
+        memcpy(code,identity,sizeof(identity));memcpy(code+32,consume,sizeof(consume));
+        uint32_t storage=compat_runtime32_allocate(40,1);
+        uint32_t *block=(void *)(uintptr_t)storage;
+        block[4]=storage+32;block[9]=24; /* descriptor: reserved, size */
+        uint32_t selector=compat_runtime32_copy_cstring("addLocalMonitorForEventsMatchingMask:handler:");
+        uint32_t remove=compat_runtime32_copy_cstring("removeMonitor:");
+        NSEvent *event=[NSEvent keyEventWithType:NSEventTypeKeyUp location:NSZeroPoint
+            modifierFlags:0 timestamp:0 windowNumber:0 context:nil characters:@"\r"
+            charactersIgnoringModifiers:@"\r" isARepeat:NO keyCode:36];
+        for(unsigned pass=0;pass<2;++pass) {
+            block[3]=(uint32_t)(uintptr_t)(code+32*pass);block[5]=0;
+            uint32_t a[]={proxy_for_object([NSEvent class]),selector,NSEventMaskKeyUp,storage};uint64_t result=0;
+            if(!objc_bridge32_dispatch("_objc_msgSend",a,&result) || !result)return -1;
+            id monitor=object_for_argument((uint32_t)result);
+            LP32GuestBlock *owner=[objc_getAssociatedObject(monitor,&event_monitor_owner_key) retain];
+            if(!owner || owner->guestBlock==storage)return -1;
+            [NSApp sendEvent:event];[NSApp sendEvent:event];
+            if(((uint32_t *)(uintptr_t)owner->guestBlock)[5]!=2 || block[5])return -1;
+            uint32_t r[]={a[0],remove,(uint32_t)result};
+            if(!objc_bridge32_dispatch("_objc_msgSend",r,&result) || owner->guestBlock)return -1;
+            [NSApp sendEvent:event];
+            [owner release];
+        }
+        compat_runtime32_deallocate(selector);compat_runtime32_deallocate(remove);
+        compat_runtime32_deallocate(storage);munmap(code,4096);
+        puts("event-monitor-selftest: PASS (AppKit key-up delivery, copied i386 captures, returned/consumed events, removal)");
+        return 0;
+    }
+}
+
+static volatile uint32_t app_event_test_received;
+static volatile uint32_t app_event_test_last;
+static void app_event_test_send_event(id self, SEL command, NSEvent *event)
+{
+    if (event.type == NSEventTypeApplicationDefined && event.subtype == 0x5a17) {
+        __atomic_store_n(&app_event_test_last, (uint32_t)event.data1, __ATOMIC_RELEASE);
+        __atomic_add_fetch(&app_event_test_received, 1, __ATOMIC_ACQ_REL);
+        return;
+    }
+    struct objc_super super = {self, class_getSuperclass(object_getClass(self))};
+    ((void (*)(struct objc_super *, SEL, NSEvent *))objc_msgSendSuper)(&super, command, event);
+}
+
+static uint32_t app_event_test_post(uint32_t app, uint32_t selector, long value)
+{
+    NSEvent *event = [NSEvent otherEventWithType:NSEventTypeApplicationDefined
+        location:NSZeroPoint modifierFlags:0 timestamp:0 windowNumber:0
+        context:nil subtype:0x5a17 data1:value data2:0];
+    uint32_t a[] = {app, selector, proxy_for_object(event), 0};
+    uint64_t result = 0;
+    return objc_bridge32_dispatch("_objc_msgSend", a, &result);
+}
+
+/* Game threads post application-defined wake-ups to NSApp and wait for the
+   main thread's -sendEvent:.  They must arrive promptly and in order, while
+   a guest's own -nextEventMatchingMask: loop still dequeues them itself. */
+int objc_bridge32_run_app_event_delivery_self_test(void)
+{
+    @autoreleasepool {
+        [NSApplication sharedApplication];
+        Class base = object_getClass(NSApp);
+        Class probe = objc_allocateClassPair(base, "LP32AppEventProbe", 0);
+        if (!probe) return -1;
+        class_addMethod(probe, @selector(sendEvent:), (IMP)app_event_test_send_event, "v@:@");
+        objc_registerClassPair(probe);
+        object_setClass(NSApp, probe);
+        uint32_t app = proxy_for_object(NSApp);
+        uint32_t post = compat_runtime32_copy_cstring("postEvent:atStart:");
+        enum { rounds = 120 };
+        static double latency[rounds];
+        __block bool ordered = true, worker_done = false;
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+            for (int i = 0; i < rounds; ++i) {
+                uint32_t before = __atomic_load_n(&app_event_test_received, __ATOMIC_ACQUIRE);
+                CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+                if (!app_event_test_post(app, post, i + 1)) { ordered = false; break; }
+                while (__atomic_load_n(&app_event_test_received, __ATOMIC_ACQUIRE) == before &&
+                       CFAbsoluteTimeGetCurrent() - start < 1.0) {}
+                latency[i] = CFAbsoluteTimeGetCurrent() - start;
+                if (__atomic_load_n(&app_event_test_last, __ATOMIC_ACQUIRE) != (uint32_t)(i + 1))
+                    ordered = false;
+            }
+            __atomic_store_n(&worker_done, true, __ATOMIC_RELEASE);
+        });
+        CFAbsoluteTime deadline = CFAbsoluteTimeGetCurrent() + 30;
+        while (!__atomic_load_n(&worker_done, __ATOMIC_ACQUIRE) && CFAbsoluteTimeGetCurrent() < deadline) {
+            @autoreleasepool {
+                NSEvent *event = [NSApp nextEventMatchingMask:NSEventMaskAny
+                    untilDate:[NSDate dateWithTimeIntervalSinceNow:0.25]
+                    inMode:NSDefaultRunLoopMode dequeue:YES];
+                if (event) [NSApp sendEvent:event];
+            }
+        }
+        if (!worker_done || !ordered || app_event_test_received != rounds) {
+            fprintf(stderr, "app-event-selftest: received %u/%d ordered=%d\n",
+                    app_event_test_received, rounds, ordered);
+            return -1;
+        }
+        double sorted[rounds];
+        memcpy(sorted, latency, sizeof(sorted));
+        for (int i = 1; i < rounds; ++i)
+            for (int j = i; j > 0 && sorted[j] < sorted[j - 1]; --j) {
+                double t = sorted[j]; sorted[j] = sorted[j - 1]; sorted[j - 1] = t;
+            }
+        double median = sorted[rounds / 2] * 1e3, p90 = sorted[rounds * 9 / 10] * 1e3;
+
+        /* A guest pumping events itself must still receive the wake-up. */
+        __block bool posted = false;
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+            usleep(20000);
+            posted = app_event_test_post(app, post, 0x7777);
+        });
+        uint32_t next = compat_runtime32_copy_cstring("nextEventMatchingMask:untilDate:inMode:dequeue:");
+        uint32_t pump[] = {app, next, (uint32_t)NSEventMaskApplicationDefined,
+            proxy_for_object([NSDate dateWithTimeIntervalSinceNow:2]),
+            proxy_for_object(NSDefaultRunLoopMode), 1};
+        uint64_t pumped = 0;
+        uint32_t received_before = app_event_test_received;
+        bool pump_ok = objc_bridge32_dispatch("_objc_msgSend", pump, &pumped) && pumped;
+        NSEvent *guest_event = pump_ok ? object_for_argument((uint32_t)pumped) : nil;
+        pump_ok = pump_ok && posted && guest_event.subtype == 0x5a17 &&
+                  guest_event.data1 == 0x7777 && app_event_test_received == received_before;
+        object_setClass(NSApp, base);
+        compat_runtime32_deallocate(post);
+        compat_runtime32_deallocate(next);
+        printf("app-event-selftest: median %.2f ms p90 %.2f ms over %d round trips; guest pump %s\n",
+               median, p90, rounds, pump_ok ? "dequeued" : "FAILED");
+        if (!pump_ok || median > 4.0) return -1;
+        puts("app-event-selftest: PASS");
+        return 0;
+    }
+}
+
 static NSBundle *legacy_game_bundle(void)
 {
     static NSBundle *bundle;
@@ -1316,6 +1654,8 @@ static size_t guest_words_for_type(const char *type)
         case 'q': case 'Q': return 1;
         case 'd': return 2;
         case '{': {
+            if(!strncmp(type,@encode(CMTimeRange),strlen(@encode(CMTimeRange))))return sizeof(CMTimeRange)/4;
+            if(!strncmp(type,@encode(CMTime),strlen(@encode(CMTime))))return sizeof(CMTime)/4;
             /* The legacy ABI uses 32-bit CGFloat, so count encoded floats. */
             size_t words = 0;
             for (const char *cursor = type; *cursor; ++cursor) {
@@ -1385,6 +1725,9 @@ static bool invoke_simple_message(id receiver, const char *selector_name,
     [invocation setSelector:selector];
 
     size_t word = 2;
+    id object_outputs[64]={nil};
+    uint32_t *guest_object_outputs[64]={NULL};
+    if(signature.numberOfArguments>64)return false;
     bool explicit_long_long = strstr(selector_name, "LongLong") != NULL;
     for (NSUInteger index = 2; index < [signature numberOfArguments]; ++index) {
         const char *type = skip_type_qualifiers([signature getArgumentTypeAtIndex:index]);
@@ -1407,6 +1750,13 @@ static bool invoke_simple_message(id receiver, const char *selector_name,
             }
             case '^': {
                 uint32_t token=guest_arguments[word];
+                if(type[1]=='@' && index+1==signature.numberOfArguments &&
+                   (strstr(selector_name,"error:") || strstr(selector_name,"Error:"))) {
+                    guest_object_outputs[index]=(void *)(uintptr_t)token;
+                    id *pointer=token?&object_outputs[index]:NULL;
+                    [invocation setArgument:&pointer atIndex:index];
+                    break;
+                }
                 id object=object_for_argument(token);
                 void *value=object ? ([object isKindOfClass:[NSValue class]] ?
                     [(NSValue *)object pointerValue] : (void *)object) : (void *)(uintptr_t)token;
@@ -1427,7 +1777,11 @@ static bool invoke_simple_message(id receiver, const char *selector_name,
                 /* i386 AppKit geometry is float-based and passed by value on
                    the stack; widen to the host's CGFloat layout. */
                 const float *fields = (const float *)(guest_arguments + word);
-                if (strncmp(type, "{CGRect=", 8) == 0) {
+                if(!strncmp(type,@encode(CMTimeRange),strlen(@encode(CMTimeRange))) || !strncmp(type,@encode(CMTime),strlen(@encode(CMTime)))) {
+                    size_t size=!strncmp(type,@encode(CMTimeRange),strlen(@encode(CMTimeRange)))?sizeof(CMTimeRange):sizeof(CMTime);
+                    [invocation setArgument:(void *)(guest_arguments+word) atIndex:index];
+                    word+=size/4;
+                } else if (strncmp(type, "{CGRect=", 8) == 0) {
                     NSRect value = NSMakeRect(fields[0], fields[1], fields[2], fields[3]);
                     [invocation setArgument:&value atIndex:index];
                     word += 4;
@@ -1457,6 +1811,8 @@ static bool invoke_simple_message(id receiver, const char *selector_name,
         if (super_method) {
             if (!invoke_using_imp(invocation, method_getImplementation(super_method))) return false;
         } else [invocation invoke];
+        for(NSUInteger i=2;i<signature.numberOfArguments;++i)
+            if(guest_object_outputs[i])*guest_object_outputs[i]=proxy_for_object(object_outputs[i]);
     } @catch (NSException *exception) {
         fprintf(stderr, "compat32: host Objective-C message %s raised %s\n",
                 selector_name, [[exception reason] UTF8String]);
@@ -1521,7 +1877,10 @@ static bool invoke_simple_message(id receiver, const char *selector_name,
             bool registers = guest_struct_result == NULL;
             uint64_t pair_result = 0;
             if (registers) guest_struct_result = &pair_result;
-            if (strstr(return_type, "Rect=")) {
+            if(!strncmp(return_type,@encode(CMTimeRange),strlen(@encode(CMTimeRange))) || !strncmp(return_type,@encode(CMTime),strlen(@encode(CMTime)))) {
+                if(registers)return false;
+                [invocation getReturnValue:guest_struct_result];
+            } else if (strstr(return_type, "Rect=")) {
                 if (registers) return false;
                 NSRect rect; [invocation getReturnValue:&rect];
                 float f[] = {rect.origin.x, rect.origin.y, rect.size.width, rect.size.height};
@@ -1569,6 +1928,24 @@ static NSScreen *preferred_game_screen(void)
 {
     static bool resolved;
     static NSScreen *screen;
+    /* A display can become the main display or the game window can move
+       after launch. Use the screen that is actually showing the GL view. */
+    if (presenting_view && [NSThread isMainThread]) {
+        NSScreen *current = [[(NSView *)presenting_view window] screen];
+        if (current) {
+            static CGDirectDisplayID last_view_display;
+            CGDirectDisplayID display = display_id_for_screen(current);
+            if (display != last_view_display) {
+                NSRect frame = [current frame];
+                fprintf(stderr,
+                        "compat32: game view display id=%u frame=%.0f,%.0f %.0fx%.0f\n",
+                        display, frame.origin.x, frame.origin.y,
+                        frame.size.width, frame.size.height);
+                last_view_display = display;
+            }
+            return current;
+        }
+    }
     if (resolved) return screen;
 
     NSArray *screens = [NSScreen screens];
@@ -1653,6 +2030,220 @@ static NSSize preferred_display_native_size(void)
                              (CGFloat)CGDisplayModeGetHeight(current));
     CFRelease(current);
     return size;
+}
+
+float objc_bridge32_preferred_display_aspect_ratio(void)
+{
+    NSSize size = preferred_display_native_size();
+    if (size.width <= 0 || size.height <= 0) return 0;
+    return (float)(size.width / size.height);
+}
+
+/* Guest objects may live in the image or the guest heap, below the stacks. */
+static bool saga_guest_pointer(uint32_t address, uint32_t length)
+{
+    return address >= UINT32_C(0x1000) && address < UINT32_C(0x7c000000) - length;
+}
+
+/* The automatic HUD camera reads a 16:9 constant even when the render mode
+   is 16:10. Keep that input in step with the aspect of the mode that CGL
+   actually presents. The renderer already stores the mode's correct ratio. */
+static void set_saga_automatic_hud_aspect(uint32_t address, float aspect)
+{
+    static bool failed;
+    if (failed) return;
+    float current;
+    memcpy(&current, (const void *)(uintptr_t)address, sizeof(current));
+    if (current == aspect) return;
+    size_t page_size = (size_t)getpagesize();
+    uintptr_t page = (uintptr_t)address & ~(page_size - 1);
+    if (mprotect((void *)page, page_size, PROT_READ | PROT_WRITE | PROT_EXEC)) {
+        fprintf(stderr, "compat32: Saga HUD aspect page protection failed: %s\n",
+                strerror(errno));
+        failed = true;
+        return;
+    }
+    memcpy((void *)(uintptr_t)address, &aspect, sizeof(aspect));
+    if (mprotect((void *)page, page_size, PROT_READ | PROT_EXEC)) {
+        fprintf(stderr, "compat32: Saga HUD aspect page restore failed: %s\n",
+                strerror(errno));
+        failed = true;
+        return;
+    }
+    fprintf(stderr, "compat32: Saga automatic HUD aspect %.6f -> %.6f\n",
+            current, aspect);
+}
+
+/* Saga's InitPanel selects only a 16:9 or 4:3 scale for 3D HUD models.
+   It can replace an output changed after presentation. Update both source
+   presets for the active mode so subsequent InitPanel calls retain it. */
+static void correct_saga_panel_scale(const struct lp32_screen_aspect_patch *patch,
+                                     float mode_ratio)
+{
+    static float original[4];
+    static bool original_saved;
+    static bool failed;
+    if (failed) return;
+    if (getenv("LP32_DISABLE_PANEL_SCALE_FIX") ||
+        !isfinite(mode_ratio) || mode_ratio < 1.0f || mode_ratio > 2.4f) return;
+    float *table = (void *)(uintptr_t)patch->panel_scale_table;
+    if (!original_saved) {
+        memcpy(original, table, sizeof(original));
+        original_saved = true;
+    }
+    float blend = (mode_ratio - 4.0f / 3.0f) /
+                  (16.0f / 9.0f - 4.0f / 3.0f);
+    float wanted_x = original[1] + (original[0] - original[1]) * blend;
+    float wanted_y = original[3] + (original[2] - original[3]) * blend;
+    if (fabsf(table[0] - wanted_x) > 0.00001f ||
+        fabsf(table[1] - wanted_x) > 0.00001f ||
+        fabsf(table[2] - wanted_y) > 0.00001f ||
+        fabsf(table[3] - wanted_y) > 0.00001f) {
+        size_t page_size = (size_t)getpagesize();
+        uintptr_t page = (uintptr_t)table & ~(page_size - 1);
+        if (mprotect((void *)page, page_size, PROT_READ | PROT_WRITE | PROT_EXEC)) {
+            fprintf(stderr, "compat32: Saga panel scale page protection failed: %s\n",
+                    strerror(errno));
+            failed = true;
+            return;
+        }
+        table[0] = table[1] = wanted_x;
+        table[2] = table[3] = wanted_y;
+        if (mprotect((void *)page, page_size, PROT_READ | PROT_EXEC)) {
+            fprintf(stderr, "compat32: Saga panel scale page restore failed: %s\n",
+                    strerror(errno));
+            failed = true;
+            return;
+        }
+        fprintf(stderr,
+                "compat32: Saga 3D panel presets %.6f %.6f (aspect %.6f)\n",
+                wanted_x, wanted_y, mode_ratio);
+    }
+    volatile float *panel_x = (void *)(uintptr_t)patch->panel_scale_x;
+    volatile float *panel_y = (void *)(uintptr_t)patch->panel_scale_y;
+    if (fabsf(*panel_x - wanted_x) < 0.00001f &&
+        fabsf(*panel_y - wanted_y) < 0.00001f) return;
+    *panel_x = wanted_x;
+    *panel_y = wanted_y;
+}
+
+/* The shipped score and heart rows are one original row span apart. At the
+   corrected 3D scale their models nearly touch. Reserve another third of
+   that span between the rows, in panel coordinates, so the gap scales with
+   the HUD at each render resolution. The join prompt uses the heart row. */
+static void correct_saga_panel_row_spacing(const struct lp32_screen_aspect_patch *patch)
+{
+    if (getenv("LP32_DISABLE_PANEL_ROW_SPACING")) return;
+    const float coin_y = *(const float *)(uintptr_t)patch->panel_coin_y;
+    volatile float *heart_y = (void *)(uintptr_t)patch->panel_heart_y;
+    const float original_heart_y = -0.045f;
+    float wanted = coin_y - (coin_y - original_heart_y) * 4.0f / 3.0f;
+    if (!isfinite(coin_y) || !isfinite(*heart_y) ||
+        (fabsf(*heart_y - original_heart_y) > 0.00001f &&
+         fabsf(*heart_y - wanted) > 0.00001f))
+        return;
+    if (fabsf(*heart_y - wanted) < 0.00001f) return;
+    *heart_y = wanted;
+    fprintf(stderr, "compat32: Saga panel heart row %.6f -> %.6f\n",
+            original_heart_y, wanted);
+}
+
+int objc_bridge32_run_panel_scale_self_test(const struct lp32_screen_aspect_patch *patch)
+{
+    if (!patch) return -1;
+    const float *table = (const void *)(uintptr_t)patch->panel_scale_table;
+    const volatile float *panel_x = (const void *)(uintptr_t)patch->panel_scale_x;
+    const volatile float *panel_y = (const void *)(uintptr_t)patch->panel_scale_y;
+    correct_saga_panel_scale(patch, 16.0f / 10.0f);
+    float blend = (16.0f / 10.0f - 4.0f / 3.0f) /
+                  (16.0f / 9.0f - 4.0f / 3.0f);
+    float x = 0.52373159f + (0.60556465f - 0.52373159f) * blend;
+    float y = 0.39126638f + (0.33842796f - 0.39126638f) * blend;
+    for (unsigned i = 0; i < 2; ++i) {
+        if (fabsf(table[i] - x) > 0.00001f ||
+            fabsf(table[i + 2] - y) > 0.00001f) return -1;
+    }
+    if (fabsf(*panel_x - x) > 0.00001f ||
+        fabsf(*panel_y - y) > 0.00001f) return -1;
+    correct_saga_panel_row_spacing(patch);
+    if (fabsf(*(const float *)(uintptr_t)patch->panel_heart_y + 0.075f) > 0.00001f)
+        return -1;
+    correct_saga_panel_scale(patch, 4.0f / 3.0f);
+    return fabsf(table[0] - 0.52373159f) < 0.00001f &&
+           fabsf(table[1] - 0.52373159f) < 0.00001f &&
+           fabsf(table[2] - 0.39126638f) < 0.00001f &&
+           fabsf(table[3] - 0.39126638f) < 0.00001f ? 0 : -1;
+}
+
+static void correct_saga_automatic_camera_ratio(uint64_t swap_count)
+{
+    (void)swap_count;
+    const struct lp32_screen_aspect_patch *patch =
+        lp32_profile()->screen_aspect_patch;
+    if (!patch || getenv("LP32_DISABLE_SCREEN_ASPECT_PATCH")) return;
+
+    uint32_t renderer_address =
+        *(const uint32_t *)(uintptr_t)patch->renderer_pointer_slot;
+    uint32_t option_address =
+        *(const uint32_t *)(uintptr_t)patch->option_pointer_slot;
+    if (renderer_address < UINT32_C(0x1000) ||
+        renderer_address > bridge_image->max_address - 0x634 ||
+        option_address < UINT32_C(0x1000) ||
+        option_address > bridge_image->max_address - 0x428) return;
+
+    const volatile uint32_t *option = (const void *)(uintptr_t)option_address;
+    volatile uint32_t *renderer = (void *)(uintptr_t)renderer_address;
+    uint32_t width = renderer[0x138 / 4];
+    uint32_t height = renderer[0x13c / 4];
+    if (getenv("LP32_TRACE_ASPECT_STATE")) {
+        static bool logged_state;
+        if (!logged_state && width >= 320 && height >= 200) {
+            float ratio;
+            memcpy(&ratio, (const void *)(renderer + 0x630 / 4), sizeof(ratio));
+            fprintf(stderr,
+                    "compat32: Saga aspect state option=%u mode=%ux%u camera=%.6f\n",
+                    option[0x424 / 4], width, height, ratio);
+            logged_state = true;
+        }
+    }
+    if (width < 320 || width > 8192 || height < 200 || height > 8192) return;
+    float mode_ratio = (float)width / (float)height;
+    if (!isfinite(mode_ratio) || mode_ratio <= 0) return;
+    correct_saga_panel_scale(patch, mode_ratio);
+    correct_saga_panel_row_spacing(patch);
+    if (option[0x424 / 4] != 3 || getenv("LP32_DISABLE_SCREEN_MODE_DATA")) {
+        set_saga_automatic_hud_aspect(patch->hud_default_scale_address,
+                                      9.0f / 16.0f);
+        return;
+    }
+    float wanted = (float)height / (float)width;
+    set_saga_automatic_hud_aspect(patch->hud_default_scale_address, wanted);
+
+    /* The camera's automatic option initially uses the 16:9 constant. Match
+       its aspect and derived fov to the render mode on the next frame. */
+    uint32_t camera = *(const volatile uint32_t *)(uintptr_t)patch->camera_pointer;
+    if (saga_guest_pointer(camera, 0x48)) {
+        volatile float *fields = (void *)(uintptr_t)(camera + 0x40);
+        float fov = fields[0], aspect = fields[1];
+        if (aspect == 9.0f / 16.0f && wanted != aspect && isfinite(fov) && fov > 0) {
+            fields[0] = fabsf(fov - (aspect + 0.75f) * 0.5f) < 0.0001f ?
+                (wanted + 0.75f) * 0.5f : fov * wanted / aspect;
+            fields[1] = wanted;
+        }
+    }
+    float old_ratio;
+    memcpy(&old_ratio, (const void *)(renderer + 0x630 / 4), sizeof(old_ratio));
+    if (!isfinite(old_ratio) || old_ratio <= 0 ||
+        fabsf(old_ratio - mode_ratio) < 0.0001f) return;
+    memcpy((void *)(renderer + 0x630 / 4), &mode_ratio,
+           sizeof(mode_ratio));
+    static bool logged;
+    if (!logged || getenv("LP32_TRACE_DISPLAY")) {
+        fprintf(stderr,
+                "compat32: Saga automatic camera ratio %.6f -> %.6f (mode %ux%u)\n",
+                old_ratio, mode_ratio, width, height);
+        logged = true;
+    }
 }
 
 static bool guest_display_mode_active(void)
@@ -1782,7 +2373,10 @@ static int read_test_key_fifo(double *hold_seconds)
     memmove(test_key_fifo_buffer, newline + 1,
             test_key_fifo_length - consumed);
     test_key_fifo_length -= consumed;
-    if (end == test_key_fifo_buffer || key_code < 0 || key_code > 127) {
+    if (end == test_key_fifo_buffer || key_code < 0 ||
+        (key_code > 127 && !(getenv("LP32_TEST_HID_BUTTONS") &&
+            ((key_code>200 && key_code<=232) || (key_code>=240 && key_code<=247) ||
+             key_code==260 || (key_code>=270 && key_code<=274))))) {
         return -1;
     }
     *hold_seconds = hold;
@@ -1829,10 +2423,45 @@ static unsigned char test_key_states[128];
 int objc_bridge32_test_key_down(unsigned key) {
     return key<128 ? __atomic_load_n(&test_key_states[key],__ATOMIC_RELAXED) : 0;
 }
+static int saga_test_pad_named(const char *part)
+{
+    unsigned count=hid_bridge32_saga_pad_count();
+    for(unsigned index=0;index<count;++index){
+        const char *name=hid_bridge32_saga_pad_name(index);
+        if(name && strstr(name,part))return (int)index;
+    }
+    return -1;
+}
 static void post_test_key_event(NSWindow *window, unsigned short key_code,
                                 BOOL is_down)
 {
     if (!window) return;
+    if(key_code>200 && key_code<=232){
+        int delivered=hid_bridge32_test_button(key_code-200,is_down);
+        fprintf(stderr,"compat32: scripted HID button %u down=%d delivered=%d\n",key_code-200,is_down,delivered);
+        return;
+    }
+    if(key_code>=240 && key_code<=247){
+        int value=is_down?key_code-240:8;
+        int delivered=hid_bridge32_test_hat(value);
+        fprintf(stderr,"compat32: scripted HID hat value=%d delivered=%d\n",value,delivered);
+        return;
+    }
+    if(key_code==260){
+        int delivered=hid_bridge32_test_named_button("DUALSHOCK",2,is_down);
+        fprintf(stderr,"compat32: scripted DualShock face button delivered=%d\n",delivered);
+        return;
+    }
+    if(key_code>=270 && key_code<=274){
+        int index=saga_test_pad_named("Xbox");
+        unsigned page=key_code==270?9:1;
+        unsigned usage=key_code==270?10:(key_code<=272?48:49);
+        int value=key_code==270?!!is_down:(is_down?(key_code==271||key_code==274?255:0):128);
+        int delivered=index>=0 && hid_bridge32_saga_emit((unsigned)index,page,usage,value);
+        fprintf(stderr,"compat32: scripted Saga semantic page=%u usage=%u value=%d delivered=%d\n",
+            page,usage,value,delivered);
+        return;
+    }
     if(key_code<128)__atomic_store_n(&test_key_states[key_code],is_down,__ATOMIC_RELAXED);
     NSString *characters = characters_for_test_key(key_code);
     NSTimeInterval timestamp = [[NSProcessInfo processInfo] systemUptime];
@@ -1847,7 +2476,7 @@ static void post_test_key_event(NSWindow *window, unsigned short key_code,
       charactersIgnoringModifiers:characters
                 isARepeat:NO
                   keyCode:key_code];
-    if (getenv("LP32_BACKGROUND_TEST") && objc_legacy32_token(window))
+    if (getenv("LP32_BACKGROUND_TEST") && !getenv("LP32_TEST_APP_EVENT_QUEUE") && objc_legacy32_token(window))
         [window sendEvent:event];
     else [NSApp postEvent:event atStart:NO];
 }
@@ -1855,6 +2484,9 @@ static void post_test_key_event(NSWindow *window, unsigned short key_code,
 static void install_window_test_input(NSWindow *window)
 {
     if (!window || !getenv("LP32_TEST_KEY_FIFO")) return;
+    /* Saga polls its own CGL frame path. Two FIFO readers can route a test
+       key to the launcher window instead of the game. */
+    if (lp32_profile()->title == LP32_TITLE_COMPLETE_SAGA) return;
     static NSHashTable *installed;
     if (!installed) installed=[[NSHashTable weakObjectsHashTable] retain];
     if ([installed containsObject:window]) return;
@@ -1866,8 +2498,9 @@ static void install_window_test_input(NSWindow *window)
         CFAbsoluteTime now=CFAbsoluteTimeGetCurrent();
         if(key>=0 && now>=release_time) {
             post_test_key_event(window,(unsigned short)key,NO);key=-1;
+            release_time=now+0.10; /* Let polling guests observe key-up. */
         }
-        if(key<0 && window.isVisible) {
+        if(key<0 && now>=release_time && window.isVisible) {
             double hold=0;int next=read_test_key_fifo(&hold);
             if(next>=0) {
                 key=next;release_time=now+(hold>0?hold:0.15);
@@ -1877,6 +2510,143 @@ static void install_window_test_input(NSWindow *window)
         }
     }];
     [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
+}
+
+/* The Steam Saga build presents through CGLFlushDrawable, so it never reaches
+ * the NSOpenGLView swapBuffers test input path. Keep its scripted key state in
+ * sync with the Carbon GetKeys and CGEventSourceKeyState bridges. */
+static void poll_cgl_test_input(void)
+{
+    if (!getenv("LP32_TEST_KEY_FIFO")) return;
+    static int active_key = -1;
+    static CFAbsoluteTime release_time;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    NSWindow *window = [NSApp keyWindow] ?: [NSApp mainWindow] ?: [NSApp.windows firstObject];
+    if (active_key >= 0 && now >= release_time) {
+        post_test_key_event(window, (unsigned short)active_key, NO);
+        active_key = -1;
+        release_time = now + 0.10;
+    }
+    if (active_key < 0 && now >= release_time && window) {
+        double hold = 0;
+        int next = read_test_key_fifo(&hold);
+        if (next >= 0) {
+            active_key = next;
+            release_time = now + (hold > 0 ? hold : 0.15);
+            post_test_key_event(window, (unsigned short)next, YES);
+            fprintf(stderr, "compat32: scripted CGL key %d\n", next);
+        }
+    }
+}
+
+static void trace_saga_aspect_state(uint64_t frame)
+{
+    if (!getenv("LP32_TRACE_ASPECT") ||
+        !lp32_profile()->screen_aspect_patch || frame % 120) return;
+    /* PIC globals used by the Saga camera routine at guest 0x001a1ec1. */
+    uint32_t display = *(volatile uint32_t *)(uintptr_t)0x00b2800c;
+    uint32_t settings = *(volatile uint32_t *)(uintptr_t)0x00b28014;
+    if (display < 0x1000 || display + 0x634 >= bridge_image->max_address ||
+        settings < 0x1000 || settings + 0x428 >= bridge_image->max_address)
+        return;
+    float ratio = *(volatile float *)(uintptr_t)(display + 0x630);
+    int32_t derived_mode = *(volatile int32_t *)(uintptr_t)(display + 0x62c);
+    int32_t mode = *(volatile int32_t *)(uintptr_t)(settings + 0x424);
+    fprintf(stderr, "compat32: aspect frame=%llu mode=%d derived=%d ratio=%.6f display=%08x settings=%08x\n",
+            (unsigned long long)frame, mode, derived_mode, ratio, display, settings);
+}
+
+/*
+ * Test-only guest memory probe.  LP32_DEBUG_MEM_FIFO names a FIFO read once
+ * per presented frame, since lldb cannot attach to this process.  Commands:
+ *   r ADDR COUNT        dump COUNT dwords (hex and float)
+ *   p SLOT OFF COUNT    dump COUNT dwords at *(SLOT) + OFF
+ *   w ADDR FLOAT        write a float once
+ *   k ADDR FLOAT        write a float after every frame (k 0 0 clears all)
+ */
+static bool debug_read_guest(uint32_t address, void *out, size_t length)
+{
+    mach_vm_size_t copied = 0;
+    return address >= UINT32_C(0x1000) &&
+        mach_vm_read_overwrite(mach_task_self(), address, length,
+                               (mach_vm_address_t)(uintptr_t)out,
+                               &copied) == KERN_SUCCESS && copied == length;
+}
+
+static void debug_write_guest_float(uint32_t address, float value)
+{
+    float current;
+    if (!debug_read_guest(address, &current, sizeof(current))) return;
+    if (mach_vm_write(mach_task_self(), address, (vm_offset_t)&value,
+                      sizeof(value)) == KERN_SUCCESS) return;
+    size_t page_size = (size_t)getpagesize();
+    uintptr_t page = address & ~(page_size - 1);
+    mprotect((void *)page, page_size * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
+    memcpy((void *)(uintptr_t)address, &value, sizeof(value));
+}
+
+static void debug_dump_guest(uint32_t address, unsigned count)
+{
+    if (count > 64) count = 64;
+    for (unsigned i = 0; i < count; ++i) {
+        uint32_t word;
+        float value;
+        if (!debug_read_guest(address + i * 4, &word, 4)) {
+            fprintf(stderr, "compat32: mem %08x unreadable\n", address + i * 4);
+            return;
+        }
+        memcpy(&value, &word, 4);
+        fprintf(stderr, "compat32: mem %08x = %08x %g\n", address + i * 4, word,
+                value);
+    }
+}
+
+static void poll_debug_mem_fifo(void)
+{
+    static int fd = -2;
+    static char buffer[1024];
+    static size_t length;
+    static struct { uint32_t address; float value; } kept[16];
+    static unsigned kept_count;
+    if (fd == -2) {
+        const char *path = getenv("LP32_DEBUG_MEM_FIFO");
+        fd = path && path[0] ? open(path, O_RDONLY | O_NONBLOCK) : -1;
+    }
+    if (fd < 0) return;
+    ssize_t count = read(fd, buffer + length, sizeof(buffer) - 1 - length);
+    if (count > 0) length += (size_t)count;
+    char *newline;
+    while ((newline = memchr(buffer, '\n', length))) {
+        *newline = '\0';
+        char op = 0;
+        unsigned a = 0, b = 0, c = 0;
+        float value = 0;
+        if (sscanf(buffer, " %c", &op) == 1) {
+            if (op == 'r' && sscanf(buffer, " r %x %u", &a, &b) == 2) {
+                debug_dump_guest(a, b);
+            } else if (op == 'p' && sscanf(buffer, " p %x %x %u", &a, &b, &c) == 3) {
+                uint32_t base;
+                if (debug_read_guest(a, &base, 4)) {
+                    fprintf(stderr, "compat32: mem *%08x = %08x\n", a, base);
+                    debug_dump_guest(base + b, c);
+                }
+            } else if (op == 'w' && sscanf(buffer, " w %x %f", &a, &value) == 2) {
+                debug_write_guest_float(a, value);
+            } else if (op == 'k' && sscanf(buffer, " k %x %f", &a, &value) == 2) {
+                if (!a) kept_count = 0;
+                else if (kept_count < 16) {
+                    kept[kept_count].address = a;
+                    kept[kept_count++].value = value;
+                }
+            }
+        }
+        size_t consumed = (size_t)(newline + 1 - buffer);
+        memmove(buffer, newline + 1, length - consumed);
+        length -= consumed;
+    }
+    if (length == sizeof(buffer) - 1) length = 0;
+    for (unsigned i = 0; i < kept_count; ++i)
+        debug_write_guest_float(kept[i].address, kept[i].value);
 }
 
 /*
@@ -2142,9 +2912,7 @@ static void frame_pacer_wait(NSWindow *window)
 - (NSRect)letterboxedFrame;
 @end
 
-/* The view the game presents through; the display-mode emulation re-applies
-   its surface size here when the guest switches modes mid-session. */
-static OpenGLView *presenting_view;
+/* The view the game presents through is declared above the screen selector. */
 
 /*
  * Activation.  macOS 14 made it cooperative: activateIgnoringOtherApps: from a
@@ -4718,8 +5486,10 @@ struct mipmap_repair_entry {
     GLuint texture;
     GLint requested_maximum;
     GLint compatibility_maximum;
-    /* State the last full scan saw; lets a repeated glTexParameteri with
-       the same value skip the rescan (see repair_mipmap_range_for_parameter). */
+    /* Bumped whenever an upload may add or resize one of this texture's
+       levels.  The last full scan recorded the value it saw; while the two
+       match, repeated parameter writes can reuse that scan. */
+    uint64_t level_generation;
     uint64_t validated_generation;
     GLint validated_min_filter;
     GLint validated_base_level;
@@ -4729,28 +5499,38 @@ struct mipmap_repair_entry {
 static struct mipmap_repair_entry mipmap_repairs[kMipmapRepairCapacity];
 static pthread_mutex_t mipmap_repair_mutex = PTHREAD_MUTEX_INITIALIZER;
 static unsigned int mipmap_repair_reports;
-/* Bumped by every call that can add or resize a mip level.  Starts at 1 so a
-   zeroed entry never matches. */
-static uint64_t texture_level_generation = 1;
 
+/* Level generations come from one counter, so an entry recreated for a
+   reused texture name never matches a scan of the deleted texture. */
+static uint64_t mipmap_generation_counter;
+
+static size_t mipmap_repair_home(CGLShareGroupObj share_group, GLenum target,
+                                 GLuint texture)
+{
+    return ((size_t)texture * 2654435761u + (size_t)target * 40503u +
+            ((uintptr_t)share_group >> 4)) % kMipmapRepairCapacity;
+}
+
+/* Callers hold mipmap_repair_mutex. Deletion moves entries, so a returned
+   pointer is valid only until the mutex is released. */
 static struct mipmap_repair_entry *mipmap_repair_entry_for(
     CGLShareGroupObj share_group, GLenum target, GLuint texture, bool create)
 {
-    size_t start = ((size_t)texture * 2654435761u +
-                    (size_t)target * 40503u +
-                    ((uintptr_t)share_group >> 4)) % kMipmapRepairCapacity;
+    size_t start = mipmap_repair_home(share_group, target, texture);
     for (size_t probe = 0; probe < kMipmapRepairCapacity; ++probe) {
         struct mipmap_repair_entry *entry =
             &mipmap_repairs[(start + probe) % kMipmapRepairCapacity];
         if (!entry->occupied) {
             if (!create) return NULL;
-            entry->share_group = share_group;
-            entry->target = target;
-            entry->texture = texture;
-            entry->requested_maximum = 0;
-            entry->compatibility_maximum = 0;
-            entry->occupied = true;
-            entry->clamped = false;
+            *entry = (struct mipmap_repair_entry){
+                .share_group = share_group,
+                .target = target,
+                .texture = texture,
+                /* A validated generation of 0 never matches, so the first
+                   parameter write scans. */
+                .level_generation = ++mipmap_generation_counter,
+                .occupied = true,
+            };
             return entry;
         }
         if (entry->share_group == share_group && entry->target == target &&
@@ -4761,24 +5541,45 @@ static struct mipmap_repair_entry *mipmap_repair_entry_for(
     return NULL;
 }
 
+/* Linear-probing deletion: pull later entries of the same probe run back
+   into the hole, so lookups can still stop at the first empty slot. */
+static void remove_mipmap_repair_entry(size_t hole)
+{
+    mipmap_repairs[hole].occupied = false;
+    for (size_t next = (hole + 1) % kMipmapRepairCapacity;
+         mipmap_repairs[next].occupied;
+         next = (next + 1) % kMipmapRepairCapacity) {
+        const struct mipmap_repair_entry *entry = &mipmap_repairs[next];
+        size_t home = mipmap_repair_home(entry->share_group, entry->target,
+                                         entry->texture);
+        /* The entry can move only if its home is not in (hole, next]. */
+        bool home_after_hole = hole <= next ?
+            (home > hole && home <= next) : (home > hole || home <= next);
+        if (home_after_hole) continue;
+        mipmap_repairs[hole] = *entry;
+        mipmap_repairs[next].occupied = false;
+        hole = next;
+    }
+}
+
+/*
+ * The loader thread can delete hundreds of textures at once while the render
+ * thread sets texture parameters.  Each name is found by hashing, instead of
+ * scanning the whole table under the mutex the render thread waits on.
+ */
 static void forget_mipmap_repairs(GLsizei count, const GLuint *textures)
 {
     if (count <= 0 || !textures) return;
     CGLContextObj context = CGLGetCurrentContext();
     CGLShareGroupObj share_group = context ? CGLGetShareGroup(context) : NULL;
+    static const GLenum targets[] = {GL_TEXTURE_2D, GL_TEXTURE_CUBE_MAP};
     pthread_mutex_lock(&mipmap_repair_mutex);
     for (GLsizei index = 0; index < count; ++index) {
-        for (size_t slot = 0; slot < kMipmapRepairCapacity; ++slot) {
-            struct mipmap_repair_entry *entry = &mipmap_repairs[slot];
-            if (entry->occupied && entry->share_group == share_group &&
-                entry->texture == textures[index]) {
-                /* Keep the open-addressing slot occupied so later colliding
-                 * entries remain discoverable; a reused GL name reuses it. */
-                entry->requested_maximum = 0;
-                entry->compatibility_maximum = 0;
-                entry->clamped = false;
-                entry->validated_generation = 0;
-            }
+        for (size_t t = 0; t < sizeof(targets) / sizeof(targets[0]); ++t) {
+            struct mipmap_repair_entry *entry = mipmap_repair_entry_for(
+                share_group, targets[t], textures[index], false);
+            if (entry) remove_mipmap_repair_entry(
+                (size_t)(entry - mipmap_repairs));
         }
     }
     pthread_mutex_unlock(&mipmap_repair_mutex);
@@ -4815,10 +5616,6 @@ static void repair_bound_texture_mipmap_range(GLenum upload_target)
     }
     if (!target || repair_disabled) return;
 
-    /* Read before the scan: a level added by another context mid-scan then
-       leaves the entry stale rather than wrongly current. */
-    uint64_t level_generation =
-        __atomic_load_n(&texture_level_generation, __ATOMIC_ACQUIRE);
     GLint texture = 0;
     GLint min_filter = 0;
     GLint base_level = 0;
@@ -4828,6 +5625,17 @@ static void repair_bound_texture_mipmap_range(GLenum upload_target)
     if (texture <= 0) return;
     glGetTexParameteriv(target, GL_TEXTURE_MIN_FILTER, &min_filter);
     if (!texture_filter_needs_mipmaps(min_filter)) return;
+    CGLContextObj context = CGLGetCurrentContext();
+    CGLShareGroupObj share_group = context ? CGLGetShareGroup(context) : NULL;
+    /* Read before the scan: a level added by another context mid-scan then
+       leaves the entry stale rather than wrongly current. */
+    uint64_t level_generation = 0;
+    pthread_mutex_lock(&mipmap_repair_mutex);
+    struct mipmap_repair_entry *entry = mipmap_repair_entry_for(
+        share_group, target, (GLuint)texture, true);
+    if (entry) level_generation = entry->level_generation;
+    pthread_mutex_unlock(&mipmap_repair_mutex);
+    if (!entry) return;
     glGetTexParameteriv(target, GL_TEXTURE_BASE_LEVEL, &base_level);
     glGetTexParameteriv(target, GL_TEXTURE_MAX_LEVEL, &current_maximum);
 
@@ -4852,10 +5660,8 @@ static void repair_bound_texture_mipmap_range(GLenum upload_target)
                              GL_TEXTURE_INTERNAL_FORMAT, &base_format);
     if (base_width <= 0 || base_height <= 0 || !base_format) return;
 
-    CGLContextObj context = CGLGetCurrentContext();
-    CGLShareGroupObj share_group = context ? CGLGetShareGroup(context) : NULL;
     pthread_mutex_lock(&mipmap_repair_mutex);
-    struct mipmap_repair_entry *entry = mipmap_repair_entry_for(
+    entry = mipmap_repair_entry_for(
         share_group, target, (GLuint)texture, true);
     if (!entry) {
         pthread_mutex_unlock(&mipmap_repair_mutex);
@@ -4937,21 +5743,9 @@ static void repair_bound_texture_mipmap_range(GLenum upload_target)
     }
 }
 
-static void note_texture_level_change(void)
-{
-    __atomic_fetch_add(&texture_level_generation, 1, __ATOMIC_RELEASE);
-}
-
-/*
- * glTexParameteri(MIN_FILTER / BASE_LEVEL / MAX_LEVEL) runs about 1,500 times a
- * frame, mostly re-stating the value a texture already has.  When the last
- * full scan of this texture saw the same value and no level has been created
- * anywhere since, the scan would reach the same answer, so skip it.  A
- * MAX_LEVEL write is only skippable while the texture is unclamped: on a
- * clamped one the game's write just undid the clamp and the scan must redo it.
- */
-static void repair_mipmap_range_for_parameter(GLenum upload_target,
-                                              GLenum parameter, GLint value)
+/* Called before an upload that may add or resize a level of the texture
+   bound to upload_target.  Other textures keep their cached scans. */
+static void note_texture_level_change(GLenum upload_target)
 {
     GLenum target = canonical_mipmap_target(upload_target);
     if (!target) return;
@@ -4961,25 +5755,95 @@ static void repair_mipmap_range_for_parameter(GLenum upload_target,
     if (texture <= 0) return;
     CGLContextObj context = CGLGetCurrentContext();
     CGLShareGroupObj share_group = context ? CGLGetShareGroup(context) : NULL;
-    uint64_t level_generation =
-        __atomic_load_n(&texture_level_generation, __ATOMIC_ACQUIRE);
+    pthread_mutex_lock(&mipmap_repair_mutex);
+    struct mipmap_repair_entry *entry = mipmap_repair_entry_for(
+        share_group, target, (GLuint)texture, false);
+    if (entry) entry->level_generation = ++mipmap_generation_counter;
+    pthread_mutex_unlock(&mipmap_repair_mutex);
+}
 
+enum mipmap_parameter_action {
+    kMipmapParameterApply,
+    kMipmapParameterApplyAndScan,
+    /* The bridge's last validated value is already the GL value. */
+    kMipmapParameterSkip,
+    /* GL already holds the clamped maximum for this requested value. */
+    kMipmapParameterKeepClamp,
+};
+
+/*
+ * The game restates MIN_FILTER, BASE_LEVEL and MAX_LEVEL about 1,500 times a
+ * frame, through both glTexParameteri and glTexParameterf.  When the last
+ * full scan of this texture saw the same value and none of its levels has
+ * changed since, the scan would reach the same answer, so skip it.  On a
+ * clamped texture, the game's MAX_LEVEL write restates its requested maximum;
+ * forwarding it would undo the clamp and force another scan and clamp, and
+ * each change makes the driver revalidate the texture.  Keep the clamp and
+ * drop the write instead.
+ */
+static enum mipmap_parameter_action mipmap_parameter_action(
+    GLenum upload_target, GLenum parameter, GLint value)
+{
+    if (parameter != GL_TEXTURE_MIN_FILTER &&
+        parameter != GL_TEXTURE_BASE_LEVEL &&
+        parameter != GL_TEXTURE_MAX_LEVEL) {
+        return kMipmapParameterApply;
+    }
+    GLenum target = canonical_mipmap_target(upload_target);
+    if (!target) return kMipmapParameterApply;
+    GLint texture = 0;
+    glGetIntegerv(target == GL_TEXTURE_2D ? GL_TEXTURE_BINDING_2D :
+                  GL_TEXTURE_BINDING_CUBE_MAP, &texture);
+    if (texture <= 0) return kMipmapParameterApply;
+    CGLContextObj context = CGLGetCurrentContext();
+    CGLShareGroupObj share_group = context ? CGLGetShareGroup(context) : NULL;
+
+    enum mipmap_parameter_action action = kMipmapParameterApplyAndScan;
     pthread_mutex_lock(&mipmap_repair_mutex);
     const struct mipmap_repair_entry *entry = mipmap_repair_entry_for(
         share_group, target, (GLuint)texture, false);
-    bool unchanged = false;
-    if (entry && entry->validated_generation == level_generation) {
+    if (entry && entry->validated_generation == entry->level_generation) {
         if (parameter == GL_TEXTURE_MIN_FILTER) {
-            unchanged = value == entry->validated_min_filter;
+            if (value == entry->validated_min_filter) {
+                action = kMipmapParameterSkip;
+            }
         } else if (parameter == GL_TEXTURE_BASE_LEVEL) {
-            unchanged = value == entry->validated_base_level;
-        } else if (parameter == GL_TEXTURE_MAX_LEVEL) {
-            unchanged = !entry->clamped && value == entry->requested_maximum;
+            if (value == entry->validated_base_level) {
+                action = kMipmapParameterSkip;
+            }
+        } else if (value == entry->requested_maximum) {
+            action = entry->clamped ? kMipmapParameterKeepClamp :
+                                      kMipmapParameterSkip;
         }
     }
     pthread_mutex_unlock(&mipmap_repair_mutex);
-    if (unchanged) return;
-    repair_bound_texture_mipmap_range(upload_target);
+    return action;
+}
+
+static void set_texture_parameter_i(GLenum target, GLenum parameter,
+                                    GLint value)
+{
+    enum mipmap_parameter_action action =
+        mipmap_parameter_action(target, parameter, value);
+    if (action == kMipmapParameterKeepClamp ||
+        action == kMipmapParameterSkip) return;
+    glTexParameteri(target, parameter, value);
+    if (action == kMipmapParameterApplyAndScan) {
+        repair_bound_texture_mipmap_range(target);
+    }
+}
+
+static void set_texture_parameter_f(GLenum target, GLenum parameter,
+                                    GLfloat value)
+{
+    enum mipmap_parameter_action action =
+        mipmap_parameter_action(target, parameter, (GLint)value);
+    if (action == kMipmapParameterKeepClamp ||
+        action == kMipmapParameterSkip) return;
+    glTexParameterf(target, parameter, value);
+    if (action == kMipmapParameterApplyAndScan) {
+        repair_bound_texture_mipmap_range(target);
+    }
 }
 
 static void trace_texture_units(void)
@@ -5292,6 +6156,69 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                                        uint64_t *result);
 
 /*
+ * Feral's MacDoze SendMessage wakes the main thread with an application-
+ * defined NSEvent posted from the game thread, then spins until the main
+ * thread's -sendEvent: override has handled the message.  Current AppKit
+ * returns such queued events from -nextEventMatchingMask: only on its next
+ * display-cycle pass, about 16 ms later, whether they were posted from the
+ * game thread or re-posted on the main thread.  Several round trips per
+ * frame capped Complete Saga's title and menus near 30 FPS, and much lower
+ * while loading.  Deliver these wake-up events from a main-thread run-loop
+ * source instead.  -[NSApplication run] would pass them to the same
+ * -sendEvent:.  Other run-loop modes (modal panels, tracking) and guests
+ * pumping -nextEventMatchingMask: themselves keep AppKit's queue, so their
+ * event filtering is unchanged.
+ */
+static os_unfair_lock cross_thread_event_lock = OS_UNFAIR_LOCK_INIT;
+static NSMutableArray *cross_thread_events;
+/* Main-thread depth of guest-issued -nextEventMatchingMask: calls.  A guest
+   pumping its own events must dequeue (or skip) these events itself. */
+static unsigned guest_event_wait_depth;
+
+static void cross_thread_event_perform(void *info)
+{
+    (void)info;
+    os_unfair_lock_lock(&cross_thread_event_lock);
+    NSArray *events = cross_thread_events;
+    cross_thread_events = nil;
+    os_unfair_lock_unlock(&cross_thread_event_lock);
+    if (!events) return;
+    CFStringRef mode = CFRunLoopCopyCurrentMode(CFRunLoopGetMain());
+    bool direct = mode && CFEqual(mode, kCFRunLoopDefaultMode) &&
+                  !guest_event_wait_depth;
+    if (mode) CFRelease(mode);
+    for (NSArray *entry in events) {
+        NSEvent *event = entry[0];
+        if (direct) {
+            @autoreleasepool { [NSApp sendEvent:event]; }
+        } else {
+            [NSApp postEvent:event atStart:[entry[1] boolValue]];
+        }
+    }
+    [events release];
+}
+
+static void deliver_cross_thread_event(NSEvent *event, BOOL at_start)
+{
+    static CFRunLoopSourceRef source;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        CFRunLoopSourceContext context = {0};
+        context.perform = cross_thread_event_perform;
+        source = CFRunLoopSourceCreate(kCFAllocatorDefault, 0, &context);
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
+    });
+    NSArray *entry = [[NSArray alloc] initWithObjects:event, @(at_start), nil];
+    os_unfair_lock_lock(&cross_thread_event_lock);
+    if (!cross_thread_events) cross_thread_events = [[NSMutableArray alloc] init];
+    [cross_thread_events addObject:entry];
+    os_unfair_lock_unlock(&cross_thread_event_lock);
+    [entry release];
+    CFRunLoopSourceSignal(source);
+    CFRunLoopWakeUp(CFRunLoopGetMain());
+}
+
+/*
  * Direct handlers for the GL entry points that make up most of the 10-30
  * thousand imports per frame.  The runtime memoizes them per import id after
  * the first chained dispatch, so later calls skip the name chains in
@@ -5302,10 +6229,50 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     static uint64_t fast_##name(const uint32_t *arguments, \
                                 uint32_t return_address)
 
+/* Feral's command queues poll these at very high frequency. Keep exactly
+ * the same i386 argument widening/native operations as the chained handlers. */
+FAST_GL(dispatch_time)
+{
+    (void)return_address;
+    uint64_t when; int64_t delta;
+    memcpy(&when, arguments, 8); memcpy(&delta, arguments + 2, 8);
+    return dispatch_time(when, delta);
+}
+FAST_GL(dispatch_semaphore_wait)
+{
+    (void)return_address;
+    uint64_t timeout; memcpy(&timeout, arguments + 1, 8);
+    /* A past monotonic deadline means a nonblocking attempt. libdispatch's
+       generic timed path still enters the kernel for it. Feral constructs
+       dispatch_time(NOW,0) millions of times; use the explicit poll path.
+       Leave encoded wall/continuous clocks and FOREVER untouched. */
+    if(timeout && timeout<(UINT64_C(1)<<62) && timeout<=dispatch_time(DISPATCH_TIME_NOW,0))
+        timeout=DISPATCH_TIME_NOW;
+    return (uint32_t)dispatch_semaphore_wait(
+        (dispatch_semaphore_t)object_for_argument(arguments[0]), timeout);
+}
+FAST_GL(dispatch_semaphore_signal)
+{
+    (void)return_address;
+    return (uint32_t)dispatch_semaphore_signal(
+        (dispatch_semaphore_t)object_for_argument(arguments[0]));
+}
+
 FAST_GL(CGLGetCurrentContext)
 {
     (void)arguments; (void)return_address;
     return objc_bridge32_guest_pointer(CGLGetCurrentContext());
+}
+
+/* Resource unloads switch contexts about 14,000 times a frame, almost all to
+   the context that is already current. */
+FAST_GL(CGLSetCurrentContext)
+{
+    (void)return_address;
+    NSValue *wrapper = object_for_argument(arguments[0]);
+    CGLContextObj context = wrapper ? [wrapper pointerValue] : NULL;
+    if (context == CGLGetCurrentContext()) return kCGLNoError;
+    return (uint32_t)CGLSetCurrentContext(context);
 }
 
 FAST_GL(glVertexAttribPointer)
@@ -5567,13 +6534,7 @@ FAST_GL(glBindTexture)
 FAST_GL(glTexParameteri)
 {
     (void)return_address;
-    glTexParameteri(arguments[0], arguments[1], arguments[2]);
-    if (arguments[1] == GL_TEXTURE_MIN_FILTER ||
-        arguments[1] == GL_TEXTURE_BASE_LEVEL ||
-        arguments[1] == GL_TEXTURE_MAX_LEVEL) {
-        repair_mipmap_range_for_parameter(arguments[0], arguments[1],
-                                          (GLint)arguments[2]);
-    }
+    set_texture_parameter_i(arguments[0], arguments[1], (GLint)arguments[2]);
     return 0;
 }
 
@@ -5624,7 +6585,11 @@ lp32_fast_import_fn objc_bridge32_fast_import(const char *import_name)
         const char *name;
         lp32_fast_import_fn handler;
     } table[] = {
+        {"dispatch_time", fast_dispatch_time},
+        {"dispatch_semaphore_wait", fast_dispatch_semaphore_wait},
+        {"dispatch_semaphore_signal", fast_dispatch_semaphore_signal},
         {"CGLGetCurrentContext", fast_CGLGetCurrentContext},
+        {"CGLSetCurrentContext", fast_CGLSetCurrentContext},
         {"glVertexAttribPointer", fast_glVertexAttribPointer},
         {"glVertexAttribPointerARB", fast_glVertexAttribPointer},
         {"glEnableVertexAttribArray", fast_glEnableVertexAttribArray},
@@ -6043,18 +7008,15 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_dispatch_semaphore_signal")) {
-        *result = (uint32_t)dispatch_semaphore_signal((dispatch_semaphore_t)object_for_argument(arguments[0]));
+        *result = fast_dispatch_semaphore_signal(arguments, 0);
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_dispatch_semaphore_wait")) {
-        uint64_t timeout; memcpy(&timeout, arguments + 1, 8);
-        *result = (uint32_t)dispatch_semaphore_wait((dispatch_semaphore_t)object_for_argument(arguments[0]), timeout);
+        *result = fast_dispatch_semaphore_wait(arguments, 0);
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_dispatch_time")) {
-        uint64_t when; int64_t delta;
-        memcpy(&when, arguments, 8); memcpy(&delta, arguments + 2, 8);
-        *result = dispatch_time(when, delta); return 1;
+        *result = fast_dispatch_time(arguments, 0); return 1;
     }
     if ((strncmp(import_name,"_CF",3)==0 || strncmp(import_name,"_SC",3)==0) &&
         cfnetwork_bridge32_dispatch(import_name, arguments, result)) return 1;
@@ -6149,6 +7111,13 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     }
     if (LP32_NAME_IS(import_name,import_length,"_CGColorSpaceCreateDeviceRGB")) {
         CGColorSpaceRef color=CGColorSpaceCreateDeviceRGB();*result=proxy_for_object((id)color);CGColorSpaceRelease(color);return 1;
+    }
+    if (LP32_NAME_IS(import_name,import_length,"_CGColorSpaceCopyICCProfile")) {
+        /* Complete Saga's movie decoder looks for Apple's HDTV profile to
+           pick the Rec. 709 YUV matrix for each attract/cutscene movie. */
+        CGColorSpaceRef color=(CGColorSpaceRef)object_for_argument(arguments[0]);
+        CFDataRef profile=color?CGColorSpaceCopyICCData(color):NULL;
+        *result=profile?proxy_for_object((id)profile):0;if(profile)CFRelease(profile);return 1;
     }
     if (LP32_NAME_IS(import_name,import_length,"_CGImageCreate")) {
         CGColorSpaceRef color=(CGColorSpaceRef)object_for_argument(arguments[5]);
@@ -6545,18 +7514,84 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CGLFlushDrawable")) {
+        static uint64_t presented_frames;
         NSValue *wrapper = object_for_argument(arguments[0]);
         CGLContextObj context = wrapper ? [wrapper pointerValue] : NULL;
+        uint64_t flush_start=hitch_recorder_enabled?hitch_now():0;
+        {
+            /* Test aid: `touch $LP32_CAPTURE_TRIGGER` dumps the next CGL
+               back buffer to $LP32_CAPTURE_TRIGGER.ppm. */
+            static const char *trigger;
+            static bool checked;
+            if (!checked) { trigger = getenv("LP32_CAPTURE_TRIGGER"); checked = true; }
+            if (trigger && context && access(trigger, F_OK) == 0) {
+                unlink(trigger);
+                GLint viewport[4] = {0};
+                glGetIntegerv(GL_VIEWPORT, viewport);
+                size_t row = (size_t)viewport[2] * 3, size = row * (size_t)viewport[3];
+                uint8_t *pixels = size ? malloc(size) : NULL;
+                if (pixels) {
+                    GLint old_read = GL_BACK, old_align = 4;
+                    glGetIntegerv(GL_READ_BUFFER, &old_read);
+                    glGetIntegerv(GL_PACK_ALIGNMENT, &old_align);
+                    glReadBuffer(GL_BACK);
+                    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+                    glReadPixels(viewport[0], viewport[1], viewport[2], viewport[3],
+                                 GL_RGB, GL_UNSIGNED_BYTE, pixels);
+                    glReadBuffer((GLenum)old_read);
+                    glPixelStorei(GL_PACK_ALIGNMENT, old_align);
+                    char path[4096];
+                    snprintf(path, sizeof(path), "%s.ppm", trigger);
+                    FILE *file = fopen(path, "wb");
+                    if (file) {
+                        fprintf(file, "P6\n%d %d\n255\n", viewport[2], viewport[3]);
+                        for (GLint y = viewport[3] - 1; y >= 0; --y)
+                            fwrite(pixels + (size_t)y * row, row, 1, file);
+                        fclose(file);
+                    }
+                    free(pixels);
+                }
+            }
+        }
         *result = context ? CGLFlushDrawable(context) : kCGLBadContext;
+        poll_cgl_test_input();
+        if(lp32_profile()->title==LP32_TITLE_COMPLETE_SAGA)
+            controller_bridge32_poll(presented_frames+1);
+        /* Same cap as the NSOpenGLView path: at most 60 FPS (less on a
+           slower display).  The TT engine's simulation is frame-rate bound;
+           above 60 FPS the PC release breaks physics and puzzles. */
+        if (context) frame_pacer_wait(nil);
+        ++presented_frames;
+        correct_saga_automatic_camera_ratio(presented_frames);
+        trace_saga_aspect_state(presented_frames);
+        poll_debug_mem_fifo();
+        if(hitch_recorder_enabled) {
+            uint64_t end=hitch_now();
+            hitch_frame(presented_frames,flush_start,end,end,0,
+                [NSApp isActive] || getenv("LP32_BACKGROUND_TEST"));
+        }
         if (getenv("LP32_TRACE_GL_FRAMES")) {
-            static uint64_t frames;
+            static uint64_t frames, previous, worst;
+            static unsigned slow_frames;
+            uint64_t now=hitch_now();
+            if(previous) {
+                uint64_t duration=now-previous;
+                if(duration>worst)worst=duration;
+                if(duration>50000000)++slow_frames;
+            }
+            previous=now;
             if (++frames <= 3 || frames % 120 == 0) {
-                GLint viewport[4], framebuffer;
+                GLint viewport[4], framebuffer, swap_interval = -1;
+                if(context) CGLGetParameter(context,kCGLCPSwapInterval,&swap_interval);
                 glGetIntegerv(GL_VIEWPORT, viewport);
                 glGetIntegerv(GL_FRAMEBUFFER_BINDING, &framebuffer);
-                fprintf(stderr, "compat32: CGL present=%llu context=%p current=%p status=%u viewport=%d,%d,%d,%d fbo=%d\n",
-                    (unsigned long long)frames, context, CGLGetCurrentContext(),
-                    (unsigned)*result, viewport[0], viewport[1], viewport[2], viewport[3], framebuffer);
+                fprintf(stderr, "compat32: CGL present=%llu end=%.6f context=%p current=%p status=%u viewport=%d,%d,%d,%d fbo=%d swap_interval=%d max_ms=%.2f slow50=%u\n",
+                    (unsigned long long)frames, now / 1e9, context, CGLGetCurrentContext(),
+                    (unsigned)*result, viewport[0], viewport[1], viewport[2], viewport[3], framebuffer, swap_interval,
+                    worst/1e6,slow_frames);
+                worst=0;slow_frames=0;
+                if (compat_runtime32_frame_profile_enabled && getenv("LP32_FRAME_STATS_IMPORTS"))
+                    compat_runtime32_report_import_profile((unsigned)strtoul(getenv("LP32_FRAME_STATS_IMPORTS"), NULL, 0));
             }
         }
         return 1;
@@ -6933,7 +7968,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     if (LP32_NAME_IS(import_name, import_length, "glTexImage3D") ||
         LP32_NAME_IS(import_name, import_length, "glTexImage3DEXT")) {
         ++gl_frame_diagnostics.texture_uploads;
-        note_texture_level_change();
+        note_texture_level_change(arguments[0]);
         if (trace_gl_render_call()) {
             gl_trace_printf(
                 "compat32: glTexImage3D swap=%llu target=%04x level=%d "
@@ -6997,7 +8032,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     if (LP32_NAME_IS(import_name, import_length, "glCompressedTexImage2D") ||
         LP32_NAME_IS(import_name, import_length, "glCompressedTexImage2DARB")) {
         ++gl_frame_diagnostics.texture_uploads;
-        note_texture_level_change();
+        note_texture_level_change(arguments[0]);
         if (trace_gl_render_call()) {
             gl_trace_printf(
                 "compat32: glCompressedTexImage2D swap=%llu target=%04x "
@@ -7196,7 +8231,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     }
     if (LP32_NAME_IS(import_name, import_length, "glGenerateMipmap") ||
         LP32_NAME_IS(import_name, import_length, "glGenerateMipmapEXT")) {
-        note_texture_level_change();
+        note_texture_level_change(arguments[0]);
         glGenerateMipmap(arguments[0]); *result = 0; return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "glEnableIndexedEXT")) {
@@ -7469,7 +8504,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     }
     if (LP32_NAME_IS(import_name, import_length, "_glTexImage2D")) {
         ++gl_frame_diagnostics.texture_uploads;
-        note_texture_level_change();
+        note_texture_level_change(arguments[0]);
         if (trace_gl_render_call()) {
             gl_trace_printf(
                 "compat32: glTexImage2D swap=%llu target=%04x level=%d "
@@ -7489,21 +8524,17 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     }
     if (LP32_NAME_IS(import_name, import_length, "_glTexParameterf")) {
         float value; memcpy(&value, arguments + 2, sizeof(value));
-        glTexParameterf(arguments[0], arguments[1], value);
-        if (arguments[1] == GL_TEXTURE_MIN_FILTER ||
-            arguments[1] == GL_TEXTURE_BASE_LEVEL ||
-            arguments[1] == GL_TEXTURE_MAX_LEVEL) {
-            repair_bound_texture_mipmap_range(arguments[0]);
-        }
+        set_texture_parameter_f(arguments[0], arguments[1], value);
         *result = 0; return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_glTexParameterfv")) {
-        glTexParameterfv(arguments[0], arguments[1],
-                         (const GLfloat *)(uintptr_t)arguments[2]);
+        const GLfloat *values = (const GLfloat *)(uintptr_t)arguments[2];
         if (arguments[1] == GL_TEXTURE_MIN_FILTER ||
             arguments[1] == GL_TEXTURE_BASE_LEVEL ||
             arguments[1] == GL_TEXTURE_MAX_LEVEL) {
-            repair_bound_texture_mipmap_range(arguments[0]);
+            set_texture_parameter_f(arguments[0], arguments[1], values[0]);
+        } else {
+            glTexParameterfv(arguments[0], arguments[1], values);
         }
         *result = 0; return 1;
     }
@@ -7600,7 +8631,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         *result = (background_test_mode() || (lp32_suppress_background_input() && !arguments[0])) ? 0 : CGAssociateMouseAndMouseCursorPosition(arguments[0] != 0); return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CGEventSourceKeyState")) {
-        *result = background_test_mode() ? objc_bridge32_test_key_down(arguments[1]) :
+        *result = (background_test_mode() || getenv("LP32_TEST_KEY_FIFO")) ? objc_bridge32_test_key_down(arguments[1]) :
             lp32_suppress_background_input() ? false : CGEventSourceKeyState((CGEventSourceStateID)arguments[0], (CGKeyCode)arguments[1]);
         return 1;
     }
@@ -7746,6 +8777,16 @@ static int objc_bridge32_dispatch_body(const char *import_name,
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
         CFPropertyListRef value=CFPropertyListCreateFromXMLData(NULL,(CFDataRef)object_for_argument(arguments[1]),arguments[2],&error);
 #pragma clang diagnostic pop
+        if(getenv("LP32_TRACE_HID")){
+            static unsigned traced_plists;
+            if(!value || traced_plists++<5){
+                CFDataRef data=(CFDataRef)object_for_argument(arguments[1]);
+                fprintf(stderr,"compat32: plist parse bytes=%ld dictionary=%ld error=%s\n",
+                    data?CFDataGetLength(data):-1L,
+                    value && CFGetTypeID(value)==CFDictionaryGetTypeID()?CFDictionaryGetCount(value):-1L,
+                    error?[(NSString *)error UTF8String]:"(none)");
+            }
+        }
         *result=proxy_for_object((id)value);
         if(arguments[3])*(uint32_t *)(uintptr_t)arguments[3]=proxy_for_object((id)error);
         if(error)CFRelease(error);if(value)CFRelease(value);return 1;
@@ -7832,7 +8873,12 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFBundleCopyResourceURLsOfType")) {
         NSBundle *bundle=object_for_argument(arguments[0]);
-        *result=proxy_for_object([bundle URLsForResourcesWithExtension:object_for_argument(arguments[1]) subdirectory:object_for_argument(arguments[2])]);return 1;
+        NSString *extension=object_for_argument(arguments[1]);
+        NSString *subdirectory=object_for_argument(arguments[2]);
+        NSArray *urls=[bundle URLsForResourcesWithExtension:extension subdirectory:subdirectory];
+        if(getenv("LP32_TRACE_HID"))fprintf(stderr,"compat32: CFBundle resources extension=%s directory=%s count=%lu\n",
+            extension?[extension UTF8String]:"(null)",subdirectory?[subdirectory UTF8String]:"(null)",(unsigned long)[urls count]);
+        *result=proxy_for_object(urls);return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFBundleLoadExecutable")) {
         NSBundle *bundle = object_for_argument(arguments[0]);
@@ -7914,6 +8960,8 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         const char *path=[[object_for_argument(arguments[0]) path] fileSystemRepresentation];
         int16_t (*makeRef)(const UInt8 *,void *,void *)=dlsym(RTLD_DEFAULT,"FSPathMakeRef");
         *result=path && makeRef && !makeRef((const UInt8 *)path,(void *)(uintptr_t)arguments[1],NULL);
+        if(getenv("LP32_TRACE_HID") && path && strstr(path,"InputDevices"))
+            fprintf(stderr,"compat32: CFURLGetFSRef path=%s result=%llu\n",path,(unsigned long long)*result);
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFURLCreateWithFileSystemPath") ||
@@ -7979,9 +9027,12 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         NSString *name = object_for_argument(arguments[1]);
         NSString *extension = object_for_argument(arguments[2]);
         NSString *subdirectory = object_for_argument(arguments[3]);
-        *result = proxy_for_object([bundle URLForResource:name
-                                          withExtension:extension
-                                           subdirectory:subdirectory]);
+        NSURL *url=[bundle URLForResource:name withExtension:extension subdirectory:subdirectory];
+        if(getenv("LP32_TRACE_HID") && (strstr([name UTF8String]?:"","Input") || strstr([subdirectory UTF8String]?:"","Input")))
+            fprintf(stderr,"compat32: CFBundle resource name=%s extension=%s directory=%s path=%s\n",
+                [name UTF8String]?:"(null)",[extension UTF8String]?:"(null)",
+                [subdirectory UTF8String]?:"(null)",[[url path] UTF8String]?:"(null)");
+        *result = proxy_for_object(url);
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFURLGetFileSystemRepresentation")) {
@@ -7995,6 +9046,8 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             memcpy(buffer, path, strlen(path) + 1);
             *result = 1;
         }
+        if(getenv("LP32_TRACE_HID") && path && strstr(path,"InputDevices"))
+            fprintf(stderr,"compat32: CFURLGetFileSystemRepresentation path=%s result=%llu\n",path,(unsigned long long)*result);
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFRelease") ||
@@ -8018,7 +9071,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             else if (entry->cf_owners && --entry->cf_owners == 0 && !entry->pinned) {
                 released = entry->object;
                 memset(entry, 0, sizeof(*entry));
-
+                publish_proxy((uint32_t)(entry-proxies));
             }
             break;
         }
@@ -8032,9 +9085,19 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         *result = object ? CFGetTypeID((CFTypeRef)object) : 0;
         return 1;
     }
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringCreateMutable")) {
+        CFMutableStringRef string = CFStringCreateMutable(NULL, (CFIndex)(int32_t)arguments[1]);
+        *result = proxy_for_object((id)string);
+        if (string) CFRelease(string);
+        return 1;
+    }
     if (LP32_NAME_IS(import_name, import_length, "_CFStringCreateMutableCopy")) {
+        CFStringRef source=(CFStringRef)object_for_argument(arguments[2]);
+        /* The game's DirectInput registry reader sometimes passes an
+         * unresolved guest string token here. CoreFoundation crashes on a
+         * NULL source; an empty mutable string lets the reader continue. */
         CFMutableStringRef string = CFStringCreateMutableCopy(NULL, (int32_t)arguments[1],
-            (CFStringRef)object_for_argument(arguments[2]));
+            source?source:CFSTR(""));
         *result = proxy_for_object((id)string);
         if (string) CFRelease(string);
         return 1;
@@ -8271,6 +9334,13 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         NSDictionary *dictionary = object_for_argument(arguments[0]);
         id key = object_for_argument(arguments[1]);
         id value = [dictionary objectForKey:key];
+        if (getenv("LP32_TRACE_HID") && [dictionary isKindOfClass:[NSDictionary class]] &&
+            [key isKindOfClass:[NSString class]] &&
+            [[dictionary objectForKey:@"VendorID"] intValue] == 1356 &&
+            [[dictionary objectForKey:@"ProductID"] intValue] == 2508)
+            fprintf(stderr,"compat32: HID profile lookup key=%s value=%s product=%s\n",
+                [[key description] UTF8String],[[value description] UTF8String],
+                [[[dictionary objectForKey:@"ProductID"] description] UTF8String]);
         if (getenv("LP32_TRACE_DISPLAY") &&
             [dictionary objectForKey:@"Width"]) {
             fprintf(stderr, "compat32: display dictionary get %s -> %s\n",
@@ -8369,6 +9439,252 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         NSLocale *locale = object_for_argument(arguments[0]);
         NSString *key = object_for_argument(arguments[1]);
         *result = proxy_for_object([locale objectForKey:key]);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFEqual")) {
+        CFTypeRef left = (CFTypeRef)object_for_argument(arguments[0]);
+        CFTypeRef right = (CFTypeRef)object_for_argument(arguments[1]);
+        *result = left && right ? CFEqual(left, right) : left == right;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFAttributedStringCreate")) {
+        CFAttributedStringRef value = CFAttributedStringCreate(NULL,
+            (CFStringRef)object_for_argument(arguments[1]),
+            (CFDictionaryRef)object_for_argument(arguments[2]));
+        *result = proxy_for_object((id)value);
+        if (value) CFRelease(value);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFBundleGetBundleWithIdentifier")) {
+        *result = proxy_for_object((id)CFBundleGetBundleWithIdentifier(
+            (CFStringRef)object_for_argument(arguments[0])));
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFBundleIsExecutableLoaded")) {
+        *result = CFBundleIsExecutableLoaded(
+            (CFBundleRef)object_for_argument(arguments[0]));
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFBundleOpenBundleResourceMap")) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        *result = (uint32_t)(int32_t)CFBundleOpenBundleResourceMap(
+            (CFBundleRef)object_for_argument(arguments[0]));
+#pragma clang diagnostic pop
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFBundleCopyPrivateFrameworksURL")) {
+        CFURLRef value = CFBundleCopyPrivateFrameworksURL(
+            (CFBundleRef)object_for_argument(arguments[0]));
+        *result = proxy_for_object((id)value);
+        if (value) CFRelease(value);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length,
+                     "_CFBundleCopyLocalizationsForPreferences")) {
+        CFArrayRef value = CFBundleCopyLocalizationsForPreferences(
+            (CFArrayRef)object_for_argument(arguments[0]),
+            (CFArrayRef)object_for_argument(arguments[1]));
+        *result = proxy_for_object((id)value);
+        if (value) CFRelease(value);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFDataCreateWithBytesNoCopy")) {
+        CFDataRef value = CFDataCreate(NULL,
+            (const UInt8 *)(uintptr_t)arguments[1], (CFIndex)(int32_t)arguments[2]);
+        *result = proxy_for_object((id)value);
+        if (value) CFRelease(value);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFDataIncreaseLength")) {
+        CFDataIncreaseLength((CFMutableDataRef)object_for_argument(arguments[0]),
+                             (CFIndex)(int32_t)arguments[1]);
+        *result = 0;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFDataReplaceBytes")) {
+        CFDataReplaceBytes((CFMutableDataRef)object_for_argument(arguments[0]),
+            CFRangeMake((int32_t)arguments[1], (int32_t)arguments[2]),
+            (const UInt8 *)(uintptr_t)arguments[3], (CFIndex)(int32_t)arguments[4]);
+        *result = 0;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringCreateWithBytesNoCopy")) {
+        CFStringRef value = CFStringCreateWithBytes(NULL,
+            (const UInt8 *)(uintptr_t)arguments[1], (CFIndex)(int32_t)arguments[2],
+            (CFStringEncoding)arguments[3], arguments[4] != 0);
+        *result = proxy_for_object((id)value);
+        if (value) CFRelease(value);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFURLCreateData")) {
+        CFDataRef value = CFURLCreateData(NULL,
+            (CFURLRef)object_for_argument(arguments[1]),
+            (CFStringEncoding)arguments[2], arguments[3] != 0);
+        *result = proxy_for_object((id)value);
+        if (value) CFRelease(value);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length,
+                     "_CFURLCreateDataAndPropertiesFromResource")) {
+        CFDataRef data = NULL;
+        CFDictionaryRef properties = NULL;
+        SInt32 error = 0;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        Boolean ok = CFURLCreateDataAndPropertiesFromResource(NULL,
+            (CFURLRef)object_for_argument(arguments[1]),
+            arguments[2] ? &data : NULL,
+            arguments[3] ? &properties : NULL,
+            (CFArrayRef)object_for_argument(arguments[4]),
+            arguments[5] ? &error : NULL);
+#pragma clang diagnostic pop
+        if (arguments[2]) *(uint32_t *)(uintptr_t)arguments[2] =
+            proxy_for_object((id)data);
+        if (arguments[3]) *(uint32_t *)(uintptr_t)arguments[3] =
+            proxy_for_object((id)properties);
+        if (arguments[5]) *(SInt32 *)(uintptr_t)arguments[5] = error;
+        if (data) CFRelease(data);
+        if (properties) CFRelease(properties);
+        *result = ok;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFDateCompare")) {
+        *result = (uint32_t)CFDateCompare(
+            (CFDateRef)object_for_argument(arguments[0]),
+            (CFDateRef)object_for_argument(arguments[1]),
+            (void *)(uintptr_t)arguments[2]);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFCalendarCreateWithIdentifier")) {
+        CFCalendarRef value = CFCalendarCreateWithIdentifier(NULL,
+            (CFStringRef)object_for_argument(arguments[1]));
+        *result = proxy_for_object((id)value);
+        if (value) CFRelease(value);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFCalendarSetTimeZone")) {
+        CFCalendarSetTimeZone((CFCalendarRef)object_for_argument(arguments[0]),
+            (CFTimeZoneRef)object_for_argument(arguments[1]));
+        *result = 0;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFCalendarComposeAbsoluteTime")) {
+        CFCalendarRef calendar = (CFCalendarRef)object_for_argument(arguments[0]);
+        CFAbsoluteTime value = 0;
+        const char *components = (const char *)(uintptr_t)arguments[2];
+        const int32_t *v = (const int32_t *)(arguments + 3);
+        if (!components) return 0;
+        size_t component_count = strnlen(components, 9);
+        if (component_count > 8) return 0;
+        Boolean ok = false;
+        switch (component_count) {
+        case 0: ok = CFCalendarComposeAbsoluteTime(calendar, &value, components); break;
+        case 1: ok = CFCalendarComposeAbsoluteTime(calendar, &value, components, v[0]); break;
+        case 2: ok = CFCalendarComposeAbsoluteTime(calendar, &value, components, v[0], v[1]); break;
+        case 3: ok = CFCalendarComposeAbsoluteTime(calendar, &value, components, v[0], v[1], v[2]); break;
+        case 4: ok = CFCalendarComposeAbsoluteTime(calendar, &value, components, v[0], v[1], v[2], v[3]); break;
+        case 5: ok = CFCalendarComposeAbsoluteTime(calendar, &value, components, v[0], v[1], v[2], v[3], v[4]); break;
+        case 6: ok = CFCalendarComposeAbsoluteTime(calendar, &value, components, v[0], v[1], v[2], v[3], v[4], v[5]); break;
+        case 7: ok = CFCalendarComposeAbsoluteTime(calendar, &value, components, v[0], v[1], v[2], v[3], v[4], v[5], v[6]); break;
+        case 8: ok = CFCalendarComposeAbsoluteTime(calendar, &value, components, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]); break;
+        }
+        if (arguments[1]) memcpy((void *)(uintptr_t)arguments[1], &value, sizeof(value));
+        *result = ok;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFNumberFormatterCreate")) {
+        CFNumberFormatterRef value = CFNumberFormatterCreate(NULL,
+            (CFLocaleRef)object_for_argument(arguments[1]),
+            (CFNumberFormatterStyle)arguments[2]);
+        *result = proxy_for_object((id)value);
+        if (value) CFRelease(value);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFNumberFormatterSetProperty")) {
+        CFNumberFormatterSetProperty(
+            (CFNumberFormatterRef)object_for_argument(arguments[0]),
+            (CFStringRef)object_for_argument(arguments[1]),
+            (CFTypeRef)object_for_argument(arguments[2]));
+        *result = 0;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length,
+                     "_CFNumberFormatterCreateStringWithNumber")) {
+        CFStringRef value = CFNumberFormatterCreateStringWithNumber(NULL,
+            (CFNumberFormatterRef)object_for_argument(arguments[1]),
+            (CFNumberRef)object_for_argument(arguments[2]));
+        *result = proxy_for_object((id)value);
+        if (value) CFRelease(value);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length,
+                     "_CFNumberFormatterCreateStringWithValue")) {
+        uint32_t create[] = {0, arguments[2], arguments[3]};
+        uint64_t number_token = 0;
+        if (!objc_bridge32_dispatch("_CFNumberCreate", create, &number_token)) return 0;
+        CFStringRef value = CFNumberFormatterCreateStringWithNumber(NULL,
+            (CFNumberFormatterRef)object_for_argument(arguments[1]),
+            (CFNumberRef)object_for_argument((uint32_t)number_token));
+        *result = proxy_for_object((id)value);
+        if (value) CFRelease(value);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFNotificationCenterGetDistributedCenter")) {
+        *result = proxy_for_object((id)CFNotificationCenterGetDistributedCenter());
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFNotificationCenterAddObserver")) {
+        struct cf_notification32 *notification = malloc(sizeof(*notification));
+        if (!notification) return 0;
+        *notification = (struct cf_notification32){arguments[1], arguments[2]};
+        CFNotificationCenterAddObserver(
+            (CFNotificationCenterRef)object_for_argument(arguments[0]),
+            notification, cf_notification_callback,
+            (CFStringRef)object_for_argument(arguments[3]),
+            object_for_argument(arguments[4]),
+            (CFNotificationSuspensionBehavior)arguments[5]);
+        *result = 0;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFRunLoopPerformBlock")) {
+        LP32GuestBlock *owner = [[LP32GuestBlock alloc] init];
+        owner->guestBlock = blocks_bridge32_copy(arguments[2]);
+        if (!owner->guestBlock) { [owner release]; return 0; }
+        CFRunLoopPerformBlock(
+            (CFRunLoopRef)object_for_argument(arguments[0]),
+            (CFTypeRef)object_for_argument(arguments[1]),
+            ^{ blocks_bridge32_invoke(owner->guestBlock); });
+        [owner release];
+        *result = 0;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFDateFormatterCreate")) {
+        CFLocaleRef locale = (CFLocaleRef)object_for_argument(arguments[1]);
+        CFDateFormatterRef formatter = CFDateFormatterCreate(
+            NULL, locale, (CFDateFormatterStyle)arguments[2],
+            (CFDateFormatterStyle)arguments[3]);
+        *result = proxy_for_object((id)formatter);
+        if (formatter) CFRelease(formatter);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length,
+                     "_CFDateFormatterCreateStringWithAbsoluteTime")) {
+        CFAbsoluteTime time;
+        memcpy(&time, arguments + 2, sizeof(time));
+        CFStringRef string = CFDateFormatterCreateStringWithAbsoluteTime(
+            NULL, (CFDateFormatterRef)object_for_argument(arguments[1]), time);
+        *result = proxy_for_object((id)string);
+        if (string) CFRelease(string);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length,
+                     "_CFDateFormatterCreateStringWithDate")) {
+        CFStringRef string = CFDateFormatterCreateStringWithDate(
+            NULL, (CFDateFormatterRef)object_for_argument(arguments[1]),
+            (CFDateRef)object_for_argument(arguments[2]));
+        *result = proxy_for_object((id)string);
+        if (string) CFRelease(string);
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFNumberCreate")) {
@@ -8543,6 +9859,48 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         if (objc_legacy32_message(arguments, result)) return 1;
         id receiver = object_for_receiver(arguments[0]);
         const char *selector_name = (const char *)(uintptr_t)arguments[1];
+
+        if(receiver && selector_name && !strcmp(selector_name,"copyNextSampleBuffer") &&
+            [receiver isKindOfClass:[AVAssetReaderOutput class]]) {
+            CMSampleBufferRef sample=[(AVAssetReaderOutput *)receiver copyNextSampleBuffer];
+            if(getenv("LP32_TRACE_MEDIA")) {
+                static unsigned samples;
+                if(samples++<8 || !(samples%120)) {
+                    CVImageBufferRef pixel=sample?CMSampleBufferGetImageBuffer(sample):NULL;
+                    OSType format=pixel?CVPixelBufferGetPixelFormatType(pixel):0;
+                    fprintf(stderr,"compat32: movie sample=%u ptr=%p pts=%.3f pixel=%p size=%zux%zu format=%c%c%c%c planar=%d stride=%zu\n",samples,sample,
+                        sample?CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sample)):0,pixel,
+                        pixel?CVPixelBufferGetWidth(pixel):0,pixel?CVPixelBufferGetHeight(pixel):0,
+                        (char)(format>>24),(char)(format>>16),(char)(format>>8),(char)format,
+                        pixel?(int)CVPixelBufferIsPlanar(pixel):-1,pixel?CVPixelBufferGetBytesPerRow(pixel):0);
+                }
+            }
+            bool previous=creating_cf_object;creating_cf_object=true;
+            *result=proxy_for_object((id)sample);creating_cf_object=previous;
+            if(sample)CFRelease(sample);return 1;
+        }
+        if (receiver && selector_name &&
+            !strcmp(selector_name,"loadValuesAsynchronouslyForKeys:completionHandler:")) {
+            LP32GuestBlock *owner=[[LP32GuestBlock alloc] init];
+            owner->guestBlock=blocks_bridge32_copy(arguments[3]);
+            if(!owner->guestBlock){[owner release];return 0;}
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            [(AVAsset *)receiver loadValuesAsynchronouslyForKeys:object_for_argument(arguments[2])
+                completionHandler:^{ blocks_bridge32_invoke(owner->guestBlock); }];
+#pragma clang diagnostic pop
+            [owner release];*result=0;return 1;
+        }
+        if (receiver == [NSEvent class] && selector_name) {
+            if (!strcmp(selector_name,"addLocalMonitorForEventsMatchingMask:handler:")) {
+                *result=proxy_for_object(add_guest_event_monitor(arguments[2],arguments[3]));
+                return 1;
+            }
+            if (!strcmp(selector_name,"removeMonitor:")) {
+                remove_guest_event_monitor(object_for_argument(arguments[2]));
+                *result=0;return 1;
+            }
+        }
         static int trace_selectors = -1;
         if (trace_selectors < 0) {
             trace_selectors = getenv("LP32_TRACE_OBJC_SELECTORS") != NULL;
@@ -8664,6 +10022,24 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                 [(NSArray *)receiver initWithObjects:objects count:count] :
                 [(Class)receiver arrayWithObjects:objects count:count];
             free(objects); *result = proxy_for_object(value); return 1;
+        }
+        if (!strcmp(selector_name, "dictionaryWithObjects:forKeys:count:") ||
+            !strcmp(selector_name, "initWithObjects:forKeys:count:")) {
+            size_t count=arguments[4];
+            const uint32_t *values=(void *)(uintptr_t)arguments[2];
+            const uint32_t *guest_keys=(void *)(uintptr_t)arguments[3];
+            if(count>1048576 || (count && (!values || !guest_keys)))return 0;
+            id *objects=calloc(count?count:1,sizeof(id));
+            id *keys=calloc(count?count:1,sizeof(id));
+            if(!objects || !keys){free(objects);free(keys);return 0;}
+            for(size_t i=0;i<count;++i) {
+                objects[i]=object_for_argument(values[i]);keys[i]=object_for_argument(guest_keys[i]);
+                if(!objects[i] || !keys[i]){free(objects);free(keys);return 0;}
+            }
+            id value=!strncmp(selector_name,"init",4) ?
+                [(NSDictionary *)receiver initWithObjects:objects forKeys:keys count:count] :
+                [(Class)receiver dictionaryWithObjects:objects forKeys:keys count:count];
+            free(objects);free(keys);*result=proxy_for_object(value);return 1;
         }
         if (!strcmp(selector_name, "dictionaryWithObjectsAndKeys:") || !strcmp(selector_name, "initWithObjectsAndKeys:")) {
             size_t count = 0;
@@ -8806,9 +10182,11 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             *result = proxy_for_object(value);
             return 1;
         }
+        bool guest_event_wait = false;
         if (strcmp(selector_name,
                    "nextEventMatchingMask:untilDate:inMode:dequeue:") == 0 &&
             [receiver isKindOfClass:[NSApplication class]]) {
+            guest_event_wait = pthread_main_np();
             /*
              * The guest pumps its own event loop (mask 0xffffffff, default
              * mode) after finishLaunching and never enters -[NSApplication
@@ -8847,10 +10225,36 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         }
         if(getenv("LP32_TRACE_EVENTS") && !strcmp(selector_name,"postEvent:atStart:")) {
             NSEvent *e=object_for_argument(arguments[2]);
-            if(e.type==NSEventTypeApplicationDefined)fprintf(stderr,"POST tid=%u token=%08x data=%lx,%lx subtype=%d\n",pthread_mach_thread_np(pthread_self()),arguments[2],(long)e.data1,(long)e.data2,(int)e.subtype);
+            if(e.type==NSEventTypeApplicationDefined)fprintf(stderr,"POST t=%.6f tid=%u token=%08x data=%lx,%lx subtype=%d atStart=%u\n",CFAbsoluteTimeGetCurrent(),pthread_mach_thread_np(pthread_self()),arguments[2],(long)e.data1,(long)e.data2,(int)e.subtype,arguments[3]);
         }
+        if (selector_name[0] == 'p' &&
+            strcmp(selector_name, "postEvent:atStart:") == 0 &&
+            !pthread_main_np() && receiver == NSApp &&
+            !getenv("LP32_QUEUED_APP_EVENTS")) {
+            NSEvent *event = object_for_argument(arguments[2]);
+            if (event && event.type == NSEventTypeApplicationDefined) {
+                deliver_cross_thread_event(event, arguments[3] != 0);
+                *result = 0;
+                return 1;
+            }
+        }
+        if (guest_event_wait) ++guest_event_wait_depth;
         bool invoked = invoke_simple_message(receiver, selector_name,
                                              arguments, result, NULL, NULL);
+        if (guest_event_wait) --guest_event_wait_depth;
+        if(getenv("LP32_TRACE_MEDIA") && !strcmp(selector_name,"status") &&
+           [receiver isKindOfClass:[AVAssetReader class]]) {
+            static unsigned traced;
+            if(traced++<20 || *result!=1)
+                fprintf(stderr,"compat32: movie status=%llu error=%s\n",(unsigned long long)*result,
+                    [[[(AVAssetReader *)receiver error] description] UTF8String]);
+        }
+        if(getenv("LP32_TRACE_MEDIA") && !strcmp(selector_name,"startReading") &&
+           [receiver isKindOfClass:[AVAssetReader class]])
+            fprintf(stderr,"compat32: movie start=%llu error=%s outputs=%lu range=%.3f/%.3f\n",(unsigned long long)*result,
+                [[[(AVAssetReader *)receiver error] description] UTF8String],
+                (unsigned long)[[(AVAssetReader *)receiver outputs] count],
+                CMTimeGetSeconds([(AVAssetReader *)receiver timeRange].start),CMTimeGetSeconds([(AVAssetReader *)receiver timeRange].duration));
         if (!invoked) {
             fprintf(stderr,
                     "compat32: Objective-C bridge cannot invoke %s on %s\n",
@@ -8916,6 +10320,9 @@ static int objc_bridge32_dispatch_body(const char *import_name,
 uint32_t objc_bridge32_pointer_import(const char *import_name)
 {
     const size_t import_length = strlen(import_name);
+    if (LP32_NAME_IS(import_name, import_length, "_AVMediaTypeAudio")) return proxy_for_object(AVMediaTypeAudio);
+    if (LP32_NAME_IS(import_name, import_length, "_AVMediaTypeVideo")) return proxy_for_object(AVMediaTypeVideo);
+    if (LP32_NAME_IS(import_name, import_length, "_kCVPixelBufferPixelFormatTypeKey")) return proxy_for_object((id)kCVPixelBufferPixelFormatTypeKey);
     if (LP32_NAME_IS(import_name, import_length, "_kCFAllocatorSystemDefault")) return proxy_for_object((id)kCFAllocatorSystemDefault);
     if (LP32_NAME_IS(import_name, import_length, "_kCFAllocatorNull")) return proxy_for_object((id)kCFAllocatorNull);
     uint32_t network_constant = cfnetwork_bridge32_pointer_import(import_name);
@@ -8983,6 +10390,20 @@ uint32_t objc_bridge32_pointer_import(const char *import_name)
     if (LP32_NAME_IS(import_name, import_length, "_NSWindowWillCloseNotification")) {
         return proxy_for_object(NSWindowWillCloseNotification);
     }
+    /* These linked Core Foundation data imports are object references.  The
+       two numeric time intervals and callback tables use separate guest cells. */
+    if (!strncmp(import_name, "_kCFBundle", 10) ||
+        !strncmp(import_name, "_kCFGregorianCalendar", 21) ||
+        !strncmp(import_name, "_kCFHTTPVersion", 15) ||
+        !strncmp(import_name, "_kCFLocaleCurrency", 18) ||
+        !strcmp(import_name, "_kCFNull") ||
+        !strncmp(import_name, "_kCFNumberFormatter", 19) ||
+        !strncmp(import_name, "_kCFProxy", 9) ||
+        !strncmp(import_name, "_kCFStream", 10) ||
+        !strncmp(import_name, "_kCFStringTransform", 19)) {
+        const id *symbol = dlsym(RTLD_DEFAULT, import_name + 1);
+        return symbol ? proxy_for_object(*symbol) : 0;
+    }
     return 0;
 }
 
@@ -9026,6 +10447,171 @@ int objc_bridge32_run_gl_parameter_self_test(void)
 
     puts("gl-parameter-selftest: PASS (atomic batch policy and finite containment)");
     return 0;
+}
+
+int objc_bridge32_run_date_formatter_self_test(void)
+{
+    @autoreleasepool {
+        uint64_t result;
+        uint32_t create[] = {0, objc_bridge32_guest_object(
+            [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"]),
+            kCFDateFormatterShortStyle, kCFDateFormatterShortStyle};
+        if (!objc_bridge32_dispatch("_CFDateFormatterCreate", create, &result) ||
+            !result) return -1;
+        uint32_t formatter = (uint32_t)result;
+        double seconds = 123456.0;
+        uint32_t absolute[] = {0, formatter, 0, 0};
+        memcpy(absolute + 2, &seconds, sizeof(seconds));
+        if (!objc_bridge32_dispatch("_CFDateFormatterCreateStringWithAbsoluteTime",
+                                    absolute, &result) || !result) return -1;
+        NSString *first = objc_bridge32_host_object((uint32_t)result);
+        uint32_t date[] = {0, formatter, objc_bridge32_guest_object(
+            [NSDate dateWithTimeIntervalSinceReferenceDate:seconds])};
+        if (!objc_bridge32_dispatch("_CFDateFormatterCreateStringWithDate",
+                                    date, &result) || !result) return -1;
+        NSString *second = objc_bridge32_host_object((uint32_t)result);
+        if (![first length] || ![first isEqualToString:second]) return -1;
+        uint32_t release[] = {formatter};
+        if (!objc_bridge32_dispatch("_CFRelease", release, &result)) return -1;
+
+        uint32_t guest = compat_runtime32_allocate(64, 1);
+        if (!guest) return -1;
+        uint32_t property = objc_bridge32_pointer_import(
+            "_kCFNumberFormatterMaxFractionDigits");
+        uint32_t calendar_id = objc_bridge32_pointer_import("_kCFGregorianCalendar");
+        if (!property || !calendar_id) return -1;
+        const char *linked_object_constants[] = {
+            "_kCFBundleExecutableKey", "_kCFBundleIdentifierKey",
+            "_kCFBundleNameKey", "_kCFBundleVersionKey",
+            "_kCFGregorianCalendar", "_kCFHTTPVersion1_1",
+            "_kCFLocaleCurrencyCode", "_kCFNull",
+            "_kCFNumberFormatterCurrencyCode",
+            "_kCFNumberFormatterMaxFractionDigits",
+            "_kCFProxyAutoConfigurationURLKey", "_kCFProxyHostNameKey",
+            "_kCFProxyPortNumberKey", "_kCFProxyTypeAutoConfigurationURL",
+            "_kCFProxyTypeHTTP", "_kCFProxyTypeKey",
+            "_kCFStreamPropertyAppendToFile", "_kCFStreamPropertyHTTPProxy",
+            "_kCFStreamPropertyHTTPProxyHost", "_kCFStreamPropertyHTTPProxyPort",
+            "_kCFStreamPropertyHTTPResponseHeader", "_kCFStreamPropertySSLSettings",
+            "_kCFStreamSSLIsServer", "_kCFStreamSSLLevel",
+            "_kCFStreamSSLPeerName", "_kCFStreamSSLValidatesCertificateChain",
+            "_kCFStreamSocketSecurityLevelNegotiatedSSL",
+            "_kCFStringTransformStripDiacritics",
+        };
+        for (unsigned i = 0; i < sizeof(linked_object_constants) /
+                               sizeof(linked_object_constants[0]); ++i) {
+            if (!objc_bridge32_pointer_import(linked_object_constants[i])) {
+                fprintf(stderr, "missing Core Foundation constant: %s\n",
+                        linked_object_constants[i]);
+                return -1;
+            }
+        }
+        uint32_t number_create[] = {0, create[1], kCFNumberFormatterDecimalStyle};
+        if (!objc_bridge32_dispatch("_CFNumberFormatterCreate", number_create,
+                                    &result) || !result) return -1;
+        uint32_t number_formatter = (uint32_t)result;
+        uint32_t set_property[] = {number_formatter, property,
+                                   objc_bridge32_guest_object(@2)};
+        if (!objc_bridge32_dispatch("_CFNumberFormatterSetProperty", set_property,
+                                    &result)) return -1;
+        *(int32_t *)(uintptr_t)guest = 12345;
+        uint32_t number_value[] = {0, number_formatter, kCFNumberSInt32Type, guest};
+        if (!objc_bridge32_dispatch("_CFNumberFormatterCreateStringWithValue",
+                                    number_value, &result) || !result ||
+            ![(NSString *)objc_bridge32_host_object((uint32_t)result) length]) return -1;
+        uint32_t calendar_create[] = {0, calendar_id};
+        if (!objc_bridge32_dispatch("_CFCalendarCreateWithIdentifier",
+                                    calendar_create, &result) || !result) return -1;
+        uint32_t calendar = (uint32_t)result;
+        uint32_t time_zone[] = {calendar, objc_bridge32_guest_object(
+            [NSTimeZone timeZoneForSecondsFromGMT:0])};
+        if (!objc_bridge32_dispatch("_CFCalendarSetTimeZone", time_zone, &result))
+            return -1;
+        memcpy((void *)(uintptr_t)(guest + 16), "yMdHms", 7);
+        uint32_t compose[] = {calendar, guest + 8, guest + 16,
+                              2002, 1, 2, 3, 4, 5};
+        if (!objc_bridge32_dispatch("_CFCalendarComposeAbsoluteTime", compose,
+                                    &result) || !result ||
+            !isfinite(*(double *)(uintptr_t)(guest + 8))) return -1;
+        uint32_t dates[] = {
+            objc_bridge32_guest_object([NSDate dateWithTimeIntervalSinceReferenceDate:1]),
+            objc_bridge32_guest_object([NSDate dateWithTimeIntervalSinceReferenceDate:2]),
+            0};
+        if (!objc_bridge32_dispatch("_CFDateCompare", dates, &result) ||
+            (int32_t)result != kCFCompareLessThan) return -1;
+        uint32_t resource[] = {
+            0, objc_bridge32_guest_object([NSURL fileURLWithPath:@"/etc/hosts"]),
+            guest + 24, 0, 0, guest + 28};
+        if (!objc_bridge32_dispatch("_CFURLCreateDataAndPropertiesFromResource",
+                                    resource, &result) || !result) return -1;
+        uint32_t data_token = *(uint32_t *)(uintptr_t)(guest + 24);
+        if (!data_token || ![(NSData *)objc_bridge32_host_object(data_token) length])
+            return -1;
+        release[0] = data_token;
+        if (!objc_bridge32_dispatch("_CFRelease", release, &result)) return -1;
+        release[0] = number_formatter;
+        if (!objc_bridge32_dispatch("_CFRelease", release, &result)) return -1;
+        release[0] = calendar;
+        if (!objc_bridge32_dispatch("_CFRelease", release, &result)) return -1;
+        compat_runtime32_deallocate(guest);
+        puts("Core Foundation bridge PASS (formatting, calendar, file resources, constants)");
+        return 0;
+    }
+}
+
+static void *signal_test_semaphore(void *raw)
+{
+    usleep(10000);
+    dispatch_semaphore_signal((dispatch_semaphore_t)raw);
+    return NULL;
+}
+int objc_bridge32_run_dispatch_fast_self_test(void)
+{
+    @autoreleasepool {
+        const char *names[] = {"dispatch_time", "dispatch_semaphore_wait", "dispatch_semaphore_signal"};
+        for (unsigned i=0;i<3;++i) {
+            char decorated[64];snprintf(decorated,sizeof(decorated),"_%s",names[i]);
+            if (!objc_bridge32_fast_import(names[i]) || objc_bridge32_fast_import(names[i]) != objc_bridge32_fast_import(decorated)) return -1;
+        }
+        uint64_t whens[] = {UINT64_C(100000000000), DISPATCH_TIME_FOREVER};
+        int64_t deltas[] = {0, -1000000000, 1000000000, INT64_MAX, INT64_MIN};
+        for (unsigned i=0;i<2;++i) for(unsigned j=0;j<5;++j) {
+            uint32_t a[4];memcpy(a,&whens[i],8);memcpy(a+2,&deltas[j],8);
+            uint64_t expected=dispatch_time(whens[i],deltas[j]), result;
+            if (fast_dispatch_time(a,0)!=expected || !objc_bridge32_dispatch("_dispatch_time",a,&result) || result!=expected) return -1;
+        }
+        dispatch_semaphore_t semaphore=dispatch_semaphore_create(0);
+        uint32_t token=proxy_for_object((id)semaphore), a[]={token,0,0};
+        if (!token) return -1;
+        if (!fast_dispatch_semaphore_wait(a,0)) return -1; /* Poll must time out. */
+        uint64_t result;
+        if (!objc_bridge32_dispatch("_dispatch_semaphore_signal",a,&result) || fast_dispatch_semaphore_wait(a,0)) return -1;
+        fast_dispatch_semaphore_signal(a,0);
+        if (!objc_bridge32_dispatch("_dispatch_semaphore_wait",a,&result) || result) return -1;
+        uint64_t expired=dispatch_time(DISPATCH_TIME_NOW,-1000000);memcpy(a+1,&expired,8);
+        if(!fast_dispatch_semaphore_wait(a,0))return -1;
+        fast_dispatch_semaphore_signal(a,0);
+        if(fast_dispatch_semaphore_wait(a,0))return -1; /* Still consume available signals. */
+        uint64_t deadline=dispatch_time(DISPATCH_TIME_NOW,2000000);memcpy(a+1,&deadline,8);
+        if (!fast_dispatch_semaphore_wait(a,0)) return -1;
+        pthread_t worker; if(pthread_create(&worker,NULL,signal_test_semaphore,semaphore))return -1;
+        deadline=dispatch_time(DISPATCH_TIME_NOW,1000000000);memcpy(a+1,&deadline,8);
+        if (fast_dispatch_semaphore_wait(a,0) || pthread_join(worker,NULL))return -1;
+        deadline=DISPATCH_TIME_FOREVER;memcpy(a+1,&deadline,8);
+        fast_dispatch_semaphore_signal(a,0);if(fast_dispatch_semaphore_wait(a,0))return -1;
+        uint32_t clock_args[]={0,0,0,0};
+        for(unsigned pass=0;pass<4;++pass) {
+            uint64_t start=hitch_now();
+            for(unsigned i=0;i<100000;++i) {
+                if(pass%2)result=fast_dispatch_time(clock_args,0);
+                else if(!objc_bridge32_dispatch("_dispatch_time",clock_args,&result))return -1;
+            }
+            fprintf(stderr,"dispatch-fast-selftest: timeout %s %.1f ns/call\n",pass%2?"direct":"chained",(hitch_now()-start)/100000.0);
+        }
+        dispatch_release(semaphore);
+        puts("dispatch-fast-selftest: PASS (aliases, 64-bit signed deadlines, overflow, polling, timeout, worker wakeup, queued signal)");
+        return 0;
+    }
 }
 
 static void *pointer_proxy_test_worker(void *pointer)
@@ -9091,6 +10677,20 @@ int objc_bridge32_run_pointer_self_test(void)
             if (!objc_bridge32_dispatch("_objc_msgSend", args, &value) || value != direct) return -1;
             if ([(NSValue *)object_for_receiver((uint32_t)value) pointerValue] != contexts[i]) return -1;
         }
+        /* Setting through the fast path switches contexts, and restating the
+           current context leaves it current. */
+        lp32_fast_import_fn set_fast = objc_bridge32_fast_import("_CGLSetCurrentContext");
+        uint32_t second_token = objc_bridge32_guest_pointer(contexts[1]);
+        if (!set_fast || !second_token) return -1;
+        for (unsigned pass = 0; pass < 2; ++pass) {
+            uint32_t set_args[] = {pass ? first_token : second_token};
+            if (set_fast(set_args, 0) != kCGLNoError ||
+                set_fast(set_args, 0) != kCGLNoError ||
+                CGLGetCurrentContext() != contexts[pass ? 0 : 1]) return -1;
+        }
+        uint32_t clear_args[] = {0};
+        if (set_fast(clear_args, 0) != kCGLNoError || CGLGetCurrentContext()) return -1;
+        if (CGLSetCurrentContext(contexts[0])) return -1;
         GLuint refs = CGLGetContextRetainCount(contexts[0]);
         before = proxy_count;
         uint64_t start = hitch_now();
@@ -9751,8 +11351,63 @@ cleanup_3d:
     return status;
 }
 
+/* Deleting from colliding probe runs must leave every other entry
+   reachable. Names 8192 apart share a home slot. Runs without a context. */
+static int run_mipmap_repair_table_case(void)
+{
+    enum { kNames = 1500, kAliases = 3 };
+    int status = 0;
+    pthread_mutex_lock(&mipmap_repair_mutex);
+    for (GLuint name = 1; name <= kNames; ++name) {
+        for (GLuint alias = 0; alias < kAliases; ++alias) {
+            struct mipmap_repair_entry *entry = mipmap_repair_entry_for(
+                NULL, GL_TEXTURE_2D, name + alias * 8192u, true);
+            if (!entry) status = -1;
+            else entry->requested_maximum = (GLint)(name + alias * 8192u);
+        }
+    }
+    pthread_mutex_unlock(&mipmap_repair_mutex);
+    GLuint removed[kNames];
+    GLsizei removed_count = 0;
+    for (GLuint name = 1; name <= kNames; ++name) {
+        removed[removed_count++] = name + (name % kAliases) * 8192u;
+    }
+    forget_mipmap_repairs(removed_count, removed);
+    pthread_mutex_lock(&mipmap_repair_mutex);
+    for (GLuint name = 1; name <= kNames && status == 0; ++name) {
+        for (GLuint alias = 0; alias < kAliases; ++alias) {
+            GLuint texture = name + alias * 8192u;
+            const struct mipmap_repair_entry *entry = mipmap_repair_entry_for(
+                NULL, GL_TEXTURE_2D, texture, false);
+            bool expected = alias != name % kAliases;
+            if (expected != (entry != NULL) ||
+                (entry && entry->requested_maximum != (GLint)texture)) {
+                fprintf(stderr, "gl-texture-selftest: mip table entry %u "
+                        "%s after deletion\n", texture,
+                        expected ? "lost" : "kept");
+                status = -1;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&mipmap_repair_mutex);
+    GLuint all[kNames * kAliases];
+    for (GLuint index = 0; index < kNames * kAliases; ++index) {
+        all[index] = 1 + index % kNames + (index / kNames) * 8192u;
+    }
+    forget_mipmap_repairs(kNames * kAliases, all);
+    pthread_mutex_lock(&mipmap_repair_mutex);
+    for (size_t slot = 0; slot < kMipmapRepairCapacity; ++slot) {
+        if (mipmap_repairs[slot].occupied) status = -1;
+    }
+    pthread_mutex_unlock(&mipmap_repair_mutex);
+    if (status) fputs("gl-texture-selftest: mip table not empty\n", stderr);
+    return status;
+}
+
 int objc_bridge32_run_gl_texture_self_test(void)
 {
+    if (run_mipmap_repair_table_case() != 0) return -1;
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     CGLPixelFormatAttribute attributes[] = {
@@ -9855,6 +11510,45 @@ int objc_bridge32_run_gl_texture_self_test(void)
                         "clamped: max=%d expected=5\n", maximum);
                 status = -1;
             }
+            /* Restating the requested maximum, as the game does each bind,
+               keeps the clamp, including through the float entry point. */
+            set_texture_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 6);
+            set_texture_parameter_f(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL,
+                                    6.0f);
+            set_texture_parameter_f(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                                    (GLfloat)GL_LINEAR_MIPMAP_NEAREST);
+            glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL,
+                                &maximum);
+            if (maximum != 5) {
+                fprintf(stderr,
+                        "gl-texture-selftest: restated maximum undid "
+                        "clamp: max=%d expected=5\n", maximum);
+                status = -1;
+            }
+            /* An upload to another texture leaves this texture's scan
+               current. */
+            GLuint other_texture = 0;
+            glGenTextures(1, &other_texture);
+            glBindTexture(GL_TEXTURE_2D, other_texture);
+            note_texture_level_change(GL_TEXTURE_2D);
+            glCompressedTexImage2D(
+                GL_TEXTURE_2D, 0, GL_COMPRESSED_RGBA_S3TC_DXT1_EXT,
+                4, 4, 0, 8, blocks);
+            glDeleteTextures(1, &other_texture);
+            glBindTexture(GL_TEXTURE_2D, texture);
+            if (mipmap_parameter_action(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL,
+                                        6) != kMipmapParameterKeepClamp) {
+                fputs("gl-texture-selftest: unrelated upload invalidated "
+                      "mip scan\n", stderr);
+                status = -1;
+            }
+            note_texture_level_change(GL_TEXTURE_2D);
+            if (mipmap_parameter_action(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL,
+                                        6) != kMipmapParameterApplyAndScan) {
+                fputs("gl-texture-selftest: own upload did not invalidate "
+                      "mip scan\n", stderr);
+                status = -1;
+            }
             glCompressedTexImage2D(
                 GL_TEXTURE_2D, 6,
                 GL_COMPRESSED_RGBA_S3TC_DXT1_EXT,
@@ -9867,6 +11561,17 @@ int objc_bridge32_run_gl_texture_self_test(void)
                         "gl-texture-selftest: completed chain did not "
                         "restore requested max: max=%d expected=6\n",
                         maximum);
+                status = -1;
+            }
+            if (mipmap_parameter_action(GL_TEXTURE_2D,
+                                        GL_TEXTURE_MIN_FILTER,
+                                        GL_LINEAR_MIPMAP_NEAREST) !=
+                    kMipmapParameterSkip ||
+                mipmap_parameter_action(GL_TEXTURE_2D,
+                                        GL_TEXTURE_MAX_LEVEL, 6) !=
+                    kMipmapParameterSkip) {
+                fputs("gl-texture-selftest: unchanged texture state was "
+                      "forwarded to the driver\n", stderr);
                 status = -1;
             }
             forget_mipmap_repairs(1, &texture);
@@ -9950,7 +11655,8 @@ int objc_bridge32_run_gl_texture_self_test(void)
         puts("gl-texture-selftest: PASS (DXT1/DXT5 direct and sliced "
              "uploads survive shared contexts and texture-name reuse; "
              "3D image/subimage dispatch works; incomplete 2D/cubemap "
-             "ranges are clamped and restored)");
+             "ranges are clamped and restored; mip table deletion keeps "
+             "colliding entries)");
     }
     return status;
 }

@@ -3,19 +3,25 @@
 #include "carbon_bridge.h"
 #include "controller_bridge.h"
 #include "game_profile.h"
+#include "hid_bridge.h"
 #include "macho_loader.h"
 #include "objc_bridge.h"
+#include "quicktime_bridge.h"
 #include "hitch_recorder.h"
 #include "host_diagnostics.h"
 #include "steam_bridge.h"
 
 #include <errno.h>
+#include <dirent.h>
+#include <pthread.h>
+#include <pthread/qos.h>
 #include <dlfcn.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <math.h>
 #include <mach-o/dyld.h>
 #include <signal.h>
 #include <stdio.h>
@@ -44,6 +50,87 @@ static int guest_diagnostic_fd = -1;
     } while (0)
 
 static void flush_guest_instruction(uintptr_t address);
+
+/*
+ * Complete Saga loads each level's shaders as separate files from
+ * feralshaders/ (4,276 files, 17 MiB) and its hub data from game.dat.  After a
+ * reboot these reads miss the page cache; the loader thread holds an engine
+ * lock through them, and the render thread stalls behind it during the fade
+ * into the cantina.  Read them once at utility priority so the first load
+ * finds them cached.  Episode archives are left to the OS.
+ */
+static size_t prefetch_file(const char *path, char *buffer, size_t capacity)
+{
+    int descriptor = open(path, O_RDONLY | O_CLOEXEC);
+    if (descriptor < 0) return 0;
+    size_t total = 0;
+    ssize_t count;
+    while ((count = read(descriptor, buffer, capacity)) > 0) total += (size_t)count;
+    close(descriptor);
+    return total;
+}
+
+static void *prefetch_saga_data(void *raw)
+{
+    char *root = raw;
+    char *buffer = malloc(1 << 20);
+    if (!buffer) { free(root); return NULL; }
+    uint64_t start = hitch_now();
+    size_t bytes = 0, files = 0;
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/feralshaders", root);
+    DIR *directory = opendir(path);
+    if (directory) {
+        struct dirent *entry;
+        while ((entry = readdir(directory))) {
+            if (entry->d_name[0] == '.') continue;
+            snprintf(path, sizeof(path), "%s/feralshaders/%s", root, entry->d_name);
+            bytes += prefetch_file(path, buffer, 1 << 20);
+            ++files;
+        }
+        closedir(directory);
+    }
+    snprintf(path, sizeof(path), "%s/game.dat", root);
+    bytes += prefetch_file(path, buffer, 1 << 20);
+    ++files;
+    GUEST_DIAGNOSTIC("compat32: prefetched %zu data files (%.1f MiB) in %.0f ms\n",
+                     files, bytes / 1048576.0, (hitch_now() - start) / 1e6);
+    free(buffer);
+    free(root);
+    return NULL;
+}
+
+static void start_saga_data_prefetch(void)
+{
+    if (lp32_profile()->title != LP32_TITLE_COMPLETE_SAGA ||
+        getenv("LP32_NO_DATA_PREFETCH")) return;
+    char executable[PATH_MAX], resolved[PATH_MAX];
+    uint32_t size = sizeof(executable);
+    if (_NSGetExecutablePath(executable, &size) != 0 ||
+        !realpath(executable, resolved)) return;
+    /* <parent>/<App>.app/Contents/MacOS/<loader>: the data sits in <parent>. */
+    for (int level = 0; level < 4; ++level) {
+        char *slash = strrchr(resolved, '/');
+        if (!slash) return;
+        *slash = 0;
+    }
+    char root[PATH_MAX];
+    struct stat info;
+    if (snprintf(root, sizeof(root), "%s/LEGOStarWarsSagaData", resolved) >=
+            (int)sizeof(root) || stat(root, &info) != 0 || !S_ISDIR(info.st_mode)) {
+        return;
+    }
+    pthread_attr_t attributes;
+    pthread_attr_init(&attributes);
+    pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
+    pthread_attr_set_qos_class_np(&attributes, QOS_CLASS_UTILITY, 0);
+    pthread_t thread;
+    char *copy = strdup(root);
+    if (copy && pthread_create(&thread, &attributes, prefetch_saga_data, copy) != 0) {
+        free(copy);
+    }
+    pthread_attr_destroy(&attributes);
+}
 
 static void open_guest_diagnostic_log(const char *executable_path)
 {
@@ -380,6 +467,50 @@ static int install_texture_bind_guard(void)
     return 0;
 }
 
+/* Validate the addresses used by the display bridge before guest startup. */
+static int install_screen_aspect_patch(void)
+{
+    const struct lp32_screen_aspect_patch *patch =
+        lp32_profile()->screen_aspect_patch;
+    if (!patch) return 0;
+    const struct lp32_code_signature *store = &patch->mode_ratio_store;
+    const struct lp32_code_signature *hud = &patch->hud_scale_load;
+    const struct lp32_code_signature *panel = &patch->panel_scale_select;
+    float original_hud_scale;
+    float panel_scales[4];
+    float panel_coin_y, panel_heart_y;
+    memcpy(&original_hud_scale,
+           (const void *)(uintptr_t)patch->hud_default_scale_address,
+           sizeof(original_hud_scale));
+    memcpy(panel_scales, (const void *)(uintptr_t)patch->panel_scale_table,
+           sizeof(panel_scales));
+    memcpy(&panel_coin_y, (const void *)(uintptr_t)patch->panel_coin_y,
+           sizeof(panel_coin_y));
+    memcpy(&panel_heart_y, (const void *)(uintptr_t)patch->panel_heart_y,
+           sizeof(panel_heart_y));
+    if (store->length != 8 ||
+        memcmp((const void *)(uintptr_t)store->address,
+               store->expected, store->length) != 0 ||
+        hud->length != 8 ||
+        memcmp((const void *)(uintptr_t)hud->address,
+               hud->expected, hud->length) != 0 ||
+        panel->length != 8 ||
+        memcmp((const void *)(uintptr_t)panel->address,
+               panel->expected, panel->length) != 0 ||
+        fabsf(panel_scales[0] - 0.60556465f) > 0.000001f ||
+        fabsf(panel_scales[1] - 0.52373159f) > 0.000001f ||
+        fabsf(panel_scales[2] - 0.33842796f) > 0.000001f ||
+        fabsf(panel_scales[3] - 0.39126638f) > 0.000001f ||
+        fabsf(panel_coin_y - 0.045f) > 0.000001f ||
+        fabsf(panel_heart_y + 0.045f) > 0.000001f ||
+        original_hud_scale != 9.0f / 16.0f) {
+        fprintf(stderr, "compat32: screen aspect data signature mismatch\n");
+        return -1;
+    }
+    fprintf(stderr, "compat32: verified Saga aspect and panel scale data addresses\n");
+    return 0;
+}
+
 /* Keep the original disabled-achievements return (eax = 0) when Steam's
    stats object is NULL. Do not invent an interface, claim an unlock, or
    alter Steam's initialization/relaunch result. All non-NULL calls retain
@@ -700,6 +831,14 @@ static const char *default_image_path(const char *argv0, char *buffer,
 
 int main(int argc, char **argv)
 {
+    objc_bridge32_initialize_test_mode();
+    if (getenv("LP32_SILENT_TEST_SELFTEST")) {
+        const char *mute = getenv("LP32_MUTE_AUDIO");
+        const char *background = getenv("LP32_BACKGROUND_TEST");
+        int ok = mute && !strcmp(mute, "1") && background && !strcmp(background, "1");
+        fprintf(stderr, "silent-test startup: %s (before guest/audio initialization)\n", ok ? "PASS" : "FAIL");
+        return ok ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
     install_guest_crash_diagnostics();
     compat_runtime32_set_diagnostic_sink(runtime_diagnostic_line);
     if (getenv("LP32_FOCUS_SELFTEST")) {
@@ -709,6 +848,9 @@ int main(int argc, char **argv)
     if (getenv("LP32_CRASH_DIAGNOSTIC_SELFTEST")) {
         raise(SIGSEGV);
         return EXIT_FAILURE;
+    }
+    if (getenv("LP32_DISPATCH_FAST_SELFTEST")) {
+        return objc_bridge32_run_dispatch_fast_self_test() == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
     if (getenv("LP32_POINTER_SELFTEST")) {
         return objc_bridge32_run_pointer_self_test() == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
@@ -827,8 +969,33 @@ int main(int argc, char **argv)
         macho_image32_unload(&image);
         return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
+    if (getenv("LP32_MEDIA_SELFTEST")) {
+        int result=quicktime_bridge32_run_media_self_test();
+        macho_image32_unload(&image);
+        return result==0?EXIT_SUCCESS:EXIT_FAILURE;
+    }
+    if (getenv("LP32_DATE_FORMATTER_SELFTEST")) {
+        int result=objc_bridge32_run_date_formatter_self_test();
+        macho_image32_unload(&image);
+        return result==0?EXIT_SUCCESS:EXIT_FAILURE;
+    }
+    if (getenv("LP32_APP_EVENT_SELFTEST")) {
+        int result = objc_bridge32_run_app_event_delivery_self_test();
+        macho_image32_unload(&image);
+        return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (getenv("LP32_EVENT_MONITOR_SELFTEST")) {
+        int result = objc_bridge32_run_event_monitor_self_test();
+        macho_image32_unload(&image);
+        return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
     if (getenv("LP32_IMPORT_RETURN_SELFTEST")) {
         int result = compat_runtime32_run_import_return_self_test();
+        macho_image32_unload(&image);
+        return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (getenv("LP32_HID_MAP_SELFTEST")) {
+        int result = hid_bridge32_run_ds4_map_self_test();
         macho_image32_unload(&image);
         return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
@@ -844,6 +1011,25 @@ int main(int argc, char **argv)
     }
     if (getenv("LP32_STEAM_ACHIEVEMENT_SELFTEST")) {
         int result = steam_achievement_selftest();
+        macho_image32_unload(&image);
+        return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (getenv("LP32_SCREEN_ASPECT_SELFTEST")) {
+        int result = install_screen_aspect_patch();
+        if (result == 0 && lp32_profile()->screen_aspect_patch) {
+            const struct lp32_screen_aspect_patch *patch =
+                lp32_profile()->screen_aspect_patch;
+            uint32_t renderer = *(const uint32_t *)(uintptr_t)patch->renderer_pointer_slot;
+            uint32_t option = *(const uint32_t *)(uintptr_t)patch->option_pointer_slot;
+            if (renderer < image.min_address ||
+                renderer > image.max_address - 0x634 ||
+                option < image.min_address ||
+                option > image.max_address - 0x428) result = -1;
+            if (result == 0 &&
+                objc_bridge32_run_panel_scale_self_test(patch) != 0) result = -1;
+        }
+        fprintf(stderr, "compat32: screen aspect data check %s\n",
+                result == 0 ? "PASS" : "FAIL");
         macho_image32_unload(&image);
         return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
@@ -876,16 +1062,22 @@ int main(int argc, char **argv)
         macho_image32_unload(&image);
         return EXIT_FAILURE;
     }
+    if (!getenv("LP32_DISABLE_SCREEN_ASPECT_PATCH") &&
+        install_screen_aspect_patch() != 0) {
+        macho_image32_unload(&image);
+        return EXIT_FAILURE;
+    }
 
     if (objc_bridge32_prepare_shader_cache() != 0) {
         macho_image32_unload(&image);
         return EXIT_FAILURE;
     }
 
-    /* Automatic only for Marvel; no full import profiling or draw dumps. */
+    /* Automatic for Marvel and Complete Saga; no full import profiling or draw dumps. */
     const char *hitch_option = getenv("LP32_HITCH_LOG");
     if ((hitch_option && strcmp(hitch_option, "0")) ||
-        (!hitch_option && lp32_profile()->title == LP32_TITLE_MARVEL)) {
+        (!hitch_option && (lp32_profile()->title == LP32_TITLE_MARVEL ||
+                           lp32_profile()->title == LP32_TITLE_COMPLETE_SAGA))) {
         char path[PATH_MAX];
         const char *home = getenv("HOME");
         int length = snprintf(path, sizeof(path), "%s/Library/Logs/%s/hitches-%ld-%llu.log",
@@ -901,6 +1093,7 @@ int main(int argc, char **argv)
             perror("compat32: hitch recorder unavailable");
         }
     }
+    start_saga_data_prefetch();
 
     const uint32_t *initializers =
         (const void *)(uintptr_t)image.initializer_address;

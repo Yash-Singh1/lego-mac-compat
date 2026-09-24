@@ -6,6 +6,7 @@ import plistlib
 import shutil
 import subprocess
 import tempfile
+from configure_bundle import install_saga_controller_profile
 
 
 def ditto(source, destination):
@@ -64,6 +65,7 @@ def main():
         for directory in ("MacOS", "SharedSupport"):
             (staged_contents / directory).mkdir(parents=True, exist_ok=True)
         ditto(contents / "Resources", staged_contents / "Resources")
+        install_saga_controller_profile(staged_contents / "Resources")
         ditto(contents / "Frameworks", staged_contents / "Frameworks")
         # Steam's depot omits the conventional versioned-framework symlinks.
         # Reconstruct them in the output so dyld and strict codesign can use it.

@@ -154,7 +154,7 @@ static void forward(id self,SEL command,NSInvocation *inv){
     if(getenv("LP32_TRACE_OBJC_SELECTORS"))fprintf(stderr,"CALLBACK ENTER %s tid=%u imp=%08x self=%08x\n",selector,pthread_mach_thread_np(pthread_self()),m->imp,a[0]);
     if(getenv("LP32_TRACE_EVENTS") && !strcmp(selector,"sendEvent:")) {
         NSEvent *e=objc_bridge32_host_object(a[2]);
-        if(e.type==NSEventTypeApplicationDefined)fprintf(stderr,"RECEIVE tid=%u token=%08x data=%lx,%lx subtype=%d\n",pthread_mach_thread_np(pthread_self()),a[2],(long)e.data1,(long)e.data2,(int)e.subtype);
+        if(e.type==NSEventTypeApplicationDefined)fprintf(stderr,"RECEIVE t=%.6f tid=%u token=%08x data=%lx,%lx subtype=%d\n",CFAbsoluteTimeGetCurrent(),pthread_mach_thread_np(pthread_self()),a[2],(long)e.data1,(long)e.data2,(int)e.subtype);
     }
     for(unsigned i=2;i<n;++i)objc_bridge32_pin_event(a[i],1);
     uint32_t result=compat_runtime32_call(m->imp,a,n);
@@ -248,7 +248,11 @@ int objc_legacy32_message(const uint32_t *a,uint64_t *out){
     uint32_t args[128];if(n>128)return 0;memcpy(args,a,n*4);args[0]=objc_bridge32_guest_object(object);
     if(getenv("LP32_TRACE_OBJC_SELECTORS"))fprintf(stderr,"LEGACY %s self=%08x tid=%u ra=%08x\n",sel,args[0],pthread_mach_thread_np(pthread_self()),a[-1]);
     for(unsigned i=2;i<n;++i)objc_bridge32_pin_event(args[i],1);
-    *out=compat_runtime32_call(m->imp,args,n);
+    /* i386 returns 8-byte results (CGSize/NSPoint/NSRange/long long) in
+       EDX:EAX; keep EDX only for those so other callers still see a
+       zero-extended 32-bit result. */
+    uint64_t value=compat_runtime32_call64(m->imp,args,n);
+    *out=guest_size(type(sig.methodReturnType))==8 && *type(sig.methodReturnType)!='d' ? value : (uint32_t)value;
     for(unsigned i=2;i<n;++i)objc_bridge32_pin_event(args[i],0);
     return 1;
 }
@@ -303,7 +307,9 @@ int objc_legacy32_super_message(void *receiver, void *parent, const uint32_t *a,
     NSMethodSignature *sig=[NSMethodSignature signatureWithObjCTypes:str(m->types)];unsigned n=2;
     for(NSUInteger i=2;i<sig.numberOfArguments;++i){size_t bytes=guest_size(type([sig getArgumentTypeAtIndex:i]));if(!bytes)return 0;n+=(unsigned)(bytes/4);}
     if(n>128)return 0;uint32_t args[128];memcpy(args,a,n*4);args[0]=objc_bridge32_guest_object(receiver);
-    *out=compat_runtime32_call(m->imp,args,n);return 1;
+    uint64_t value=compat_runtime32_call64(m->imp,args,n);
+    *out=guest_size(type(sig.methodReturnType))==8 && *type(sig.methodReturnType)!='d' ? value : (uint32_t)value;
+    return 1;
 }
 
 int objc_legacy32_run_lifetime_self_test(void) {

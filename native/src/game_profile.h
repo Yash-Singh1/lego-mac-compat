@@ -120,6 +120,23 @@ struct lp32_texture_bind_guard {
     uint32_t resume;                 /* the jnz that follows the test */
 };
 
+/* The Steam Saga build derives its automatic aspect ratio from its selected
+   render mode. The automatic HUD path reads a separate 16:9 data constant. */
+struct lp32_screen_aspect_patch {
+    struct lp32_code_signature mode_ratio_store;
+    struct lp32_code_signature hud_scale_load;
+    struct lp32_code_signature panel_scale_select;
+    uint32_t renderer_pointer_slot;
+    uint32_t option_pointer_slot;
+    uint32_t hud_default_scale_address;
+    uint32_t camera_pointer;       /* global holding the shared camera */
+    uint32_t panel_scale_table;    /* 16:9 x, 4:3 x, 16:9 y, 4:3 y */
+    uint32_t panel_scale_x;
+    uint32_t panel_scale_y;
+    uint32_t panel_coin_y;
+    uint32_t panel_heart_y;
+};
+
 /* Marvel can keep running after Steam startup requested a relaunch. Its
    achievement submitter, unlike its stats polling code, assumes stats exist. */
 struct lp32_steam_achievement_guard {
@@ -181,6 +198,7 @@ struct lp32_game_profile {
     const struct lp32_button_font_layout *button_font; /* NULL = Xbox glyphs only */
     const struct lp32_save_worker_patch *save_worker;  /* NULL = single init */
     const struct lp32_texture_bind_guard *texture_bind_guard; /* NULL = none */
+    const struct lp32_screen_aspect_patch *screen_aspect_patch;
     const struct lp32_steam_achievement_guard *steam_achievement_guard;
     const struct lp32_display_layout *display;
     const struct lp32_render_pool *render_pool;

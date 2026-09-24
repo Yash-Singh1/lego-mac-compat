@@ -39,6 +39,8 @@ int main(void)
     assert(hitch_classify("_lp32_steam_4_16") == HITCH_IO);
     assert(hitch_classify("_lp32_steam_1_0") == HITCH_RUNTIME);
     assert(hitch_classify("_pthread_cond_wait$UNIX2003") == HITCH_WAIT);
+    assert(hitch_classify("_dispatch_semaphore_wait") == HITCH_WAIT);
+    assert(hitch_classify("_usleep$UNIX2003") == HITCH_WAIT);
     assert(hitch_classify("_glProgramEnvParameters4fvEXT") == HITCH_GL_STATE);
     assert(hitch_classify("_objc_msgSend") == HITCH_OBJC);
     assert(hitch_classify("_AudioUnitRender") == HITCH_AUDIO);
@@ -98,6 +100,9 @@ int main(void)
     assert(strstr(text, "rosetta="));
     assert(strstr(text, "caller=00abcdef vp=17 fp=28 count=600"));
     assert(strstr(text, "worker name=cgCreateProgram"));
+    assert(strstr(text, "  total name=glDrawRangeElements calls=1 ms=40.000"));
+    assert(strstr(text, "  total name=outer calls=1 ms=6.000"));
+    assert(strstr(text, "  wtotal name=cgCreateProgram calls=1 ms=9.000"));
     assert(strstr(text, "end reports=1 skipped=0"));
     unlink(path);
     puts("hitch-recorder PASS (threshold, history, workers, cooldown, exclusive nesting, presentation boundaries, host metadata)");

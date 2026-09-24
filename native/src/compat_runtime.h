@@ -12,6 +12,9 @@ int compat_runtime32_initialize(struct macho_image32 *image);
 const struct macho_image32 *compat_runtime32_image(void);
 uint32_t compat_runtime32_call(uint32_t function, const uint32_t *arguments,
                                size_t argument_count);
+/* As compat_runtime32_call, returning the guest's EDX:EAX pair. */
+uint64_t compat_runtime32_call64(uint32_t function, const uint32_t *arguments,
+                                 size_t argument_count);
 int compat_runtime32_last_call_trapped(void);
 uint32_t compat_runtime32_copy_cstring(const char *string);
 uint32_t compat_runtime32_allocate(size_t size, int clear);

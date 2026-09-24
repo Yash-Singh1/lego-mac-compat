@@ -7,7 +7,17 @@
 
 uint64_t compat_runtime32_return_double(double x){uint64_t result;memcpy(&result,&x,8);return result;}
 static CFTypeRef objects[128];
-static unsigned count, retained, released, timer_fired, stream_fired;
+static unsigned count, retained, released, timer_fired, stream_fired, source_fired;
+static uint8_t *guest_pool;
+static size_t guest_used;
+uint32_t compat_runtime32_allocate(size_t size, int clear) {
+  assert(guest_pool && guest_used + size <= 2048);
+  uint8_t *p = guest_pool + guest_used;
+  guest_used += (size + 7) & ~7u;
+  if (clear) memset(p, 0, size);
+  return (uint32_t)(uintptr_t)p;
+}
+void compat_runtime32_deallocate(uint32_t pointer) { (void)pointer; }
 uint32_t objc_bridge32_guest_object(void *object) {
   if (!object)
     return 0;
@@ -38,6 +48,9 @@ uint32_t compat_runtime32_call(uint32_t callback, const uint32_t *a,
     assert(n == 3 && a[0] && a[2] == 456);
     if (a[1] == kCFStreamEventHasBytesAvailable)
       stream_fired++;
+  } else if (callback == 5) {
+    assert(n == 1 && a[0] == 456);
+    source_fired++;
   } else
     assert(!"unknown callback");
   return 0;
@@ -54,6 +67,7 @@ int main(void) {
   uint32_t *low = mmap((void *)0x30000000, 4096, PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
   assert(low != MAP_FAILED);
+  guest_pool = (uint8_t *)(low + 256);
   uint32_t *ctx = low;
   ctx[0] = 0;
   ctx[1] = 123;
@@ -131,6 +145,30 @@ int main(void) {
   assert(dispatch("_CFReadStreamSetClient", a));
   assert(released <= retained);
   dispatch("_CFReadStreamClose", a);
+  uint32_t *source_ctx = low + 128;
+  source_ctx[0] = 0;
+  source_ctx[1] = 123;
+  source_ctx[2] = 1;
+  source_ctx[3] = 2;
+  source_ctx[4] = 0;
+  source_ctx[5] = 0;
+  source_ctx[6] = 0;
+  source_ctx[7] = 0;
+  source_ctx[8] = 0;
+  source_ctx[9] = 5;
+  uint32_t source_args[] = {0, 0, (uint32_t)(uintptr_t)source_ctx};
+  uint32_t source = dispatch("_CFRunLoopSourceCreate", source_args);
+  assert(source);
+  a[0] = loop;
+  a[1] = source;
+  a[2] = token(kCFRunLoopDefaultMode);
+  dispatch("_CFRunLoopAddSource", a);
+  a[0] = source;
+  dispatch("_CFRunLoopSourceSignal", a);
+  CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.03, false);
+  assert(source_fired == 1);
+  a[0] = loop;
+  dispatch("_CFRunLoopRemoveSource", a);
   CFRelease(stream);
   CFRelease(data);
   CFRelease(url);
@@ -138,6 +176,6 @@ int main(void) {
     CFRelease(objects[i]);
   assert(released == retained);
   munmap(low, 4096);
-  puts("CFNetwork bridge: HTTP data, constants, run loops, timers, stream "
+  puts("CFNetwork bridge: HTTP data, constants, run loops, sources, timers, stream "
        "callbacks and ownership PASS");
 }

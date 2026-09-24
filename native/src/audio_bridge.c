@@ -1,4 +1,5 @@
 #include "audio_bridge.h"
+#include "audio_queue_bridge.h"
 #include "compat_runtime.h"
 #include "game_profile.h"
 #include "name_match.h"
@@ -1552,6 +1553,7 @@ static OSStatus set_unit_parameter_for_guest(const uint32_t *arguments,
 int audio_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
                             uint64_t *result)
 {
+    if(audio_queue_bridge32_dispatch(import_name,arguments,result))return 1;
     const size_t import_length = strlen(import_name);
     if (LP32_NAME_IS(import_name, import_length, "_NewAUGraph")) {
         AUGraph graph = NULL;
