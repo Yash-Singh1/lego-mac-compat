@@ -15,7 +15,7 @@ Support for the original 32-bit Mac releases:
 | LEGO Star Wars II: The Original Trilogy | Aspyr, 2006 | - |
 | LEGO Indiana Jones: The Original Adventures | 2008 | - |
 | LEGO Batman: The Videogame | Feral, 2009 | - |
-| LEGO Star Wars: The Complete Saga | Feral, Steam 1.2.1 | WIP; launcher, cantina and first-level entry verified |
+| LEGO Star Wars: The Complete Saga | Feral, Steam 1.2.1 | ✓\* |
 | LEGO Indiana Jones 2: The Adventure Continues | Feral, 2009 | - |
 | LEGO Harry Potter: Years 1-4 | Feral, 2011 | - |
 | LEGO Star Wars III: The Clone Wars | Feral, 2011 | ✓\* |
@@ -46,7 +46,7 @@ make GAME=marvel    SOURCE_APP="/path/to/LEGO Marvel Super Heroes.app"     bundl
 make GAME=saga      SOURCE_APP="/path/to/LEGO Star Wars Saga.app"         bundle
 ```
 
-Complete Saga's WIP build and current limitations are documented in
+Complete Saga's build and current limitations are documented in
 [native/SAGA.md](native/SAGA.md). Muted probes reach the cantina and the first
 playable room of Negotiations. A connected DualShock 4's HID elements, with
 injected values, advanced through the title prompt and menus into New Game.
