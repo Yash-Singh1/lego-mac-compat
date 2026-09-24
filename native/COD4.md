@@ -1,13 +1,22 @@
-# Call of Duty 4: Modern Warfare (Steam Mac)
+# Call of Duty 4: Modern Warfare (Mac)
 
-This branch ports Aspyr's **1.7.2 Steam Mac release**, app 7940, using the
+The converter accepts a 32-bit Intel Mac COD4 app with its game data regardless
+of bundle ID, version string, or executable hash. Steam's library is optional.
+For an executable other than the tested Steam binary, the loader uses a generic
+COD4 profile and skips patches tied to fixed game addresses. Conversion means
+the game can be tried; it does not establish that its menus or gameplay work.
+PowerPC-only and Windows executables cannot run in this i386 loader. A release
+that requires its own activation or App Store receipt may still require work.
+The converter does not modify those checks.
+
+The only build verified in gameplay is Aspyr's **1.7.2 Steam Mac release**, app 7940, using the
 same i386-in-x86_64 loader as the LEGO games. The `tfu` and `portal2` branches
 provided the guest dylib, C++ runtime extraction, and guest context machinery.
 The existing main-branch Carbon, OpenGL and audio bridges remain in use.
 
 ## Validation status
 
-This is an experimental port with campaign and local multiplayer smoke tests.
+The Steam build is an experimental port with campaign and local multiplayer smoke tests.
 On macOS 26.5.2
 with an Apple M5 Pro, single-player initializes Steam, plays the intro movies,
 renders the main menu, creates a profile, and starts or resumes the F.N.G.
@@ -45,7 +54,7 @@ capture, so its cause has not been established.
 Build the standalone converter with `make -C native cod4-converter` from the
 repository root. Open `native/build/COD4-Converter.app` and select **Campaign**
 or **Multiplayer**. Click **Find in Steam**, choose the game manually, or drag
-`Call of Duty 4.app` or its Steam game folder into the window. Discovery also
+the original Mac COD4 app or its game folder into the window. Discovery also
 accepts Steam library/common folders and the nested multiplayer app.
 
 Choose an output folder. Campaign creates `COD4-Compat.app`; Multiplayer
@@ -56,9 +65,8 @@ its own roughly 7 GB game-data copy. Cancel removes the unfinished copy.
 
 The converter is universal (Apple Silicon and Intel), includes the current
 game loader, and uses only macOS system tools. Its users need no Python,
-Make, Xcode, or repository checkout. Games require Rosetta 2 on Apple Silicon
-and the supported Aspyr Steam Mac 1.7.2 installation. Open Steam with the
-owning account before launching the generated game.
+Make, Xcode, or repository checkout. Games require Rosetta 2 on Apple Silicon.
+The tested Steam build requires Steam with the owning account before launch.
 
 On the first conversion, it downloads Apple's 4.72 GB Lion archive, verifies
 its checksum, and extracts the two private C++ libraries without running an
@@ -80,8 +88,8 @@ installation integration test is
 ## Command-line build
 
 Requires macOS, the Xcode command-line tools, Python 3, Rosetta 2 on Apple
-Silicon, and your installed Steam Mac copy of the game. Start Steam with the
-account that owns the game before launching a converted app.
+Silicon, and a 32-bit Intel Mac copy of the game. Start Steam with the account
+that owns the game when using the Steam release.
 
 ```sh
 cd native
@@ -92,7 +100,8 @@ make GAME=cod4mp bundle
 
 Steam's default library and additional libraries from `libraryfolders.vdf`
 are searched automatically. To select a particular installation, pass the
-**outer single-player app** for either edition:
+outer single-player app for either edition, or a standalone multiplayer app for
+`GAME=cod4mp`:
 
 ```sh
 make GAME=cod4 SOURCE_APP="/path/to/Call of Duty 4.app" bundle
@@ -102,9 +111,9 @@ make GAME=cod4mp SOURCE_APP="/path/to/Call of Duty 4.app" bundle
 The output apps are `build/COD4-Compat.app` and `build/COD4MP-Compat.app`.
 Each contains its own copy of `Call of Duty 4 Data`; allow space for a full
 additional data copy per app. No game files, Steam SDK binaries, or Apple
-runtime libraries are stored in this repository. The converter reads the
-Steam installation and validates the selected executable's SHA-256 before
-copying. It rejects overlapping source/output paths and refuses to replace
+runtime libraries are stored in this repository. The converter checks for a
+32-bit Intel Mac executable and copies the selected edition without modifying
+its original files. It rejects overlapping source/output paths and refuses to replace
 an output that is not marked as a generated COD4 compatibility app.
 
 `cod4-runtime` extracts two private i386 libraries from Apple's public Lion

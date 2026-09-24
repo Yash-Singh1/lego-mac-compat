@@ -822,7 +822,7 @@ int main(int argc, char **argv)
 
     struct macho_image32 image;
     if (macho_image32_load(image_path, &image) != 0) return EXIT_FAILURE;
-    if (lp32_profile_select(&image) != 0) {
+    if (lp32_profile_select(&image, image_path) != 0) {
         macho_image32_unload(&image);
         return EXIT_FAILURE;
     }
@@ -879,20 +879,25 @@ int main(int argc, char **argv)
            Current Apple GPUs offer 32-bit depth. Accept both; the original
            AGL request still chooses a real format with at least 24 bits. */
         const struct lp32_code_signature *check = &lp32_profile()->depth_capability_check;
-        uint8_t *code = (void *)(uintptr_t)check->address;
-        if (memcmp(code, check->expected, check->length) ||
-            mprotect((void *)(uintptr_t)(check->address & ~4095u), 4096, PROT_READ | PROT_WRITE | PROT_EXEC)) {
-            fprintf(stderr, "game_loader: COD4 depth capability signature mismatch or protection error\n");
-            return EXIT_FAILURE;
+        if (check->length) {
+            uint8_t *code = (void *)(uintptr_t)check->address;
+            if (memcmp(code, check->expected, check->length) ||
+                mprotect((void *)(uintptr_t)(check->address & ~4095u), 4096, PROT_READ | PROT_WRITE | PROT_EXEC)) {
+                fprintf(stderr, "game_loader: COD4 depth capability signature mismatch or protection error\n");
+                return EXIT_FAILURE;
+            }
+            code[check->length - 1] = 0x18;
+            flush_guest_instruction(check->address);
         }
-        code[check->length - 1] = 0x18;
-        flush_guest_instruction(check->address);
         if (guest_dyld32_initialize(image_path) || guest_dyld32_bind_main_cxx(&image))
             return EXIT_FAILURE;
         char bink_path[PATH_MAX];
         int length = snprintf(bink_path, sizeof(bink_path), "%s/libBinkMachOx86.dylib", guest_dyld32_game_root());
-        uint32_t bink = length > 0 && (size_t)length < sizeof(bink_path) ? guest_dyld32_open(bink_path, RTLD_NOW) : 0;
-        if (!bink) {
+        unsigned bink_imports = 0;
+        for (unsigned i = 0; i < image.import_count; ++i)
+            if (!strncmp(image.imports[i].name, "_Bink", 5)) ++bink_imports;
+        uint32_t bink = bink_imports && length > 0 && (size_t)length < sizeof(bink_path) ? guest_dyld32_open(bink_path, RTLD_NOW) : 0;
+        if (bink_imports && !bink) {
             fprintf(stderr, "game_loader: cannot load original Bink library: %s\n", (char *)(uintptr_t)guest_dyld32_error());
             return EXIT_FAILURE;
         }
@@ -904,7 +909,7 @@ int main(int argc, char **argv)
             if (!address || macho_image32_bind_import(import, address)) return EXIT_FAILURE;
             ++bound;
         }
-        fprintf(stderr, "compat32: bound %u Bink imports to the original i386 library\n", bound);
+        if (bink_imports) fprintf(stderr, "compat32: bound %u Bink imports to the original i386 library\n", bound);
     }
     if (getenv("LP32_OBJC_LIFETIME_SELFTEST")) {
         int result=objc_legacy32_run_lifetime_self_test();

@@ -8,57 +8,84 @@ enum GameMode: String, CaseIterable {
     var imageName: String { self == .sp ? "COD4.image" : "COD4MP.image" }
     var originalExecutable: String { self == .sp ? "Call of Duty 4" : "Call of Duty 4 Multiplayer" }
     var icon: String { self == .sp ? "Game.icns" : "Game_mp.icns" }
-    var digest: String {
-        self == .sp ? "43629c7f2f1b6f891e93c134f3101dbfb9fc4b46cabb1491e90437a450208870" :
-            "f90ec11a0822628aac0c2f788d980967ad333405b2fec5f3ecfbca1e3d8d1374"
-    }
 }
 
 struct COD4Source {
     static let appName = "Call of Duty 4.app"
     let app: URL
     let mode: GameMode
+    var directMultiplayer = false
     var contents: URL {
-        app.appendingPathComponent(mode == .sp ? "Contents" : "Contents/Call of Duty 4 Multiplayer.app/Contents")
+        app.appendingPathComponent(mode == .sp || directMultiplayer ? "Contents" : "Contents/Call of Duty 4 Multiplayer.app/Contents")
     }
-    var image: URL { contents.appendingPathComponent("MacOS/" + mode.originalExecutable) }
+    var image: URL {
+        let info = (try? Data(contentsOf: contents.appendingPathComponent("Info.plist")))
+            .flatMap { try? PropertyListSerialization.propertyList(from: $0, format: nil) as? [String: Any] }
+        let name = info?["CFBundleExecutable"] as? String ?? mode.originalExecutable
+        return contents.appendingPathComponent("MacOS/" + name)
+    }
     var resources: URL { contents.appendingPathComponent("Resources") }
-    var gameData: URL { app.appendingPathComponent("Contents/Call of Duty 4 Data") }
+    var gameData: URL {
+        let candidates = [app.appendingPathComponent("Contents/Call of Duty 4 Data"),
+                          app.appendingPathComponent("Contents/Resources/Call of Duty 4 Data"),
+                          app.deletingLastPathComponent().appendingPathComponent("Call of Duty 4 Data")]
+        return candidates.first { FileManager.default.fileExists(atPath: $0.appendingPathComponent("main/iw_00.iwd").path) } ?? candidates[0]
+    }
+    private func library(_ name: String) -> URL? {
+        for directory in ["MacOS", "Frameworks", "Resources"] {
+            let url = contents.appendingPathComponent(directory + "/" + name)
+            if FileManager.default.fileExists(atPath: url.path) { return url }
+        }
+        return nil
+    }
+    var steamLibrary: URL? { library("libsteam_api.dylib") }
+    var binkLibrary: URL? { library("libBinkMachOx86.dylib") }
 
     static func discover(_ selected: URL, mode: GameMode = .sp) throws -> COD4Source {
         let selected = selected.resolvingSymlinksInPath().standardizedFileURL
         var candidates = [selected]
         // Finder can select the nested multiplayer app as well as the outer app.
         if selected.lastPathComponent == "Call of Duty 4 Multiplayer.app" {
-            candidates.append(selected.deletingLastPathComponent().deletingLastPathComponent())
+            candidates.insert(selected.deletingLastPathComponent().deletingLastPathComponent(), at: 0)
         }
         for prefix in ["", "Call of Duty 4/", "common/Call of Duty 4/", "steamapps/common/Call of Duty 4/"] {
             candidates.append(selected.appendingPathComponent(prefix + appName))
         }
+        var firstError: Error?
         for app in candidates {
-            guard FileManager.default.fileExists(atPath: app.appendingPathComponent("Contents/MacOS/Call of Duty 4").path) else { continue }
-            let source = COD4Source(app: app, mode: mode)
-            _ = try source.validateLayout()
-            return source
+            guard FileManager.default.fileExists(atPath: app.appendingPathComponent("Contents/Info.plist").path) else { continue }
+            let source = COD4Source(app: app, mode: mode,
+                                    directMultiplayer: mode == .mp && app == selected &&
+                                        app.lastPathComponent == "Call of Duty 4 Multiplayer.app")
+            do {
+                _ = try source.validateLayout()
+                return source
+            } catch {
+                if firstError == nil { firstError = error }
+            }
         }
-        throw ConversionError.message("Choose Call of Duty 4.app or its Steam Mac game folder. This converter needs Aspyr’s Steam Mac 1.7.2 release of the original Modern Warfare; Windows, retail and Remastered installations are not supported.")
+        if let firstError { throw firstError }
+        throw ConversionError.message("Choose the original Mac Call of Duty 4 app or its game folder. The executable must contain 32-bit Intel Mac code.")
     }
 
     func validateLayout() throws -> [String: Any] {
         let fm = FileManager.default
-        for file in [image, contents.appendingPathComponent("Info.plist"),
-                     resources.appendingPathComponent(mode.icon), contents.appendingPathComponent("MacOS/libBinkMachOx86.dylib"),
-                     contents.appendingPathComponent("MacOS/libsteam_api.dylib"), gameData.appendingPathComponent("main/iw_00.iwd")] {
+        let infoURL = contents.appendingPathComponent("Info.plist")
+        let data = try Data(contentsOf: infoURL)
+        guard let info = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+              let executable = info["CFBundleExecutable"] as? String,
+              !executable.isEmpty, executable != ".", executable != "..",
+              !executable.contains("/"), !executable.contains("\\") else {
+            throw ConversionError.message("The Mac game app has an invalid executable entry in Info.plist.")
+        }
+        for file in [image, infoURL, gameData.appendingPathComponent("main/iw_00.iwd")] {
             var directory: ObjCBool = false
             guard fm.fileExists(atPath: file.path, isDirectory: &directory), !directory.boolValue else {
-                throw ConversionError.message("The Steam Mac installation is incomplete: missing \(file.lastPathComponent). Let Steam finish installing the Mac version before converting.")
+                throw ConversionError.message("The Mac game installation is incomplete: missing \(file.lastPathComponent).")
             }
         }
-        let data = try Data(contentsOf: contents.appendingPathComponent("Info.plist"))
-        guard let info = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
-              info["CFBundleIdentifier"] as? String == "com.aspyr.callofduty4.\(mode.rawValue).steam",
-              info["CFBundleShortVersionString"] as? String == "1.7.2" else {
-            throw ConversionError.message("This is not the supported Aspyr Steam Mac 1.7.2 installation. Choose the original Steam app, rather than an already converted copy.")
+        if info["LP32GeneratedGame"] as? String == "cod4" {
+            throw ConversionError.message("Choose the original game app, rather than an already converted copy.")
         }
         return info
     }
@@ -96,8 +123,10 @@ struct COD4Source {
 }
 
 // Materialize an independent copy. Reject links before any signing or metadata
-// changes could follow them back into the Steam installation.
-func copyGameTree(_ source: URL, to target: URL, check: () throws -> Void = {}) throws {
+// changes could follow them back into the source installation.
+func copyGameTree(_ source: URL, to target: URL, excluding excluded: URL? = nil,
+                  check: () throws -> Void = {}) throws {
+    if let excluded, source.standardizedFileURL == excluded.standardizedFileURL { return }
     let fm = FileManager.default
     try check()
     let attributes = try fm.attributesOfItem(atPath: source.path)
@@ -105,11 +134,12 @@ func copyGameTree(_ source: URL, to target: URL, check: () throws -> Void = {}) 
     case .typeDirectory:
         try fm.createDirectory(at: target, withIntermediateDirectories: true)
         for item in try fm.contentsOfDirectory(at: source, includingPropertiesForKeys: nil) {
-            try copyGameTree(item, to: target.appendingPathComponent(item.lastPathComponent), check: check)
+            try copyGameTree(item, to: target.appendingPathComponent(item.lastPathComponent),
+                             excluding: excluded, check: check)
         }
     case .typeRegular:
         try fm.copyItem(at: source, to: target)
     default:
-        throw ConversionError.message("The installation contains a link or unsupported file at \(source.path). Choose a complete, original Steam installation.")
+        throw ConversionError.message("The installation contains a link or unsupported file at \(source.path). Choose a complete original Mac installation.")
     }
 }

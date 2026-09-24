@@ -212,7 +212,7 @@ struct lp32_game_profile {
 
 /* Chooses the profile for a loaded image (LP32_GAME overrides detection).
    Returns -1 when the image is not a known title. */
-int lp32_profile_select(const struct macho_image32 *image);
+int lp32_profile_select(const struct macho_image32 *image, const char *image_path);
 
 /* Always non-NULL after lp32_profile_select; before that a neutral profile
    with no patches is returned. */

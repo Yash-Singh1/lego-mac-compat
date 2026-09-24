@@ -56,7 +56,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var window: NSWindow!
     private let drop = DropView()
     private let status = label("Drop Call of Duty 4 here", size: 20, weight: .semibold)
-    private let detail = label("Drop the Steam Mac app or its game folder.\nRequires the original Modern Warfare (2007).", size: 13)
+    private let detail = label("Drop a 32-bit Mac COD4 app or its game folder.\nSteam is optional; other releases are experimental.", size: 13)
     private let footnote = label("Creates a new copy. Your original game and saves stay untouched.", size: 11)
     private let progress = NSProgressIndicator()
     private let choose = NSButton(title: "Choose Call of Duty 4…", target: nil, action: #selector(chooseSource))
@@ -167,7 +167,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         choosing = true
         let panel = NSOpenPanel()
-        panel.message = "Choose Call of Duty 4.app or its Steam Mac game folder."
+        panel.message = "Choose a 32-bit Mac Call of Duty 4 app or its game folder."
         panel.prompt = "Choose Game"
         panel.allowedContentTypes = [.applicationBundle, .folder]
         panel.treatsFilePackagesAsDirectories = false
@@ -197,7 +197,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         secondary.isHidden = true
         choose.title = "Choose Call of Duty 4…"
         status.stringValue = "Drop Call of Duty 4 here"
-        detail.stringValue = "Choose Campaign or Multiplayer, then drop the Steam Mac app or its game folder."
+        detail.stringValue = "Choose Campaign or Multiplayer, then drop the Mac app or its game folder."
     }
 
     private func selectDestination(for source: URL) {

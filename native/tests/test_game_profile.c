@@ -16,14 +16,14 @@ int main(void)
             .entry_eip = profile->entry_eip,
             .max_address = profile->image_end,
         };
-        assert(lp32_profile_select(&image) == 0);
+        assert(lp32_profile_select(&image, NULL) == 0);
         assert(lp32_profile() == profile);
         /* Neither half of the fingerprint alone may select a patch layout. */
         ++image.max_address;
-        assert(lp32_profile_select(&image) == -1);
+        assert(lp32_profile_select(&image, NULL) == -1);
         --image.max_address;
         ++image.entry_eip;
-        assert(lp32_profile_select(&image) == -1);
+        assert(lp32_profile_select(&image, NULL) == -1);
         assert(profile->thread_argument_is_direct == (i >= 2));
         assert(profile->callee_pops_struct_return == (i == 2 || i == 5));
         assert((profile->steam_achievement_guard != NULL) == (i == 2));
@@ -38,14 +38,24 @@ int main(void)
         assert(p && p->steam_app_id == 7940 && p->callee_pops_struct_return);
         assert(!p->controller && !p->startup_latch && !p->steam_achievement_guard);
         assert((p->loading_screen != NULL) == (i == 0));
-        struct macho_image32 image = {.entry_eip = p->entry_eip, .max_address = p->image_end};
-        assert(lp32_profile_select(&image) == 0 && lp32_profile() == p);
+        struct macho_image32 image = {.entry_eip = p->entry_eip, .max_address = p->image_end,
+                                     .import_count = 1};
+        image.imports[0].name = "_SteamAPI_Init";
+        assert(lp32_profile_select(&image, NULL) == 0 && lp32_profile() == p);
         ++image.max_address;
-        assert(lp32_profile_select(&image) == -1);
+        assert(lp32_profile_select(&image, NULL) == -1);
         --image.max_address;
         ++image.entry_eip;
-        assert(lp32_profile_select(&image) == -1);
+        assert(lp32_profile_select(&image, NULL) == -1);
         assert(p->depth_capability_check.length == 7);
+        image.import_count = 0;
+        assert(lp32_profile_select(&image, "COD4.image") == 0);
+        assert(lp32_profile()->steam_app_id == 0);
+        ++image.max_address;
+        assert(lp32_profile_select(&image, i ? "COD4MP.image" : "COD4.image") == 0);
+        assert(lp32_profile()->depth_capability_check.length == 0);
+        assert(lp32_profile()->main_address == 0);
+        assert(lp32_profile()->loading_screen == NULL);
     }
     assert(lp32_profile_named("cod") == lp32_profile_named("cod4"));
     assert(lp32_profile_named("cod4-mp") == lp32_profile_named("cod4mp"));
@@ -61,9 +71,9 @@ int main(void)
     assert(!lp32_profile_named("unsupported"));
     struct macho_image32 unknown = {0};
     setenv("LP32_GAME", "unsupported", 1);
-    assert(lp32_profile_select(&unknown) == -1);
+    assert(lp32_profile_select(&unknown, NULL) == -1);
     setenv("LP32_GAME", "marvel", 1);
-    assert(lp32_profile_select(&unknown) == 0);
+    assert(lp32_profile_select(&unknown, NULL) == 0);
     assert(lp32_profile()->title == LP32_TITLE_MARVEL);
     unsetenv("LP32_GAME");
     puts("game-profile PASS (fingerprints, aliases, overrides, ABI isolation)");

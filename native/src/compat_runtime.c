@@ -3654,6 +3654,10 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
     if (!strcmp(name, "_puts")) {
         /* Aspyr prints the Steam proof-of-purchase key before storing it.
            Keep the license callback intact without recording its secret. */
+        if ((lp32_profile()->title == LP32_TITLE_COD4 ||
+             lp32_profile()->title == LP32_TITLE_COD4_MP) &&
+            !lp32_profile()->license_log_return_address)
+            return 0;
         if (return_address && return_address == lp32_profile()->license_log_return_address)
             return (uint32_t)puts("compat32: Steam license key received");
         return (uint32_t)puts((const char *)(uintptr_t)arguments[0]);

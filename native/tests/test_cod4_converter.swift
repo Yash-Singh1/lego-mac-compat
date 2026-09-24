@@ -80,13 +80,14 @@ struct ConverterTests {
                                  (layout.gameData.appendingPathComponent("main/iw_00.iwd"), Data("game".utf8))] {
                 try bytes.write(to: url)
             }
-            let info = ["CFBundleIdentifier": "com.aspyr.callofduty4.\(mode.rawValue).steam", "CFBundleShortVersionString": "1.7.2"]
+            let info = ["CFBundleIdentifier": "com.aspyr.callofduty4.\(mode.rawValue).steam",
+                        "CFBundleShortVersionString": "1.7.2", "CFBundleExecutable": mode.originalExecutable]
             try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0).write(to: layout.contents.appendingPathComponent("Info.plist"))
             for selection in [source, source.deletingLastPathComponent(), steamRoot,
                               steamRoot.appendingPathComponent("steamapps"), steamRoot.appendingPathComponent("steamapps/common")] {
                 try expect(try COD4Source.discover(selection, mode: mode).image == layout.image, "Steam folder and mode discovery")
             }
-            try rejects("unsupported executable fingerprint") { _ = try converter.convert(source: source, destination: destination, mode: mode) }
+            try expect(try machOSlice(Data(contentsOf: layout.image), cpu: 7) == thin, "other i386 builds are accepted")
         }
         let nested = source.appendingPathComponent("Contents/Call of Duty 4 Multiplayer.app")
         try expect(try COD4Source.discover(nested, mode: .mp).app.path == source.path, "nested multiplayer selection")
@@ -107,6 +108,30 @@ struct ConverterTests {
         try rejects("output inside converter") { _ = try converter.convert(source: source, destination: resources) }
         try rejects("missing game") { _ = try COD4Source.discover(destination) }
         let layout = try COD4Source.discover(source)
+        let retail = temp.appendingPathComponent("Retail/Call of Duty 4.app")
+        let retailContents = retail.appendingPathComponent("Contents")
+        try fm.createDirectory(at: retailContents.appendingPathComponent("MacOS"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: retailContents.appendingPathComponent("Call of Duty 4 Data/main"), withIntermediateDirectories: true)
+        try thin.write(to: retailContents.appendingPathComponent("MacOS/COD4 Retail"))
+        try Data("game".utf8).write(to: retailContents.appendingPathComponent("Call of Duty 4 Data/main/iw_00.iwd"))
+        let retailInfo = ["CFBundleIdentifier": "com.aspyr.callofduty4.retail", "CFBundleShortVersionString": "1.0",
+                          "CFBundleExecutable": "COD4 Retail"]
+        try PropertyListSerialization.data(fromPropertyList: retailInfo, format: .xml, options: 0)
+            .write(to: retailContents.appendingPathComponent("Info.plist"))
+        let retailLayout = try COD4Source.discover(retail)
+        try expect(retailLayout.image.lastPathComponent == "COD4 Retail" && retailLayout.steamLibrary == nil,
+                   "non-Steam executable and layout accepted")
+        let directMP = temp.appendingPathComponent("Standalone/Call of Duty 4 Multiplayer.app")
+        let directContents = directMP.appendingPathComponent("Contents")
+        try fm.createDirectory(at: directContents.appendingPathComponent("MacOS"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: directMP.deletingLastPathComponent().appendingPathComponent("Call of Duty 4 Data/main"), withIntermediateDirectories: true)
+        try thin.write(to: directContents.appendingPathComponent("MacOS/COD4 MP"))
+        try Data("game".utf8).write(to: directMP.deletingLastPathComponent().appendingPathComponent("Call of Duty 4 Data/main/iw_00.iwd"))
+        let directInfo = ["CFBundleExecutable": "COD4 MP"]
+        try PropertyListSerialization.data(fromPropertyList: directInfo, format: .xml, options: 0)
+            .write(to: directContents.appendingPathComponent("Info.plist"))
+        try expect(try COD4Source.discover(directMP, mode: .mp).image.lastPathComponent == "COD4 MP",
+                   "standalone multiplayer app accepted")
         let copy = temp.appendingPathComponent("data-copy")
         try copyGameTree(layout.gameData, to: copy)
         try expect(try Data(contentsOf: copy.appendingPathComponent("main/iw_00.iwd")) == Data("game".utf8), "independent data copy")
@@ -117,7 +142,7 @@ struct ConverterTests {
         try fm.removeItem(at: layout.gameData.appendingPathComponent("main/iw_00.iwd"))
         try rejects("incomplete data") { _ = try COD4Source.discover(source) }
         try Data("game".utf8).write(to: layout.gameData.appendingPathComponent("main/iw_00.iwd"))
-        print("PASS: SP/MP layouts, Steam discovery, fingerprint, copy, links, containment and missing data")
+        print("PASS: SP/MP layouts, Steam discovery, other editions, copy, links, containment and missing data")
 
         let existing = destination.appendingPathComponent("COD4-Compat.app")
         try fm.createDirectory(at: existing, withIntermediateDirectories: false)

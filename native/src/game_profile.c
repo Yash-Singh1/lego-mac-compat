@@ -2,8 +2,10 @@
 #include "macho_loader.h"
 
 #include <stdio.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <CommonCrypto/CommonDigest.h>
 
 /* ------------------------------------------------------------------------
  * LEGO Pirates of the Caribbean (TransGaming, 2011; recovered from the SecuROM
@@ -411,6 +413,60 @@ static const struct lp32_game_profile *const known_profiles[] = {
 };
 
 static const struct lp32_game_profile *current_profile = &unknown_profile;
+static struct lp32_game_profile cod4_detected_profile;
+
+static bool tested_cod4_image(const char *path, enum lp32_title title)
+{
+    const char *expected = title == LP32_TITLE_COD4 ?
+        "43629c7f2f1b6f891e93c134f3101dbfb9fc4b46cabb1491e90437a450208870" :
+        "f90ec11a0822628aac0c2f788d980967ad333405b2fec5f3ecfbca1e3d8d1374";
+    FILE *file = fopen(path, "rb");
+    if (!file) return false;
+    CC_SHA256_CTX state;
+    CC_SHA256_Init(&state);
+    uint8_t buffer[65536];
+    size_t count;
+    while ((count = fread(buffer, 1, sizeof(buffer), file)) != 0)
+        CC_SHA256_Update(&state, buffer, (CC_LONG)count);
+    bool valid = !ferror(file);
+    fclose(file);
+    if (!valid) return false;
+    uint8_t digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256_Final(digest, &state);
+    char actual[CC_SHA256_DIGEST_LENGTH * 2 + 1];
+    for (unsigned i = 0; i < sizeof(digest); ++i)
+        snprintf(actual + i * 2, 3, "%02x", digest[i]);
+    return !strcmp(actual, expected);
+}
+
+static struct lp32_code_signature cod4_depth_signature(const struct macho_image32 *image)
+{
+    static const uint8_t pattern[] = {0xf6, 0x85, 0xbd, 0xfb, 0xff, 0xff, 0x08};
+    struct lp32_code_signature found = {0};
+    if (!image->header) return found;
+    const struct load_command *command = (const void *)(image->header + 1);
+    for (uint32_t i = 0; i < image->header->ncmds; ++i) {
+        if (command->cmd == LC_SEGMENT && command->cmdsize >= sizeof(struct segment_command)) {
+            const struct segment_command *segment = (const void *)command;
+            if ((segment->initprot & VM_PROT_EXECUTE) &&
+                segment->vmaddr >= image->min_address && segment->vmaddr < image->max_address) {
+                uint32_t size = segment->vmsize;
+                if (size > image->max_address - segment->vmaddr)
+                    size = image->max_address - segment->vmaddr;
+                const uint8_t *bytes = (const void *)(uintptr_t)segment->vmaddr;
+                for (uint32_t offset = 0; offset + sizeof(pattern) <= size; ++offset) {
+                    if (memcmp(bytes + offset, pattern, sizeof(pattern))) continue;
+                    if (found.length) return (struct lp32_code_signature){0};
+                    found.address = segment->vmaddr + offset;
+                    memcpy(found.expected, pattern, sizeof(pattern));
+                    found.length = sizeof(pattern);
+                }
+            }
+        }
+        command = (const void *)((const char *)command + command->cmdsize);
+    }
+    return found;
+}
 
 const struct lp32_game_profile *lp32_profile(void)
 {
@@ -451,17 +507,31 @@ static uint32_t call_target(const struct macho_image32 *image, uint32_t site)
 uint32_t lp32_profile_main_address(const struct macho_image32 *image)
 {
     if (image->main_address) return image->main_address;
+    if (image->entry_eip < image->min_address || image->entry_eip >= image->max_address)
+        return 0;
+    uint32_t entry_bytes = image->max_address - image->entry_eip;
+    if (entry_bytes > 128) entry_bytes = 128;
+    /* Aspyr's COD4 crt calls main directly from start, then stores eax as
+       exit's argument before a second call and hlt. */
+    const uint8_t *stub = (const void *)(uintptr_t)image->entry_eip;
+    for (uint32_t offset = 0; offset + 15 <= entry_bytes; ++offset) {
+        if (stub[offset] != 0xe8 || stub[offset + 5] != 0x89 ||
+            stub[offset + 6] != 0x44 || stub[offset + 7] != 0x24 ||
+            stub[offset + 8] != 0x00 || stub[offset + 9] != 0xe8 ||
+            stub[offset + 14] != 0xf4) continue;
+        uint32_t main = call_target(image, image->entry_eip + offset);
+        if (main) return main;
+    }
     /*
      * crt1's `start` stub ends with `call __start; hlt`.  The C-level
      * `__start` asks dyld for its initializer/terminator hooks through the
      * __dyld section (which this loader does not populate: initializers are
      * run explicitly), then ends with `call main; mov %eax,(%esp); call exit`.
-     * Both titles share this crt, so find main as the call preceding that
-     * exit sequence rather than executing the crt.
+     * The LEGO titles using this crt put main before that exit sequence.
+     * Find the call instead of executing crt startup.
      */
-    const uint8_t *stub = (const void *)(uintptr_t)image->entry_eip;
     uint32_t crt_start = 0;
-    for (uint32_t offset = 0; offset + 6 <= 96; ++offset) {
+    for (uint32_t offset = 0; offset + 6 <= entry_bytes && offset < 96; ++offset) {
         if (stub[offset] != 0xe8 || stub[offset + 5] != 0xf4) continue;
         crt_start = call_target(image, image->entry_eip + offset);
         if (crt_start) break;
@@ -469,7 +539,9 @@ uint32_t lp32_profile_main_address(const struct macho_image32 *image)
     if (!crt_start) return 0;
 
     const uint8_t *code = (const void *)(uintptr_t)crt_start;
-    for (uint32_t offset = 0; offset + 9 <= 0x200; ++offset) {
+    uint32_t crt_bytes = image->max_address - crt_start;
+    if (crt_bytes > 0x200) crt_bytes = 0x200;
+    for (uint32_t offset = 0; offset + 9 <= crt_bytes; ++offset) {
         /* e8 rel32 ; 89 04 24 ; e8 */
         if (code[offset] != 0xe8 || code[offset + 5] != 0x89 ||
             code[offset + 6] != 0x04 || code[offset + 7] != 0x24 ||
@@ -482,7 +554,7 @@ uint32_t lp32_profile_main_address(const struct macho_image32 *image)
     return 0;
 }
 
-int lp32_profile_select(const struct macho_image32 *image)
+int lp32_profile_select(const struct macho_image32 *image, const char *image_path)
 {
     const struct lp32_game_profile *selected = NULL;
     const char *override = getenv("LP32_GAME");
@@ -502,12 +574,50 @@ int lp32_profile_select(const struct macho_image32 *image)
             }
         }
     }
+    if (selected && image_path &&
+        (selected->title == LP32_TITLE_COD4 || selected->title == LP32_TITLE_COD4_MP) &&
+        (!tested_cod4_image(image_path, selected->title) || getenv("LP32_COD4_GENERIC")))
+        selected = NULL;
+    if (!selected && image_path) {
+        const char *name = strrchr(image_path, '/');
+        name = name ? name + 1 : image_path;
+        if (!strcmp(name, "COD4.image") || !strcmp(name, "COD4MP.image")) {
+            /* Other Mac releases may place functions at different addresses.
+               Retain title-level ABI handling, but never apply the tested
+               Steam image's address-based patches to an unknown binary. */
+            cod4_detected_profile = !strcmp(name, "COD4.image") ? cod4_profile : cod4_mp_profile;
+            cod4_detected_profile.entry_eip = image->entry_eip;
+            cod4_detected_profile.image_end = image->max_address;
+            cod4_detected_profile.main_address = 0;
+            cod4_detected_profile.depth_capability_check = cod4_depth_signature(image);
+            cod4_detected_profile.server_name_compare = (struct lp32_code_signature){0};
+            cod4_detected_profile.license_log_return_address = 0;
+            cod4_detected_profile.loading_screen = NULL;
+            selected = &cod4_detected_profile;
+            fprintf(stderr, "compat32: using generic COD4 profile for an untested image\n");
+        }
+    }
     if (!selected) {
         fprintf(stderr,
                 "game_loader: unrecognised image (entry=0x%08x end=0x%08x); "
                 "set LP32_GAME to force a profile\n",
                 image->entry_eip, image->max_address);
         return -1;
+    }
+    if (selected->title == LP32_TITLE_COD4 || selected->title == LP32_TITLE_COD4_MP) {
+        bool has_steam = false;
+        for (unsigned i = 0; i < image->import_count; ++i) {
+            const char *name = image->imports[i].name;
+            if (name && (!strncmp(name, "_Steam", 6) || !strncmp(name, "Steam", 5))) {
+                has_steam = true;
+                break;
+            }
+        }
+        if (!has_steam) {
+            cod4_detected_profile = *selected;
+            cod4_detected_profile.steam_app_id = 0;
+            selected = &cod4_detected_profile;
+        }
     }
     current_profile = selected;
     fprintf(stderr, "compat32: title profile %s (%s)\n", selected->name,

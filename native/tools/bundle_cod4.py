@@ -1,18 +1,49 @@
 #!/usr/bin/env python3
-"""Build a COD4 compatibility app from the user's original Steam Mac installation."""
+"""Build a COD4 compatibility app from a 32-bit Mac installation."""
 import argparse
-import hashlib
 import plistlib
 import re
 import shutil
+import struct
 import subprocess
 import tempfile
 from pathlib import Path
 
-EXECUTABLES = {
-    "sp": ("Call of Duty 4", "43629c7f2f1b6f891e93c134f3101dbfb9fc4b46cabb1491e90437a450208870"),
-    "mp": ("Call of Duty 4 Multiplayer", "f90ec11a0822628aac0c2f788d980967ad333405b2fec5f3ecfbca1e3d8d1374"),
-}
+EXECUTABLES = {"sp": "Call of Duty 4", "mp": "Call of Duty 4 Multiplayer"}
+
+
+def macho_slice(data, cpu):
+    thin_magic = b"\xce\xfa\xed\xfe" if cpu == 7 else b"\xcf\xfa\xed\xfe"
+    header_size = 28 if cpu == 7 else 32
+    if len(data) >= header_size and data[:4] == thin_magic and struct.unpack_from('<I', data, 4)[0] == cpu:
+        return data
+    if len(data) < 8 or data[:4] != b"\xca\xfe\xba\xbe":
+        raise ValueError("The library or game executable has no required Intel Mach-O architecture")
+    count = struct.unpack_from('>I', data, 4)[0]
+    if count > (len(data) - 8) // 20:
+        raise ValueError("Invalid universal Mach-O architecture table")
+    for index in range(count):
+        kind, _, offset, size, _ = struct.unpack_from('>IIIII', data, 8 + index * 20)
+        if kind != cpu:
+            continue
+        if offset < 8 + count * 20 or size < header_size or offset > len(data) or size > len(data) - offset:
+            raise ValueError("Invalid Intel Mach-O slice")
+        return macho_slice(data[offset:offset + size], cpu)
+    raise ValueError("The library or game executable has no required Intel Mach-O architecture")
+
+
+def game_data(source):
+    for path in (source / 'Contents/Call of Duty 4 Data',
+                 source / 'Contents/Resources/Call of Duty 4 Data',
+                 source.parent / 'Call of Duty 4 Data'):
+        if (path / 'main/iw_00.iwd').is_file():
+            return path
+    raise ValueError("Missing Call of Duty 4 Data/main/iw_00.iwd")
+
+
+def library(contents, name):
+    return next((contents / directory / name for directory in ('MacOS', 'Frameworks', 'Resources')
+                 if (contents / directory / name).is_file()), None)
 
 
 def steam_source(steam=None):
@@ -36,25 +67,30 @@ def steam_source(steam=None):
 
 def validate_source(source, mode):
     contents = source / "Contents"
-    selected = contents if mode == "sp" else contents / "Call of Duty 4 Multiplayer.app/Contents"
-    name, digest = EXECUTABLES[mode]
+    selected = contents if mode == "sp" or source.name == "Call of Duty 4 Multiplayer.app" else contents / "Call of Duty 4 Multiplayer.app/Contents"
+    info_path = selected / "Info.plist"
+    if not info_path.is_file():
+        raise ValueError(f"Missing Mac app Info.plist: {info_path}")
+    info = plistlib.loads(info_path.read_bytes())
+    name = info.get('CFBundleExecutable')
+    if not isinstance(name, str) or name in ('', '.', '..') or '/' in name or '\\' in name:
+        raise ValueError("Invalid CFBundleExecutable in the Mac app Info.plist")
+    if info.get('LP32GeneratedGame') == 'cod4':
+        raise ValueError("Choose the original Mac game app, not a converted copy")
     image = selected / "MacOS" / name
-    required = [selected / "Info.plist", selected / ("Resources/Game.icns" if mode == "sp" else "Resources/Game_mp.icns"), image,
-                selected / "MacOS/libBinkMachOx86.dylib", selected / "MacOS/libsteam_api.dylib",
-                contents / "Call of Duty 4 Data/main/iw_00.iwd"]
+    required = [image, game_data(source) / 'main/iw_00.iwd']
     missing = [str(p) for p in required if not p.is_file()]
     if missing:
-        raise ValueError("Missing Steam Mac files: " + ", ".join(missing))
-    info = plistlib.loads((selected / "Info.plist").read_bytes())
-    if info.get("CFBundleIdentifier") != f"com.aspyr.callofduty4.{mode}.steam" or info.get("CFBundleShortVersionString") != "1.7.2":
-        raise ValueError("Expected the Aspyr Steam Mac 1.7.2 release")
-    if hashlib.sha256(image.read_bytes()).hexdigest() != digest:
-        raise ValueError(f"Unsupported {name} executable; its fingerprint differs from the tested Steam build")
+        raise ValueError("Missing Mac game files: " + ", ".join(missing))
+    macho_slice(image.read_bytes(), 7)
     return selected, image, info
 
 
 def validate_destination(source, bundle):
     source, destination = source.resolve(), bundle.resolve()
+    if (source.name == 'Call of Duty 4 Multiplayer.app' and source.parent.name == 'Contents'
+            and source.parent.parent.suffix == '.app'):
+        source = source.parent.parent
     if source == destination or source in destination.parents or destination in source.parents:
         raise ValueError("Build destination must be separate from the Steam source installation")
     if bundle.exists():
@@ -81,7 +117,10 @@ def build(source, mode, loader, bundle, inactive, runtime):
     for name, (_, digest) in LIBRARIES.items():
         if not (runtime / name).is_file() or sha256(runtime / name) != digest:
             raise ValueError("Missing or unrecognized private C++ runtime; run make cod4-runtime")
-    run("lipo", selected / "MacOS/libsteam_api.dylib", "-verify_arch", "x86_64")
+    steam_library = library(selected, 'libsteam_api.dylib')
+    steam_image = macho_slice(steam_library.read_bytes(), 0x01000007) if steam_library else None
+    bink_source = library(selected, 'libBinkMachOx86.dylib')
+    data_source = game_data(source)
     suffix = "MP" if mode == "mp" else ""
     bundle.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".cod4-stage-", dir=bundle.parent) as tmp:
@@ -89,22 +128,35 @@ def build(source, mode, loader, bundle, inactive, runtime):
         contents = staged / "Contents"
         for name in ("MacOS", "SharedSupport", "Resources"):
             (contents / name).mkdir(parents=True)
-        ditto(selected / "Resources", contents / "Resources")
-        ditto(source / "Contents/Call of Duty 4 Data", contents / "Call of Duty 4 Data")
+        resources = selected / "Resources"
+        if resources.is_dir():
+            if data_source.parent == resources:
+                for item in resources.iterdir():
+                    if item != data_source:
+                        ditto(item, contents / "Resources" / item.name)
+            else:
+                ditto(resources, contents / "Resources")
+        ditto(data_source, contents / "Call of Duty 4 Data")
         shutil.copy2(loader, contents / f"MacOS/COD4{suffix}Compat")
         target = contents / f"SharedSupport/COD4{suffix}.image"
-        shutil.copy2(image, target)
+        target.write_bytes(macho_slice(image.read_bytes(), 7))
         target.chmod(0o644)
         # The original i386 Bink runs as guest code; the Steam SDK runs through
         # the host bridge using the publisher's unmodified x86_64 slice.
-        shutil.copy2(selected / "MacOS/libBinkMachOx86.dylib", contents / "SharedSupport/libBinkMachOx86.dylib")
+        if bink_source:
+            shutil.copy2(bink_source, contents / "SharedSupport/libBinkMachOx86.dylib")
         ditto(runtime, contents / "SharedSupport/compat-runtime")
         steam = contents / "Resources/libsteam_api.dylib"
-        if steam.exists():
-            steam.unlink()
-        run("lipo", selected / "MacOS/libsteam_api.dylib", "-thin", "x86_64", "-output", steam)
-        run("codesign", "--force", "--sign", "-", steam)
-        info.update(CFBundleExecutable=f"COD4{suffix}Compat", CFBundleIdentifier=info["CFBundleIdentifier"] + ".compat",
+        if steam_image:
+            if steam.exists():
+                steam.unlink()
+            steam.write_bytes(steam_image)
+            run("codesign", "--force", "--sign", "-", steam)
+        source_id = info.get('CFBundleIdentifier')
+        if not isinstance(source_id, str) or not source_id:
+            source_id = f'org.32bitgoofy.cod4.{mode}'
+        info.update(CFBundleExecutable=f"COD4{suffix}Compat",
+                    CFBundleIdentifier=source_id + '.compat',
                     CFBundleName=f"Call of Duty 4{(' Multiplayer' if suffix else '')} (Compatibility)",
                     CFBundleDisplayName=f"Call of Duty 4{(' Multiplayer' if suffix else '')} (Compatibility)",
                     LSMinimumSystemVersion="11.0", NSHighResolutionCapable=False,

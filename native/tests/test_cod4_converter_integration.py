@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Exercise the standalone converter with the user's Steam Mac files, read-only."""
 import argparse
-import hashlib
 import os
 from pathlib import Path
 import plistlib
@@ -90,7 +89,7 @@ def main():
             assert info['CFBundleIdentifier'] == f'com.aspyr.callofduty4.{mode}.steam.compat'
             assert info['LP32GeneratedGame'] == 'cod4' and not info['LP32ContinueWhenInactive']
             assert info.get('NSAppTransportSecurity', {}).get('NSAllowsArbitraryLoads', False) == (mode == 'mp')
-            assert runtime.sha256(contents / f'SharedSupport/COD4{suffix}.image') == bundle_cod4.EXECUTABLES[mode][1]
+            assert runtime.sha256(contents / f'SharedSupport/COD4{suffix}.image') == runtime.sha256(bundle_cod4.validate_source(source, mode)[1])
             for name, (_, digest) in runtime.LIBRARIES.items():
                 assert runtime.sha256(contents / 'SharedSupport/compat-runtime' / name) == digest
             # Both game-data trees are independent copies with the original bytes.

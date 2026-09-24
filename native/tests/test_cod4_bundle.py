@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """Source discovery, edition checks and protections for Steam conversions."""
-import hashlib
 from pathlib import Path
 import plistlib
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
 import bundle_cod4 as cod
@@ -23,7 +21,7 @@ class BundleTests(unittest.TestCase):
 
     def fixture(self, mode='sp'):
         contents = self.contents if mode == 'sp' else self.contents / 'Call of Duty 4 Multiplayer.app/Contents'
-        name, _ = cod.EXECUTABLES[mode]
+        name = cod.EXECUTABLES[mode]
         icon = 'Game.icns' if mode == 'sp' else 'Game_mp.icns'
         files = [contents / 'MacOS' / name, contents / 'MacOS/libsteam_api.dylib',
                  contents / 'MacOS/libBinkMachOx86.dylib', contents / 'Resources' / icon,
@@ -33,7 +31,8 @@ class BundleTests(unittest.TestCase):
             p.write_bytes(b'fixture')
         (contents / 'Info.plist').write_bytes(plistlib.dumps({
             'CFBundleIdentifier': f'com.aspyr.callofduty4.{mode}.steam',
-            'CFBundleShortVersionString': '1.7.2', 'CFBundleIconFile': icon}))
+            'CFBundleShortVersionString': '1.7.2', 'CFBundleIconFile': icon,
+            'CFBundleExecutable': name}))
         return contents
 
     def test_external_steam_library(self):
@@ -51,29 +50,34 @@ class BundleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'not found'):
             cod.steam_source(steam)
 
-    def test_exact_supported_images_and_mode_layouts(self):
+    def test_mac_images_and_mode_layouts(self):
         for mode in ('sp', 'mp'):
             contents = self.fixture(mode)
-            with self.assertRaisesRegex(ValueError, 'fingerprint'):
+            name = cod.EXECUTABLES[mode]
+            image = contents / 'MacOS' / name
+            image.write_bytes(bytes.fromhex('cefaedfe07000000') + bytes(20))
+            selected, found, _ = cod.validate_source(self.source, mode)
+            self.assertEqual(selected, contents)
+            self.assertEqual(found, image)
+            image.write_bytes(b'changed')
+            with self.assertRaisesRegex(ValueError, 'Mach-O'):
                 cod.validate_source(self.source, mode)
-            name = cod.EXECUTABLES[mode][0]
-            digest = hashlib.sha256(b'fixture').hexdigest()
-            with patch.dict(cod.EXECUTABLES, {mode: (name, digest)}):
-                selected, image, _ = cod.validate_source(self.source, mode)
-                self.assertEqual(selected, contents)
-                self.assertEqual(image, contents / 'MacOS' / name)
-                image.write_bytes(b'changed')
-                with self.assertRaisesRegex(ValueError, 'fingerprint'):
-                    cod.validate_source(self.source, mode)
 
-    def test_wrong_edition_and_incomplete_data(self):
+    def test_other_edition_and_incomplete_data(self):
         self.fixture()
+        original = self.contents / 'MacOS/Call of Duty 4'
+        image = self.contents / 'MacOS/Retail COD4'
+        original.rename(image)
+        image.write_bytes(bytes.fromhex('cefaedfe07000000') + bytes(20))
+        (self.contents / 'MacOS/libsteam_api.dylib').unlink()
+        (self.contents / 'MacOS/libBinkMachOx86.dylib').unlink()
         info = self.contents / 'Info.plist'
-        info.write_bytes(plistlib.dumps({'CFBundleIdentifier': 'retail', 'CFBundleShortVersionString': '1.7.2'}))
-        with self.assertRaisesRegex(ValueError, 'Aspyr Steam'):
-            cod.validate_source(self.source, 'sp')
+        info.write_bytes(plistlib.dumps({'CFBundleIdentifier': 'retail', 'CFBundleShortVersionString': '1.0',
+                                        'CFBundleExecutable': 'Retail COD4'}))
+        self.assertEqual(cod.validate_source(self.source, 'sp')[1], image)
+        self.assertIsNone(cod.library(self.contents, 'libsteam_api.dylib'))
         (self.contents / 'Call of Duty 4 Data/main/iw_00.iwd').unlink()
-        with self.assertRaisesRegex(ValueError, 'Missing Steam Mac files'):
+        with self.assertRaisesRegex(ValueError, 'Missing Call of Duty 4 Data'):
             cod.validate_source(self.source, 'sp')
 
     def test_source_overlap_and_symlink_protection(self):

@@ -275,11 +275,9 @@ final class Converter {
         }
         let layout = try COD4Source.discover(source, mode: mode)
         try layout.checkDestination(destination)
-        progress("Checking Call of Duty 4…", "Verifying the Steam Mac \(mode.title.lowercased()) installation.")
-        guard try sha256(layout.image) == mode.digest else {
-            throw ConversionError.message("This executable differs from the supported Steam Mac 1.7.2 build. Verify the game files in Steam and choose the original Mac installation.")
-        }
-        let steam = try machOSlice(Data(contentsOf: layout.contents.appendingPathComponent("MacOS/libsteam_api.dylib")), cpu: 0x01000007)
+        progress("Checking Call of Duty 4…", "Reading the Mac \(mode.title.lowercased()) executable.")
+        let gameImage = try machOSlice(Data(contentsOf: layout.image), cpu: 7)
+        let steam = try layout.steamLibrary.map { try machOSlice(Data(contentsOf: $0), cpu: 0x01000007) }
         let loader = resources.appendingPathComponent("game_loader")
         guard fm.isExecutableFile(atPath: loader.path) else {
             throw ConversionError.message("The converter is missing its game launcher. Use a complete copy of COD4-Converter.app.")
@@ -297,19 +295,27 @@ final class Converter {
         }
         progress("Copying Call of Duty 4…", "Creating your \(mode.title.lowercased()) app. This copies about 7 GB of game files.")
         try copyGameTree(layout.gameData, to: output.appendingPathComponent("Call of Duty 4 Data"), check: cancellation.check)
-        try copyGameTree(layout.resources, to: output.appendingPathComponent("Resources"), check: cancellation.check)
-        try copyGameTree(layout.image, to: output.appendingPathComponent("SharedSupport/" + mode.imageName), check: cancellation.check)
+        if fm.fileExists(atPath: layout.resources.path) {
+            try copyGameTree(layout.resources, to: output.appendingPathComponent("Resources"),
+                             excluding: layout.gameData, check: cancellation.check)
+        }
+        try gameImage.write(to: output.appendingPathComponent("SharedSupport/" + mode.imageName))
         try fm.setAttributes([.posixPermissions: 0o644], ofItemAtPath: output.appendingPathComponent("SharedSupport/" + mode.imageName).path)
-        try copyGameTree(layout.contents.appendingPathComponent("MacOS/libBinkMachOx86.dylib"), to: output.appendingPathComponent("SharedSupport/libBinkMachOx86.dylib"), check: cancellation.check)
+        if let bink = layout.binkLibrary {
+            try copyGameTree(bink, to: output.appendingPathComponent("SharedSupport/libBinkMachOx86.dylib"), check: cancellation.check)
+        }
         try copyGameTree(runtime, to: output.appendingPathComponent("SharedSupport/compat-runtime"), check: cancellation.check)
         try fm.copyItem(at: loader, to: output.appendingPathComponent("MacOS/" + mode.executable))
         try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: output.appendingPathComponent("MacOS/" + mode.executable).path)
         let steamOutput = output.appendingPathComponent("Resources/libsteam_api.dylib")
-        if fm.fileExists(atPath: steamOutput.path) { try fm.removeItem(at: steamOutput) }
-        try steam.write(to: steamOutput)
+        if let steam {
+            if fm.fileExists(atPath: steamOutput.path) { try fm.removeItem(at: steamOutput) }
+            try steam.write(to: steamOutput)
+        }
         var info = try layout.validateLayout()
         info["CFBundleExecutable"] = mode.executable
-        info["CFBundleIdentifier"] = "com.aspyr.callofduty4.\(mode.rawValue).steam.compat"
+        let sourceID = info["CFBundleIdentifier"] as? String
+        info["CFBundleIdentifier"] = sourceID.map { $0 + ".compat" } ?? "org.32bitgoofy.cod4.\(mode.rawValue).compat"
         let name = "Call of Duty 4\(mode == .mp ? " Multiplayer" : "") (Compatibility)"
         info["CFBundleName"] = name
         info["CFBundleDisplayName"] = name
@@ -326,7 +332,7 @@ final class Converter {
             .write(to: output.appendingPathComponent("Info.plist"))
         progress("Finishing your app…", "Preparing Call of Duty 4 to open from Finder.")
         try run("/usr/bin/xattr", ["-cr", app.path])
-        try run("/usr/bin/codesign", ["--force", "--sign", "-", steamOutput.path])
+        if steam != nil { try run("/usr/bin/codesign", ["--force", "--sign", "-", steamOutput.path]) }
         try run("/usr/bin/codesign", ["--force", "--sign", "-", app.path])
         try run("/usr/bin/codesign", ["--verify", "--strict", app.path])
         try cancellation.check()
