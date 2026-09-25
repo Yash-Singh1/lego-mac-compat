@@ -60,6 +60,14 @@ verified. This validates the reported controller path, not a full playthrough.
 
 ## Remaining unsupported contracts
 
+The unreleased issue #10 changes add opt-in method/callback tracing and Source
+send-table/class overrides; see [the co-op notes](PORTAL2.md#experimental-cross-build-co-op-issue-10).
+Legacy `SendUserConnectAndAuthenticate_DEPRECATED` and disconnect calls still
+use the native legacy API. No denials are suppressed or approvals synthesized.
+The reported relayed-client authentication failure is not fixed by ABI tracing
+or by the table overrides. `test-portal2-coop` checks callback payloads and
+delivery against a mock client, including all denial reasons 0–14.
+
 The audit covers the generated 983 method entries; it is not a claim that
 every Steamworks feature is implemented. There are still 46 entries with
 explicitly unsupported types/handles. They fail with a named diagnostic

@@ -18,6 +18,7 @@
 #import <OpenGL/OpenGL.h>
 #import <OpenGL/gl.h>
 #import <ImageIO/ImageIO.h>
+#import <CFNetwork/CFNetwork.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <malloc/malloc.h>
@@ -25,6 +26,7 @@
 #import <IOKit/pwr_mgt/IOPMLib.h>
 
 #include <dlfcn.h>
+#include <ffi/ffi.h>
 #include <dispatch/dispatch.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -1074,6 +1076,408 @@ static void guest_source_cancel(void *opaque, CFRunLoopRef loop, CFStringRef mod
     struct guest_runloop_context *context = opaque;
     uint32_t args[] = {context->words[1], proxy_for_object((id)loop), proxy_for_object((id)mode)};
     if (context->words[8]) compat_runtime32_call(context->words[8], args, 3);
+}
+
+static void guest_proxy_autoconfiguration_callback(void *opaque,
+                                                   CFArrayRef proxies,
+                                                   CFErrorRef error)
+{
+    struct guest_runloop_context *context = opaque;
+    uint32_t guest_args[] = {
+        context->words[1], proxy_for_object((id)proxies),
+        proxy_for_object((id)error)
+    };
+    if (context->callback)
+        compat_runtime32_call(context->callback, guest_args, 3);
+}
+
+static void release_proxy_configuration_context(void *opaque)
+{
+    release_runloop_context(opaque);
+}
+
+static uint32_t owned_cf_result(CFTypeRef object)
+{
+    uint32_t handle = proxy_for_owned_value((id)object);
+    if (object) CFRelease(object);
+    return handle;
+}
+
+static const CFDictionaryKeyCallBacks *guest_dictionary_key_callbacks(uint32_t guest)
+{
+    if (guest == compat_runtime32_resolve_symbol(
+            "_kCFCopyStringDictionaryKeyCallBacks", 1))
+        return &kCFCopyStringDictionaryKeyCallBacks;
+    return &kCFTypeDictionaryKeyCallBacks;
+}
+
+static const CFSetCallBacks *guest_set_callbacks(uint32_t guest)
+{
+    if (guest == compat_runtime32_resolve_symbol(
+            "_kCFCopyStringSetCallBacks", 1))
+        return &kCFCopyStringSetCallBacks;
+    return &kCFTypeSetCallBacks;
+}
+
+static void *guest_cf_allocate(CFIndex size, CFOptionFlags hint, void *info)
+{
+    (void)hint; (void)info;
+    return (void *)(uintptr_t)compat_runtime32_allocate(size > 0 ?
+                                                         (size_t)size : 1, 0);
+}
+
+static void *guest_cf_reallocate(void *pointer, CFIndex size,
+                                 CFOptionFlags hint, void *info)
+{
+    (void)hint; (void)info;
+    return (void *)(uintptr_t)compat_runtime32_reallocate(
+        (uint32_t)(uintptr_t)pointer, size > 0 ? (size_t)size : 1);
+}
+
+static void guest_cf_deallocate(void *pointer, void *info)
+{
+    (void)info;
+    compat_runtime32_deallocate((uint32_t)(uintptr_t)pointer);
+}
+
+static CFAllocatorRef guest_data_allocator;
+static void create_guest_data_allocator(void)
+{
+    CFAllocatorContext context = {0};
+    context.allocate = guest_cf_allocate;
+    context.reallocate = guest_cf_reallocate;
+    context.deallocate = guest_cf_deallocate;
+    guest_data_allocator = CFAllocatorCreate(NULL, &context);
+}
+
+static CFAllocatorRef guest_cf_data_allocator(void)
+{
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, create_guest_data_allocator);
+    return guest_data_allocator;
+}
+
+struct guest_allocator_context {
+    uint32_t words[9];
+};
+
+static void release_guest_allocator_context(const void *opaque)
+{
+    struct guest_allocator_context *context = (void *)opaque;
+    if (context->words[3])
+        compat_runtime32_call(context->words[3], context->words + 1, 1);
+    free(context);
+}
+
+static void *guest_allocator_allocate(CFIndex size, CFOptionFlags hint,
+                                      void *opaque)
+{
+    struct guest_allocator_context *context = opaque;
+    if (size < 0 || size > UINT32_MAX || !context->words[5]) return NULL;
+    uint32_t args[] = {(uint32_t)size, (uint32_t)hint, context->words[1]};
+    return (void *)(uintptr_t)compat_runtime32_call(context->words[5], args, 3);
+}
+
+static void *guest_allocator_reallocate(void *pointer, CFIndex size,
+                                        CFOptionFlags hint, void *opaque)
+{
+    struct guest_allocator_context *context = opaque;
+    if (size < 0 || size > UINT32_MAX || !context->words[6]) return NULL;
+    uint32_t args[] = {(uint32_t)(uintptr_t)pointer, (uint32_t)size,
+                       (uint32_t)hint, context->words[1]};
+    return (void *)(uintptr_t)compat_runtime32_call(context->words[6], args, 4);
+}
+
+static void guest_allocator_deallocate(void *pointer, void *opaque)
+{
+    struct guest_allocator_context *context = opaque;
+    if (!context->words[7]) return;
+    uint32_t args[] = {(uint32_t)(uintptr_t)pointer, context->words[1]};
+    compat_runtime32_call(context->words[7], args, 2);
+}
+
+static CFIndex guest_allocator_preferred_size(CFIndex size,
+                                              CFOptionFlags hint,
+                                              void *opaque)
+{
+    struct guest_allocator_context *context = opaque;
+    if (size < 0 || size > UINT32_MAX || !context->words[8]) return size;
+    uint32_t args[] = {(uint32_t)size, (uint32_t)hint, context->words[1]};
+    return (CFIndex)(int32_t)compat_runtime32_call(context->words[8], args, 3);
+}
+
+/* CEF's private CFReadStreamCreate import uses the version-zero callback
+   layout. The public SDK omits this declaration, but CoreFoundation exports
+   it on supported macOS versions. Callback outputs need low guest addresses. */
+struct guest_read_stream_context {
+    uint32_t callbacks[10];
+    uint32_t info, release_info;
+};
+
+struct host_read_stream_callbacks_v1 {
+    CFIndex version;
+    void *(*create)(CFReadStreamRef, void *);
+    void (*finalize)(CFReadStreamRef, void *);
+    CFStringRef (*copy_description)(CFReadStreamRef, void *);
+    Boolean (*open)(CFReadStreamRef, CFStreamError *, Boolean *, void *);
+    Boolean (*open_completed)(CFReadStreamRef, CFStreamError *, void *);
+    CFIndex (*read)(CFReadStreamRef, UInt8 *, CFIndex, CFStreamError *, Boolean *, void *);
+    const UInt8 *(*get_buffer)(CFReadStreamRef, CFIndex, CFIndex *, CFStreamError *, Boolean *, void *);
+    Boolean (*can_read)(CFReadStreamRef, void *);
+    void (*close)(CFReadStreamRef, void *);
+    CFTypeRef (*copy_property)(CFReadStreamRef, CFStringRef, void *);
+    Boolean (*set_property)(CFReadStreamRef, CFStringRef, CFTypeRef, void *);
+    void (*request_events)(CFReadStreamRef, CFOptionFlags, void *);
+    void (*schedule)(CFReadStreamRef, CFRunLoopRef, CFStringRef, void *);
+    void (*unschedule)(CFReadStreamRef, CFRunLoopRef, CFStringRef, void *);
+};
+
+static void *guest_stream_create(CFReadStreamRef stream, void *opaque)
+{
+    (void)stream;
+    return opaque;
+}
+
+static void guest_stream_finalize(CFReadStreamRef stream, void *opaque)
+{
+    (void)stream;
+    struct guest_read_stream_context *context = opaque;
+    if (context->release_info) {
+        uint32_t arg = context->info;
+        compat_runtime32_call(context->release_info, &arg, 1);
+    }
+    free(context);
+}
+
+static void guest_stream_error(CFStreamError *error, const uint32_t *words)
+{
+    if (error) {
+        error->domain = (CFIndex)(int32_t)words[0];
+        error->error = (SInt32)words[1];
+    }
+}
+
+static Boolean guest_stream_open(CFReadStreamRef stream, CFStreamError *error,
+                                 Boolean *complete, void *opaque)
+{
+    struct guest_read_stream_context *context = opaque;
+    uint32_t memory = compat_runtime32_allocate(12, 1);
+    if (!memory) return false;
+    uint32_t args[] = {proxy_for_object((id)stream), memory, memory + 8,
+                       context->info};
+    Boolean result = context->callbacks[1] &&
+        compat_runtime32_call(context->callbacks[1], args, 4);
+    guest_stream_error(error, (const void *)(uintptr_t)memory);
+    if (complete) *complete = *(uint8_t *)(uintptr_t)(memory + 8);
+    compat_runtime32_deallocate(memory);
+    return result;
+}
+
+static Boolean guest_stream_open_completed(CFReadStreamRef stream,
+                                           CFStreamError *error, void *opaque)
+{
+    struct guest_read_stream_context *context = opaque;
+    uint32_t memory = compat_runtime32_allocate(8, 1);
+    if (!memory) return false;
+    uint32_t args[] = {proxy_for_object((id)stream), memory, context->info};
+    Boolean result = context->callbacks[2] &&
+        compat_runtime32_call(context->callbacks[2], args, 3);
+    guest_stream_error(error, (const void *)(uintptr_t)memory);
+    compat_runtime32_deallocate(memory);
+    return result;
+}
+
+static CFIndex guest_stream_read(CFReadStreamRef stream, UInt8 *buffer,
+                                 CFIndex length, CFStreamError *error,
+                                 Boolean *eof, void *opaque)
+{
+    struct guest_read_stream_context *context = opaque;
+    if (length < 0 || length > 16 * 1024 * 1024 || !context->callbacks[3])
+        return -1;
+    uint32_t memory = compat_runtime32_allocate((size_t)length + 12, 1);
+    if (!memory) return -1;
+    uint32_t error_address = memory + (uint32_t)length;
+    uint32_t eof_address = error_address + 8;
+    uint32_t args[] = {proxy_for_object((id)stream), memory,
+                       (uint32_t)length, error_address, eof_address,
+                       context->info};
+    int32_t count = (int32_t)compat_runtime32_call(context->callbacks[3],
+                                                   args, 6);
+    guest_stream_error(error, (const void *)(uintptr_t)error_address);
+    if (eof) *eof = *(uint8_t *)(uintptr_t)eof_address;
+    if (count > 0 && count <= length && buffer)
+        memcpy(buffer, (const void *)(uintptr_t)memory, (size_t)count);
+    if (count > length) count = -1;
+    compat_runtime32_deallocate(memory);
+    return count;
+}
+
+static const UInt8 *guest_stream_get_buffer(CFReadStreamRef stream,
+                                            CFIndex length, CFIndex *read_count,
+                                            CFStreamError *error, Boolean *eof,
+                                            void *opaque)
+{
+    struct guest_read_stream_context *context = opaque;
+    if (length < 0 || length > UINT32_MAX || !context->callbacks[4]) return NULL;
+    uint32_t memory = compat_runtime32_allocate(16, 1);
+    if (!memory) return NULL;
+    uint32_t args[] = {proxy_for_object((id)stream), (uint32_t)length,
+                       memory, memory + 4, memory + 12, context->info};
+    uint32_t buffer = compat_runtime32_call(context->callbacks[4], args, 6);
+    if (read_count) *read_count = (CFIndex)(int32_t)*(uint32_t *)(uintptr_t)memory;
+    guest_stream_error(error, (const void *)(uintptr_t)(memory + 4));
+    if (eof) *eof = *(uint8_t *)(uintptr_t)(memory + 12);
+    compat_runtime32_deallocate(memory);
+    return (const void *)(uintptr_t)buffer;
+}
+
+static Boolean guest_stream_can_read(CFReadStreamRef stream, void *opaque)
+{
+    struct guest_read_stream_context *context = opaque;
+    uint32_t args[] = {proxy_for_object((id)stream), context->info};
+    return context->callbacks[5] &&
+        compat_runtime32_call(context->callbacks[5], args, 2);
+}
+
+static void guest_stream_close(CFReadStreamRef stream, void *opaque)
+{
+    struct guest_read_stream_context *context = opaque;
+    if (!context->callbacks[6]) return;
+    uint32_t args[] = {proxy_for_object((id)stream), context->info};
+    compat_runtime32_call(context->callbacks[6], args, 2);
+}
+
+static CFTypeRef guest_stream_copy_property(CFReadStreamRef stream,
+                                            CFStringRef key, void *opaque)
+{
+    struct guest_read_stream_context *context = opaque;
+    if (!context->callbacks[7]) return NULL;
+    uint32_t args[] = {proxy_for_object((id)stream), proxy_for_object((id)key),
+                       context->info};
+    uint32_t value = compat_runtime32_call(context->callbacks[7], args, 3);
+    CFTypeRef object = (CFTypeRef)object_for_argument(value);
+    return object ? CFRetain(object) : NULL;
+}
+
+static void guest_stream_schedule(CFReadStreamRef stream, CFRunLoopRef loop,
+                                  CFStringRef mode, void *opaque)
+{
+    struct guest_read_stream_context *context = opaque;
+    if (!context->callbacks[8]) return;
+    uint32_t args[] = {proxy_for_object((id)stream), proxy_for_object((id)loop),
+                       proxy_for_object((id)mode), context->info};
+    compat_runtime32_call(context->callbacks[8], args, 4);
+}
+
+static void guest_stream_unschedule(CFReadStreamRef stream, CFRunLoopRef loop,
+                                    CFStringRef mode, void *opaque)
+{
+    struct guest_read_stream_context *context = opaque;
+    if (!context->callbacks[9]) return;
+    uint32_t args[] = {proxy_for_object((id)stream), proxy_for_object((id)loop),
+                       proxy_for_object((id)mode), context->info};
+    compat_runtime32_call(context->callbacks[9], args, 4);
+}
+
+static const struct host_read_stream_callbacks_v1 host_stream_v1 = {
+    1, guest_stream_create, guest_stream_finalize, NULL,
+    guest_stream_open, guest_stream_open_completed, guest_stream_read,
+    guest_stream_get_buffer, guest_stream_can_read, guest_stream_close,
+    guest_stream_copy_property, NULL, NULL,
+    guest_stream_schedule, guest_stream_unschedule
+};
+
+/* A guest printf argument occupies 32-bit stack words. Rebuild the variable
+   arguments for the host ABI instead of passing the guest stack to CF. */
+static CFStringRef format_guest_cf_string(CFStringRef format,
+                                          CFDictionaryRef options,
+                                          const uint32_t *guest_words)
+{
+    if (!format) return NULL;
+    CFIndex size = CFStringGetMaximumSizeForEncoding(CFStringGetLength(format),
+                                                    kCFStringEncodingUTF8);
+    if (size < 0 || size > 65535) return NULL;
+    char *bytes = malloc((size_t)size + 1);
+    if (!bytes) return NULL;
+    if (!CFStringGetCString(format, bytes, size + 1, kCFStringEncodingUTF8)) {
+        free(bytes);
+        return NULL;
+    }
+    enum { kMaxFormatArguments = 32 };
+    ffi_type *types[3 + kMaxFormatArguments] = {
+        &ffi_type_pointer, &ffi_type_pointer, &ffi_type_pointer
+    };
+    void *values[3 + kMaxFormatArguments];
+    uint64_t storage[3 + kMaxFormatArguments] = {0};
+    values[0] = &storage[0]; values[1] = &storage[1]; values[2] = &storage[2];
+    storage[1] = (uintptr_t)options;
+    storage[2] = (uintptr_t)format;
+    unsigned count = 0, word = 0;
+    for (const char *p = bytes; *p; ++p) {
+        if (*p != '%') continue;
+        if (*++p == '%') continue;
+        if (!*p) { free(bytes); return NULL; }
+        while (strchr("-+ #0'", *p) && *p) ++p;
+        if (*p == '*') {
+            if (count == kMaxFormatArguments) { free(bytes); return NULL; }
+            types[3 + count] = &ffi_type_sint32;
+            storage[3 + count] = (int32_t)guest_words[word++];
+            values[3 + count] = &storage[3 + count]; ++count; ++p;
+        } else while (*p >= '0' && *p <= '9') ++p;
+        if (*p == '.') {
+            ++p;
+            if (*p == '*') {
+                if (count == kMaxFormatArguments) { free(bytes); return NULL; }
+                types[3 + count] = &ffi_type_sint32;
+                storage[3 + count] = (int32_t)guest_words[word++];
+                values[3 + count] = &storage[3 + count]; ++count; ++p;
+            } else while (*p >= '0' && *p <= '9') ++p;
+        }
+        bool wide = false, host_long = false;
+        if (*p == 'l' || *p == 'z' || *p == 't' || *p == 'j' || *p == 'q') {
+            host_long = true;
+            wide = *p == 'q' || *p == 'j' || (*p == 'l' && p[1] == 'l');
+            if (*p == 'l' && p[1] == 'l') ++p;
+            ++p;
+        } else if (*p == 'h') {
+            ++p; if (*p == 'h') ++p;
+        }
+        if (!*p || count == kMaxFormatArguments) { free(bytes); return NULL; }
+        ffi_type *type = &ffi_type_sint32;
+        uint64_t value = 0;
+        if (strchr("fFeEgGaA", *p)) {
+            type = &ffi_type_double;
+            memcpy(&value, guest_words + word, sizeof(value)); word += 2;
+        } else if (*p == '@') {
+            type = &ffi_type_pointer;
+            value = (uintptr_t)object_for_argument(guest_words[word++]);
+        } else if (*p == 's' || *p == 'S' || *p == 'p' || *p == 'P') {
+            type = &ffi_type_pointer;
+            value = (uintptr_t)guest_words[word++];
+        } else if (strchr("diuoxXcCDUO", *p)) {
+            if (wide) {
+                type = &ffi_type_sint64;
+                memcpy(&value, guest_words + word, sizeof(value)); word += 2;
+            } else {
+                value = guest_words[word++];
+                if (host_long) {
+                    type = &ffi_type_sint64;
+                    if (strchr("diD", *p)) value = (int64_t)(int32_t)value;
+                }
+            }
+        } else { free(bytes); return NULL; }
+        types[3 + count] = type;
+        storage[3 + count] = value;
+        values[3 + count] = &storage[3 + count];
+        ++count;
+    }
+    free(bytes);
+    ffi_cif cif;
+    if (ffi_prep_cif_var(&cif, FFI_DEFAULT_ABI, 3, 3 + count,
+                         &ffi_type_pointer, types) != FFI_OK) return NULL;
+    CFStringRef result = NULL;
+    ffi_call(&cif, FFI_FN(CFStringCreateWithFormat), &result, values);
+    return result;
 }
 
 static const struct legacy_method32 *legacy_method_for_object(id object, SEL selector)
@@ -6000,6 +6404,81 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     if (LP32_NAME_IS(import_name, import_length, "_CFDataGetLength")) {
         *result = (uint32_t)[(NSData *)object_for_argument(arguments[0]) length]; return 1;
     }
+    if (LP32_NAME_IS(import_name, import_length, "_CFAllocatorCreate")) {
+        const uint32_t *guest = (const void *)(uintptr_t)arguments[1];
+        if (!guest || guest[0]) { *result = 0; return 1; }
+        struct guest_allocator_context *context = calloc(1, sizeof(*context));
+        if (!context) { *result = 0; return 1; }
+        memcpy(context->words, guest, sizeof(context->words));
+        if (context->words[2])
+            context->words[1] = compat_runtime32_call(context->words[2],
+                                                      context->words + 1, 1);
+        CFAllocatorContext native = {0};
+        native.info = context;
+        native.release = release_guest_allocator_context;
+        native.allocate = guest_allocator_allocate;
+        native.reallocate = guest_allocator_reallocate;
+        native.deallocate = guest_allocator_deallocate;
+        native.preferredSize = guest_allocator_preferred_size;
+        CFAllocatorRef allocator = CFAllocatorCreate(NULL, &native);
+        *result = owned_cf_result(allocator);
+        if (!allocator) release_guest_allocator_context(context);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFAllocatorAllocate")) {
+        CFAllocatorRef allocator =
+            (CFAllocatorRef)object_for_argument(arguments[0]);
+        void *pointer = allocator ? CFAllocatorAllocate(allocator,
+            (CFIndex)(int32_t)arguments[1], arguments[2]) : NULL;
+        *result = (uintptr_t)pointer <= UINT32_MAX ?
+            (uint32_t)(uintptr_t)pointer : 0;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFAllocatorDeallocate")) {
+        CFAllocatorRef allocator =
+            (CFAllocatorRef)object_for_argument(arguments[0]);
+        if (allocator && arguments[1])
+            CFAllocatorDeallocate(allocator,
+                                  (void *)(uintptr_t)arguments[1]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFDataCreate")) {
+        const UInt8 *bytes = (const void *)(uintptr_t)arguments[1];
+        CFIndex length = (int32_t)arguments[2];
+        *result = length >= 0 && (bytes || !length) ?
+            owned_cf_result(CFDataCreate(guest_cf_data_allocator(), bytes,
+                                        length)) : 0;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFDataCreateMutable")) {
+        CFIndex capacity = (CFIndex)(int32_t)arguments[1];
+        *result = capacity >= 0 ? owned_cf_result(CFDataCreateMutable(
+            guest_cf_data_allocator(), capacity)) : 0;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length,
+                     "_CFDataCreateWithBytesNoCopy")) {
+        const UInt8 *bytes = (const void *)(uintptr_t)arguments[1];
+        CFIndex length = (int32_t)arguments[2];
+        *result = length >= 0 && (bytes || !length) ?
+            owned_cf_result(CFDataCreate(guest_cf_data_allocator(), bytes,
+                                        length)) : 0;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFDataAppendBytes")) {
+        CFMutableDataRef data = (CFMutableDataRef)object_for_argument(arguments[0]);
+        const UInt8 *bytes = (const void *)(uintptr_t)arguments[1];
+        CFIndex length = (int32_t)arguments[2];
+        if (data && length >= 0 && (bytes || !length))
+            CFDataAppendBytes(data, bytes, length);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFDataIncreaseLength")) {
+        CFMutableDataRef data = (CFMutableDataRef)object_for_argument(arguments[0]);
+        CFIndex length = (int32_t)arguments[1];
+        if (data && length >= 0) CFDataIncreaseLength(data, length);
+        *result = 0; return 1;
+    }
     if (LP32_NAME_IS(import_name, import_length, "_CFStringCreateWithCString") ||
         LP32_NAME_IS(import_name, import_length, "_CFStringCreateWithCStringNoCopy")) {
         CFStringRef string = CFStringCreateWithCString(NULL, (const char *)(uintptr_t)arguments[1], arguments[2]);
@@ -6008,10 +6487,110 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         if (string) CFRelease(string);
         return 1;
     }
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringCreateWithFormat")) {
+        CFStringRef format = (CFStringRef)object_for_argument(arguments[2]);
+        CFDictionaryRef options = (CFDictionaryRef)object_for_argument(arguments[1]);
+        *result = owned_cf_result(format_guest_cf_string(format, options,
+                                                         arguments + 3));
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringAppendFormat")) {
+        CFMutableStringRef destination =
+            (CFMutableStringRef)object_for_argument(arguments[0]);
+        CFDictionaryRef options =
+            (CFDictionaryRef)object_for_argument(arguments[1]);
+        CFStringRef format = (CFStringRef)object_for_argument(arguments[2]);
+        CFStringRef suffix = format_guest_cf_string(format, options,
+                                                     arguments + 3);
+        if (destination && suffix) CFStringAppend(destination, suffix);
+        if (suffix) CFRelease(suffix);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length,
+                     "_CFStringCreateWithPascalStringNoCopy")) {
+        const UInt8 *pascal_bytes = (const void *)(uintptr_t)arguments[1];
+        *result = pascal_bytes ? owned_cf_result(CFStringCreateWithBytes(
+            NULL, pascal_bytes + 1, pascal_bytes[0], arguments[2], false)) : 0;
+        return 1;
+    }
     if (LP32_NAME_IS(import_name, import_length, "_CFURLCreateWithFileSystemPath")) {
         CFURLRef url = CFURLCreateWithFileSystemPath(NULL, (CFStringRef)object_for_argument(arguments[1]), arguments[2], arguments[3] != 0);
         *result = proxy_for_object((id)url);
         if (url) CFRelease(url);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFURLCreateWithBytes")) {
+        const UInt8 *bytes = (const void *)(uintptr_t)arguments[1];
+        CFIndex length = (int32_t)arguments[2];
+        CFURLRef base = (CFURLRef)object_for_argument(arguments[4]);
+        *result = length >= 0 && (bytes || !length) ?
+            owned_cf_result(CFURLCreateWithBytes(NULL, bytes, length,
+                                                arguments[3], base)) : 0;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFURLCreateWithString")) {
+        CFStringRef string = (CFStringRef)object_for_argument(arguments[1]);
+        CFURLRef base = (CFURLRef)object_for_argument(arguments[2]);
+        *result = string ? owned_cf_result(CFURLCreateWithString(
+            NULL, string, base)) : 0;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length,
+                     "_CFURLCreateFromFileSystemRepresentation")) {
+        const UInt8 *bytes = (const void *)(uintptr_t)arguments[1];
+        CFIndex length = (int32_t)arguments[2];
+        *result = length >= 0 && (bytes || !length) ? owned_cf_result(
+            CFURLCreateFromFileSystemRepresentation(NULL, bytes, length,
+                                                    arguments[3] != 0)) : 0;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFURLCreateFromFSRef")) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        const FSRef *ref = (const void *)(uintptr_t)arguments[1];
+        *result = ref ? owned_cf_result(CFURLCreateFromFSRef(NULL, ref)) : 0;
+#pragma clang diagnostic pop
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFNetworkCopyProxiesForURL")) {
+        CFURLRef url = (CFURLRef)object_for_argument(arguments[0]);
+        CFDictionaryRef settings = (CFDictionaryRef)object_for_argument(arguments[1]);
+        *result = url && settings ?
+            owned_cf_result(CFNetworkCopyProxiesForURL(url, settings)) : 0;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length,
+                     "_CFNetworkCopyProxiesForAutoConfigurationScript")) {
+        CFStringRef script = (CFStringRef)object_for_argument(arguments[0]);
+        CFURLRef url = (CFURLRef)object_for_argument(arguments[1]);
+        CFErrorRef error = NULL;
+        CFArrayRef proxies = script && url ?
+            CFNetworkCopyProxiesForAutoConfigurationScript(script, url, &error) : NULL;
+        if (arguments[2]) *(uint32_t *)(uintptr_t)arguments[2] =
+            owned_cf_result(error);
+        else if (error) CFRelease(error);
+        *result = owned_cf_result(proxies);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length,
+                     "_CFNetworkExecuteProxyAutoConfigurationURL")) {
+        CFURLRef configuration =
+            (CFURLRef)object_for_argument(arguments[0]);
+        CFURLRef target = (CFURLRef)object_for_argument(arguments[1]);
+        struct guest_runloop_context *context =
+            runloop_context(arguments[3], 5, arguments[2]);
+        if (!configuration || !target || !context) {
+            if (context) release_runloop_context(context);
+            *result = 0; return 1;
+        }
+        CFStreamClientContext native = {0, context, NULL,
+                                        release_proxy_configuration_context,
+                                        NULL};
+        CFRunLoopSourceRef source =
+            CFNetworkExecuteProxyAutoConfigurationURL(configuration, target,
+                guest_proxy_autoconfiguration_callback, &native);
+        *result = owned_cf_result(source);
+        if (!source) release_runloop_context(context);
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CGImageSourceCreateWithURL")) {
@@ -7501,6 +8080,92 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         *result = proxy_for_object(legacy_game_bundle());
         return 1;
     }
+    if (LP32_NAME_IS(import_name, import_length, "_CFBundleGetInfoDictionary")) {
+        NSBundle *bundle = object_for_argument(arguments[0]);
+        *result = proxy_for_object([bundle infoDictionary]);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length,
+                     "_CFBundleGetBundleWithIdentifier")) {
+        NSString *identifier = object_for_argument(arguments[0]);
+        *result = proxy_for_object([NSBundle bundleWithIdentifier:identifier]);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length,
+                     "_CFBundleGetValueForInfoDictionaryKey")) {
+        NSBundle *bundle = object_for_argument(arguments[0]);
+        NSString *key = object_for_argument(arguments[1]);
+        *result = proxy_for_object([bundle objectForInfoDictionaryKey:key]);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFBundleGetPackageInfo")) {
+        NSBundle *guest_bundle = object_for_argument(arguments[0]);
+        CFBundleRef bundle = guest_bundle ? CFBundleCreate(NULL,
+            (CFURLRef)[guest_bundle bundleURL]) : NULL;
+        UInt32 type = 0, creator = 0;
+        if (bundle) CFBundleGetPackageInfo(bundle, &type, &creator);
+        if (bundle) CFRelease(bundle);
+        if (arguments[1]) *(uint32_t *)(uintptr_t)arguments[1] = type;
+        if (arguments[2]) *(uint32_t *)(uintptr_t)arguments[2] = creator;
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length,
+                     "_CFBundlePreflightExecutable")) {
+        NSBundle *guest_bundle = object_for_argument(arguments[0]);
+        CFBundleRef bundle = guest_bundle ? CFBundleCreate(NULL,
+            (CFURLRef)[guest_bundle bundleURL]) : NULL;
+        CFErrorRef error = NULL;
+        *result = bundle && CFBundlePreflightExecutable(bundle, &error);
+        if (bundle) CFRelease(bundle);
+        if (arguments[1]) *(uint32_t *)(uintptr_t)arguments[1] =
+            owned_cf_result(error);
+        else if (error) CFRelease(error);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length,
+                     "_CFBundleOpenBundleResourceMap")) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        NSBundle *guest_bundle = object_for_argument(arguments[0]);
+        CFBundleRef bundle = guest_bundle ? CFBundleCreate(NULL,
+            (CFURLRef)[guest_bundle bundleURL]) : NULL;
+        *result = bundle ? (uint32_t)CFBundleOpenBundleResourceMap(bundle) : 0;
+        if (bundle) CFRelease(bundle);
+#pragma clang diagnostic pop
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length,
+                     "_CFBundleCloseBundleResourceMap")) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        NSBundle *guest_bundle = object_for_argument(arguments[0]);
+        CFBundleRef bundle = guest_bundle ? CFBundleCreate(NULL,
+            (CFURLRef)[guest_bundle bundleURL]) : NULL;
+        if (bundle) CFBundleCloseBundleResourceMap(bundle,
+                                                    (CFBundleRefNum)arguments[1]);
+        if (bundle) CFRelease(bundle);
+#pragma clang diagnostic pop
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length,
+                     "_CFUserNotificationDisplayAlert")) {
+        double timeout;
+        memcpy(&timeout, arguments, sizeof(timeout));
+        CFOptionFlags response = 0;
+        *result = (uint32_t)CFUserNotificationDisplayAlert(
+            timeout, arguments[2],
+            (CFURLRef)object_for_argument(arguments[3]),
+            (CFURLRef)object_for_argument(arguments[4]),
+            (CFURLRef)object_for_argument(arguments[5]),
+            (CFStringRef)object_for_argument(arguments[6]),
+            (CFStringRef)object_for_argument(arguments[7]),
+            (CFStringRef)object_for_argument(arguments[8]),
+            (CFStringRef)object_for_argument(arguments[9]),
+            (CFStringRef)object_for_argument(arguments[10]), &response);
+        if (arguments[11]) *(uint32_t *)(uintptr_t)arguments[11] =
+            (uint32_t)response;
+        return 1;
+    }
     if (LP32_NAME_IS(import_name, import_length, "_CFUUIDGetConstantUUIDWithBytes")) {
         CFUUIDRef uuid = CFUUIDGetConstantUUIDWithBytes(NULL,
             arguments[1], arguments[2], arguments[3], arguments[4],
@@ -7508,6 +8173,14 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             arguments[9], arguments[10], arguments[11], arguments[12],
             arguments[13], arguments[14], arguments[15], arguments[16]);
         *result = proxy_for_object((id)uuid);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFUUIDGetUUIDBytes")) {
+        /* i386 returns a 16-byte struct through a hidden first argument. */
+        CFUUIDBytes *output = (void *)(uintptr_t)arguments[0];
+        CFUUIDRef uuid = (CFUUIDRef)object_for_argument(arguments[1]);
+        if (output) *output = uuid ? CFUUIDGetUUIDBytes(uuid) : (CFUUIDBytes){0};
+        *result = 0;
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_PasteboardCreate")) {
@@ -7596,6 +8269,12 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         *result = 0;
         return 1;
     }
+    if (LP32_NAME_IS(import_name, import_length, "_CFEqual")) {
+        CFTypeRef left = (CFTypeRef)object_for_argument(arguments[0]);
+        CFTypeRef right = (CFTypeRef)object_for_argument(arguments[1]);
+        *result = left && right ? CFEqual(left, right) : left == right;
+        return 1;
+    }
     if (LP32_NAME_IS(import_name, import_length, "_CFRetain")) {
         pthread_mutex_lock(&proxy_lock);
         struct value_proxy *entry = value_proxy_for_handle(arguments[0]);
@@ -7609,10 +8288,92 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         *result = object ? CFGetTypeID((CFTypeRef)object) : 0;
         return 1;
     }
+    if (LP32_NAME_IS(import_name, import_length, "_CFCopyTypeIDDescription")) {
+        *result = owned_cf_result(CFCopyTypeIDDescription(arguments[0]));
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFMakeCollectable")) {
+        *result = arguments[0];
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFErrorGetTypeID")) {
+        *result = CFErrorGetTypeID(); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFErrorGetCode")) {
+        CFErrorRef error = (CFErrorRef)object_for_argument(arguments[0]);
+        *result = error ? (uint32_t)CFErrorGetCode(error) : 0;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFErrorGetDomain")) {
+        CFErrorRef error = (CFErrorRef)object_for_argument(arguments[0]);
+        *result = error ? proxy_for_object((id)CFErrorGetDomain(error)) : 0;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFNumberGetTypeID")) {
+        *result = CFNumberGetTypeID(); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFAttributedStringCreate")) {
+        CFStringRef string = (CFStringRef)object_for_argument(arguments[1]);
+        CFDictionaryRef attributes =
+            (CFDictionaryRef)object_for_argument(arguments[2]);
+        *result = string ? owned_cf_result(CFAttributedStringCreate(
+            NULL, string, attributes)) : 0;
+        return 1;
+    }
     if (LP32_NAME_IS(import_name, import_length, "_CFStringGetLength")) {
         NSString *string = object_for_argument(arguments[0]);
         *result = (uint32_t)[string length];
         return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringGetTypeID")) {
+        *result = CFStringGetTypeID(); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringCreateMutable")) {
+        *result = owned_cf_result(CFStringCreateMutable(NULL,
+            (CFIndex)(int32_t)arguments[1]));
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length,
+                     "_CFStringCreateWithCharacters") ||
+        LP32_NAME_IS(import_name, import_length,
+                     "_CFStringCreateWithCharactersNoCopy")) {
+        const UniChar *characters = (const void *)(uintptr_t)arguments[1];
+        CFIndex length = (int32_t)arguments[2];
+        *result = length >= 0 && (characters || !length) ?
+            owned_cf_result(CFStringCreateWithCharacters(NULL, characters,
+                                                         length)) : 0;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length,
+                     "_CFStringCreateWithBytesNoCopy")) {
+        const UInt8 *bytes = (const void *)(uintptr_t)arguments[1];
+        CFIndex length = (int32_t)arguments[2];
+        *result = length >= 0 && (bytes || !length) ?
+            owned_cf_result(CFStringCreateWithBytes(NULL, bytes, length,
+                                                     arguments[3],
+                                                     arguments[4] != 0)) : 0;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length,
+                     "_CFStringGetCharacters")) {
+        CFStringRef string = (CFStringRef)object_for_argument(arguments[0]);
+        UniChar *output = (void *)(uintptr_t)arguments[3];
+        if (string && output) CFStringGetCharacters(string,
+            CFRangeMake((CFIndex)(int32_t)arguments[1],
+                        (CFIndex)(int32_t)arguments[2]), output);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringHasSuffix")) {
+        CFStringRef string = (CFStringRef)object_for_argument(arguments[0]);
+        CFStringRef suffix = (CFStringRef)object_for_argument(arguments[1]);
+        *result = string && suffix && CFStringHasSuffix(string, suffix);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringTrimWhitespace")) {
+        CFMutableStringRef string =
+            (CFMutableStringRef)object_for_argument(arguments[0]);
+        if (string) CFStringTrimWhitespace(string);
+        *result = 0; return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFStringGetSystemEncoding")) {
         *result = CFStringGetSystemEncoding();
@@ -7644,6 +8405,35 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFCharacterSetGetPredefined")) {
         *result = proxy_for_object((id)CFCharacterSetGetPredefined(arguments[0])); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFCharacterSetCreateMutable")) {
+        *result = owned_cf_result(CFCharacterSetCreateMutable(NULL));
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length,
+                     "_CFCharacterSetAddCharactersInRange")) {
+        CFMutableCharacterSetRef set =
+            (CFMutableCharacterSetRef)object_for_argument(arguments[0]);
+        if (set) CFCharacterSetAddCharactersInRange(set,
+            CFRangeMake((CFIndex)(int32_t)arguments[1],
+                        (CFIndex)(int32_t)arguments[2]));
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length,
+                     "_CFCharacterSetAddCharactersInString")) {
+        CFMutableCharacterSetRef set =
+            (CFMutableCharacterSetRef)object_for_argument(arguments[0]);
+        CFStringRef characters = (CFStringRef)object_for_argument(arguments[1]);
+        if (set && characters) CFCharacterSetAddCharactersInString(set, characters);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFCharacterSetUnion")) {
+        CFMutableCharacterSetRef set =
+            (CFMutableCharacterSetRef)object_for_argument(arguments[0]);
+        CFCharacterSetRef other =
+            (CFCharacterSetRef)object_for_argument(arguments[1]);
+        if (set && other) CFCharacterSetUnion(set, other);
+        *result = 0; return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFCharacterSetIsLongCharacterMember")) {
         CFCharacterSetRef set = (CFCharacterSetRef)object_for_argument(arguments[0]);
@@ -7681,6 +8471,47 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         *result = (uint32_t)[array count];
         return 1;
     }
+    if (LP32_NAME_IS(import_name, import_length, "_CFArrayCreateMutable")) {
+        *result = owned_cf_result(CFArrayCreateMutable(NULL,
+            (CFIndex)(int32_t)arguments[1], &kCFTypeArrayCallBacks));
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFArrayCreateMutableCopy")) {
+        CFArrayRef source = (CFArrayRef)object_for_argument(arguments[2]);
+        *result = source ? owned_cf_result(CFArrayCreateMutableCopy(NULL,
+            (CFIndex)(int32_t)arguments[1], source)) : 0;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFArrayAppendValue")) {
+        CFMutableArrayRef array = (CFMutableArrayRef)object_for_argument(arguments[0]);
+        CFTypeRef value = (CFTypeRef)object_for_argument(arguments[1]);
+        if (array && value) CFArrayAppendValue(array, value);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFArrayAppendArray")) {
+        CFMutableArrayRef array = (CFMutableArrayRef)object_for_argument(arguments[0]);
+        CFArrayRef source = (CFArrayRef)object_for_argument(arguments[1]);
+        if (array && source) CFArrayAppendArray(array, source,
+            CFRangeMake((CFIndex)(int32_t)arguments[2],
+                        (CFIndex)(int32_t)arguments[3]));
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFArrayApplyFunction")) {
+        NSArray *array = object_for_argument(arguments[0]);
+        uint32_t location = arguments[1], count = arguments[2];
+        uint32_t callback = arguments[3];
+        if (array && callback && location <= [array count] &&
+            count <= [array count] - location) {
+            for (uint32_t index = location; index < location + count; ++index) {
+                uint32_t guest_args[] = {
+                    proxy_for_object([array objectAtIndex:index]), arguments[4]
+                };
+                compat_runtime32_call(callback, guest_args, 2);
+            }
+        }
+        *result = 0;
+        return 1;
+    }
     if (LP32_NAME_IS(import_name, import_length, "_CFArrayGetTypeID")) {
         *result = CFArrayGetTypeID();
         return 1;
@@ -7703,6 +8534,45 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         }
         *result = proxy_for_object(value);
         return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFDictionaryCreateMutable")) {
+        *result = owned_cf_result(CFDictionaryCreateMutable(NULL,
+            (CFIndex)(int32_t)arguments[1],
+            guest_dictionary_key_callbacks(arguments[2]),
+            &kCFTypeDictionaryValueCallBacks));
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFDictionaryCreate")) {
+        const uint32_t *keys = (const void *)(uintptr_t)arguments[1];
+        const uint32_t *values = (const void *)(uintptr_t)arguments[2];
+        CFIndex count = (int32_t)arguments[3];
+        CFMutableDictionaryRef dictionary = count >= 0 && count <= 65536 &&
+            (count == 0 || (keys && values)) ?
+            CFDictionaryCreateMutable(NULL, count,
+                                      guest_dictionary_key_callbacks(arguments[4]),
+                                      &kCFTypeDictionaryValueCallBacks) : NULL;
+        for (CFIndex index = 0; dictionary && index < count; ++index) {
+            CFTypeRef key = (CFTypeRef)object_for_argument(keys[index]);
+            CFTypeRef value = (CFTypeRef)object_for_argument(values[index]);
+            if (key && value) CFDictionarySetValue(dictionary, key, value);
+        }
+        *result = owned_cf_result(dictionary);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFDictionaryAddValue")) {
+        CFMutableDictionaryRef dictionary =
+            (CFMutableDictionaryRef)object_for_argument(arguments[0]);
+        CFTypeRef key = (CFTypeRef)object_for_argument(arguments[1]);
+        CFTypeRef value = (CFTypeRef)object_for_argument(arguments[2]);
+        if (dictionary && key && value) CFDictionaryAddValue(dictionary, key, value);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFDictionaryRemoveValue")) {
+        CFMutableDictionaryRef dictionary =
+            (CFMutableDictionaryRef)object_for_argument(arguments[0]);
+        CFTypeRef key = (CFTypeRef)object_for_argument(arguments[1]);
+        if (dictionary && key) CFDictionaryRemoveValue(dictionary, key);
+        *result = 0; return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFDictionaryGetTypeID")) {
         *result = CFDictionaryGetTypeID();
@@ -7729,16 +8599,87 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         *result = CFDataGetTypeID();
         return 1;
     }
+    if (LP32_NAME_IS(import_name, import_length, "_CFSetCreate")) {
+        const uint32_t *items = (const void *)(uintptr_t)arguments[1];
+        CFIndex count = (int32_t)arguments[2];
+        CFMutableSetRef set = count >= 0 && count <= 65536 &&
+            (count == 0 || items) ?
+            CFSetCreateMutable(NULL, count,
+                               guest_set_callbacks(arguments[3])) : NULL;
+        for (CFIndex index = 0; set && index < count; ++index) {
+            CFTypeRef item = (CFTypeRef)object_for_argument(items[index]);
+            if (item) CFSetAddValue(set, item);
+        }
+        *result = owned_cf_result(set);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFPreferencesCopyValue")) {
+        CFStringRef key = (CFStringRef)object_for_argument(arguments[0]);
+        CFStringRef app = (CFStringRef)object_for_argument(arguments[1]);
+        CFStringRef user = (CFStringRef)object_for_argument(arguments[2]);
+        CFStringRef host = (CFStringRef)object_for_argument(arguments[3]);
+        *result = key && app && user && host ? owned_cf_result(
+            CFPreferencesCopyValue(key, app, user, host)) : 0;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length,
+                     "_CFPreferencesGetAppBooleanValue")) {
+        CFStringRef key = (CFStringRef)object_for_argument(arguments[0]);
+        CFStringRef app = (CFStringRef)object_for_argument(arguments[1]);
+        Boolean exists = false;
+        *result = key && app && CFPreferencesGetAppBooleanValue(key, app,
+                                                                  &exists);
+        if (arguments[2]) *(uint8_t *)(uintptr_t)arguments[2] = exists;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length,
+                     "_CFPropertyListCreateFromXMLData")) {
+        CFDataRef data = (CFDataRef)object_for_argument(arguments[1]);
+        CFStringRef error = NULL;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        CFPropertyListRef list = data ? CFPropertyListCreateFromXMLData(
+            NULL, data, arguments[2], &error) : NULL;
+#pragma clang diagnostic pop
+        if (arguments[3]) *(uint32_t *)(uintptr_t)arguments[3] =
+            owned_cf_result(error);
+        else if (error) CFRelease(error);
+        *result = owned_cf_result(list);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFTimeZoneCopySystem")) {
+        *result = owned_cf_result(CFTimeZoneCopySystem());
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length,
+                     "_CFStringGetMaximumSizeForEncoding")) {
+        *result = (uint32_t)CFStringGetMaximumSizeForEncoding(
+            (CFIndex)(int32_t)arguments[0], arguments[1]);
+        return 1;
+    }
     if (LP32_NAME_IS(import_name, import_length, "_CFDataGetBytePtr")) {
         NSData *data = object_for_argument(arguments[0]);
         if (!data) {
             *result = 0;
             return 1;
         }
+        const UInt8 *bytes = [data bytes];
+        if ((uintptr_t)bytes <= UINT32_MAX) {
+            *result = (uint32_t)(uintptr_t)bytes;
+            return 1;
+        }
         NSUInteger length = [data length];
         uint32_t copy = compat_runtime32_allocate(length ? length : 1, 0);
-        if (copy && length) memcpy((void *)(uintptr_t)copy, [data bytes], length);
+        if (copy && length) memcpy((void *)(uintptr_t)copy, bytes, length);
         *result = copy;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFDataGetMutableBytePtr")) {
+        CFMutableDataRef data =
+            (CFMutableDataRef)object_for_argument(arguments[0]);
+        UInt8 *bytes = data ? CFDataGetMutableBytePtr(data) : NULL;
+        *result = (uintptr_t)bytes <= UINT32_MAX ?
+            (uint32_t)(uintptr_t)bytes : 0;
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFBooleanGetValue")) {
@@ -7835,6 +8776,27 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         memcpy(result, &value, sizeof(value));
         return 1;
     }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    if (LP32_NAME_IS(import_name, import_length,
+                     "_CFAbsoluteTimeGetGregorianDate")) {
+        CFGregorianDate *output = (void *)(uintptr_t)arguments[0];
+        CFAbsoluteTime time;
+        memcpy(&time, arguments + 1, sizeof(time));
+        CFTimeZoneRef zone = (CFTimeZoneRef)object_for_argument(arguments[3]);
+        if (output) *output = CFAbsoluteTimeGetGregorianDate(time, zone);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length,
+                     "_CFGregorianDateGetAbsoluteTime")) {
+        CFGregorianDate date;
+        memcpy(&date, arguments, sizeof(date));
+        CFTimeZoneRef zone = (CFTimeZoneRef)object_for_argument(arguments[4]);
+        double value = CFGregorianDateGetAbsoluteTime(date, zone);
+        memcpy(result, &value, sizeof(value));
+        return 1;
+    }
+#pragma clang diagnostic pop
     if (LP32_NAME_IS(import_name, import_length, "_CFRunLoopGetCurrent")) {
         if (lp32_profile()->title == LP32_TITLE_PORTAL2) {
             *result = proxy_for_object((id)CFRunLoopGetCurrent()); return 1;
@@ -7842,6 +8804,81 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         /* A host-thread token is sufficient because Add/Remove operate on
            the current run loop for this title's IOKit notification path. */
         *result = proxy_for_object([NSThread currentThread]);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFRunLoopRun")) {
+        CFRunLoopRun();
+        *result = 0;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFReadStreamCreate")) {
+        typedef CFReadStreamRef (*create_fn)(CFAllocatorRef, const void *, void *);
+        static create_fn create_stream;
+        if (!create_stream) create_stream = (create_fn)dlsym(RTLD_DEFAULT,
+                                                             "CFReadStreamCreate");
+        const uint32_t *callbacks =
+            (const void *)(uintptr_t)arguments[1];
+        const uint32_t *client = (const void *)(uintptr_t)arguments[2];
+        if (!create_stream || !callbacks || callbacks[0] != 0 ||
+            (client && client[0] != 0)) { *result = 0; return 1; }
+        struct guest_read_stream_context *context = calloc(1, sizeof(*context));
+        if (!context) { *result = 0; return 1; }
+        memcpy(context->callbacks, callbacks, sizeof(context->callbacks));
+        if (client) {
+            context->info = client[1];
+            context->release_info = client[3];
+            if (client[2]) context->info = compat_runtime32_call(client[2],
+                                                                 &context->info, 1);
+        }
+        CFReadStreamRef stream = create_stream(NULL, &host_stream_v1, context);
+        *result = owned_cf_result(stream);
+        if (!stream) guest_stream_finalize(NULL, context);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFReadStreamOpen")) {
+        CFReadStreamRef stream =
+            (CFReadStreamRef)object_for_argument(arguments[0]);
+        *result = stream && CFReadStreamOpen(stream);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFReadStreamRead")) {
+        CFReadStreamRef stream =
+            (CFReadStreamRef)object_for_argument(arguments[0]);
+        UInt8 *buffer = (void *)(uintptr_t)arguments[1];
+        CFIndex length = (int32_t)arguments[2];
+        *result = stream && buffer && length >= 0 ?
+            (uint32_t)CFReadStreamRead(stream, buffer, length) : (uint32_t)-1;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFReadStreamClose")) {
+        CFReadStreamRef stream =
+            (CFReadStreamRef)object_for_argument(arguments[0]);
+        if (stream) CFReadStreamClose(stream);
+        *result = 0;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length,
+                     "_CFReadStreamSignalEvent")) {
+        typedef void (*signal_fn)(CFReadStreamRef, CFStreamEventType,
+                                  const void *);
+        static signal_fn signal_event;
+        if (!signal_event) signal_event = (signal_fn)dlsym(RTLD_DEFAULT,
+                                                           "CFReadStreamSignalEvent");
+        CFReadStreamRef stream =
+            (CFReadStreamRef)object_for_argument(arguments[0]);
+        const uint32_t *guest_error =
+            (const void *)(uintptr_t)arguments[2];
+        CFStreamError error = {0};
+        if (guest_error) guest_stream_error(&error, guest_error);
+        if (signal_event && stream) signal_event(stream, arguments[1],
+                                                  guest_error ? &error : NULL);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length,
+                     "_CFMachPortCreateRunLoopSource")) {
+        CFMachPortRef port = (CFMachPortRef)object_for_argument(arguments[1]);
+        *result = port ? owned_cf_result(CFMachPortCreateRunLoopSource(
+            NULL, port, (CFIndex)(int32_t)arguments[2])) : 0;
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFRunLoopTimerCreate")) {
@@ -8364,6 +9401,26 @@ uint32_t objc_bridge32_pointer_import(const char *import_name)
     if (LP32_NAME_IS(import_name, import_length, "_kCFRunLoopCommonModes")) {
         return proxy_for_object((NSString *)kCFRunLoopCommonModes);
     }
+#define CF_POINTER_IMPORT(symbol) \
+    if (LP32_NAME_IS(import_name, import_length, "_" #symbol)) \
+        return proxy_for_object((id)symbol)
+    CF_POINTER_IMPORT(kCFBooleanFalse);
+    CF_POINTER_IMPORT(kCFBooleanTrue);
+    CF_POINTER_IMPORT(kCFErrorDomainOSStatus);
+    CF_POINTER_IMPORT(kCFPreferencesAnyHost);
+    CF_POINTER_IMPORT(kCFPreferencesCurrentApplication);
+    CF_POINTER_IMPORT(kCFPreferencesCurrentUser);
+    CF_POINTER_IMPORT(kCFProxyAutoConfigurationURLKey);
+    CF_POINTER_IMPORT(kCFProxyHostNameKey);
+    CF_POINTER_IMPORT(kCFProxyPasswordKey);
+    CF_POINTER_IMPORT(kCFProxyPortNumberKey);
+    CF_POINTER_IMPORT(kCFProxyTypeAutoConfigurationURL);
+    CF_POINTER_IMPORT(kCFProxyTypeHTTP);
+    CF_POINTER_IMPORT(kCFProxyTypeKey);
+    CF_POINTER_IMPORT(kCFProxyTypeNone);
+    CF_POINTER_IMPORT(kCFProxyTypeSOCKS);
+    CF_POINTER_IMPORT(kCFProxyUsernameKey);
+#undef CF_POINTER_IMPORT
     if (LP32_NAME_IS(import_name, import_length, "_kTISPropertyInputSourceLanguages")) {
         return proxy_for_object((NSString *)kTISPropertyInputSourceLanguages);
     }

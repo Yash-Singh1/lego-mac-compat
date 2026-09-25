@@ -390,6 +390,72 @@ Temporary dates follow guest autorelease-pool lifetimes, and
 CFString Create/Release calls reclaim their handles; long sessions may still
 expose limits in other retained Cocoa-object and thread registries.
 
+## Experimental cross-build co-op (issue #10)
+
+These source changes are not in dev.6. They implement the table/class overrides
+and diagnostics from [issue #10](https://github.com/Yash-Singh1/lego-mac-compat/issues/10).
+They are opt-in and apply to the Mac host. The report tested Mac build 8408
+hosting a Windows build 10090 client; this checkout has no new live co-op result.
+
+Build the loader and update an existing local app, then launch it with:
+
+```sh
+make -C native GAME=portal2 promote-loader portal2-converter
+LP32_SET_CONVARS="sv_sendtables=1" \
+LP32_DROP_SERVER_CLASSES="CPointSurvey" \
+LP32_TRACE_STEAM_METHODS="GameServer" \
+LP32_TRACE_STEAM_CALLBACKS=1 \
+"native/build/Portal2-Compat.app/Contents/MacOS/Portal2Compat" -condebug -console -dev
+```
+
+`LP32_SET_CONVARS` is a comma-separated `name=value` list for `engine.dylib`.
+The loader locates private defined symbols and calls `ConVar::SetValue` after
+the engine's constructors finish, before map spawn generates send tables.
+This reaches the development-only `sv_sendtables` object that the retail console
+does not register. The setter maintains the string, float and integer values.
+Guest `dlsym` and cross-module imports retain their existing visibility rules.
+
+`LP32_DROP_SERVER_CLASSES` is a comma-separated list for `server.dylib`.
+Removing `CPointSurvey` prevents the old Mac server advertising `DT_PointSurvey`,
+which the reporter's Windows client no longer has. The loader checks the
+registration's network name and validates the active linked list before removing
+the entry, including when it is the head. It does this before the engine builds
+the class indices/table stream. Missing symbols, incompatible or unreadable
+objects, cyclic lists and oversized settings produce diagnostics without the
+corresponding mutation. Empty or unset variables leave normal behavior intact.
+These controls use the i386 Source layouts and are not a general patch for
+arbitrary game builds or an instruction to remove other classes.
+
+`LP32_TRACE_STEAM_METHODS` filters interface versions by substring; `*` selects
+all interfaces. It logs begin/end, argument words and return values, including
+typed packed-record calls. Authentication ticket contents and pointed-to strings
+are not dumped. `LP32_TRACE_STEAM_CALLBACKS=1` logs delivered callbacks, including
+IDs/owners, approval, denial/kick reasons and modern ticket-validation responses.
+Both traces default off; `LP32_TRACE_STEAM_CALLBACKS=0` disables callback tracing.
+Logs contain player Steam IDs and can contain network addresses; redact these
+before sharing them. Denial text is bounded by the actual callback length.
+
+**The Steam authentication failure remains unresolved.** The report's 22-minute
+session also suppressed authentication denials, including for an unapproved
+player. That workaround is not implemented: `LP32_IGNORE_STEAM_DENY` and
+`LP32_IGNORE_STEAM_DENY_UNAPPROVED` have no effect. Every Steam denial still
+reaches the guest, so the reported roughly 100-second disconnect can still occur.
+
+The proposed `BeginAuthSession` translation needs more evidence than an IP
+replacement. Valve documents the legacy blob as coming from
+`InitiateGameConnection`, while the modern API takes a `GetAuthSessionTicket`
+ticket and a known Steam ID; it warns against mixing the two authentication
+flows. A future translation must establish the ticket format and peer identity,
+wait for validation, preserve failures/revocations, and end sessions correctly.
+See [Valve's game-server authentication APIs](https://partner.steamgames.com/doc/api/ISteamGameServer#BeginAuthSession).
+
+`make -C native test-portal2-coop` checks real i386 constructors/private symbols,
+normal and downward relocation, repeated module opens, class removal and invalid
+inputs, method filters and packed returns, short callback buffers at a protected
+page boundary, and unchanged delivery of every legacy denial reason 0–14.
+It uses a mock native Steam client; it does not validate real tickets or online
+play. It also runs as part of `test-guest-dyld`.
+
 ## Checks
 
 ```sh

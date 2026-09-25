@@ -5,7 +5,9 @@
 #include "macho_file.h"
 #include "compat_runtime.h"
 #include "objc_bridge.h"
+#include "game_profile.h"
 
+#include <ctype.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <limits.h>
@@ -171,6 +173,46 @@ static uint32_t exported_recursive(const struct module32 *m, const char *name, u
 static uint32_t exported(const struct module32 *m, const char *name)
 {
     return exported_recursive(m, name, 0);
+}
+
+/* Loader-owned lookups only. Private/local definitions must never become
+   visible to guest dlsym or cross-module import binding. */
+static uint32_t defined_symbol(const struct module32 *m, const char *name)
+{
+    const struct nlist *symbols = symbol_table(m);
+    if (!symbols) return 0;
+    for (uint32_t i = 0; i < m->symtab->nsyms; ++i) {
+        const struct nlist *n = symbols + i;
+        if ((n->n_type & N_STAB) || (n->n_type & N_TYPE) != N_SECT) continue;
+        const char *candidate = symbol_name(m, n);
+        /* Slides wrap modulo 2^32 when a high preferred address is relocated
+           down into the module arena, just like exported symbol resolution. */
+        uint32_t address = n->n_value + m->slide;
+        if (candidate && !strcmp(candidate, name) &&
+            vm_range(m, address, 1)) return (uint32_t)address;
+    }
+    return 0;
+}
+
+static void *accessible_range(const struct module32 *m, uint32_t address,
+                              size_t size, vm_prot_t protection)
+{
+    for (unsigned i = 0; i < m->segment_count; ++i) {
+        const struct segment_command *s = m->segments[i];
+        uint64_t base = (uint32_t)(s->vmaddr + m->slide);
+        if ((s->initprot & protection) == protection && address >= base &&
+            address - base <= s->vmsize && size <= s->vmsize - (address - base))
+            return (void *)(uintptr_t)address;
+    }
+    return NULL;
+}
+
+static bool module_string_equals(const struct module32 *m, uint32_t address,
+                                 const char *expected)
+{
+    size_t size = strlen(expected) + 1;
+    const char *text = accessible_range(m, address, size, VM_PROT_READ);
+    return text && !memcmp(text, expected, size);
 }
 
 static uint32_t global_symbol(const char *name)
@@ -714,12 +756,147 @@ static int run_initializers(struct module32 *m)
     return 0;
 }
 
+/* Source release builds construct development-only ConVars without registering
+   them. Apply explicit overrides after constructors, before SpawnServer builds
+   m_FullSendTables. Use the guest setter so its string/float/int stay coherent. */
+static char *trim_override(char *text)
+{
+    while (isspace((unsigned char)*text)) ++text;
+    size_t length = strlen(text);
+    while (length && isspace((unsigned char)text[length - 1])) text[--length] = 0;
+    return text;
+}
+
+static bool override_name(const char *name)
+{
+    if (!*name) return false;
+    for (; *name; ++name)
+        if (!isalnum((unsigned char)*name) && *name != '_') return false;
+    return true;
+}
+
+static bool override_list(const char *variable, char buffer[1024])
+{
+    const char *value = getenv(variable);
+    if (!value || !*value) return false;
+    if (strlen(value) >= 1024) {
+        fprintf(stderr, "compat32: %s exceeds 1023 bytes; no overrides applied\n", variable);
+        return false;
+    }
+    strcpy(buffer, value);
+    return true;
+}
+
+static int apply_convar_overrides(struct module32 *m)
+{
+    char buffer[1024];
+    if (!override_list("LP32_SET_CONVARS", buffer)) return 0;
+    uint32_t setter = defined_symbol(m, "__ZN6ConVar8SetValueEPKc");
+    if (!setter || !accessible_range(m, setter, 1, VM_PROT_READ | VM_PROT_EXECUTE)) {
+        fprintf(stderr, "compat32: convar setter unavailable in %s; no overrides applied\n", m->path);
+        return 0;
+    }
+    char *state;
+    for (char *entry = strtok_r(buffer, ",", &state); entry; entry = strtok_r(NULL, ",", &state)) {
+        char *equals = strchr(entry, '=');
+        if (!equals) {
+            fprintf(stderr, "compat32: convar override requires name=value\n");
+            continue;
+        }
+        *equals = 0;
+        char *name = trim_override(entry), *value = trim_override(equals + 1);
+        char symbol[256];
+        if (!override_name(name) || snprintf(symbol, sizeof(symbol), "_%s", name) >= (int)sizeof(symbol)) {
+            fprintf(stderr, "compat32: invalid convar override name\n");
+            continue;
+        }
+        uint32_t address = defined_symbol(m, symbol);
+        const uint32_t *object = accessible_range(m, address, 52, VM_PROT_READ | VM_PROT_WRITE);
+        /* ConCommandBase::m_pszName is at +12 in the i386 Source layout. */
+        if (!object || !module_string_equals(m, object[3], name)) {
+            fprintf(stderr, "compat32: convar %s missing or incompatible in %s; left unchanged\n", name, m->path);
+            continue;
+        }
+        uint32_t arguments[] = { address, compat_runtime32_copy_cstring(value) };
+        if (!arguments[1]) return fail("allocating convar override value");
+        compat_runtime32_call(setter, arguments, 2);
+        bool trapped = compat_runtime32_last_call_trapped();
+        compat_runtime32_deallocate(arguments[1]);
+        if (trapped) return fail("convar setter trapped for %s in %s", name, m->path);
+        fprintf(stderr, "compat32: convar %s = %s at 0x%08x float_bits=%08x int=%d\n",
+                name, value, address, object[11], (int32_t)object[12]);
+    }
+    return 0;
+}
+
+struct server_class32 { uint32_t name, table, next, class_id, baseline; };
+
+static void drop_server_classes(struct module32 *m)
+{
+    char buffer[1024];
+    if (!override_list("LP32_DROP_SERVER_CLASSES", buffer)) return;
+    uint32_t head_address = defined_symbol(m, "_g_pServerClassHead");
+    uint32_t *head = accessible_range(m, head_address, 4, VM_PROT_READ | VM_PROT_WRITE);
+    if (!head) {
+        fprintf(stderr, "compat32: server class head unavailable in %s; no classes dropped\n", m->path);
+        return;
+    }
+    char *state;
+    for (char *entry = strtok_r(buffer, ",", &state); entry; entry = strtok_r(NULL, ",", &state)) {
+        char *name = trim_override(entry), symbol[256];
+        if (!override_name(name) || snprintf(symbol, sizeof(symbol), "__ZL%zug_%s_ClassReg",
+                strlen(name) + 11, name) >= (int)sizeof(symbol)) {
+            fprintf(stderr, "compat32: invalid server class override name\n");
+            continue;
+        }
+        uint32_t target = defined_symbol(m, symbol);
+        struct server_class32 *victim = accessible_range(m, target, sizeof(*victim), VM_PROT_READ | VM_PROT_WRITE);
+        if (!victim || !module_string_equals(m, victim->name, name)) {
+            fprintf(stderr, "compat32: server class %s missing or incompatible in %s; left unchanged\n", name, m->path);
+            continue;
+        }
+        /* Validate the entire bounded chain before writing. Walking the actual
+           head handles first entries and repeated removals, and cannot modify
+           an unrelated static registration that merely points at the victim. */
+        uint32_t seen[4096], count = 0, *link = head, *predecessor = NULL;
+        bool valid = true;
+        while (*link) {
+            if (count == sizeof(seen) / sizeof(seen[0])) { valid = false; break; }
+            for (unsigned i = 0; i < count; ++i) if (seen[i] == *link) valid = false;
+            if (!valid) break;
+            seen[count++] = *link;
+            struct server_class32 *node = accessible_range(m, *link, sizeof(*node), VM_PROT_READ | VM_PROT_WRITE);
+            if (!node) { valid = false; break; }
+            if (*link == target) predecessor = link;
+            link = &node->next;
+        }
+        if (!valid || !predecessor) {
+            fprintf(stderr, "compat32: server class %s %s; left unchanged\n", name,
+                    valid ? "is not in the active list" : "has an invalid/cyclic class list");
+            continue;
+        }
+        *predecessor = victim->next;
+        fprintf(stderr, "compat32: dropped server class %s at 0x%08x before map spawn\n", name, target);
+    }
+}
+
+static int apply_source_overrides(struct module32 *m)
+{
+    if (lp32_profile()->title != LP32_TITLE_PORTAL2) return 0;
+    const char *base = strrchr(m->path, '/');
+    base = base ? base + 1 : m->path;
+    if (!strcmp(base, "engine.dylib")) return apply_convar_overrides(m);
+    if (!strcmp(base, "server.dylib")) drop_server_classes(m);
+    return 0;
+}
+
 static int initialize_module(struct module32 *m)
 {
     if (m->state == 5) return fail("library initialization previously failed: %s", m->path);
     if (m->state == 3 || m->state == 4) return 0;
     m->state = 3;
     int result = run_initializers(m);
+    if (!result) result = apply_source_overrides(m);
     m->state = result ? 5 : 4;
     return result;
 }

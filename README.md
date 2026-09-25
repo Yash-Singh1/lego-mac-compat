@@ -59,6 +59,10 @@ tests reproduce the original crash without the fix and preserve live physics
 updates with it. The original challenge/reload sequence still needs an in-game
 retest. Dev.5's import diagnostics and native macOS crash reports remain included.
 The reported co-op loading stall remains unresolved.
+Unreleased source changes add opt-in send-table/class compatibility controls
+and Steam tracing from [issue #10](https://github.com/Yash-Singh1/lego-mac-compat/issues/10).
+See the [co-op setup and remaining authentication gap](native/PORTAL2.md#experimental-cross-build-co-op-issue-10);
+these changes do not suppress Steam authentication failures.
 
 Dev.4 fixes Steam controller data conversion and the missing PNG decompression
 needed for controller button glyphs. DualShock 4 buttons and sticks have been

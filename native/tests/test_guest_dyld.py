@@ -43,7 +43,7 @@ exports:
       _AudioQueueEnqueueBuffer, _AudioQueueStart, _AudioQueueStop, _AudioQueueRemovePropertyListener, _AudioQueueFreeBuffer, _AudioQueueDispose,
       _FindNextComponent, _OpenAComponent, _CloseComponent, _AudioUnitSetProperty, _AudioUnitGetProperty, _AudioUnitGetPropertyInfo,
       _AudioUnitInitialize, _AudioUnitUninitialize, _AudioUnitRender, _alcCaptureOpenDevice, _alcCaptureCloseDevice, _alcGetError,
-      _printf, _fflush, _malloc,
+      _printf, _fflush, _malloc, _memcmp, ___stdoutp,
       _strcmp, _strncmp, _strncpy, _lp32_unavailable, _stat, _stat$INODE64, _open$UNIX2003, _open,
       _close, _close$UNIX2003, _lseek, _scandir, _alphasort, _free,
       _sigaction, _raise, _getpid, _iconv_open, _iconv, _iconv_close,
@@ -59,6 +59,23 @@ exports:
       _MPEnterCriticalRegion, _MPExitCriticalRegion, _NSIsSymbolNameDefined, _NSLookupAndBindSymbol, _NSAddressOfSymbol, _NSModuleForSymbol,
       _NSLibraryNameForModule, _fgets, _fgets$UNIX2003, ___darwin_check_fd_set_overflow, _getsockname$UNIX2003, _mktime$UNIX2003,
       _CFStringCreateWithBytes, _CFStringGetLength, _CFRetain,
+      _CFEqual, _CFStringCreateWithFormat, _CFStringGetCString,
+      _CFStringCreateMutable, _CFStringAppendFormat, _CFStringTrimWhitespace,
+      _CFDataCreate, _CFDataGetLength, _CFDataGetBytePtr, _CFDataCreateMutable,
+      _CFDataAppendBytes, _CFDataGetMutableBytePtr, _CFArrayCreateMutable,
+      _CFArrayAppendValue, _CFArrayApplyFunction, _CFArrayGetCount,
+      _CFDictionaryCreateMutable, _CFDictionarySetValue, _CFDictionaryGetValue,
+      _CFURLCreateWithBytes, _CFNetworkCopyProxiesForURL,
+      _CFUUIDGetConstantUUIDWithBytes, _CFUUIDGetUUIDBytes,
+      _CFBooleanGetValue, _CFStringGetMaximumSizeForEncoding,
+      _CFAllocatorCreate, _CFAllocatorAllocate, _CFAllocatorDeallocate,
+      _CFReadStreamCreate, _CFReadStreamOpen,
+      _CFReadStreamRead, _CFReadStreamClose, _CFReadStreamSignalEvent,
+      _CFTimeZoneCopySystem, _CFAbsoluteTimeGetGregorianDate,
+      _CFGregorianDateGetAbsoluteTime, _kCFAbsoluteTimeIntervalSince1970,
+      _kCFTypeArrayCallBacks, _kCFTypeDictionaryKeyCallBacks,
+      _kCFTypeDictionaryValueCallBacks, _kCFCopyStringDictionaryKeyCallBacks,
+      _kCFBooleanTrue, _kCFBooleanFalse,
       _CFStringCreateWithCString, _ATSFontFindFromName, _ATSUCreateStyle, _ATSUSetAttributes, _ATSUCreateTextLayoutWithTextPtr, _ATSUSetLayoutControls,
       _ATSUDirectGetLayoutDataArrayPtrFromTextLayout, _ATSUGlyphGetScreenMetrics, _ATSUDrawText, _ATSUDisposeTextLayout, _ATSUDisposeStyle, _CGColorSpaceCreateDeviceRGB,
       _CGColorSpaceRelease, _CGBitmapContextCreate, _CGBitmapContextGetData, _CGContextRelease, ___stack_chk_guard, ___stack_chk_fail,
@@ -109,6 +126,7 @@ extern int strcmp(const char *, const char *) __attribute__((weak_import));
 extern int lp32_unavailable(void) __attribute__((weak_import));
 extern int check_directory(void);
 extern int check_font(void);
+extern int check_cf_bridge(void);
 extern int check_context(void);
 extern int check_mach_ipc(void);
 extern int check_steam(void);
@@ -195,6 +213,7 @@ int LauncherMain(void) {
     int timer_error = check_time_manager(); if (timer_error) return timer_error;
     int sound_error = check_sound_manager(); if (sound_error) return sound_error;
     int font_error = check_font(); if (font_error) return font_error;
+    int cf_error = check_cf_bridge(); if (cf_error) return cf_error;
     void *system = dlopen("/usr/lib/libSystem.B.dylib", RTLD_LAZY);
     if (!system || dlopen("/usr/lib/libSystem.B.dylib", RTLD_LAZY) != system) return -17;
     int (*compare)(const char *, const char *) = dlsym(system, "strcmp");
@@ -381,8 +400,11 @@ int check_directory(void) {
 """)
     (root / "start.S").write_text(".text\n.globl _start\n_start:\n ret\n")
     (root / "helper.S").write_text(".text\n.globl dyld_stub_binding_helper\ndyld_stub_binding_helper:\n ud2\n")
-    for version, address in (("10.5", 0), ("10.6", 0),
-                             ("10.5", 0x90000000), ("10.6", 0x90000000)):
+    variants = (("10.5", 0), ("10.6", 0),
+                ("10.5", 0x90000000), ("10.6", 0x90000000))
+    if os.getenv("LP32_CF_BRIDGE_ONLY"):
+        variants = (("10.5", 0),)
+    for version, address in variants:
         flags = ["xcrun", "clang", "-target", "i386-apple-macos" + version,
                  "-nostdlib", "-fno-builtin", "-L" + str(root), "-lSystem", str(root / "helper.S")]
         run("xcrun", "clang", "-target", "i386-apple-macos" + version,
@@ -398,7 +420,7 @@ int check_directory(void) {
                 "-L" + str(root / "bin"), "-lfixture_dep", "-o", str(root / "bin/libfixture_reexport.dylib"))
             dependency = "fixture_reexport"
         run(*flags, "-dynamiclib", "-Wl,-install_name,@loader_path/launcher.dylib",
-            str(root / "launcher.c"), str(root / "many_imports.c"), str(NATIVE / "tests/fixtures/font.c"), str(NATIVE / "tests/fixtures/context.c"), str(NATIVE / "tests/fixtures/mach_ipc.c"), str(NATIVE / "tests/fixtures/steam_guest.c"), str(NATIVE / "tests/fixtures/wide_scan.c"), str(NATIVE / "tests/fixtures/audio_threads.c"), str(NATIVE / "tests/fixtures/audio_unit.c"), str(NATIVE / "tests/fixtures/sound_manager.c"), str(NATIVE / "tests/fixtures/time_manager.c"), str(root / "directory.o"), "-L" + str(root / "bin"), "-l" + dependency,
+            str(root / "launcher.c"), str(root / "many_imports.c"), str(NATIVE / "tests/fixtures/font.c"), str(NATIVE / "tests/fixtures/cf_bridge.c"), str(NATIVE / "tests/fixtures/context.c"), str(NATIVE / "tests/fixtures/mach_ipc.c"), str(NATIVE / "tests/fixtures/steam_guest.c"), str(NATIVE / "tests/fixtures/wide_scan.c"), str(NATIVE / "tests/fixtures/audio_threads.c"), str(NATIVE / "tests/fixtures/audio_unit.c"), str(NATIVE / "tests/fixtures/sound_manager.c"), str(NATIVE / "tests/fixtures/time_manager.c"), str(root / "directory.o"), "-L" + str(root / "bin"), "-l" + dependency,
             "-o", str(root / "bin/launcher.dylib"))
         run(*flags, "-Wl,-e,_start,-no_pie", str(root / "start.S"), "-o", str(root / "portal2_osx"))
         # Exercise universal i386 selection on a real generated dylib.
@@ -421,7 +443,7 @@ int check_directory(void) {
         environment = dict(os.environ, LP32_GAME="portal2", LP32_MUTE_AUDIO="1", LP32_DYLD_SELFTEST="1",
                            LP32_DYLD_FIXTURE_SELFTEST="1", LP32_LOG_DIR=str(root / "logs"),
                            LP32_STEAM_FIXTURE=str(root / "steamclient.dylib"))
-        if version == "10.5" and address == 0:
+        if version == "10.5" and address == 0 and not os.getenv("LP32_CF_BRIDGE_ONLY"):
             logs = root / "logs"
             logs.mkdir()
             (logs / "last-run.log").write_text("legacy log retained\n")

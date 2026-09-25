@@ -1,6 +1,7 @@
 #include "steam_bridge.h"
 #include "compat_runtime.h"
 #include "game_profile.h"
+#include "crash_trace.h"
 #include <dlfcn.h>
 #include <ffi/ffi.h>
 #include <stdbool.h>
@@ -21,6 +22,8 @@ static uint32_t method_thunks[sizeof(steam_methods) / sizeof(steam_methods[0])];
 static _Atomic uint32_t warning_hook, callback_check_hook;
 static pthread_mutex_t cache_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool trace;
+static const char *method_filter;
+static bool callback_trace;
 
 /* Valve packs the input records and SteamIPAddress_t to one byte on both
    Darwin architectures. Use typed native calls: libffi's natural struct
@@ -153,6 +156,9 @@ uint32_t steam_bridge32_open(const char *path)
         client_library = dlopen(path, RTLD_NOW | RTLD_LOCAL);
         if (!client_library) return 0;
         trace = getenv("LP32_TRACE_STEAM") != NULL;
+        method_filter = getenv("LP32_TRACE_STEAM_METHODS");
+        const char *callbacks = getenv("LP32_TRACE_STEAM_CALLBACKS");
+        callback_trace = callbacks && *callbacks && strcmp(callbacks, "0");
         fprintf(stderr, "compat32: using native Steam client through the i386 interface bridge\n");
     }
     return LP32_STEAM_CLIENT_HANDLE;
@@ -207,7 +213,7 @@ static ffi_type *abi_type(char c)
     }
 }
 
-static int call_method(unsigned index, const uint32_t *args, uint64_t *result)
+static int invoke_method(unsigned index, const uint32_t *args, uint64_t *result)
 {
     if (index >= sizeof(steam_methods) / sizeof(steam_methods[0])) return 0;
     const struct steam_method *method = &steam_methods[index];
@@ -348,6 +354,80 @@ unsupported:
 }
 
 struct native_callback { int user, id; void *data; int size; };
+
+/* Keep tracing outside the dispatcher so typed packed-record calls and nested
+   callbacks are covered too. Only log argument words, never pointed-to ticket
+   bytes, strings, or credentials. */
+static int call_method(unsigned index, const uint32_t *args, uint64_t *result)
+{
+    if (!method_filter || !*method_filter) return invoke_method(index, args, result);
+    if (index >= sizeof(steam_methods) / sizeof(steam_methods[0])) return 0;
+    const struct steam_method *method = &steam_methods[index];
+    unsigned first = indirect_result(method->result) ? 1 : 0;
+    const struct steam_interface *interface = NULL;
+    pthread_mutex_lock(&cache_lock);
+    for (unsigned i = 0; i < proxy_count; ++i)
+        if (proxies[i].guest == args[first]) { interface = proxies[i].interface; break; }
+    pthread_mutex_unlock(&cache_lock);
+    bool selected = interface && index >= interface->first && index < interface->first + interface->count &&
+        (!strcmp(method_filter, "*") || strstr(interface->version, method_filter));
+    if (selected) {
+        flockfile(stderr);
+        fprintf(stderr, "compat32: steam method %s::%s(%s) begin", interface->version, method->name, method->args);
+        unsigned word = first + 1;
+        for (const char *code = method->args; *code; ++code) {
+            unsigned width = (*code == 'q' || *code == 'd') ? 2 : *code == 'I' ? 5 : *code == 'L' ? 3 : 1;
+            fprintf(stderr, " %c=", *code);
+            for (unsigned i = 0; i < width; ++i) fprintf(stderr, "%s%08x", i ? ":" : "", args[word++]);
+        }
+        fprintf(stderr, "\n");
+        funlockfile(stderr);
+    }
+    int handled = invoke_method(index, args, result);
+    if (selected) {
+        flockfile(stderr);
+        fprintf(stderr, "compat32: steam method %s::%s end handled=%d result(%c)=0x%llx",
+                interface->version, method->name, handled, method->result,
+                (unsigned long long)(handled ? *result : 0));
+        if (handled && *result && !strcmp(method->name, "SendUserConnectAndAuthenticate_DEPRECATED")) {
+            uint64_t id;
+            if (lp32_crash_read(args[4], &id, sizeof(id)))
+                fprintf(stderr, " steamid=%llu", (unsigned long long)id);
+        }
+        fprintf(stderr, "\n");
+        funlockfile(stderr);
+    }
+    return handled;
+}
+
+static void trace_callback(int pipe, const struct native_callback *cb)
+{
+    if (!callback_trace) return;
+    flockfile(stderr);
+    fprintf(stderr, "compat32: steam callback %d user=%d size=%d pipe=%d", cb->id, cb->user, cb->size, pipe);
+    if (cb->size >= 8 && (cb->id == 143 || cb->id == 201 || cb->id == 202 || cb->id == 203)) {
+        uint64_t id;
+        memcpy(&id, cb->data, sizeof(id));
+        const char *kind = cb->id == 143 ? "ValidateAuthTicketResponse" : cb->id == 201 ? "GSClientApprove" :
+            cb->id == 202 ? "GSClientDeny" : "GSClientKick";
+        fprintf(stderr, " %s steamid=%llu", kind, (unsigned long long)id);
+        if (cb->id != 201 && cb->size >= 12) {
+            uint32_t reason;
+            memcpy(&reason, (const char *)cb->data + 8, sizeof(reason));
+            fprintf(stderr, " %s=%u", cb->id == 143 ? "response" : "reason", reason);
+            if (cb->id == 202 && cb->size > 12)
+                fprintf(stderr, " text=\"%.*s\"", cb->size - 12 < 64 ? cb->size - 12 : 64, (const char *)cb->data + 12);
+        }
+        unsigned owner_offset = cb->id == 143 ? 12 : 8;
+        if ((cb->id == 143 || cb->id == 201) && cb->size >= (int)owner_offset + 8) {
+            uint64_t owner;
+            memcpy(&owner, (const char *)cb->data + owner_offset, sizeof(owner));
+            fprintf(stderr, " owner=%llu", (unsigned long long)owner);
+        }
+    }
+    fprintf(stderr, "\n");
+    funlockfile(stderr);
+}
 // Steam dispatches callbacks on the polling thread; retain each pipe's low
 // buffer until its next callback without sharing storage across threads.
 static _Thread_local struct { int pipe; uint32_t data; size_t capacity; } callback_buffers[16];
@@ -404,6 +484,7 @@ int steam_bridge32_dispatch(const char *name, const uint32_t *args, uint64_t *re
             if (cb.size) memcpy((void *)(uintptr_t)data, cb.data, cb.size);
             uint32_t words[] = {(uint32_t)cb.user, (uint32_t)cb.id, data, (uint32_t)cb.size};
             memcpy((void *)(uintptr_t)args[1], words, sizeof(words));
+            trace_callback((int)args[0], &cb);
         }
         *result = ok; return 1;
     }

@@ -1339,6 +1339,27 @@ uint32_t compat_runtime32_guest_callback(const char *name)
 uint32_t compat_runtime32_resolve_symbol(const char *name, int data_hint)
 {
     (void)data_hint;
+    /* These CF exports are structures (or a double), not pointer variables.
+       The collection bridge interprets the guest callback descriptors and
+       supplies host callbacks; their guest addresses must still be valid. */
+    static struct { const char *name; uint32_t address; } cf_structs[] = {
+        {"_kCFCopyStringDictionaryKeyCallBacks", 0},
+        {"_kCFCopyStringSetCallBacks", 0},
+        {"_kCFTypeArrayCallBacks", 0},
+        {"_kCFTypeDictionaryKeyCallBacks", 0},
+        {"_kCFTypeDictionaryValueCallBacks", 0},
+        {"_kCFAbsoluteTimeIntervalSince1970", 0},
+    };
+    for (unsigned i = 0; i < sizeof(cf_structs) / sizeof(cf_structs[0]); ++i) {
+        if (strcmp(name, cf_structs[i].name)) continue;
+        if (!cf_structs[i].address) {
+            cf_structs[i].address = compat_runtime32_allocate(32, 1);
+            if (cf_structs[i].address && i == 5)
+                *(double *)(uintptr_t)cf_structs[i].address =
+                    kCFAbsoluteTimeIntervalSince1970;
+        }
+        return cf_structs[i].address;
+    }
     if (!strcmp(name, "__DefaultRuneLocale")) {
         /* Darwin's cached rune arrays are identical; the two obsolete function
            pointers before them are 32-bit in the guest, so offsets differ. */
@@ -1359,7 +1380,8 @@ uint32_t compat_runtime32_resolve_symbol(const char *name, int data_hint)
     bool data = value || !strcmp(name, "_errno") ||
         !strcmp(name, "_mach_task_self_") || !strcmp(name, "_bootstrap_port") || !strcmp(name, "_environ") ||
         !strcmp(name, "___stack_chk_guard") || !strcmp(name, "___mb_cur_max") || !strcmp(name, "___CFConstantStringClassReference") ||
-        !strcmp(name, "_kCFAllocatorDefault") || !strcmp(name, "_kIOMasterPortDefault") ||
+        !strcmp(name, "_kCFAllocatorDefault") || !strcmp(name, "_kCFAllocatorNull") ||
+        !strcmp(name, "_kIOMasterPortDefault") ||
         !strncmp(name, "__ZTV", 5) || !strncmp(name, "__ZTI", 5) ||
         !strcmp(name, "__ZNSs4_Rep20_S_empty_rep_storageE") ||
         !strncmp(name, ".objc_class_name_", 17);
@@ -3091,6 +3113,8 @@ uint32_t *lp32_adjust_import_stack(uint32_t *stack)
     const char *name = import_name_for_id(stack[0]);
     if (lp32_profile()->title == LP32_TITLE_PORTAL2 &&
         (!strcmp(name, "_objc_msgSend_stret") || !strcmp(name, "_CGDisplayBounds") ||
+         !strcmp(name, "_CFUUIDGetUUIDBytes") ||
+         !strcmp(name, "_CFAbsoluteTimeGetGregorianDate") ||
          steam_bridge32_stret(name))) {
         stack[2] = stack[1];
         return stack + 1;
