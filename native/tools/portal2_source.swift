@@ -10,10 +10,10 @@ struct Portal2SourceTool {
                 throw ConversionError.message("Usage: portal2_source --image SOURCE | --copy SOURCE OUTPUT_APP")
             }
             let source = URL(fileURLWithPath: args[2]).standardizedFileURL
-            let layout = try Portal2Source.discover(source)
+            let layout = try GameSource.discover(source)
             if args[1] == "--image" && args.count == 3 { print(layout.image.path); return }
             if args[1] == "--describe" && args.count == 3 {
-                let data = try JSONSerialization.data(withJSONObject: ["roots": layout.roots.map(\.path), "image": layout.image.path])
+                let data = try JSONSerialization.data(withJSONObject: ["roots": layout.roots.map(\.path), "image": layout.image.path, "game": layout.game.gameDirectory])
                 print(String(decoding: data, as: UTF8.self)); return
             }
             guard args[1] == "--copy" && args.count == 4 else {
@@ -25,13 +25,13 @@ struct Portal2SourceTool {
             let fm = FileManager.default
             let output = app.appendingPathComponent("Contents")
             try fm.createDirectory(at: output.appendingPathComponent("Resources"), withIntermediateDirectories: true)
-            let game = output.appendingPathComponent("SharedSupport/Portal2")
+            let game = output.appendingPathComponent("SharedSupport/" + layout.game.dataDirectory)
             let staged = output.appendingPathComponent("SharedSupport/.portal2-source-\(UUID().uuidString)")
             defer { try? fm.removeItem(at: staged) }
             try layout.copyGame(to: staged)
             // Build a fresh tree so switching releases cannot leave old dylibs
             // ahead of the new ones. Retain existing local progress/options.
-            for path in Portal2Source.personalPaths {
+            for path in layout.game.personalPaths {
                 let old = game.appendingPathComponent(path)
                 guard (try? fm.attributesOfItem(atPath: old.path)) != nil else { continue }
                 let new = staged.appendingPathComponent(path)
@@ -44,7 +44,7 @@ struct Portal2SourceTool {
                     throw ConversionError.message("Could not replace the game's data: \(String(cString: strerror(errno)))")
                 }
             } else { try fm.moveItem(at: staged, to: game) }
-            let image = output.appendingPathComponent("SharedSupport/Portal2.image")
+            let image = output.appendingPathComponent("SharedSupport/" + layout.game.imageName)
             if (try? fm.attributesOfItem(atPath: image.path)) != nil { try fm.removeItem(at: image) }
             try fm.copyItem(at: layout.image, to: image)
             try fm.setAttributes([.posixPermissions: 0o644], ofItemAtPath: image.path)
@@ -57,7 +57,7 @@ struct Portal2SourceTool {
                 if (try? fm.attributesOfItem(atPath: target.path)) != nil { try fm.removeItem(at: target) }
                 try fm.copyItem(at: icon, to: target)
             }
-            print("Prepared Portal 2 from: " + layout.roots.map(\.path).joined(separator: ", "))
+            print("Prepared \(layout.game.displayName) from: " + layout.roots.map(\.path).joined(separator: ", "))
         } catch {
             fputs("\(error.localizedDescription)\n", stderr)
             exit(1)

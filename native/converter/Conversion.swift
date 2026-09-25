@@ -78,9 +78,9 @@ func isInside(_ child: URL, _ parent: URL) -> Bool {
 
 // RENAME_EXCL makes publishing atomic and never replaces a previous game (and
 // its saves), even if another conversion finishes at the same moment.
-func publish(_ staged: URL, in directory: URL) throws -> URL {
+func publish(_ staged: URL, named appName: String, in directory: URL) throws -> URL {
     for suffix in 1...10000 {
-        let name = suffix == 1 ? "Portal2-Compat.app" : "Portal2-Compat \(suffix).app"
+        let name = suffix == 1 ? "\(appName).app" : "\(appName) \(suffix).app"
         let output = directory.appendingPathComponent(name)
         if renamex_np(staged.path, output.path, UInt32(RENAME_EXCL)) == 0 { return output }
         let code = errno
@@ -271,22 +271,23 @@ final class Converter {
               !(converterApp.pathExtension == "app" && isInside(destination, converterApp)) else {
             throw ConversionError.message("Choose an output folder outside the original game and the converter app.")
         }
-        let layout = try Portal2Source.discover(source)
+        let layout = try GameSource.discover(source)
         try layout.checkDestination(destination)
+        let game = layout.game
         let image = layout.image
         try cancellation.check()
         progress("Preparing compatibility files…", "Your original game files and existing converted copies stay untouched.")
         let runtime = try prepareRuntime()
-        let temp = destination.appendingPathComponent(".portal2-converting-\(UUID().uuidString)")
+        let temp = destination.appendingPathComponent(".\(game.gameDirectory)-converting-\(UUID().uuidString)")
         try fm.createDirectory(at: temp, withIntermediateDirectories: false)
         defer { try? fm.removeItem(at: temp) }
-        let app = temp.appendingPathComponent("Portal2-Compat.app")
+        let app = temp.appendingPathComponent(game.appName + ".app")
         let output = app.appendingPathComponent("Contents")
         for directory in ["MacOS", "Resources", "SharedSupport"] {
             try fm.createDirectory(at: output.appendingPathComponent(directory), withIntermediateDirectories: true)
         }
-        progress("Copying Portal 2…", "Combining the game files into your new app. Saves stored in the source come with it.")
-        try layout.copyGame(to: output.appendingPathComponent("SharedSupport/Portal2"), check: cancellation.check)
+        progress("Copying \(game.displayName)…", "Combining the game files into your new app. Saves stored in the source come with it.")
+        try layout.copyGame(to: output.appendingPathComponent("SharedSupport/" + game.dataDirectory), check: cancellation.check)
         if let resources = layout.resources {
             try run("/usr/bin/ditto", ["--noextattr", "--noqtn", resources.path,
                                       output.appendingPathComponent("Resources").path])
@@ -294,20 +295,22 @@ final class Converter {
             try fm.copyItem(at: icon, to: output.appendingPathComponent("Resources/game.icns"))
         }
         try cancellation.check()
-        try fm.copyItem(at: image, to: output.appendingPathComponent("SharedSupport/Portal2.image"))
-        try fm.setAttributes([.posixPermissions: 0o644], ofItemAtPath: output.appendingPathComponent("SharedSupport/Portal2.image").path)
-        let runtimeOutput = output.appendingPathComponent("SharedSupport/Portal2/compat-runtime")
+        let imageOutput = output.appendingPathComponent("SharedSupport/" + game.imageName)
+        try fm.copyItem(at: image, to: imageOutput)
+        try fm.setAttributes([.posixPermissions: 0o644], ofItemAtPath: imageOutput.path)
+        let runtimeOutput = output.appendingPathComponent("SharedSupport/\(game.dataDirectory)/compat-runtime")
         // Remove only the new copy's old entry (including a symlink), before
         // copying private libraries. Never follow an input link when writing.
         if (try? fm.attributesOfItem(atPath: runtimeOutput.path)) != nil { try fm.removeItem(at: runtimeOutput) }
         try run("/usr/bin/ditto", ["--noextattr", "--noqtn", runtime.path, runtimeOutput.path])
-        try fm.copyItem(at: resources.appendingPathComponent("game_loader"), to: output.appendingPathComponent("MacOS/Portal2Compat"))
-        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: output.appendingPathComponent("MacOS/Portal2Compat").path)
-        try fm.copyItem(at: resources.appendingPathComponent("Info-Portal2.plist"), to: output.appendingPathComponent("Info.plist"))
-        progress("Finishing your app…", "Preparing Portal 2 to open from Finder.")
+        let loader = output.appendingPathComponent("MacOS/" + game.loaderName)
+        try fm.copyItem(at: resources.appendingPathComponent("game_loader"), to: loader)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: loader.path)
+        try fm.copyItem(at: resources.appendingPathComponent(game.infoPlist), to: output.appendingPathComponent("Info.plist"))
+        progress("Finishing your app…", "Preparing \(game.displayName) to open from Finder.")
         try run("/usr/bin/codesign", ["--force", "--sign", "-", app.path])
         try run("/usr/bin/codesign", ["--verify", "--deep", "--strict", app.path])
         try cancellation.check()
-        return try publish(app, in: destination)
+        return try publish(app, named: game.appName, in: destination)
     }
 }

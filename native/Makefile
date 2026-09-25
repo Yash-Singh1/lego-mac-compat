@@ -130,11 +130,11 @@ $(BUILD_DIR)/converter-x86_64: $(CONVERTER_SOURCES) | $(BUILD_DIR)
 	$(SWIFTC) -O -swift-version 5 -warnings-as-errors -target x86_64-apple-macosx11.0 -sdk $(SDK) $^ -o $@
 
 .PHONY: portal2-converter test-portal2-converter
-portal2-converter: $(BUILD_DIR)/converter-arm64 $(BUILD_DIR)/converter-x86_64 $(BUILD_DIR)/game_loader converter/Info.plist Info-Portal2.plist
+portal2-converter: $(BUILD_DIR)/converter-arm64 $(BUILD_DIR)/converter-x86_64 $(BUILD_DIR)/game_loader converter/Info.plist Info-Portal2.plist Info-Portal.plist
 	mkdir -p "$(CONVERTER_APP)/Contents/MacOS" "$(CONVERTER_APP)/Contents/Resources"
 	lipo -create $(BUILD_DIR)/converter-arm64 $(BUILD_DIR)/converter-x86_64 -output "$(CONVERTER_APP)/Contents/MacOS/Portal2Converter"
 	cp converter/Info.plist "$(CONVERTER_APP)/Contents/Info.plist"
-	cp $(BUILD_DIR)/game_loader Info-Portal2.plist "$(CONVERTER_APP)/Contents/Resources/"
+	cp $(BUILD_DIR)/game_loader Info-Portal2.plist Info-Portal.plist "$(CONVERTER_APP)/Contents/Resources/"
 	codesign --force --sign - "$(CONVERTER_APP)/Contents/Resources/game_loader"
 	codesign --force --sign - "$(CONVERTER_APP)"
 	codesign --verify --deep --strict "$(CONVERTER_APP)"

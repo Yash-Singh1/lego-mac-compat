@@ -69,13 +69,13 @@ struct ConverterTests {
         }
         try fixture(source, "Contents/MacOS/portal2/gameinfo.txt")
         try fixture(source, "Contents/MacOS/bin/launcher.dylib")
-        let legacy = try Portal2Source.discover(source)
+        let legacy = try GameSource.discover(source)
         try expect(legacy.roots == [source.appendingPathComponent("Contents/MacOS")], "legacy app layout")
         let steam = temp.appendingPathComponent("Steam library ' $")
         let flat = steam.appendingPathComponent("steamapps/common/Portal 2")
         for path in ["portal2_osx", "portal2/gameinfo.txt", "bin/osx32/launcher.dylib"] { try fixture(flat, path) }
         for root in [flat, flat.deletingLastPathComponent(), steam.appendingPathComponent("steamapps"), steam] {
-            try expect(try Portal2Source.discover(root).roots.map { $0.resolvingSymlinksInPath().path } == [flat.resolvingSymlinksInPath().path], "Steam folder discovery")
+            try expect(try GameSource.discover(root).roots.map { $0.resolvingSymlinksInPath().path } == [flat.resolvingSymlinksInPath().path], "Steam folder discovery")
         }
         let download = temp.appendingPathComponent("download")
         let common = download.appendingPathComponent("depots/621/123")
@@ -83,23 +83,23 @@ struct ConverterTests {
         for path in ["portal2_osx", "portal2/gameinfo.txt", "portal2/resource/game.icns", ".DepotDownloader/staging/partial"] {
             try fixture(common, path)
         }
-        try rejects("content without the Mac client") { _ = try Portal2Source.discover(download) }
+        try rejects("content without the Mac client") { _ = try GameSource.discover(download) }
         try fixture(mac, "bin/osx32/launcher.dylib")
         try fixture(mac, "portal2/bin/osx32/client.dylib")
         for root in [download, download.appendingPathComponent("depots"), common, mac] {
-            try expect(try Portal2Source.discover(root).roots.map { $0.resolvingSymlinksInPath().path } == [common.resolvingSymlinksInPath().path, mac.resolvingSymlinksInPath().path], "split depot discovery: \(root.path), got \(try Portal2Source.discover(root).roots.map { $0.resolvingSymlinksInPath().path }), expected \([common.resolvingSymlinksInPath().path, mac.resolvingSymlinksInPath().path])")
+            try expect(try GameSource.discover(root).roots.map { $0.resolvingSymlinksInPath().path } == [common.resolvingSymlinksInPath().path, mac.resolvingSymlinksInPath().path], "split depot discovery: \(root.path), got \(try GameSource.discover(root).roots.map { $0.resolvingSymlinksInPath().path }), expected \([common.resolvingSymlinksInPath().path, mac.resolvingSymlinksInPath().path])")
         }
-        let split = try Portal2Source.discover(download)
+        let split = try GameSource.discover(download)
         try rejects("destination inside inferred sibling depot") { try split.checkDestination(mac) }
         try expect(split.icon?.resolvingSymlinksInPath().path == common.appendingPathComponent("portal2/resource/game.icns").resolvingSymlinksInPath().path, "flat icon")
         let second = download.appendingPathComponent("depots/623/456")
         try fixture(second, "bin/osx32/launcher.dylib")
-        try expect(try Portal2Source.discover(download).roots.map { $0.resolvingSymlinksInPath().path } == [common.resolvingSymlinksInPath().path, mac.resolvingSymlinksInPath().path], "matching depot build")
+        try expect(try GameSource.discover(download).roots.map { $0.resolvingSymlinksInPath().path } == [common.resolvingSymlinksInPath().path, mac.resolvingSymlinksInPath().path], "matching depot build")
         let other = download.appendingPathComponent("depots/621/456")
         try fixture(other, "portal2_osx")
         try fixture(other, "portal2/gameinfo.txt")
-        try rejects("ambiguous depot versions") { _ = try Portal2Source.discover(download) }
-        try expect(try Portal2Source.discover(common).roots.map { $0.resolvingSymlinksInPath().path } == [common.resolvingSymlinksInPath().path, mac.resolvingSymlinksInPath().path], "specific version selection")
+        try rejects("ambiguous depot versions") { _ = try GameSource.discover(download) }
+        try expect(try GameSource.discover(common).roots.map { $0.resolvingSymlinksInPath().path } == [common.resolvingSymlinksInPath().path, mac.resolvingSymlinksInPath().path], "specific version selection")
         let merged = temp.appendingPathComponent("merged")
         try split.copyGame(to: merged)
         try expect(fm.fileExists(atPath: merged.appendingPathComponent("portal2/bin/osx32/client.dylib").path), "merge client and content directories")
@@ -112,6 +112,29 @@ struct ConverterTests {
         try split.copyGame(to: merged)
         try expect(try String(contentsOf: external.appendingPathComponent("keep")) == "untouched", "overlay does not follow copied links")
         print("PASS: app, Steam folders, split depots, ambiguity, merge and link preservation")
+
+        let portalLibrary = temp.appendingPathComponent("Portal library")
+        let portal = portalLibrary.appendingPathComponent("steamapps/common/Portal")
+        for path in ["hl2_osx", "portal/gameinfo.txt", "portal/resource/game.icns", "bin/launcher.dylib"] { try fixture(portal, path) }
+        for root in [portal, portal.deletingLastPathComponent(), portalLibrary.appendingPathComponent("steamapps"), portalLibrary] {
+            let found = try GameSource.discover(root)
+            try expect(found.game == .portal && found.roots.map { $0.resolvingSymlinksInPath().path } == [portal.resolvingSymlinksInPath().path], "Portal Steam folder discovery")
+        }
+        let portalLayout = try GameSource.discover(portal)
+        try expect(portalLayout.image.lastPathComponent == "hl2_osx" && portalLayout.game.imageName == "Portal.image" &&
+                   portalLayout.game.appName == "Portal-Compat", "Portal names")
+        try expect(portalLayout.icon?.lastPathComponent == "game.icns", "Portal icon")
+        try rejects("Portal without the Mac client") {
+            let bare = temp.appendingPathComponent("bare/Portal")
+            try fixture(bare, "hl2_osx"); try fixture(bare, "portal/gameinfo.txt")
+            _ = try GameSource.discover(bare)
+        }
+        for path in ["portal2_osx", "portal2/gameinfo.txt", "bin/osx32/launcher.dylib"] {
+            try fixture(portalLibrary.appendingPathComponent("steamapps/common/Portal 2"), path)
+        }
+        try rejects("a library with both games") { _ = try GameSource.discover(portalLibrary) }
+        try expect(try GameSource.discover(portal).game == .portal, "explicit Portal folder beside Portal 2")
+        print("PASS: Portal Steam folders, names and mixed libraries")
 
         let link = temp.appendingPathComponent("source-link")
         try fm.createSymbolicLink(at: link, withDestinationURL: source)
@@ -133,7 +156,7 @@ struct ConverterTests {
             do {
                 let stage = temp.appendingPathComponent("stage-\(index)")
                 try fm.createDirectory(at: stage, withIntermediateDirectories: false)
-                let output = try publish(stage, in: destination)
+                let output = try publish(stage, named: "Portal2-Compat", in: destination)
                 resultLock.lock()
                 outputs.append(output)
                 resultLock.unlock()
