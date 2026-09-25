@@ -3,9 +3,46 @@ BUILD_DIR := build
 CONTINUE_WHEN_INACTIVE ?= 0
 
 # One loader serves every supported title; the bundle targets pick the title
-# with GAME=pirates (default), GAME=clonewars, GAME=marvel, GAME=batman3,
-# GAME=movie or GAME=saga.
-GAME ?= pirates
+# from the game app with SOURCE_APP=... (its bundle identifier names it, see
+# GAME_BUNDLE_IDS) or explicitly with GAME=pirates (default), GAME=clonewars,
+# GAME=marvel, GAME=batman3, GAME=movie or GAME=saga.
+GAME ?=
+
+# Accepted bundle identifiers, as <identifier>=<title>.  An entry without a dot
+# matches the last component of the identifier, which covers every publisher
+# prefix of one title (com.feralinteractive.legopirates and
+# com.transgaming.cider.legopirates both end in legopirates).  The generated
+# bundles keep the game's own identifier, "<identifier>.compat".
+GAME_BUNDLE_IDS := \
+	com.t-tales.www=pirates \
+	legopirates=pirates \
+	legostarwarsiii=clonewars \
+	legomarvelsuperheroes=marvel \
+	legobatman3=batman3 \
+	legomovie=movie \
+	saga=saga
+
+# CFBundleIdentifier of the app the caller pointed at, lowercased.  plutil
+# prints nothing on stdout when the app, its Info.plist or the key is missing.
+SOURCE_BUNDLE_ID := $(if $(strip $(SOURCE_APP)),$(shell /usr/bin/plutil \
+	-extract CFBundleIdentifier raw -o - "$(SOURCE_APP)/Contents/Info.plist" \
+	2>/dev/null | tr '[:upper:]' '[:lower:]'))
+
+# The title a bundle identifier names: the first entry of GAME_BUNDLE_IDS whose
+# identifier or last component matches.
+game_for_bundle_id = $(strip $(firstword $(foreach entry,$(GAME_BUNDLE_IDS),\
+	$(if $(filter $(firstword $(subst =, ,$(entry))),$(1) $(lastword $(subst ., ,$(1)))),\
+		$(lastword $(subst =, ,$(entry)))))))
+
+ifeq ($(strip $(GAME)),)
+# Take the title from the app; with no identifier to read (no SOURCE_APP, or an
+# unreadable one) the historical pirates default stands.  An unrecognised
+# identifier reaches the Unknown GAME error below.
+GAME := $(call game_for_bundle_id,$(SOURCE_BUNDLE_ID))
+ifeq ($(strip $(GAME)$(SOURCE_BUNDLE_ID)),)
+GAME := pirates
+endif
+endif
 ifeq ($(GAME),clonewars)
 BUNDLE := $(BUILD_DIR)/LEGOCloneWars-Compat.app
 SOURCE_APP := /Volumes/Storage/games/mac/lsw3/LEGOCloneWars.app
@@ -127,7 +164,16 @@ GAME_DATA := GAME.DAT GAME0.DAT GAME1.DAT GAME2.DAT GAME3.DAT GAME4.DAT
 ICON := icons/LEGOPirates.icns
 ICON_NAME := icon.icns
 else
+# Report the identifier found in the app when there was one to read, so an
+# unrecognised game is one GAME_BUNDLE_IDS entry away from working.  The
+# informational target still runs without a title.
+ifneq ($(filter-out game-info,$(MAKECMDGOALS)),)
+ifneq ($(strip $(SOURCE_BUNDLE_ID)),)
+$(error Bundle identifier "$(SOURCE_BUNDLE_ID)" of "$(SOURCE_APP)" is not in GAME_BUNDLE_IDS; add it there or pass GAME=pirates, clonewars, marvel, batman3, movie or saga)
+else
 $(error Unknown GAME "$(GAME)"; choose pirates, clonewars, marvel, batman3, movie or saga)
+endif
+endif
 endif
 CG_SOURCE ?= $(SOURCE_CONTENTS)/Library/Frameworks/Cg.framework
 # Python for the Pirates unpacker.  By default a venv under $(BUILD_DIR) with
@@ -147,9 +193,17 @@ SDK := $(shell xcrun --sdk macosx --show-sdk-path)
 CFLAGS := -arch x86_64 -isysroot $(SDK) -mmacosx-version-min=11.0 -O2 -g -Wall -Wextra -Werror
 LDFLAGS := -Wl,-no_pie,-pagezero_size,0x1000,-segaddr,__TEXT,0x100000000,-segaddr,__LEGACY,0x1000,-segprot,__LEGACY,rwx,rwx
 
-.PHONY: test-game-profile all bundle promote-loader icons clean run run-game controller-probe test-controller test-arb-program-guard test-arb-sampler-usage mode-switch-stress
+.PHONY: test-game-profile all bundle promote-loader icons clean run run-game controller-probe game-info test-controller test-arb-program-guard test-arb-sampler-usage mode-switch-stress
 
 all: $(BUILD_DIR)/mode32_probe $(BUILD_DIR)/game_loader
+
+# Report the title this build uses and the app it came from; handy before a
+# first build, and for identifying an app whose identifier GAME_BUNDLE_IDS does
+# not list yet.
+game-info:
+	@echo "SOURCE_APP = $(if $(strip $(SOURCE_APP)),$(SOURCE_APP),<not set>)"
+	@echo "bundle id  = $(if $(strip $(SOURCE_BUNDLE_ID)),$(SOURCE_BUNDLE_ID),<not found>)"
+	@echo "GAME       = $(if $(strip $(GAME)),$(GAME),<unknown: pass GAME=... or add the identifier to GAME_BUNDLE_IDS>)"
 
 $(BUILD_DIR)/controller_probe: src/controller_probe.m | $(BUILD_DIR)
 	$(CLANG) $(CFLAGS) $^ -framework Foundation -framework GameController -o $@
