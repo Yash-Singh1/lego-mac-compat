@@ -308,6 +308,62 @@ static const struct lp32_game_profile marvel_profile = {
     .application_will_unhide = 0x0043d220,
 };
 
+/* Feral Steam 1.0.3 RC5 (86106.17767.3, 2015), the same Feral runtime and
+   GCC HID Utilities library as Marvel, located by matching Marvel's code. */
+static const struct lp32_controller_layout batman3_controller = {
+    .hid_device_list = 0x019d9ae0,
+    .hid_last_error = 0x019d9ad4,
+    .hid_get_element_value = {
+        .address = 0x0138d3f6,
+        .expected = {0x55, 0x89, 0xe5, 0x83, 0xec, 0x68},
+        .length = 6,
+    },
+    .hid_build_device_list = {
+        .address = 0x0139437c,
+        .expected = {0x55, 0x89, 0xe5, 0x83, 0xec, 0x58},
+        .length = 6,
+    },
+    .hid_get_first_device = 0x0138d689,
+    .hid_get_next_device = 0x0138d69a,
+    .convert_hid_state = 0x004f0250,
+};
+
+/* ScreenWidth/Height/RefreshRate setters: 0x2bdf60/0x2bdf90/0x2bdfc0. */
+static const struct lp32_display_layout batman3_display = {
+    .screen_width = 0x019dcd00,
+    .screen_height = 0x019dcd04,
+    .refresh_rate = 0x019dcd08,
+};
+
+/* Byte-identical to Marvel's submitter apart from its data offsets. */
+static const struct lp32_steam_achievement_guard batman3_steam_achievement_guard = {
+    .entry = 0x002d8840,
+    .stats_pointer = 0x019ddc38,
+    .enabled_check = {0x002d884f, {0x80,0xbe,0xb0,0x52,0x51,0x01,0x00}, 7},
+    .stats_load = {0x002d885e, {0x8b,0x8e,0xec,0x53,0x70,0x01,0x8b,0x11}, 8},
+    .skip_return = {0x002d8897, {0x83,0xc4,0x14,0x5e,0x5d,0xc3}, 6},
+};
+
+/* Unlike Marvel, this crt is the older one that reaches main via __start. */
+static const struct lp32_game_profile batman3_profile = {
+    .title = LP32_TITLE_BATMAN3,
+    .name = "LEGOBatman3",
+    .display_name = "LEGO Batman 3: Beyond Gotham",
+    .log_directory = "LEGOBatman3Compat",
+    .image_file = "LEGOBatman3.image",
+    .entry_eip = 0x00002cd0,
+    .image_end = 0x01b0e71c,
+    .main_address = 0x002bd290,
+    .steam_app_id = 313690,
+    .callee_pops_struct_return = 1,
+    .thread_argument_is_direct = 1,
+    .controller = &batman3_controller,
+    .steam_achievement_guard = &batman3_steam_achievement_guard,
+    .display = &batman3_display,
+    .application_should_terminate = 0x004f9730,
+    .application_will_unhide = 0x004f97b0,
+};
+
 /* Feral Complete Saga 1.0 (R17), plain i386 Carbon executable. */
 static const struct lp32_game_profile saga_10_profile = {
     .title = LP32_TITLE_COMPLETE_SAGA,
@@ -388,6 +444,7 @@ static const struct lp32_game_profile *const known_profiles[] = {
     &saga_profile,
     &saga_10_profile,
     &saga_steam_profile,
+    &batman3_profile,
 };
 
 static const struct lp32_game_profile *current_profile = &unknown_profile;
@@ -411,6 +468,7 @@ const struct lp32_game_profile *lp32_profile_named(const char *name)
     if (!strcasecmp(name, "saga-retail")) return &saga_profile;
     /* Accept the friendlier spellings used on the command line. */
     if (strcasecmp(name, "marvel") == 0) return &marvel_profile;
+    if (strcasecmp(name, "batman3") == 0) return &batman3_profile;
     if (strcasecmp(name, "pirates") == 0) return &pirates_profile;
     if (strcasecmp(name, "clonewars") == 0 || strcasecmp(name, "lsw3") == 0) {
         return &clone_wars_profile;

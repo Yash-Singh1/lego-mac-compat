@@ -8900,6 +8900,11 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         *result = proxy_for_object([bundle resourceURL]);
         return 1;
     }
+    if (LP32_NAME_IS(import_name, import_length, "_CFBundleCopyBuiltInPlugInsURL")) {
+        NSBundle *bundle = object_for_argument(arguments[0]);
+        *result = proxy_for_object([bundle builtInPlugInsURL]);
+        return 1;
+    }
     if (LP32_NAME_IS(import_name, import_length, "_CFBundleCreate")) {
         NSURL *url = object_for_argument(arguments[1]);
         NSBundle *bundle = url ? [NSBundle bundleWithURL:url] : nil;

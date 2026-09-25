@@ -3971,6 +3971,11 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
                               cg_object_for_guest(arguments[0]),
                               (int)arguments[1])) : 0;
     }
+    if (import_is(name, "_cgGetProfile")) {
+        typedef int (*function_type)(const char *);
+        function_type function = (function_type)cg_symbol("cgGetProfile");
+        return function ? (uint32_t)function((const char *)(uintptr_t)arguments[0]) : 0;
+    }
     if (import_is(name, "_cgGetString") || import_is(name, "_cgGetErrorString")) {
         typedef const char *(*function_type)(int);
         function_type function = (function_type)cg_symbol(name + 1);
@@ -3978,8 +3983,10 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
                               (int)arguments[0])) : 0;
     }
     if (import_is(name, "_cgGetParameterClass") ||
+        import_is(name, "_cgGetParameterResource") ||
         import_is(name, "_cgGetParameterResourceIndex") ||
         import_is(name, "_cgGetParameterType") ||
+        import_is(name, "_cgGetProgramProfile") ||
         import_is(name, "_cgGetParameterDirection") ||
         import_is(name, "_cgIsParameter") ||
         import_is(name, "_cgIsParameterReferenced")) {

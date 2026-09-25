@@ -6,6 +6,11 @@
 
 #include <AudioToolbox/AudioToolbox.h>
 #include <CoreAudio/CoreAudio.h>
+#include <mach/mach.h>
+#include <mach/mach_time.h>
+#include <mach/thread_policy.h>
+#include <os/workgroup.h>
+#include <dispatch/dispatch.h>
 
 #include <pthread.h>
 #include <stdbool.h>
@@ -250,9 +255,142 @@ static UInt32 guest_audio_buffer_list_size(uint32_t buffer_count)
                     buffer_count * sizeof(struct guest_audio_buffer));
 }
 
+/*
+ * The HAL's IO thread waits for each guest callback in turn, so the time
+ * these workers take to be scheduled counts against its IO cycle budget.  With
+ * many voices playing, ordinary-priority workers occasionally overran it: the
+ * HAL skipped a cycle ("ClientHALIODurationExceededBudget") and the speaker
+ * popped.  Schedule them as real-time threads and join the output device's IO
+ * workgroup, which is how Apple expects auxiliary audio threads to be run.
+ * LP32_NO_AUDIO_REALTIME=1 keeps the old ordinary-priority workers.
+ */
+static bool audio_realtime_disabled(void)
+{
+    static int disabled = -1;
+    if (disabled < 0) disabled = getenv("LP32_NO_AUDIO_REALTIME") != NULL;
+    return disabled != 0;
+}
+
+static void make_audio_worker_realtime(void)
+{
+    mach_timebase_info_data_t timebase;
+    if (mach_timebase_info(&timebase) != KERN_SUCCESS || !timebase.numer) return;
+    /* Period of one 512-frame cycle at 48 kHz; each callback is a small slice. */
+    const double ns_to_abs = (double)timebase.denom / timebase.numer;
+    thread_time_constraint_policy_data_t policy = {
+        .period = (uint32_t)(10666667 * ns_to_abs),
+        .computation = (uint32_t)(2000000 * ns_to_abs),
+        .constraint = (uint32_t)(10000000 * ns_to_abs),
+        .preemptible = 1,
+    };
+    kern_return_t result = thread_policy_set(
+        pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY,
+        (thread_policy_t)&policy, THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+    if (result != KERN_SUCCESS && trace_audio_latency()) {
+        fprintf(stderr, "compat32: audio worker real-time policy failed: %d\n", result);
+    }
+}
+
+static os_workgroup_t default_output_workgroup(void)
+{
+    AudioObjectPropertyAddress address = {
+        kAudioHardwarePropertyDefaultOutputDevice,
+        kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain,
+    };
+    AudioDeviceID device = kAudioObjectUnknown;
+    UInt32 size = sizeof(device);
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &address, 0, NULL,
+                                   &size, &device) != noErr ||
+        device == kAudioObjectUnknown) return NULL;
+    address.mSelector = kAudioDevicePropertyIOThreadOSWorkgroup;
+    os_workgroup_t workgroup = NULL;
+    size = sizeof(workgroup);
+    if (AudioObjectGetPropertyData(device, &address, 0, NULL, &size,
+                                   &workgroup) != noErr) return NULL;
+    return workgroup;
+}
+
+/*
+ * Workers must never query the HAL themselves: the IO thread that waits for a
+ * callback's result can hold the HAL state such a query needs, deadlocking
+ * both.  The workgroup is looked up at worker start-up and whenever the
+ * default output device changes; workers only compare a generation counter
+ * and join/leave, which do not call into the HAL.
+ */
+static pthread_mutex_t output_workgroup_lock = PTHREAD_MUTEX_INITIALIZER;
+static os_workgroup_t output_workgroup;
+static uint32_t output_workgroup_generation;
+
+static void update_output_workgroup(void)
+{
+    os_workgroup_t current = default_output_workgroup();
+    pthread_mutex_lock(&output_workgroup_lock);
+    if (current == output_workgroup) {
+        pthread_mutex_unlock(&output_workgroup_lock);
+        if (current) os_release(current);
+        return;
+    }
+    os_workgroup_t previous = output_workgroup;
+    output_workgroup = current;
+    __atomic_add_fetch(&output_workgroup_generation, 1, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&output_workgroup_lock);
+    if (previous) os_release(previous);
+}
+
+static void watch_output_workgroup(void)
+{
+    update_output_workgroup();
+    AudioObjectPropertyAddress address = {
+        kAudioHardwarePropertyDefaultOutputDevice,
+        kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain,
+    };
+    AudioObjectAddPropertyListenerBlock(
+        kAudioObjectSystemObject, &address,
+        dispatch_get_global_queue(QOS_CLASS_UTILITY, 0),
+        ^(UInt32 count, const AudioObjectPropertyAddress *addresses) {
+            (void)count; (void)addresses;
+            update_output_workgroup();
+        });
+}
+
+struct audio_worker_workgroup {
+    os_workgroup_t joined;
+    os_workgroup_join_token_s token;
+    uint32_t generation;
+};
+
+static void refresh_audio_worker_workgroup(struct audio_worker_workgroup *state)
+{
+    uint32_t generation = __atomic_load_n(&output_workgroup_generation,
+                                          __ATOMIC_ACQUIRE);
+    if (generation == state->generation) return;
+    state->generation = generation;
+    if (state->joined) {
+        os_workgroup_leave(state->joined, &state->token);
+        os_release(state->joined);
+        state->joined = NULL;
+    }
+    pthread_mutex_lock(&output_workgroup_lock);
+    os_workgroup_t current = output_workgroup;
+    if (current) os_retain(current);
+    pthread_mutex_unlock(&output_workgroup_lock);
+    if (!current) return;
+    if (os_workgroup_join(current, &state->token) == 0) {
+        state->joined = current;
+    } else {
+        if (trace_audio_latency()) {
+            fputs("compat32: audio worker could not join the IO workgroup\n", stderr);
+        }
+        os_release(current);
+    }
+}
+
 static void *audio_callback_worker(void *opaque)
 {
     (void)opaque;
+    struct audio_worker_workgroup workgroup = {0};
+    bool realtime = !audio_realtime_disabled();
+    if (realtime) make_audio_worker_realtime();
     for (;;) {
         pthread_mutex_lock(&audio_job_lock);
         while (!audio_job_head) {
@@ -262,6 +400,7 @@ static void *audio_callback_worker(void *opaque)
         audio_job_head = job->next;
         if (!audio_job_head) audio_job_tail = NULL;
         pthread_mutex_unlock(&audio_job_lock);
+        if (realtime) refresh_audio_worker_workgroup(&workgroup);
 
         struct audio_callback_context *context = job->context;
         pthread_mutex_lock(&context->lock);
@@ -290,6 +429,7 @@ static void *audio_callback_worker(void *opaque)
 
 static void start_audio_callback_worker(void)
 {
+    if (!audio_realtime_disabled()) watch_output_workgroup();
     unsigned created = 0;
     for (unsigned index = 0; index < kAudioWorkerCount; ++index) {
         pthread_t worker;

@@ -23,9 +23,9 @@ Support for the original 32-bit Mac releases:
 | LEGO Batman 2: DC Super Heroes | Feral, 2012 | - |
 | LEGO Harry Potter: Years 5-7 | Feral, 2012 | - |
 | LEGO The Lord of the Rings | Feral, 2013 | - |
-| LEGO Marvel Super Heroes | Feral, 2014 | Experimental |
+| LEGO Marvel Super Heroes | Feral, 2014 | ✓\* |
 | LEGO The Hobbit | Feral, 2014 | - |
-| LEGO Batman 3: Beyond Gotham | Feral, 2014 | - |
+| LEGO Batman 3: Beyond Gotham | Feral, Steam 1.0.3 | Experimental |
 | The LEGO Movie Videogame | Feral, 2014 | - |
 
 \* Not verified with a 100% run yet, report any bugs or problems in the issues tab.
@@ -44,6 +44,7 @@ make GAME=pirates   SOURCE_APP="/path/to/LEGO Pirates of the Caribbean.app" bund
 make GAME=clonewars SOURCE_APP="/path/to/LEGO Star Wars III.app"           bundle
 make GAME=marvel    SOURCE_APP="/path/to/LEGO Marvel Super Heroes.app"     bundle
 make GAME=saga      SOURCE_APP="/path/to/LEGO Star Wars Saga.app"         bundle
+make GAME=batman3   SOURCE_APP="/path/to/LEGO Batman 3.app"               bundle
 ```
 
 Complete Saga's build and current limitations are documented in
@@ -58,8 +59,8 @@ unverified. The title, menus and cantina hold the 60 FPS cap on the test Mac.
 `SAGA_EDITION=retail` and uses a separate bundle.
 
 This compiles the loader and assembles a self-contained app in
-`native/build/` (`LEGOPirates-Compat.app`, `LEGOCloneWars-Compat.app`, or
-`LEGOMarvel-Compat.app`) with
+`native/build/` (`LEGOPirates-Compat.app`, `LEGOCloneWars-Compat.app`,
+`LEGOMarvel-Compat.app`, or `LEGOBatman3-Compat.app`) with
 the game's data, resources and Cg framework copied in. The original app is
 only read. Open the built app from Finder or the Dock.
 
@@ -143,6 +144,17 @@ fixtures (override `STEAM_STORAGE_LIBRARY` to select the affected dylib).
 enumerates and reads saves without running the game or issuing save writes,
 and preserves the player's `last-run.log`.
 
+Batman 3 supports the Feral Steam 1.0.3 (RC5) i386 build. `SOURCE_APP` defaults
+to the standard Steam library location. The engine and Steam integration
+match Marvel's: the bundle carries the source app's `libsteam_api.dylib` and
+`PlugIns/Content.loader`, and the loader supplies `SteamAppId=313690`. The same
+NULL-stats achievement guard is installed at `0x2d8840`.
+Verified so far: the intro cutscene, title screen, save slot creation, and the
+first level, with keyboard movement and stud collection. Genuine Steam
+initialization and stats reach the game, and a new save was written to Steam
+Remote Storage and read back, including by a later process. Controllers,
+co-op, saves with real progress, and the rest of the campaign remain unverified.
+
 Other targets: `make GAME=<game> promote-loader` replaces only the loader in
 an existing bundle (no source app needed), `make icons` regenerates the Dock
 icons from `native/icons/`, and `make` alone builds the loader and probes.
@@ -201,5 +213,6 @@ titles leave it disabled unless explicitly enabled.
 `make -C native test-cf-import-coverage` compares all available compatibility
 app images' linked Core Foundation functions with the bridge's dispatch cases.
 The checked images currently have 43 linked calls in Clone Wars, 42 in Pirates,
-46 in Marvel, 146 in retail Complete Saga, and 234 in Steam Complete Saga.
+46 in Marvel, 48 in Batman 3, 146 in retail Complete Saga, and 234 in Steam
+Complete Saga.
 All have dispatch cases. This static check does not exercise every game path.

@@ -144,6 +144,10 @@ enum {
 static int fallback_raw_button_for_action(unsigned action)
 {
     switch (action) {
+        case kActionPadUp: return 2;
+        case kActionPadDown: return 3;
+        case kActionPadLeft: return 4;
+        case kActionPadRight: return 5;
         case kActionTriangle: return 16;
         case kActionCircle: return 14;
         case kActionCross: return 13;
@@ -296,7 +300,7 @@ static int action_for_raw_button(unsigned raw)
         }
         return -1;
     }
-    for (unsigned action = kActionTriangle; action < kActionCount; ++action) {
+    for (unsigned action = kActionPadUp; action < kActionCount; ++action) {
         if (fallback_raw_button_for_action(action) == (int)raw) return (int)action;
     }
     return -1;
@@ -778,7 +782,7 @@ static void parse_test_environment(void)
     const char *action_text = getenv("LP32_VIRTUAL_ACTION_ID");
     if (action_text && action_text[0]) {
         unsigned long action = strtoul(action_text, NULL, 0);
-        if (action >= kActionTriangle && action <= kActionStart) {
+        if (action >= kActionPadUp && action <= kActionStart) {
             virtual_action = (unsigned)action;
         }
     }

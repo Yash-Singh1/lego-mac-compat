@@ -811,7 +811,7 @@ static void runtime_diagnostic_line(const char *line)
 static const char *default_image_path(const char *argv0, char *buffer,
                                       size_t size)
 {
-    static const char *const candidates[] = {"LEGOPirates", "LEGOCloneWars", "LEGOMarvel", "LEGOCompleteSaga"};
+    static const char *const candidates[] = {"LEGOPirates", "LEGOCloneWars", "LEGOMarvel", "LEGOCompleteSaga", "LEGOBatman3"};
     const char *slash = strrchr(argv0, '/');
     size_t directory_length = slash ? (size_t)(slash - argv0) : 0;
     for (size_t index = 0; index < sizeof(candidates) / sizeof(candidates[0]); ++index) {
@@ -1073,10 +1073,11 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    /* Automatic for Marvel and Complete Saga; no full import profiling or draw dumps. */
+    /* Automatic for Marvel, Batman 3 and Complete Saga; no full import profiling or draw dumps. */
     const char *hitch_option = getenv("LP32_HITCH_LOG");
     if ((hitch_option && strcmp(hitch_option, "0")) ||
         (!hitch_option && (lp32_profile()->title == LP32_TITLE_MARVEL ||
+                           lp32_profile()->title == LP32_TITLE_BATMAN3 ||
                            lp32_profile()->title == LP32_TITLE_COMPLETE_SAGA))) {
         char path[PATH_MAX];
         const char *home = getenv("HOME");

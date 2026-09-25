@@ -3,7 +3,8 @@ BUILD_DIR := build
 CONTINUE_WHEN_INACTIVE ?= 0
 
 # One loader serves every supported title; the bundle targets pick the title
-# with GAME=pirates (default), GAME=clonewars, GAME=marvel or GAME=saga.
+# with GAME=pirates (default), GAME=clonewars, GAME=marvel, GAME=batman3 or
+# GAME=saga.
 GAME ?= pirates
 ifeq ($(GAME),clonewars)
 BUNDLE := $(BUILD_DIR)/LEGOCloneWars-Compat.app
@@ -32,6 +33,25 @@ LOADER_NAME := LEGOMarvelCompat
 INFO_PLIST := Info-Marvel.plist
 GAME_DATA := steam_appid.txt
 CG_SOURCE := $(SOURCE_CONTENTS)/Frameworks/Cg.framework
+ICON := $(SOURCE_CONTENTS)/Resources/GameIcon.icns
+ICON_NAME := GameIcon.icns
+else ifeq ($(GAME),batman3)
+BUNDLE := $(BUILD_DIR)/LEGOBatman3-Compat.app
+SOURCE_APP := $(HOME)/Library/Application Support/Steam/steamapps/common/LEGO Batman 3 Beyond Gotham/LEGO Batman 3.app
+SOURCE_CONTENTS := $(SOURCE_APP)/Contents
+IMAGE_SOURCE := $(SOURCE_CONTENTS)/MacOS/LEGO Batman 3
+IMAGE_PREREQ :=
+IMAGE_NAME := LEGOBatman3.image
+LOADER_NAME := LEGOBatman3Compat
+INFO_PLIST := Info-Batman3.plist
+# GAME*.DAT arrive with the Resources ditto; the Steam API sits in Frameworks
+# here, and the loader looks for it in Resources (as Marvel ships it).
+GAME_DATA :=
+EXTRA_RESOURCES := Frameworks/libsteam_api.dylib
+# main opens PlugIns/Content.loader before answering its MainEntry launcher.
+PLUGINS_SOURCE := $(SOURCE_CONTENTS)/PlugIns
+# Steam installs the framework without its top-level symlinks.
+CG_SOURCE := $(SOURCE_CONTENTS)/Frameworks/Cg.framework/Versions/A
 ICON := $(SOURCE_CONTENTS)/Resources/GameIcon.icns
 ICON_NAME := GameIcon.icns
 else ifeq ($(GAME),saga)
@@ -92,7 +112,7 @@ GAME_DATA := GAME.DAT GAME0.DAT GAME1.DAT GAME2.DAT GAME3.DAT GAME4.DAT
 ICON := icons/LEGOPirates.icns
 ICON_NAME := icon.icns
 else
-$(error Unknown GAME "$(GAME)"; choose pirates, clonewars, marvel or saga)
+$(error Unknown GAME "$(GAME)"; choose pirates, clonewars, marvel, batman3 or saga)
 endif
 CG_SOURCE ?= $(SOURCE_CONTENTS)/Library/Frameworks/Cg.framework
 # Python for the Pirates unpacker.  By default a venv under $(BUILD_DIR) with
@@ -237,6 +257,8 @@ bundle: $(BUILD_DIR)/game_loader $(IMAGE_PREREQ) $(INFO_PLIST)
 	if test -n "$(CG_SOURCE)"; then ditto --noextattr --noqtn "$(CG_SOURCE)" $(BUNDLE)/Contents/Library/Frameworks/Cg.framework; fi
 	cp $(INFO_PLIST) $(BUNDLE)/Contents/Info.plist
 	ditto --noextattr --noqtn "$(SOURCE_CONTENTS)/Resources" $(BUNDLE)/Contents/Resources
+	if test -n "$(PLUGINS_SOURCE)"; then ditto --noextattr --noqtn "$(PLUGINS_SOURCE)" $(BUNDLE)/Contents/PlugIns; fi
+	for extra in $(EXTRA_RESOURCES); do cp "$(SOURCE_CONTENTS)/$$extra" $(BUNDLE)/Contents/Resources/; done
 	cp "$(ICON)" $(BUNDLE)/Contents/Resources/$(ICON_NAME)
 	if test "$(RESOURCE_FORKS)" = 1; then python3 tools/flatten_resource_forks.py $(BUNDLE); fi
 	python3 tools/configure_bundle.py "$(BUNDLE)" --continue-when-inactive "$(CONTINUE_WHEN_INACTIVE)"

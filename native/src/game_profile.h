@@ -21,6 +21,7 @@ enum lp32_title {
     LP32_TITLE_CLONE_WARS,
     LP32_TITLE_MARVEL,
     LP32_TITLE_COMPLETE_SAGA,
+    LP32_TITLE_BATMAN3,
 };
 
 /* Splash-dismiss repeat latch (see game_loader.c). */
@@ -190,7 +191,7 @@ struct lp32_game_profile {
     uint32_t entry_eip;             /* detection key */
     uint32_t image_end;             /* detection key (max_address) */
     uint8_t thread_argument_is_direct; /* persistent task object, not a stack-local pointer */
-    uint8_t callee_pops_struct_return; /* Clang i386 sret ABI (Marvel) */
+    uint8_t callee_pops_struct_return; /* Clang i386 sret ABI (Marvel, Batman 3) */
     uint32_t main_address;          /* 0 = derive from the crt start stub */
     uint32_t steam_app_id;          /* relocated Steam bundle identity, 0 = none */
     const struct lp32_startup_latch_patch *startup_latch;
