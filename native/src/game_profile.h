@@ -19,6 +19,16 @@ enum lp32_title {
     LP32_TITLE_PIRATES,
     LP32_TITLE_CLONE_WARS,
     LP32_TITLE_PORTAL2,
+    LP32_TITLE_PORTAL,
+};
+
+/* Valve Source launcher layout. Source titles load the engine from guest
+   dylibs under Contents/SharedSupport/<data_directory>. */
+struct lp32_source_layout {
+    const char *data_directory;
+    const char *executable;       /* launcher inside the game root */
+    const char *game_directory;   /* value passed with -game */
+    const char *steam_app_id;
 };
 
 /* Splash-dismiss repeat latch (see game_loader.c). */
@@ -169,6 +179,7 @@ struct lp32_game_profile {
     const struct lp32_display_layout *display;
     const struct lp32_render_pool *render_pool;
     const struct lp32_activator_layout *activator;
+    const struct lp32_source_layout *source; /* NULL = not a Source title */
     /* NuSound streamer render callback (diagnostics only: lets the audio
        bridge read the stream's refill-request ring). 0 = unknown. */
     uint32_t stream_input_callback;
@@ -181,6 +192,8 @@ int lp32_profile_select(const struct macho_image32 *image);
 /* Always non-NULL after lp32_profile_select; before that a neutral profile
    with no patches is returned. */
 const struct lp32_game_profile *lp32_profile(void);
+
+static inline int lp32_profile_is_source(void) { return lp32_profile()->source != NULL; }
 
 /* Profile used when a bundle name is all we have (Makefile/bundle tooling). */
 const struct lp32_game_profile *lp32_profile_named(const char *name);

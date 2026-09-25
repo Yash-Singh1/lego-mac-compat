@@ -23,3 +23,21 @@ _run_compat32:
     xchgq %r14, %rsp
     ljmp *(%r14)
     ud2
+
+.p2align 4, 0x90
+.globl _run_compat32_pair
+_run_compat32_pair:
+    /*
+     * uint64_t run_compat32_pair(uint32_t eip, uint32_t esp, uint16_t cs32)
+     *
+     * The return pad leaves the guest's edx intact, so i386 eight-byte
+     * results (edx:eax) can be recovered here.
+     */
+    subq $8, %rsp
+    call _run_compat32
+    addq $8, %rsp
+    movl %eax, %eax
+    movl %edx, %edx
+    shlq $32, %rdx
+    orq %rdx, %rax
+    ret

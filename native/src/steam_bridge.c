@@ -149,7 +149,7 @@ static bool plain_callback(int id)
 
 uint32_t steam_bridge32_open(const char *path)
 {
-    if (lp32_profile()->title != LP32_TITLE_PORTAL2 || !path || path[0] != '/') return 0;
+    if (!lp32_profile_is_source() || !path || path[0] != '/') return 0;
     const char *base = strrchr(path, '/');
     if (!base || strcmp(base + 1, "steamclient.dylib")) return 0;
     if (!client_library) {
@@ -225,6 +225,12 @@ static int invoke_method(unsigned index, const uint32_t *args, uint64_t *result)
     pthread_mutex_unlock(&cache_lock);
     if (!proxy || index < proxy->interface->first || index >= proxy->interface->first + proxy->interface->count) return 0;
     if (trace) fprintf(stderr, "compat32: Steam %s::%s\n", proxy->interface->version, method->name);
+    /* Server-list requests need a guest ISteamMatchmakingServerListResponse
+       callback object, so none are created and every request handle is NULL. */
+    if (method->result == 'h' || strchr(method->args, 'h')) {
+        *result = 0;
+        return 1;
+    }
     void **vtable = *(void ***)proxy->host;
     void *function = vtable[index - proxy->interface->first];
     if (method->result == 'D') {

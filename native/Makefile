@@ -1,7 +1,7 @@
 BUILD_DIR := build
 
 # One loader serves every supported title; the bundle targets pick the title
-# with GAME=pirates (default), GAME=clonewars or GAME=portal2.
+# with GAME=pirates (default), GAME=clonewars, GAME=portal2 or GAME=portal.
 GAME ?= pirates
 GUEST_RUNTIME_DIR ?= $(BUILD_DIR)/guest-runtime
 ifeq ($(GAME),clonewars)
@@ -34,6 +34,18 @@ INFO_PLIST := Info-Portal2.plist
 GAME_DATA :=
 ICON := $(SOURCE_CONTENTS)/Resources/game.icns
 ICON_NAME := game.icns
+else ifeq ($(GAME),portal)
+BUNDLE := $(BUILD_DIR)/Portal-Compat.app
+# The Steam installation (steamapps/common/Portal) holds hl2_osx and its data.
+SOURCE_GAME ?= $(HOME)/Library/Application Support/Steam/steamapps/common/Portal
+IMAGE_SOURCE := $(SOURCE_GAME)/hl2_osx
+IMAGE_PREREQ :=
+IMAGE_NAME := Portal.image
+LOADER_NAME := PortalCompat
+INFO_PLIST := Info-Portal.plist
+GAME_DATA :=
+ICON := $(SOURCE_GAME)/portal/resource/game.icns
+ICON_NAME := game.icns
 else ifeq ($(GAME),pirates)
 BUNDLE := $(BUILD_DIR)/LEGOPirates-Compat.app
 SOURCE_APP := /Volumes/Storage/games/mac/LEGOPirates.app
@@ -51,7 +63,7 @@ GAME_DATA := GAME.DAT GAME0.DAT GAME1.DAT GAME2.DAT GAME3.DAT GAME4.DAT
 ICON := icons/LEGOPirates.icns
 ICON_NAME := icon.icns
 else
-$(error Unknown GAME "$(GAME)"; choose pirates, clonewars or portal2)
+$(error Unknown GAME "$(GAME)"; choose pirates, clonewars, portal2 or portal)
 endif
 # Python for the Pirates unpacker.  By default a venv under $(BUILD_DIR) with
 # `unicorn` installed is created on first use (system and Homebrew Pythons
@@ -179,7 +191,7 @@ $(BUILD_DIR)/test_crash_trace: tests/test_crash_trace.c src/crash_trace.c src/cr
 test-crash-trace: $(BUILD_DIR)/test_crash_trace
 	arch -x86_64 ./$(BUILD_DIR)/test_crash_trace
 
-$(BUILD_DIR)/game_loader: src/game_loader.c src/crash_trace.c src/crash_trace.h src/physics_trace.c src/physics_trace.h src/game_profile.c src/macho_loader.c src/macho_file.c src/guest_dyld.c src/steam_bridge.c src/steam_startup.c src/steam_startup.h src/objc_bridge.h src/zlib_bridge.c src/zlib_bridge.h src/steam_bridge.h src/steam_abi.inc src/guest_memory.c src/network_bridge.c src/font_bridge.m src/gl_shader_bridge.c src/gl_misc_bridge.c src/compat_runtime.c src/wide_format.c src/audio_bridge.c src/audio_queue_bridge.c src/openal_capture_bridge.c src/openal_capture_bridge.h src/sound_manager_bridge.c src/sound_manager_bridge.h src/time_manager_bridge.c src/time_manager_bridge.h src/controller_bridge.m src/cursor_state.c src/objc_bridge.m src/arb_program_guard.c src/arb_sampler_usage.c src/mode32_switch.S src/import_gateway.S src/guest_context.S src/address_space_reserve.S | $(BUILD_DIR)
+$(BUILD_DIR)/game_loader: src/game_loader.c src/crash_trace.c src/crash_trace.h src/physics_trace.c src/physics_trace.h src/source_patches.c src/source_patches.h src/game_profile.c src/macho_loader.c src/macho_file.c src/guest_dyld.c src/steam_bridge.c src/steam_startup.c src/steam_startup.h src/objc_bridge.h src/zlib_bridge.c src/zlib_bridge.h src/steam_bridge.h src/steam_abi.inc src/guest_memory.c src/network_bridge.c src/font_bridge.m src/gl_shader_bridge.c src/gl_misc_bridge.c src/compat_runtime.c src/wide_format.c src/audio_bridge.c src/audio_queue_bridge.c src/openal_capture_bridge.c src/openal_capture_bridge.h src/sound_manager_bridge.c src/sound_manager_bridge.h src/time_manager_bridge.c src/time_manager_bridge.h src/controller_bridge.m src/cursor_state.c src/objc_bridge.m src/arb_program_guard.c src/arb_sampler_usage.c src/mode32_switch.S src/import_gateway.S src/guest_context.S src/address_space_reserve.S | $(BUILD_DIR)
 	$(CLANG) $(CFLAGS) $(LDFLAGS) $(filter %.c %.m %.S,$^) -framework Cocoa -framework Carbon -framework OpenGL -framework ImageIO -framework CoreText -framework CFNetwork -framework AudioToolbox -framework AudioUnit -framework CoreAudio -framework OpenAL -framework GameController -framework IOKit -liconv -lffi -lz -o $@
 	codesign --force --sign - $@
 
@@ -214,7 +226,7 @@ mode-switch-stress: $(BUILD_DIR)/mode_switch_stress
 run: $(BUILD_DIR)/mode32_probe
 	arch -x86_64 ./$(BUILD_DIR)/mode32_probe
 
-ifeq ($(GAME),portal2)
+ifneq ($(filter portal2 portal,$(GAME)),)
 run-game: bundle
 	arch -x86_64 "./$(BUNDLE)/Contents/MacOS/$(LOADER_NAME)"
 else
@@ -242,6 +254,21 @@ bundle: $(BUILD_DIR)/game_loader $(BUILD_DIR)/portal2_source $(INFO_PLIST) porta
 	cp $(INFO_PLIST) "$(BUNDLE)/Contents/Info.plist"
 	codesign --force --sign - "$(BUNDLE)"
 	codesign --verify --deep --strict "$(BUNDLE)"
+else ifeq ($(GAME),portal)
+# ditto merges into an existing bundle, so saves and configs the game wrote
+# under SharedSupport/Portal survive a rebuild.
+bundle: $(BUILD_DIR)/game_loader $(INFO_PLIST) portal2-runtime
+	test -f "$(IMAGE_SOURCE)" || { echo "missing $(IMAGE_SOURCE); pass SOURCE_GAME=/path/to/steamapps/common/Portal" >&2; exit 1; }
+	mkdir -p "$(BUNDLE)/Contents/MacOS" "$(BUNDLE)/Contents/Resources" "$(BUNDLE)/Contents/SharedSupport/Portal"
+	ditto --noextattr --noqtn "$(SOURCE_GAME)" "$(BUNDLE)/Contents/SharedSupport/Portal"
+	cp "$(IMAGE_SOURCE)" "$(BUNDLE)/Contents/SharedSupport/$(IMAGE_NAME)"
+	chmod 0644 "$(BUNDLE)/Contents/SharedSupport/$(IMAGE_NAME)"
+	ditto --noextattr --noqtn "$(GUEST_RUNTIME_DIR)" "$(BUNDLE)/Contents/SharedSupport/Portal/compat-runtime"
+	cp $(BUILD_DIR)/game_loader "$(BUNDLE)/Contents/MacOS/$(LOADER_NAME)"
+	cp "$(ICON)" "$(BUNDLE)/Contents/Resources/$(ICON_NAME)"
+	cp $(INFO_PLIST) "$(BUNDLE)/Contents/Info.plist"
+	codesign --force --sign - "$(BUNDLE)"
+	codesign --verify --deep --strict "$(BUNDLE)"
 else
 bundle: $(BUILD_DIR)/game_loader $(IMAGE_PREREQ) $(INFO_PLIST)
 	test -d "$(SOURCE_CONTENTS)" || { echo "missing $(SOURCE_APP); pass SOURCE_APP=/path/to/the/game.app" >&2; exit 1; }
@@ -265,7 +292,7 @@ promote-loader: $(BUILD_DIR)/game_loader
 	cp $(BUILD_DIR)/game_loader $(BUNDLE)/Contents/MacOS/$(LOADER_NAME).new
 	mv $(BUNDLE)/Contents/MacOS/$(LOADER_NAME).new $(BUNDLE)/Contents/MacOS/$(LOADER_NAME)
 	if test -f "$(ICON)"; then cp "$(ICON)" $(BUNDLE)/Contents/Resources/$(ICON_NAME); fi
-ifeq ($(GAME),portal2)
+ifneq ($(filter portal2 portal,$(GAME)),)
 	codesign --force --sign - $(BUNDLE)
 else
 	codesign --force --deep --sign - $(BUNDLE)

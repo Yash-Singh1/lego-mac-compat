@@ -1,25 +1,42 @@
 #!/usr/bin/env python3
 """Generate compact ABI facts from Valve's Steamworks 1.53a JSON and matching headers.
 
-Usage: generate_steam_abi.py JSON HEADER_DIRECTORY OUTPUT_INC
+Usage: generate_steam_abi.py JSON HEADER_DIRECTORY OUTPUT_INC [--newer JSON HEADER_DIRECTORY]...
 Also supply SDK 1.32's client header as isteamclient017.h and SDK 1.52's input
 header as isteaminput005.h in HEADER_DIRECTORY.
 
+Each --newer SDK contributes only the interface versions (and plain
+callbacks) the primary SDK lacks, appended after the primary tables.
+
 Inputs are development-only; the loader/converter do not download SDK files.
-Reference: Steamworks SDK 1.53a, 37e939ea0d938b43a0466d0aa6ed4619c300a7c7
-at https://github.com/rlabrecque/SteamworksSDK (Valve's SDK mirror).
+Reference: Steamworks SDK 1.53a, 37e939ea0d938b43a0466d0aa6ed4619c300a7c7,
+and 1.60, e7bb839178fc (Portal's libsteam_api: SteamClient021, SteamUser023,
+STEAMTIMELINE_INTERFACE_V001), at https://github.com/rlabrecque/SteamworksSDK
+(Valve's SDK mirror).
 """
 import json, re, sys
 from pathlib import Path
 
-api = json.loads(Path(sys.argv[1]).read_text())
-typedefs = {x["typedef"]: x["type"] for x in api["typedefs"]}
-enums = {x["enumname"] for x in api["enums"]}
-for interface in api["interfaces"]:
-    for enum in interface.get("enums", []):
-        enums.add(enum.get("fqname", interface["classname"] + "::" + enum["enumname"]))
-structs = {x["struct"]: x["fields"] for x in api["structs"]}
-structs.update({x["struct"]: x["fields"] for x in api["callback_structs"]})
+arguments = sys.argv[1:]
+newer_sdks = []
+while "--newer" in arguments:
+    at = arguments.index("--newer")
+    newer_sdks.append((arguments[at + 1], arguments[at + 2]))
+    del arguments[at:at + 3]
+if len(arguments) != 3:
+    sys.exit(__doc__)
+primary_json, primary_headers, output_path = arguments
+
+
+def load_types(api):
+    global typedefs, enums, structs
+    typedefs = {x["typedef"]: x["type"] for x in api["typedefs"]}
+    enums = {x["enumname"] for x in api["enums"]}
+    for interface in api["interfaces"]:
+        for enum in interface.get("enums", []):
+            enums.add(enum.get("fqname", interface["classname"] + "::" + enum["enumname"]))
+    structs = {x["struct"]: x["fields"] for x in api["structs"]}
+    structs.update({x["struct"]: x["fields"] for x in api["callback_structs"]})
 
 
 def scalar(t):
@@ -123,88 +140,100 @@ def code(t, result=False, output_string=False):
 
 methods = []
 interfaces = []
-for obj in api["interfaces"]:
-    version = obj.get("version_string")
-    entries = obj["methods"]
-    if obj["classname"] == "ISteamClient":
-        version = "SteamClient020"
-    if not version:
-        continue
-    header_name = obj["classname"].lower() + ".h"
-    if obj["classname"] in (
-        "ISteamMatchmakingServers",
-        "ISteamGameSearch",
-        "ISteamParties",
-    ):
-        header_name = "isteammatchmaking.h"
-    header = (Path(sys.argv[2]) / header_name).read_text(encoding="latin1")
-    declared_versions = re.findall(r'#define\s+\w*INTERFACE_VERSION\w*\s+"([^"]+)"', header)
-    if declared_versions and version not in declared_versions:
-        raise ValueError(f"SDK version mismatch: JSON {version}, {header_name} {declared_versions}")
-    header = re.sub(r"/\*.*?\*/|//[^\n]*", "", header, flags=re.S)
-    body = re.search(
-        r"class\s+" + obj["classname"] + r"\s*\{(.*?)^\};", header, re.M | re.S
-    )
-    if not body:
-        raise ValueError("class body " + obj["classname"])
-    byname = {}
-    for m in entries:
-        byname.setdefault(m["methodname"], []).append(m)
-    entries = []
-    # JSON omits private virtual slots. Recover every ordinal from the header,
-    # including overloaded methods, and trap if a private ABI is unknown.
-    for name in re.findall(r"virtual\s+[\w\s*&]+?\b(\w+)\s*\(", body[1]):
-        if byname.get(name):
-            entries.append(byname[name].pop(0))
+
+
+def add_interfaces(api, header_directory, client_version, skip_versions=()):
+    load_types(api)
+    for obj in api["interfaces"]:
+        version = obj.get("version_string")
+        entries = obj["methods"]
+        if obj["classname"] == "ISteamClient":
+            version = client_version
+        if not version or version in skip_versions:
             continue
-        params = []
-        ret = "unsupported_private"
-        if name in ("RunFrame", "DestroyAllInterfaces"):
-            ret = "void"
-        if name == "GetCSERIPPort":
-            ret = "bool"
-            params = [{"paramtype": "uint32 *"}, {"paramtype": "uint16 *"}]
-        if name == "InitGameServer":
-            ret = "bool"
-            params = [
-                {"paramtype": t}
-                for t in [
-                    "uint32",
-                    "uint16",
-                    "uint16",
-                    "uint32",
-                    "AppId_t",
-                    "const char *",
-                ]
-            ]
-        if name in (
-            "DEPRECATED_Set_SteamAPI_CPostAPIResultInProcess",
-            "DEPRECATED_Remove_SteamAPI_CPostAPIResultInProcess",
+        header_name = obj["classname"].lower() + ".h"
+        if obj["classname"] in (
+            "ISteamMatchmakingServers",
+            "ISteamGameSearch",
+            "ISteamParties",
         ):
-            ret = "void"
-            params = [{"paramtype": "unsupported_callback"}]
-        if name == "Set_SteamAPI_CCheckCallbackRegisteredInProcess":
-            ret = "void"
-            params = [{"paramtype": "SteamAPI_CheckCallbackRegistered_t"}]
-        entries.append({"methodname": name, "returntype": ret, "params": params})
-    # Inline convenience functions in JSON do not occupy vtable slots.
-    if not version:
-        continue
-    start = len(methods)
-    for m in entries:
-        ret = code(m["returntype"], True)
-        # Interface factories take a version string. Other object returns need
-        # their own proxy/lifetime contract; an integer argument is not a name.
-        if ret == "o" and not (m["methodname"].startswith("GetISteam") and
-                               m.get("params") and m["params"][-1]["paramtype"] == "const char *"):
-            ret = "?"
-        args = "".join(code(p["paramtype"], output_string="out_string" in p)
-                       for p in m.get("params", []))
-        methods.append((m["methodname"], ret, args))
-    interfaces.append((version, start, len(entries)))
+            header_name = "isteammatchmaking.h"
+        header = (Path(header_directory) / header_name).read_text(encoding="latin1")
+        declared_versions = re.findall(r'#define\s+\w*INTERFACE_VERSION\w*\s+"([^"]+)"', header)
+        if declared_versions and version not in declared_versions:
+            raise ValueError(f"SDK version mismatch: JSON {version}, {header_name} {declared_versions}")
+        header = re.sub(r"/\*.*?\*/|//[^\n]*", "", header, flags=re.S)
+        body = re.search(
+            r"class\s+" + obj["classname"] + r"\s*\{(.*?)^\};", header, re.M | re.S
+        )
+        if not body:
+            raise ValueError("class body " + obj["classname"])
+        byname = {}
+        for m in entries:
+            byname.setdefault(m["methodname"], []).append(m)
+        entries = []
+        # JSON omits private virtual slots. Recover every ordinal from the header,
+        # including overloaded methods, and trap if a private ABI is unknown.
+        for name in re.findall(r"virtual\s+[\w\s*&]+?\b(\w+)\s*\(", body[1]):
+            if byname.get(name):
+                entries.append(byname[name].pop(0))
+                continue
+            params = []
+            ret = "unsupported_private"
+            if name in ("RunFrame", "DestroyAllInterfaces"):
+                ret = "void"
+            if name == "GetCSERIPPort":
+                ret = "bool"
+                params = [{"paramtype": "uint32 *"}, {"paramtype": "uint16 *"}]
+            if name == "InitGameServer":
+                ret = "bool"
+                params = [
+                    {"paramtype": t}
+                    for t in [
+                        "uint32",
+                        "uint16",
+                        "uint16",
+                        "uint32",
+                        "AppId_t",
+                        "const char *",
+                    ]
+                ]
+            if name in (
+                "DEPRECATED_Set_SteamAPI_CPostAPIResultInProcess",
+                "DEPRECATED_Remove_SteamAPI_CPostAPIResultInProcess",
+            ):
+                ret = "void"
+                params = [{"paramtype": "unsupported_callback"}]
+            if name == "Set_SteamAPI_CCheckCallbackRegisteredInProcess":
+                ret = "void"
+                params = [{"paramtype": "SteamAPI_CheckCallbackRegistered_t"}]
+            entries.append({"methodname": name, "returntype": ret, "params": params})
+        start = len(methods)
+        for m in entries:
+            ret = code(m["returntype"], True)
+            # Interface factories take a version string. Other object returns need
+            # their own proxy/lifetime contract; an integer argument is not a name.
+            if ret == "o" and not (m["methodname"].startswith("GetISteam") and
+                                   m.get("params") and m["params"][-1]["paramtype"] == "const char *"):
+                ret = "?"
+            args = "".join(code(p["paramtype"], output_string="out_string" in p)
+                           for p in m.get("params", []))
+            methods.append((m["methodname"], ret, args))
+        interfaces.append((version, start, len(entries)))
+
+
+def plain_callbacks(api):
+    load_types(api)
+    return [(callback["callback_id"], callback["struct"]) for callback in api["callback_structs"]
+            if all(safe_struct(field["fieldtype"]) for field in callback["fields"])]
+
+
+api = json.loads(Path(primary_json).read_text())
+add_interfaces(api, primary_headers, "SteamClient020")
+callbacks = plain_callbacks(api)
 # libsteam_api also asks for its older client facade during InitSafe. The
 # v1.32 header (3aa76d12fa78) describes SteamClient017's distinct ordinals.
-legacy_header = (Path(sys.argv[2]) / "isteamclient017.h").read_text(encoding="latin1")
+legacy_header = (Path(primary_headers) / "isteamclient017.h").read_text(encoding="latin1")
 legacy_names = re.findall(r"virtual\s+[\w\s*&]+?\b(\w+)\s*\(", legacy_header)
 client = next(i for i in interfaces if i[0] == "SteamClient020")
 client_methods = {m[0]: m for m in methods[client[1]:client[1] + client[2]]}
@@ -219,7 +248,7 @@ for name in legacy_names:
 interfaces.append(("SteamClient017", legacy_start, len(legacy_names)))
 
 # Steam Input 005 differs from 006's vtable; derive its old ordinals too.
-input_header = (Path(sys.argv[2]) / "isteaminput005.h").read_text(encoding="latin1")
+input_header = (Path(primary_headers) / "isteaminput005.h").read_text(encoding="latin1")
 input_header = re.sub(r"/\*.*?\*/|//[^\n]*", "", input_header, flags=re.S)
 input_names = re.findall(r"virtual\s+[\w\s*&]+?\b(\w+)\s*\(", input_header)
 input_start = len(methods)
@@ -237,6 +266,18 @@ methods += [
     ("IsMessageAvailable", "b", "p"),
     ("RetrieveMessage", "i", "ppip"),
 ]
+
+for newer_json, newer_headers in newer_sdks:
+    newer_api = json.loads(Path(newer_json).read_text())
+    newer_header = (Path(newer_headers) / "isteamclient.h").read_text(encoding="latin1")
+    client_version = re.search(r'#define\s+STEAMCLIENT_INTERFACE_VERSION\s+"([^"]+)"', newer_header)
+    if not client_version:
+        raise ValueError("STEAMCLIENT_INTERFACE_VERSION in " + newer_headers)
+    add_interfaces(newer_api, newer_headers, client_version[1],
+                   skip_versions={version for version, _, _ in interfaces})
+    known = {callback_id for callback_id, _ in callbacks}
+    callbacks += [c for c in plain_callbacks(newer_api) if c[0] not in known]
+
 out = [
     "/* Generated ABI descriptions; see tools/generate_steam_abi.py. */",
     "static const struct steam_method steam_methods[] = {",
@@ -247,14 +288,13 @@ out += ["};", "static const struct steam_interface steam_interfaces[] = {"]
 for version, start, count in interfaces:
     out.append(f'    {{"{version}", {start}, {count}}},')
 out += ["};", "static const int steam_plain_callbacks[] = {"]
-for callback in api["callback_structs"]:
-    if all(safe_struct(field["fieldtype"]) for field in callback["fields"]):
-        out.append(f"    {callback['callback_id']}, /* {callback['struct']} */")
+for callback_id, struct in callbacks:
+    out.append(f"    {callback_id}, /* {struct} */")
 out += [
     "    1701, /* GCMessageAvailable_t */",
     "    1702, /* GCMessageFailed_t */",
     "};",
     "",
 ]
-Path(sys.argv[3]).write_text("\n".join(out))
+Path(output_path).write_text("\n".join(out))
 print(f"{len(interfaces)} interfaces, {len(methods)} methods")

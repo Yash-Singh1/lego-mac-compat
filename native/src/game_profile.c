@@ -254,6 +254,13 @@ static const struct lp32_game_profile clone_wars_profile = {
 };
 
 /* Valve's launcher executable; Source itself is loaded from guest dylibs. */
+static const struct lp32_source_layout portal2_source = {
+    .data_directory = "Portal2",
+    .executable = "portal2_osx",
+    .game_directory = "portal2",
+    .steam_app_id = "620",
+};
+
 static const struct lp32_game_profile portal2_profile = {
     .title = LP32_TITLE_PORTAL2,
     .name = "Portal2",
@@ -263,6 +270,28 @@ static const struct lp32_game_profile portal2_profile = {
     .entry_eip = 0x00001cf0,
     .image_end = 0x0000335c,
     .main_address = 0x00001d60,
+    .source = &portal2_source,
+};
+
+/* The Source 2013 Steam build shares Half-Life 2's hl2_osx launcher, which
+   opens bin/launcher.dylib and jumps to LauncherMain. */
+static const struct lp32_source_layout portal_source = {
+    .data_directory = "Portal",
+    .executable = "hl2_osx",
+    .game_directory = "portal",
+    .steam_app_id = "400",
+};
+
+static const struct lp32_game_profile portal_profile = {
+    .title = LP32_TITLE_PORTAL,
+    .name = "Portal",
+    .display_name = "Portal",
+    .log_directory = "PortalCompat",
+    .image_file = "Portal.image",
+    .entry_eip = 0x00001de0,
+    .image_end = 0x00004000,
+    .main_address = 0x00001e20,
+    .source = &portal_source,
 };
 
 static const struct lp32_game_profile unknown_profile = {
@@ -277,6 +306,7 @@ static const struct lp32_game_profile *const known_profiles[] = {
     &pirates_profile,
     &clone_wars_profile,
     &portal2_profile,
+    &portal_profile,
 };
 
 static const struct lp32_game_profile *current_profile = &unknown_profile;
@@ -299,6 +329,7 @@ const struct lp32_game_profile *lp32_profile_named(const char *name)
     if (strcasecmp(name, "clonewars") == 0 || strcasecmp(name, "lsw3") == 0) {
         return &clone_wars_profile;
     }
+    if (strcasecmp(name, "portal1") == 0) return &portal_profile;
     return NULL;
 }
 

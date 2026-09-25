@@ -2227,8 +2227,22 @@ int audio_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
         *result = (uint32_t)status;
         return 1;
     }
-    if (LP32_NAME_IS(import_name, import_length, "_AudioObjectGetPropertyData")) {
+    if (LP32_NAME_IS(import_name, import_length, "_AudioConverterNew")) {
+        /* Only Source's voice-chat capture resamples through a converter;
+           reporting the format unsupported disables voice recording. */
+        if (arguments[2]) *(uint32_t *)(uintptr_t)arguments[2] = 0;
+        trace_audio_status("AudioConverterNew", kAudioConverterErr_FormatNotSupported);
+        *result = (uint32_t)kAudioConverterErr_FormatNotSupported;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_AudioConverterDispose")) {
+        *result = 0;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_AudioObjectGetPropertyData") ||
+        LP32_NAME_IS(import_name, import_length, "_AudioObjectGetPropertyDataSize")) {
         const AudioObjectPropertyAddress *address = (const void *)(uintptr_t)arguments[1];
+        bool size_only = LP32_NAME_IS(import_name, import_length, "_AudioObjectGetPropertyDataSize");
         OSStatus status = kAudioHardwareUnknownPropertyError;
         // These device-ID properties have identical layouts in both ABIs.
         // Other properties may contain native pointers and need converters.
@@ -2236,11 +2250,17 @@ int audio_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
                         address->mSelector == kAudioHardwarePropertyDefaultOutputDevice ||
                         address->mSelector == kAudioHardwarePropertyDefaultSystemOutputDevice ||
                         address->mSelector == kAudioHardwarePropertyDevices)) {
-            status = AudioObjectGetPropertyData(arguments[0], address, arguments[2],
-                (const void *)(uintptr_t)arguments[3], (UInt32 *)(uintptr_t)arguments[4],
-                (void *)(uintptr_t)arguments[5]);
+            if (size_only) {
+                status = AudioObjectGetPropertyDataSize(arguments[0], address, arguments[2],
+                    (const void *)(uintptr_t)arguments[3], (UInt32 *)(uintptr_t)arguments[4]);
+            } else {
+                status = AudioObjectGetPropertyData(arguments[0], address, arguments[2],
+                    (const void *)(uintptr_t)arguments[3], (UInt32 *)(uintptr_t)arguments[4],
+                    (void *)(uintptr_t)arguments[5]);
+            }
         }
-        trace_audio_status("AudioObjectGetPropertyData", status);
+        trace_audio_status(size_only ? "AudioObjectGetPropertyDataSize" :
+                           "AudioObjectGetPropertyData", status);
         *result = (uint32_t)status;
         return 1;
     }

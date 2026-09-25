@@ -123,8 +123,20 @@ static int dispatch(const char *name, const uint32_t *a, uint64_t *r)
 #define PTR(i) ((void *)(uintptr_t)a[i])
 #define FAIL() do { *r = (uint32_t)-50; return 1; } while (0)
     *r = 0;
-    if (IS("_ATSFontActivateFromMemory")) {
-        CFDataRef data = CFDataCreate(NULL, PTR(0), a[1]);
+    if (IS("_ATSFontActivateFromMemory") || IS("_ATSFontActivateFromFileReference")) {
+        bool file = IS("_ATSFontActivateFromFileReference");
+        CFDataRef data = NULL;
+        if (file) {
+            UInt8 path[PATH_MAX];
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            if (!a[0] || FSRefMakePath(PTR(0), path, sizeof(path)) != noErr) FAIL();
+#pragma clang diagnostic pop
+            NSData *contents = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:(const char *)path]];
+            data = contents ? CFRetain((__bridge CFDataRef)contents) : NULL;
+        } else {
+            data = CFDataCreate(NULL, PTR(0), a[1]);
+        }
         CFArrayRef descriptors = data ? CTFontManagerCreateFontDescriptorsFromData(data) : NULL;
         uint32_t first = 0;
         for (CFIndex i = 0; descriptors && i < CFArrayGetCount(descriptors); ++i) {
@@ -133,7 +145,10 @@ static int dispatch(const char *name, const uint32_t *a, uint64_t *r)
             if (font) CFRelease(font);
         }
         if (descriptors) CFRelease(descriptors); if (data) CFRelease(data);
-        if (a[6]) *(uint32_t *)PTR(6) = first;
+        unsigned container = file ? 5 : 6;
+        if (a[container]) *(uint32_t *)PTR(container) = first;
+        if (getenv("LP32_TRACE_FONT"))
+            fprintf(stderr, "compat32: %s activated font id %u\n", name + 1, first);
         if (!first) FAIL();
     } else if (IS("_ATSFontFindFromName") || IS("_ATSFontFindFromPostScriptName")) {
         CFStringRef string = objc_bridge32_host_object(a[0]);
@@ -143,6 +158,9 @@ static int dispatch(const char *name, const uint32_t *a, uint64_t *r)
         CTFontRef font = CTFontCreateWithName(string, 1, NULL);
         if (font && font_matches(font, string, postscript)) *r = register_font(font);
         if (font) CFRelease(font);
+        if (!*r && getenv("LP32_TRACE_FONT"))
+            fprintf(stderr, "compat32: %s found no font named %s\n", name + 1,
+                    [(__bridge NSString *)string UTF8String]);
     } else if (IS("_ATSFontGetName")) {
         CTFontRef font = font_for_id(a[0]); if (!font || !a[2]) FAIL();
         CFStringRef string = CTFontCopyFullName(font);

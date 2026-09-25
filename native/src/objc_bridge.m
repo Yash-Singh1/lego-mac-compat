@@ -24,6 +24,10 @@
 #import <malloc/malloc.h>
 #import <IOKit/IOKitLib.h>
 #import <IOKit/pwr_mgt/IOPMLib.h>
+#import <IOKit/graphics/IOGraphicsLib.h>
+#import <IOKit/ps/IOPowerSources.h>
+#import <IOKit/ps/IOPSKeys.h>
+#import <objc/objc-sync.h>
 
 #include <dlfcn.h>
 #include <ffi/ffi.h>
@@ -44,12 +48,14 @@
 #include <unistd.h>
 #include <mach/mach_time.h>
 
-void objc_bridge32_show_steam_required(void)
+void objc_bridge32_show_steam_required(const char *game_name)
 {
     @autoreleasepool {
-        NSString *title = @"Portal 2 couldn’t connect to Steam";
-        NSString *message = @"Open Steam and sign in to an account that owns Portal 2, then launch the game again.\n\n"
-            @"If Steam is already open, quit and reopen it before retrying.";
+        NSString *game = @(game_name);
+        NSString *title = [NSString stringWithFormat:@"%@ couldn’t connect to Steam", game];
+        NSString *message = [NSString stringWithFormat:
+            @"Open Steam and sign in to an account that owns %@, then launch the game again.\n\n"
+            @"If Steam is already open, quit and reopen it before retrying.", game];
         fprintf(stderr, "%s\n%s\n", title.UTF8String, message.UTF8String);
         /* Explicit opt-out for headless regression runs; normal launches
            always show the error, including launches from Terminal. */
@@ -71,7 +77,8 @@ void objc_bridge32_show_steam_required(void)
             ![[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:@"steam://open/main"]]) {
             NSAlert *failed = [[NSAlert alloc] init];
             failed.messageText = @"Steam couldn’t be opened";
-            failed.informativeText = @"Open Steam from Applications and sign in, then launch Portal 2 again.";
+            failed.informativeText = [NSString stringWithFormat:
+                @"Open Steam from Applications and sign in, then launch %@ again.", game];
             [failed addButtonWithTitle:@"OK"];
             [failed runModal];
             [failed release];
@@ -85,6 +92,7 @@ struct steam_startup_probe {
     bool (*initialize)(void);
     void (*shutdown)(void);
     double deadline;
+    const char *game_name;
 };
 static bool startup_steam_running(void *opaque)
 {
@@ -106,8 +114,8 @@ static void startup_steam_shutdown(void *opaque)
 }
 static bool startup_steam_open(void *opaque)
 {
-    (void)opaque;
-    fprintf(stderr, "compat32: opening Steam before launching Portal 2\n");
+    struct steam_startup_probe *probe = opaque;
+    fprintf(stderr, "compat32: opening Steam before launching %s\n", probe->game_name);
     if (getenv("LP32_HEADLESS_ERRORS")) return false;
     return [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:@"steam://open/main"]];
 }
@@ -120,12 +128,12 @@ static bool startup_steam_wait(void *opaque)
     }
     return true;
 }
-int objc_bridge32_prepare_steam(const char *game_root)
+int objc_bridge32_prepare_steam(const char *game_root, const char *app_id, const char *game_name)
 {
     @autoreleasepool {
-        setenv("SteamAppId", "620", 1);
-        setenv("SteamGameId", "620", 1);
-        struct steam_startup_probe probe = {0};
+        setenv("SteamAppId", app_id, 1);
+        setenv("SteamGameId", app_id, 1);
+        struct steam_startup_probe probe = {.game_name = game_name};
         void *library = NULL;
         /* The supplied Steam API is universal. Probe its native slice in
            this isolated helper; the game still initializes its own i386 API. */
@@ -152,7 +160,7 @@ int objc_bridge32_prepare_steam(const char *game_root)
         }
         fprintf(stderr, "compat32: Steam startup %s\n",
             result == STEAM_STARTUP_OPEN_FAILED ? "could not open the client" : "timed out waiting for the client");
-        objc_bridge32_show_steam_required();
+        objc_bridge32_show_steam_required(game_name);
         return EXIT_FAILURE;
     }
 }
@@ -1559,6 +1567,330 @@ static void legacy_rect_method(id object, SEL selector, NSRect rect)
     (void)legacy_call_method(object, selector, words, 4);
 }
 
+/*
+ * General adapter for guest methods whose shape the fixed IMPs above cannot
+ * express (SDL2's NSTextInput responder: NSRange/NSPoint arguments, NSRange
+ * and NSRect results). A libffi closure receives the host call and rebuilds
+ * the i386 argument words: 32-bit integers and CGFloat, eight-byte structs
+ * returned in edx:eax, larger structs through a callee-popped hidden pointer.
+ */
+enum legacy_value_kind {
+    kLegacyVoid, kLegacyObject, kLegacySelector, kLegacyInteger, kLegacyPointer,
+    kLegacyFloat, kLegacyDouble, kLegacyRange, kLegacyPair, kLegacyRect,
+};
+
+enum { kLegacyMaxArguments = 8 };
+
+struct legacy_ffi_method {
+    ffi_cif cif;
+    ffi_type *host_types[kLegacyMaxArguments + 2];
+    uint8_t guest_kinds[kLegacyMaxArguments + 2];
+    uint8_t return_kind;
+    unsigned count;
+};
+
+static ffi_type *legacy_range_type(void)
+{
+    static ffi_type *elements[] = {&ffi_type_uint64, &ffi_type_uint64, NULL};
+    static ffi_type type = {0, 0, FFI_TYPE_STRUCT, elements};
+    return &type;
+}
+
+static ffi_type *legacy_pair_type(void)
+{
+    static ffi_type *elements[] = {&ffi_type_double, &ffi_type_double, NULL};
+    static ffi_type type = {0, 0, FFI_TYPE_STRUCT, elements};
+    return &type;
+}
+
+static ffi_type *legacy_rect_type(void)
+{
+    static ffi_type *elements[] = {&ffi_type_double, &ffi_type_double,
+                                   &ffi_type_double, &ffi_type_double, NULL};
+    static ffi_type type = {0, 0, FFI_TYPE_STRUCT, elements};
+    return &type;
+}
+
+static int legacy_value_kind(const char *type)
+{
+    type = skip_type_qualifiers(type);
+    switch (*type) {
+        case 'v': return kLegacyVoid;
+        case '@': case '#': return kLegacyObject;
+        case ':': return kLegacySelector;
+        case 'c': case 'C': case 's': case 'S': case 'i': case 'I':
+        case 'l': case 'L': case 'B': return kLegacyInteger;
+        case '*': case '^': return kLegacyPointer;
+        case 'f': return kLegacyFloat;
+        case 'd': return kLegacyDouble;
+        case '{':
+            if (!strncmp(type, "{_NSRange=", 10)) return kLegacyRange;
+            if (!strncmp(type, "{_NSPoint=", 10) || !strncmp(type, "{_NSSize=", 9) ||
+                !strncmp(type, "{CGPoint=", 9) || !strncmp(type, "{CGSize=", 8)) return kLegacyPair;
+            if (!strncmp(type, "{_NSRect=", 9) || !strncmp(type, "{CGRect=", 8)) return kLegacyRect;
+            return -1;
+        default: return -1;
+    }
+}
+
+/* Host encoding for a guest type, used when no inherited declaration exists. */
+static const char *legacy_host_encoding(const char *type)
+{
+    type = skip_type_qualifiers(type);
+    switch (legacy_value_kind(type)) {
+        case kLegacyVoid: return "v";
+        case kLegacyObject: return *type == '#' ? "#" : "@";
+        case kLegacySelector: return ":";
+        case kLegacyPointer: return *type == '*' ? "*" : "^v";
+        case kLegacyFloat: return "f";
+        case kLegacyDouble: return "d";
+        case kLegacyRange: return "{_NSRange=QQ}";
+        case kLegacyPair: return strstr(type, "Size") ? "{CGSize=dd}" : "{CGPoint=dd}";
+        case kLegacyRect: return "{CGRect={CGPoint=dd}{CGSize=dd}}";
+        case kLegacyInteger: {
+            static const char *const scalars[] = {"c", "C", "s", "S", "i", "I", "i", "I", "B"};
+            const char *order = "cCsSiIlLB";
+            return scalars[strchr(order, *type) - order];
+        }
+        default: return NULL;
+    }
+}
+
+static ffi_type *legacy_host_ffi_type(const char *type)
+{
+    type = skip_type_qualifiers(type);
+    switch (*type) {
+        case 'v': return &ffi_type_void;
+        case 'c': return &ffi_type_sint8;
+        case 'C': case 'B': return &ffi_type_uint8;
+        case 's': return &ffi_type_sint16;
+        case 'S': return &ffi_type_uint16;
+        case 'i': return &ffi_type_sint32;
+        case 'I': return &ffi_type_uint32;
+        case 'l': case 'q': return &ffi_type_sint64;
+        case 'L': case 'Q': return &ffi_type_uint64;
+        case 'f': return &ffi_type_float;
+        case 'd': return &ffi_type_double;
+        case '@': case '#': case ':': case '*': case '^': return &ffi_type_pointer;
+        case '{':
+            switch (legacy_value_kind(type)) {
+                case kLegacyRange: return legacy_range_type();
+                case kLegacyPair: return legacy_pair_type();
+                case kLegacyRect: return legacy_rect_type();
+                default: return NULL;
+            }
+        default: return NULL;
+    }
+}
+
+static uint64_t legacy_host_integer(const ffi_type *type, const void *value)
+{
+    switch (type->type) {
+        case FFI_TYPE_SINT8: return (uint64_t)(int64_t)*(const int8_t *)value;
+        case FFI_TYPE_UINT8: return *(const uint8_t *)value;
+        case FFI_TYPE_SINT16: return (uint64_t)(int64_t)*(const int16_t *)value;
+        case FFI_TYPE_UINT16: return *(const uint16_t *)value;
+        case FFI_TYPE_SINT32: return (uint64_t)(int64_t)*(const int32_t *)value;
+        case FFI_TYPE_UINT32: return *(const uint32_t *)value;
+        default: return *(const uint64_t *)value;
+    }
+}
+
+static double legacy_host_real(const ffi_type *type, const void *value)
+{
+    if (type->type == FFI_TYPE_FLOAT) return *(const float *)value;
+    if (type->type == FFI_TYPE_DOUBLE) return *(const double *)value;
+    return (double)(int64_t)legacy_host_integer(type, value);
+}
+
+static uint32_t legacy_float_word(double value)
+{
+    float narrow = (float)value;
+    uint32_t word;
+    memcpy(&word, &narrow, sizeof(word));
+    return word;
+}
+
+static double legacy_word_float(uint32_t word)
+{
+    float narrow;
+    memcpy(&narrow, &word, sizeof(narrow));
+    return narrow;
+}
+
+static uint32_t legacy_guest_location(NSUInteger location)
+{
+    return location == NSNotFound ? 0x7fffffffu : (uint32_t)location;
+}
+
+static NSUInteger legacy_host_location(uint32_t location)
+{
+    return location == 0x7fffffffu ? NSNotFound : location;
+}
+
+static void legacy_ffi_handler(ffi_cif *cif, void *result, void **values, void *opaque)
+{
+    (void)cif;
+    struct legacy_ffi_method *adapter = opaque;
+    id object = *(id *)values[0];
+    SEL selector = *(SEL *)values[1];
+    const struct legacy_method32 *method = legacy_method_for_object(object, selector);
+    if (adapter->return_kind != kLegacyVoid)
+        memset(result, 0, adapter->host_types[0]->size < sizeof(ffi_arg) ?
+               sizeof(ffi_arg) : adapter->host_types[0]->size);
+    if (!method) return;
+    uint32_t words[1 + 2 + kLegacyMaxArguments * 4];
+    size_t count = 0;
+    uint32_t hidden = 0;
+    if (adapter->return_kind == kLegacyRect) {
+        hidden = compat_runtime32_allocate(16, 1);
+        if (!hidden) return;
+        words[count++] = hidden;
+    }
+    words[count++] = proxy_for_object(object);
+    words[count++] = method->name;
+    for (unsigned i = 2; i < adapter->count; ++i) {
+        const ffi_type *type = adapter->host_types[i + 1];
+        const void *value = values[i];
+        switch (adapter->guest_kinds[i]) {
+            case kLegacyObject:
+                words[count++] = proxy_for_object(*(id *)value);
+                break;
+            case kLegacySelector:
+                words[count++] = compat_runtime32_copy_cstring(sel_getName(*(SEL *)value));
+                break;
+            case kLegacyPointer:
+                words[count++] = (uint32_t)(uintptr_t)*(void **)value;
+                break;
+            case kLegacyInteger:
+                words[count++] = (uint32_t)legacy_host_integer(type, value);
+                break;
+            case kLegacyFloat:
+                words[count++] = legacy_float_word(legacy_host_real(type, value));
+                break;
+            case kLegacyDouble: {
+                double real = legacy_host_real(type, value);
+                memcpy(words + count, &real, sizeof(real));
+                count += 2;
+                break;
+            }
+            case kLegacyRange: {
+                const NSRange *range = value;
+                words[count++] = legacy_guest_location(range->location);
+                words[count++] = (uint32_t)range->length;
+                break;
+            }
+            case kLegacyPair: case kLegacyRect: {
+                const double *fields = value;
+                unsigned n = adapter->guest_kinds[i] == kLegacyPair ? 2 : 4;
+                for (unsigned f = 0; f < n; ++f) words[count++] = legacy_float_word(fields[f]);
+                break;
+            }
+        }
+    }
+    uint64_t pair = compat_runtime32_call_pair(method->imp, words, count);
+    uint32_t low = (uint32_t)pair, high = (uint32_t)(pair >> 32);
+    switch (adapter->return_kind) {
+        case kLegacyVoid:
+            break;
+        case kLegacyObject:
+            *(id *)result = object_for_receiver(low);
+            break;
+        case kLegacySelector:
+            *(SEL *)result = low ? sel_registerName((const char *)(uintptr_t)low) : NULL;
+            break;
+        case kLegacyPointer:
+            *(void **)result = (void *)(uintptr_t)low;
+            break;
+        case kLegacyInteger: {
+            const ffi_type *type = adapter->host_types[0];
+            ffi_sarg value = type->type == FFI_TYPE_SINT8 ? (int8_t)low :
+                type->type == FFI_TYPE_SINT16 ? (int16_t)low :
+                type->type == FFI_TYPE_UINT8 ? (uint8_t)low :
+                type->type == FFI_TYPE_UINT16 ? (uint16_t)low :
+                type->type == FFI_TYPE_SINT32 || type->type == FFI_TYPE_SINT64 ?
+                    (int32_t)low : (ffi_sarg)low;
+            *(ffi_sarg *)result = value;
+            break;
+        }
+        case kLegacyRange:
+            *(NSRange *)result = NSMakeRange(legacy_host_location(low), high);
+            break;
+        case kLegacyPair: {
+            double *fields = result;
+            fields[0] = legacy_word_float(low);
+            fields[1] = legacy_word_float(high);
+            break;
+        }
+        case kLegacyRect: {
+            const uint32_t *guest = (const void *)(uintptr_t)hidden;
+            double *fields = result;
+            for (unsigned f = 0; f < 4; ++f) fields[f] = legacy_word_float(guest[f]);
+            break;
+        }
+    }
+    if (hidden) compat_runtime32_deallocate(hidden);
+}
+
+/* Returns the closure IMP and its host encoding, or NULL when the guest
+   signature has no supported i386 translation. */
+static IMP legacy_ffi_imp(const char *guest_types, const char *inherited_types,
+                          char *encoding, size_t encoding_size)
+{
+    NSMethodSignature *guest = [NSMethodSignature signatureWithObjCTypes:guest_types];
+    NSUInteger count = [guest numberOfArguments];
+    if (count < 2 || count > kLegacyMaxArguments) return NULL;
+    struct legacy_ffi_method *adapter = calloc(1, sizeof(*adapter));
+    if (!adapter) return NULL;
+    adapter->count = (unsigned)count;
+    int return_kind = legacy_value_kind([guest methodReturnType]);
+    /* Guest float/double results arrive on the x87 stack, which the
+       return pad does not preserve. */
+    if (return_kind < 0 || return_kind == kLegacyFloat || return_kind == kLegacyDouble) {
+        free(adapter);
+        return NULL;
+    }
+    adapter->return_kind = (uint8_t)return_kind;
+    encoding[0] = 0;
+    const char *host_return = legacy_host_encoding([guest methodReturnType]);
+    snprintf(encoding, encoding_size, "%s@:", host_return);
+    for (NSUInteger i = 2; i < count; ++i) {
+        int kind = legacy_value_kind([guest getArgumentTypeAtIndex:i]);
+        const char *host = legacy_host_encoding([guest getArgumentTypeAtIndex:i]);
+        if (kind < 0 || kind == kLegacyVoid || !host ||
+            strlen(encoding) + strlen(host) >= encoding_size) {
+            free(adapter);
+            return NULL;
+        }
+        adapter->guest_kinds[i] = (uint8_t)kind;
+        strcat(encoding, host);
+    }
+    NSMethodSignature *host = [NSMethodSignature signatureWithObjCTypes:
+        inherited_types ? inherited_types : encoding];
+    if ([host numberOfArguments] != count) {
+        free(adapter);
+        return NULL;
+    }
+    adapter->host_types[0] = legacy_host_ffi_type([host methodReturnType]);
+    for (NSUInteger i = 0; i < count; ++i)
+        adapter->host_types[i + 1] = legacy_host_ffi_type([host getArgumentTypeAtIndex:i]);
+    for (NSUInteger i = 0; i <= count; ++i) {
+        if (!adapter->host_types[i]) { free(adapter); return NULL; }
+    }
+    if (inherited_types) snprintf(encoding, encoding_size, "%s", inherited_types);
+    void *code = NULL;
+    ffi_closure *closure = ffi_closure_alloc(sizeof(ffi_closure), &code);
+    if (!closure ||
+        ffi_prep_cif(&adapter->cif, FFI_DEFAULT_ABI, (unsigned)count,
+                     adapter->host_types[0], adapter->host_types + 1) != FFI_OK ||
+        ffi_prep_closure_loc(closure, &adapter->cif, legacy_ffi_handler, adapter, code) != FFI_OK) {
+        if (closure) ffi_closure_free(closure);
+        free(adapter);
+        return NULL;
+    }
+    return (IMP)code;
+}
+
 static int legacy_install_methods(Class target, uint32_t address, bool category)
 {
     if (!address) return 0;
@@ -1576,7 +1908,10 @@ static int legacy_install_methods(Class target, uint32_t address, bool category)
         IMP imp = *types == '@' ? (IMP)legacy_object_method : (IMP)legacy_scalar_method;
         char encoding[256];
         snprintf(encoding, sizeof(encoding), "%c@:", *types);
-        for (NSUInteger k = 2; k < count; ++k) {
+        int return_kind = legacy_value_kind(types);
+        bool general = return_kind == kLegacyRange || return_kind == kLegacyPair ||
+            return_kind == kLegacyRect;
+        for (NSUInteger k = 2; k < count && !general; ++k) {
             const char *arg_type = skip_type_qualifiers([sig getArgumentTypeAtIndex:k]);
             const char *append = NULL;
             char scalar[2] = {*arg_type, 0};
@@ -1592,13 +1927,22 @@ static int legacy_install_methods(Class target, uint32_t address, bool category)
                 imp = count == 5 ? (IMP)legacy_object_float3_method : (IMP)legacy_object_float4_method;
                 append = "f";
             } else {
-                fprintf(stderr, "compat32: unsupported legacy method %s %s\n", sel_name, types);
-                return -1;
+                general = true;
+                break;
             }
             if (strlen(encoding) + strlen(append) >= sizeof(encoding)) return -1;
             strcat(encoding, append);
         }
         Method inherited = class_getInstanceMethod(class_getSuperclass(target), selector);
+        if (general) {
+            imp = legacy_ffi_imp(types, inherited ? method_getTypeEncoding(inherited) : NULL,
+                                 encoding, sizeof(encoding));
+            if (!imp) {
+                fprintf(stderr, "compat32: unsupported legacy method %s %s\n", sel_name, types);
+                return -1;
+            }
+            inherited = NULL;
+        }
         const char *native_types = inherited ? method_getTypeEncoding(inherited) : encoding;
         if (category) class_replaceMethod(target, selector, imp, native_types);
         else if (!class_addMethod(target, selector, imp, native_types)) return -1;
@@ -1729,13 +2073,79 @@ static size_t guest_words_for_type(const char *type)
     }
 }
 
-static bool invoke_simple_message(id receiver, const char *selector_name,
-                                  const uint32_t *guest_arguments,
-                                  uint64_t *guest_result)
+@interface NSInvocation (LP32PrivateInvoke)
+- (void)invokeUsingIMP:(IMP)imp;
+@end
+
+/* Keeps guest-heap pixel storage alive for the image rep that uses it. */
+@interface LP32GuestAllocation : NSObject {
+@public
+    uint32_t address;
+}
+@end
+
+@implementation LP32GuestAllocation
+- (void)dealloc
+{
+    if (address) compat_runtime32_deallocate(address);
+    [super dealloc];
+}
+@end
+
+static char guest_bitmap_key;
+
+/* -[NSBitmapImageRep initWithBitmapDataPlanes:...] with guest planes.
+   Guests write pixels through -bitmapData, so the backing store must be
+   guest-addressable: NULL planes get a guest-heap buffer owned by the rep,
+   and supplied plane arrays hold 32-bit guest pointers. */
+static id init_guest_bitmap(NSBitmapImageRep *receiver, const uint32_t *arguments)
+{
+    NSInteger width = (int32_t)arguments[3], height = (int32_t)arguments[4];
+    NSInteger bits_per_sample = (int32_t)arguments[5], samples = (int32_t)arguments[6];
+    BOOL alpha = arguments[7] != 0, planar = arguments[8] != 0;
+    NSColorSpaceName space = object_for_argument(arguments[9]);
+    NSInteger row_bytes = (int32_t)arguments[10], bits_per_pixel = (int32_t)arguments[11];
+    unsigned char *planes[5] = {0};
+    LP32GuestAllocation *owner = nil;
+    if (arguments[2]) {
+        const uint32_t *guest_planes = (const void *)(uintptr_t)arguments[2];
+        NSInteger count = planar ? samples : 1;
+        for (NSInteger i = 0; i < count && i < 5; ++i)
+            planes[i] = (unsigned char *)(uintptr_t)guest_planes[i];
+    } else if (!planar && width > 0 && height > 0) {
+        NSInteger pixel_bits = bits_per_pixel ? bits_per_pixel : bits_per_sample * samples;
+        NSInteger stride = row_bytes ? row_bytes : (width * pixel_bits + 7) / 8;
+        uint32_t storage = compat_runtime32_allocate((size_t)(stride * height), 1);
+        if (!storage) { [receiver release]; return nil; }
+        owner = [[[LP32GuestAllocation alloc] init] autorelease];
+        owner->address = storage;
+        planes[0] = (unsigned char *)(uintptr_t)storage;
+        row_bytes = stride;
+    }
+    NSBitmapImageRep *rep = [receiver initWithBitmapDataPlanes:planes[0] || arguments[2] ? planes : NULL
+                                                    pixelsWide:width pixelsHigh:height
+                                                 bitsPerSample:bits_per_sample
+                                               samplesPerPixel:samples hasAlpha:alpha
+                                                      isPlanar:planar colorSpaceName:space
+                                                   bytesPerRow:row_bytes bitsPerPixel:bits_per_pixel];
+    if (rep && owner)
+        objc_setAssociatedObject(rep, &guest_bitmap_key, owner, OBJC_ASSOCIATION_RETAIN);
+    return rep;
+}
+
+/* rect_destination receives a {CGRect=} return (guest objc_msgSend_stret);
+   guest_arguments[2] is always the first method argument. A non-NULL
+   super_method is invoked directly (guest objc_msgSendSuper). */
+static bool invoke_message_with(id receiver, const char *selector_name,
+                                const uint32_t *guest_arguments,
+                                uint64_t *guest_result, float *rect_destination,
+                                Method super_method)
 {
     SEL selector = sel_registerName(selector_name);
-    if (![receiver respondsToSelector:selector]) return false;
-    NSMethodSignature *signature = [receiver methodSignatureForSelector:selector];
+    if (!super_method && ![receiver respondsToSelector:selector]) return false;
+    NSMethodSignature *signature = super_method ?
+        [NSMethodSignature signatureWithObjCTypes:method_getTypeEncoding(super_method)] :
+        [receiver methodSignatureForSelector:selector];
     if (!signature) return false;
 
     NSInvocation *invocation = [NSInvocation invocationWithMethodSignature:signature];
@@ -1818,7 +2228,8 @@ static bool invoke_simple_message(id receiver, const char *selector_name,
     }
 
     @try {
-        [invocation invoke];
+        if (super_method) [invocation invokeUsingIMP:method_getImplementation(super_method)];
+        else [invocation invoke];
     } @catch (NSException *exception) {
         fprintf(stderr, "compat32: host Objective-C message %s raised %s\n",
                 selector_name, [[exception reason] UTF8String]);
@@ -1828,6 +2239,15 @@ static bool invoke_simple_message(id receiver, const char *selector_name,
     const char *return_type = skip_type_qualifiers([signature methodReturnType]);
     switch (*return_type) {
         case '{': {
+            if (rect_destination && strncmp(return_type, "{CGRect=", 8) == 0) {
+                NSRect value; [invocation getReturnValue:&value];
+                rect_destination[0] = (float)value.origin.x;
+                rect_destination[1] = (float)value.origin.y;
+                rect_destination[2] = (float)value.size.width;
+                rect_destination[3] = (float)value.size.height;
+                *guest_result = 0;
+                return true;
+            }
             /* Darwin i386 returns these eight-byte structures in EDX:EAX,
                even though host AppKit uses sixteen-byte CGFloat geometry. */
             if (strncmp(return_type, "{CGPoint=", 9) == 0) {
@@ -1854,7 +2274,7 @@ static bool invoke_simple_message(id receiver, const char *selector_name,
             if (getenv("LP32_TRACE_EVENTS") && [value isKindOfClass:[NSEvent class]])
                 fprintf(stderr, "compat32: delivered event %p type=%lu via=%s\n", (void *)value,
                     (unsigned long)[(NSEvent *)value type], selector_name);
-            if (lp32_profile()->title == LP32_TITLE_PORTAL2 && receiver == [NSDate class] &&
+            if (lp32_profile_is_source() && receiver == [NSDate class] &&
                 (!strcmp(selector_name, "date") || !strncmp(selector_name, "dateWith", 8)))
                 *guest_result = proxy_for_autoreleased_value(value);
             else *guest_result = proxy_for_returned_object(receiver, value);
@@ -1891,6 +2311,21 @@ static bool invoke_simple_message(id receiver, const char *selector_name,
         case 'd': { double value = 0; [invocation getReturnValue:&value]; *guest_result = compat_runtime32_return_double(value); return true; }
         default: return false;
     }
+}
+
+static bool invoke_message(id receiver, const char *selector_name,
+                           const uint32_t *guest_arguments,
+                           uint64_t *guest_result, float *rect_destination)
+{
+    return invoke_message_with(receiver, selector_name, guest_arguments,
+                               guest_result, rect_destination, NULL);
+}
+
+static bool invoke_simple_message(id receiver, const char *selector_name,
+                                  const uint32_t *guest_arguments,
+                                  uint64_t *guest_result)
+{
+    return invoke_message(receiver, selector_name, guest_arguments, guest_result, NULL);
 }
 
 @interface NSFullScreenWindow : NSWindow
@@ -4070,7 +4505,7 @@ static bool portal_buffer_cache_enabled(void)
 {
     static int disabled = -1;
     if (disabled < 0) disabled = getenv("LP32_NO_BUFFER_CACHE") != NULL;
-    return lp32_profile()->title == LP32_TITLE_PORTAL2 && !disabled;
+    return lp32_profile_is_source() && !disabled;
 }
 
 static int buffer_target_index(GLenum target)
@@ -4222,7 +4657,7 @@ static void upload_mapped_buffer_range(GLenum target, GLintptr offset,
     dispatch_once(&once, ^{
         native_copy = getenv("LP32_NO_MAPPED_UPLOAD") == NULL;
     });
-    if (native_copy && lp32_profile()->title == LP32_TITLE_PORTAL2 && size > 0) {
+    if (native_copy && lp32_profile_is_source() && size > 0) {
         void *mapped = glMapBuffer(target, GL_WRITE_ONLY);
         if (mapped) {
             memcpy((unsigned char *)mapped + offset, data, (size_t)size);
@@ -5312,7 +5747,7 @@ static GLenum canonical_mipmap_target(GLenum target)
 
 static void repair_bound_texture_mipmap_range(GLenum upload_target)
 {
-    if (lp32_profile()->title == LP32_TITLE_PORTAL2) return;
+    if (lp32_profile_is_source()) return;
     GLenum target = canonical_mipmap_target(upload_target);
     static int repair_disabled = -1;
     if (repair_disabled < 0) {
@@ -6206,7 +6641,7 @@ lp32_fast_import_fn objc_bridge32_fast_import(const char *import_name)
         if (!strncmp(query, "_gl", 3)) ++query;
         if ((!strncmp(candidate, "glUniform", 9) ||
              !strncmp(candidate, "glUseProgram", 12)) &&
-            (lp32_profile()->title != LP32_TITLE_PORTAL2 ||
+            (!lp32_profile_is_source() ||
              getenv("LP32_NO_FAST_GLSL"))) continue;
         if (strcmp(query, candidate) == 0) {
             return table[index].handler;
@@ -6344,7 +6779,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         }
         *result = 0; return 1;
     }
-    if (lp32_profile()->title == LP32_TITLE_PORTAL2 &&
+    if (lp32_profile_is_source() &&
         (LP32_NAME_IS(import_name, import_length, "_ShowWindow") ||
          LP32_NAME_IS(import_name, import_length, "_CollapseWindow") ||
          LP32_NAME_IS(import_name, import_length, "_SetUserFocusWindow") ||
@@ -6381,6 +6816,18 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             arguments[0] ? (NSApplicationPresentationAutoHideDock | NSApplicationPresentationAutoHideMenuBar) : NSApplicationPresentationDefault];
         *result = 0; return 1;
     }
+    if (LP32_NAME_IS(import_name, import_length, "_NSPointInRect")) {
+        const float *values = (const void *)arguments;
+        *result = NSPointInRect(NSMakePoint(values[0], values[1]),
+                                NSMakeRect(values[2], values[3], values[4], values[5]));
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_NSRectFill")) {
+        const float *values = (const void *)arguments;
+        NSRectFill(NSMakeRect(values[0], values[1], values[2], values[3]));
+        *result = 0;
+        return 1;
+    }
     if (LP32_NAME_IS(import_name, import_length, "_NSClassFromString")) {
         *result = proxy_for_object(NSClassFromString(object_for_argument(arguments[0]))); return 1;
     }
@@ -6399,6 +6846,27 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     if (LP32_NAME_IS(import_name, import_length, "_FSRefMakePath")) {
         *result = (uint32_t)FSRefMakePath((const FSRef *)(uintptr_t)arguments[0],
                                         (UInt8 *)(uintptr_t)arguments[1], arguments[2]); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_FSPathMakeRef")) {
+        const char *path = (const char *)(uintptr_t)arguments[0];
+        OSStatus status = FSPathMakeRef((const UInt8 *)path, (FSRef *)(uintptr_t)arguments[1],
+                                        (Boolean *)(uintptr_t)arguments[2]);
+        /* Source's GetLocalPath returns the bare relative name for files it
+           finds in a VPK (Portal's custom fonts). Resolve those against the
+           loose copies in the mod, hl2, and platform directories. */
+        const char *root = guest_dyld32_game_root();
+        if (status != noErr && path && path[0] != '/' && root && lp32_profile_is_source()) {
+            const char *directories[] = {lp32_profile()->source->game_directory, "hl2", "platform"};
+            for (unsigned i = 0; status != noErr && i < 3; ++i) {
+                char resolved[PATH_MAX];
+                if (snprintf(resolved, sizeof(resolved), "%s/%s/%s", root, directories[i], path) <
+                    (int)sizeof(resolved))
+                    status = FSPathMakeRef((const UInt8 *)resolved, (FSRef *)(uintptr_t)arguments[1],
+                                           (Boolean *)(uintptr_t)arguments[2]);
+            }
+        }
+        *result = (uint32_t)status;
+        return 1;
     }
 #pragma clang diagnostic pop
     if (LP32_NAME_IS(import_name, import_length, "_CFDataGetLength")) {
@@ -6482,7 +6950,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     if (LP32_NAME_IS(import_name, import_length, "_CFStringCreateWithCString") ||
         LP32_NAME_IS(import_name, import_length, "_CFStringCreateWithCStringNoCopy")) {
         CFStringRef string = CFStringCreateWithCString(NULL, (const char *)(uintptr_t)arguments[1], arguments[2]);
-        *result = lp32_profile()->title == LP32_TITLE_PORTAL2 ?
+        *result = lp32_profile_is_source() ?
             proxy_for_owned_value((id)string) : proxy_for_object((id)string);
         if (string) CFRelease(string);
         return 1;
@@ -6693,7 +7161,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         *result = kCGErrorSuccess;
         return 1;
     }
-    if (lp32_profile()->title == LP32_TITLE_PORTAL2 &&
+    if (lp32_profile_is_source() &&
         (LP32_NAME_IS(import_name, import_length, "_CGDisplayHideCursor") ||
          LP32_NAME_IS(import_name, import_length, "_CGDisplayShowCursor"))) {
         /* Source repeats hide/show until its visibility query changes. Keep
@@ -6710,6 +7178,8 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CGDisplayCapture") ||
+        LP32_NAME_IS(import_name, import_length, "_CGCaptureAllDisplays") ||
+        LP32_NAME_IS(import_name, import_length, "_CGReleaseAllDisplays") ||
         LP32_NAME_IS(import_name, import_length, "_CGDisplayHideCursor") ||
         LP32_NAME_IS(import_name, import_length, "_CGDisplayShowCursor") ||
         LP32_NAME_IS(import_name, import_length, "_CGDisplayFade") ||
@@ -6810,7 +7280,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         // can report no active displays while AppKit still exposes connected
         // screens (for example, while displays sleep). Keep those available
         // for this windowed renderer instead of handing Source zero adapters.
-        if (!*result && lp32_profile()->title == LP32_TITLE_PORTAL2) {
+        if (!*result && lp32_profile_is_source()) {
             uint32_t active_count = 0;
             if (CGGetActiveDisplayList(0, NULL, &active_count) == kCGErrorSuccess && !active_count) {
                 for (NSScreen *screen in [NSScreen screens]) {
@@ -6824,8 +7294,80 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         if (getenv("LP32_TRACE_DISPLAY")) fprintf(stderr, "compat32: display active %u -> %llu\n", arguments[0], (unsigned long long)*result);
         return 1;
     }
+    if (LP32_NAME_IS(import_name, import_length, "_CGDisplayIsMain")) {
+        *result = CGDisplayIsMain(arguments[0]); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGDisplayMirrorsDisplay")) {
+        *result = CGDisplayMirrorsDisplay(arguments[0]); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGDisplayCopyAllDisplayModes")) {
+        CFArrayRef modes = CGDisplayCopyAllDisplayModes(arguments[0],
+            (CFDictionaryRef)object_for_argument(arguments[1]));
+        if (getenv("LP32_TRACE_DISPLAY"))
+            fprintf(stderr, "compat32: display %u has %ld modes\n", arguments[0],
+                    modes ? (long)CFArrayGetCount(modes) : 0L);
+        *result = proxy_for_object((id)modes);
+        if (modes) CFRelease(modes);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGDisplayModeRetain")) {
+        /* The proxy already owns a reference; releases are no-ops too. */
+        *result = arguments[0]; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGDisplayModeCopyPixelEncoding")) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        CFStringRef encoding = CGDisplayModeCopyPixelEncoding(
+            (CGDisplayModeRef)object_for_argument(arguments[0]));
+#pragma clang diagnostic pop
+        *result = proxy_for_object((id)encoding);
+        if (encoding) CFRelease(encoding);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGDisplaySetDisplayMode")) {
+        /* Presentation stays in a desktop-mode window (see the capture
+           comment above); SDL keeps its own record of the requested mode. */
+        if (getenv("LP32_TRACE_DISPLAY")) {
+            CGDisplayModeRef mode = (CGDisplayModeRef)object_for_argument(arguments[1]);
+            fprintf(stderr, "compat32: _CGDisplaySetDisplayMode %zux%zu (emulated)\n",
+                    mode ? CGDisplayModeGetWidth(mode) : 0,
+                    mode ? CGDisplayModeGetHeight(mode) : 0);
+        }
+        *result = kCGErrorSuccess;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGDisplayMoveCursorToPoint")) {
+        const float *point = (const void *)(arguments + 1);
+        CGRect bounds = CGDisplayBounds(arguments[0]);
+        float global[2] = { point[0] + (float)bounds.origin.x, point[1] + (float)bounds.origin.y };
+        if (lp32_profile_is_source()) {
+            pthread_mutex_lock(&portal_cursor_lock);
+            *result = lp32_cursor_warp(&portal_cursor, &portal_cursor_host, global[0], global[1]);
+            pthread_mutex_unlock(&portal_cursor_lock);
+            return 1;
+        }
+        *result = CGWarpMouseCursorPosition(CGPointMake(global[0], global[1]));
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGSetLocalEventsSuppressionInterval")) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        double interval;
+        memcpy(&interval, arguments, sizeof(interval));
+        *result = CGSetLocalEventsSuppressionInterval(interval);
+#pragma clang diagnostic pop
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGEventTapCreate")) {
+        /* A guest callback cannot run on the host tap thread; SDL falls
+           back to warping and relative deltas without a tap. */
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGEventTapEnable")) {
+        *result = 0; return 1;
+    }
     if (LP32_NAME_IS(import_name, import_length, "_CGCursorIsVisible")) {
-        if (lp32_profile()->title == LP32_TITLE_PORTAL2) {
+        if (lp32_profile_is_source()) {
             pthread_mutex_lock(&portal_cursor_lock);
             *result = portal_cursor.hide_count == 0;
             pthread_mutex_unlock(&portal_cursor_lock);
@@ -6849,7 +7391,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     }
     if (LP32_NAME_IS(import_name, import_length, "_CGWarpMouseCursorPosition")) {
         const float *point = (const void *)arguments;
-        if (lp32_profile()->title == LP32_TITLE_PORTAL2) {
+        if (lp32_profile_is_source()) {
             pthread_mutex_lock(&portal_cursor_lock);
             if (!portal_cursor.focused && ++portal_background_warps == 1 &&
                 getenv("LP32_TRACE_DISPLAY"))
@@ -6861,7 +7403,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         *result = CGWarpMouseCursorPosition(CGPointMake(point[0], point[1])); return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CGAssociateMouseAndMouseCursorPosition")) {
-        if (lp32_profile()->title == LP32_TITLE_PORTAL2) {
+        if (lp32_profile_is_source()) {
             pthread_mutex_lock(&portal_cursor_lock);
             *result = lp32_cursor_capture(&portal_cursor, &portal_cursor_host, !arguments[0]);
             if (getenv("LP32_TRACE_DISPLAY"))
@@ -7994,7 +8536,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         *result = 0; return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_IORegistryEntrySearchCFProperty")) {
-        if (lp32_profile()->title == LP32_TITLE_PORTAL2) {
+        if (lp32_profile_is_source()) {
             CFTypeRef property = IORegistryEntrySearchCFProperty(arguments[0], (const char *)(uintptr_t)arguments[1],
                 (CFStringRef)object_for_argument(arguments[2]), NULL, arguments[4]);
             *result = proxy_for_object((id)property);
@@ -8461,7 +9003,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         CFIndex length = (int32_t)arguments[2];
         CFStringRef string = CFStringCreateWithBytes(NULL, bytes, length,
                                                      arguments[3], false);
-        *result = lp32_profile()->title == LP32_TITLE_PORTAL2 ?
+        *result = lp32_profile_is_source() ?
             proxy_for_owned_value((id)string) : proxy_for_object((id)string);
         if (string) CFRelease(string);
         return 1;
@@ -8798,7 +9340,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     }
 #pragma clang diagnostic pop
     if (LP32_NAME_IS(import_name, import_length, "_CFRunLoopGetCurrent")) {
-        if (lp32_profile()->title == LP32_TITLE_PORTAL2) {
+        if (lp32_profile_is_source()) {
             *result = proxy_for_object((id)CFRunLoopGetCurrent()); return 1;
         }
         /* A host-thread token is sufficient because Add/Remove operate on
@@ -8941,6 +9483,8 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         id object = object_for_argument(arguments[1]);
         CFStringRef mode = (CFStringRef)object_for_argument(arguments[2]);
         *result = 0;
+        /* Unsupported IOKit notification ports hand SDL a NULL source. */
+        if (!loop || !object || !mode) return 1;
         if (LP32_NAME_IS(import_name, import_length, "_CFRunLoopAddTimer")) CFRunLoopAddTimer(loop, (CFRunLoopTimerRef)object, mode);
         else if (LP32_NAME_IS(import_name, import_length, "_CFRunLoopRemoveTimer")) CFRunLoopRemoveTimer(loop, (CFRunLoopTimerRef)object, mode);
         else if (LP32_NAME_IS(import_name, import_length, "_CFRunLoopAddObserver")) CFRunLoopAddObserver(loop, (CFRunLoopObserverRef)object, mode);
@@ -8979,13 +9523,84 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     if (LP32_NAME_IS(import_name, import_length, "_UCKeyTranslate")) {
         const UCKeyboardLayout *layout =
             (const void *)(uintptr_t)arguments[0];
+        /* UniCharCount is unsigned long: 32 bits in the guest. */
+        UniCharCount length = 0;
         *result = (uint32_t)UCKeyTranslate(
             layout, (UInt16)arguments[1], (UInt16)arguments[2], arguments[3],
             arguments[4], arguments[5],
-            (UInt32 *)(uintptr_t)arguments[6], arguments[7],
-            (UniCharCount *)(uintptr_t)arguments[8],
+            (UInt32 *)(uintptr_t)arguments[6], arguments[7], &length,
             (UniChar *)(uintptr_t)arguments[9]);
+        if (arguments[8]) *(uint32_t *)(uintptr_t)arguments[8] = (uint32_t)length;
         return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_TISCopyCurrentKeyboardLayoutInputSource")) {
+        TISInputSourceRef source = TISCopyCurrentKeyboardLayoutInputSource();
+        *result = proxy_for_object((id)source);
+        if (source) CFRelease(source);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_KBGetLayoutType")) {
+        *result = KBGetLayoutType((SInt16)arguments[0]);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_HideMenuBar") ||
+        LP32_NAME_IS(import_name, import_length, "_ShowMenuBar")) {
+        BOOL visible = LP32_NAME_IS(import_name, import_length, "_ShowMenuBar");
+        void (^operation)(void) = ^{ [NSMenu setMenuBarVisible:visible]; };
+        if ([NSThread isMainThread]) operation();
+        else dispatch_async(dispatch_get_main_queue(), operation);
+        *result = 0;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_IOIteratorIsValid")) {
+        *result = IOIteratorIsValid(arguments[0]); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_IOObjectIsEqualTo")) {
+        *result = IOObjectIsEqualTo(arguments[0], arguments[1]); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_IODisplayCreateInfoDictionary")) {
+        /* CGDisplayIOServicePort reports no service on modern macOS. */
+        CFDictionaryRef info = arguments[0] ?
+            IODisplayCreateInfoDictionary(arguments[0], arguments[1]) : NULL;
+        *result = proxy_for_object((id)info);
+        if (info) CFRelease(info);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_IOPSCopyPowerSourcesInfo")) {
+        CFTypeRef info = IOPSCopyPowerSourcesInfo();
+        *result = proxy_for_object((id)info);
+        if (info) CFRelease(info);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_IOPSCopyPowerSourcesList")) {
+        CFArrayRef list = IOPSCopyPowerSourcesList((CFTypeRef)object_for_argument(arguments[0]));
+        *result = proxy_for_object((id)list);
+        if (list) CFRelease(list);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_IOPSGetPowerSourceDescription")) {
+        *result = proxy_for_object((id)IOPSGetPowerSourceDescription(
+            (CFTypeRef)object_for_argument(arguments[0]),
+            (CFTypeRef)object_for_argument(arguments[1])));
+        return 1;
+    }
+    if (import_length > 3 && !strncmp(import_name, "_FF", 3)) {
+        /* No force-feedback plug-ins exist for the guest; SDL treats every
+           device as non-haptic. */
+        *result = LP32_NAME_IS(import_name, import_length, "_FFIsForceFeedback") ?
+            0x80004002u /* FFERR_NOINTERFACE */ : 0x80004005u /* FFERR_GENERIC */;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_objc_sync_enter")) {
+        *result = (uint32_t)objc_sync_enter(object_for_argument(arguments[0])); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_objc_sync_exit")) {
+        *result = (uint32_t)objc_sync_exit(object_for_argument(arguments[0])); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_objc_enumerationMutation")) {
+        fprintf(stderr, "compat32: collection mutated during fast enumeration: %s\n",
+                [[object_for_argument(arguments[0]) description] UTF8String]);
+        abort();
     }
 
     if (LP32_NAME_IS(import_name, import_length, "_NSRunAlertPanel")) {
@@ -9047,7 +9662,13 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         if (!method) return 0;
         NSMethodSignature *sig = [NSMethodSignature signatureWithObjCTypes:method_getTypeEncoding(method)];
         NSUInteger count = [sig numberOfArguments] - 2;
-        if (count > 1) return 0;
+        if (count > 1) {
+            bool invoked = invoke_message_with(receiver, name, arguments, result, NULL, method);
+            if (!invoked)
+                fprintf(stderr, "compat32: Objective-C bridge cannot invoke super %s on %s\n",
+                        name, class_getName(parent));
+            return invoked;
+        }
         if (count && *[sig getArgumentTypeAtIndex:2] == '{') {
             const float *r = (const void *)(arguments + 2);
             ((void (*)(struct objc_super *, SEL, NSRect))objc_msgSendSuper)(&super, selector, NSMakeRect(r[0], r[1], r[2], r[3]));
@@ -9072,7 +9693,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
              receiver == [NSAutoreleasePool class] || [receiver isKindOfClass:[LP32GuestAutoreleasePool class]]))
             fprintf(stderr, "compat32: date/pool %s receiver=%s\n", selector_name,
                 receiver ? class_getName(object_getClass(receiver)) : "nil");
-        if (lp32_profile()->title == LP32_TITLE_PORTAL2 && selector_name) {
+        if (lp32_profile_is_source() && selector_name) {
             /* A guest pool spans import calls, while each host dispatch has
                its own nested pool. Creating an actual NSAutoreleasePool here
                would let the dispatch pop destroy the guest's pool early. */
@@ -9146,7 +9767,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                     arguments[0], selector_name ? selector_name : "(null)");
             return 0;
         }
-        if (lp32_profile()->title == LP32_TITLE_PORTAL2 &&
+        if (lp32_profile_is_source() &&
             strcmp(selector_name, "flushBuffer") == 0 &&
             [receiver isKindOfClass:[NSOpenGLContext class]]) {
             portal_flush_buffer(receiver);
@@ -9158,7 +9779,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             *result = context ? proxy_for_object([NSValue valueWithPointer:context]) : 0;
             return 1;
         }
-        if (lp32_profile()->title == LP32_TITLE_PORTAL2 &&
+        if (lp32_profile_is_source() &&
             strcmp(selector_name, "windowRef") == 0 &&
             [receiver isKindOfClass:[NSWindow class]]) {
             *result = arguments[0];
@@ -9190,7 +9811,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                                                        styleMask:arguments[6]
                                                          backing:arguments[7]
                                                            defer:arguments[8] != 0];
-            if (lp32_profile()->title == LP32_TITLE_PORTAL2 &&
+            if (lp32_profile_is_source() &&
                 [value isKindOfClass:objc_getClass("AppWindow")])
                 observe_portal_cursor_focus(value);
             *result = proxy_for_object(value);
@@ -9315,7 +9936,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                     ReleaseEvent(carbon_event);
                 }
             }
-            if (lp32_profile()->title == LP32_TITLE_PORTAL2 && background_test_mode()) {
+            if (lp32_profile_is_source() && background_test_mode()) {
                 /* The benchmark keeps rendering on a secondary display
                    without stealing focus. Source otherwise waits ~50 ms in
                    its inactive event pump, obscuring rendering costs. */
@@ -9323,6 +9944,45 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                     nextEventMatchingMask:arguments[2] untilDate:[NSDate distantPast]
                     inMode:object_for_argument(arguments[4]) dequeue:arguments[5] != 0];
                 *result = proxy_for_object(event);
+                return 1;
+            }
+        }
+        if (!strcmp(selector_name, "countByEnumeratingWithState:objects:count:")) {
+            /* i386 NSFastEnumerationState is {state, itemsPtr, mutationsPtr,
+               extra[5]} in 32-bit words. Enumerate by index: state is the
+               next position, mutationsPtr points at a constant extra word. */
+            uint32_t *state = (void *)(uintptr_t)arguments[2];
+            uint32_t *buffer = (void *)(uintptr_t)arguments[3];
+            uint32_t capacity = arguments[4];
+            if (!state || !buffer || !capacity) { *result = 0; return 1; }
+            NSArray *items = [receiver isKindOfClass:[NSArray class]] ? receiver : nil;
+            if (!items) {
+                NSMutableArray *snapshot = [NSMutableArray array];
+                for (id item in (id<NSFastEnumeration>)receiver) [snapshot addObject:item];
+                items = snapshot;
+            }
+            NSUInteger start = state[0], total = [items count], produced = 0;
+            for (; produced < capacity && start + produced < total; ++produced)
+                buffer[produced] = proxy_for_object([items objectAtIndex:start + produced]);
+            state[0] = (uint32_t)(start + produced);
+            state[1] = arguments[3];
+            state[4] = 0;
+            state[2] = arguments[2] + 4 * 4;
+            *result = (uint32_t)produced;
+            return 1;
+        }
+        if ([receiver isKindOfClass:[NSBitmapImageRep class]]) {
+            if (!strcmp(selector_name, "initWithBitmapDataPlanes:pixelsWide:pixelsHigh:"
+                        "bitsPerSample:samplesPerPixel:hasAlpha:isPlanar:colorSpaceName:"
+                        "bytesPerRow:bitsPerPixel:")) {
+                *result = proxy_for_object(init_guest_bitmap(receiver, arguments));
+                return 1;
+            }
+            if (!strcmp(selector_name, "bitmapData")) {
+                uintptr_t data = (uintptr_t)[(NSBitmapImageRep *)receiver bitmapData];
+                if (data > UINT32_MAX)
+                    fprintf(stderr, "compat32: NSBitmapImageRep storage is not guest-addressable\n");
+                *result = data > UINT32_MAX ? 0 : (uint32_t)data;
                 return 1;
             }
         }
@@ -9370,7 +10030,12 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             rect = [NSWindow contentRectForFrameRect:input
                                            styleMask:arguments[7]];
         } else {
-            return 0;
+            bool invoked = invoke_message(receiver, selector_name, arguments + 1,
+                                          result, (float *)destination);
+            if (!invoked)
+                fprintf(stderr, "compat32: Objective-C bridge cannot invoke stret %s on %s\n",
+                        selector_name, class_getName(object_getClass(receiver)));
+            return invoked;
         }
         destination->x = (float)rect.origin.x;
         destination->y = (float)rect.origin.y;
@@ -9441,6 +10106,22 @@ uint32_t objc_bridge32_pointer_import(const char *import_name)
     }
     if (LP32_NAME_IS(import_name, import_length, "_NSWindowWillCloseNotification")) {
         return proxy_for_object(NSWindowWillCloseNotification);
+    }
+#define NS_STRING_IMPORT(symbol) \
+    if (LP32_NAME_IS(import_name, import_length, "_" #symbol)) return proxy_for_object(symbol)
+    NS_STRING_IMPORT(NSApplicationDidBecomeActiveNotification);
+    NS_STRING_IMPORT(NSWindowDidBecomeKeyNotification);
+    NS_STRING_IMPORT(NSWindowDidDeminiaturizeNotification);
+    NS_STRING_IMPORT(NSWindowDidExposeNotification);
+    NS_STRING_IMPORT(NSWindowDidMiniaturizeNotification);
+    NS_STRING_IMPORT(NSWindowDidMoveNotification);
+    NS_STRING_IMPORT(NSWindowDidResignKeyNotification);
+    NS_STRING_IMPORT(NSWindowDidResizeNotification);
+    NS_STRING_IMPORT(NSDeviceRGBColorSpace);
+    NS_STRING_IMPORT(NSPasteboardTypeString);
+#undef NS_STRING_IMPORT
+    if (LP32_NAME_IS(import_name, import_length, "_NSStringPboardType")) {
+        return proxy_for_object(@"NSStringPboardType");
     }
     return 0;
 }
@@ -10378,7 +11059,7 @@ int objc_bridge32_run_gl_texture_self_test(void)
             GLint maximum = -1;
             glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL,
                                 &maximum);
-            if (maximum != (lp32_profile()->title == LP32_TITLE_PORTAL2 ? 6 : 5)) {
+            if (maximum != (lp32_profile_is_source() ? 6 : 5)) {
                 fprintf(stderr,
                         "gl-texture-selftest: incomplete chain was not "
                         "following the title policy: max=%d\n", maximum);
@@ -10425,7 +11106,7 @@ int objc_bridge32_run_gl_texture_self_test(void)
                 }
                 glGetTexParameteriv(GL_TEXTURE_CUBE_MAP,
                                     GL_TEXTURE_MAX_LEVEL, &maximum);
-                if (maximum != (lp32_profile()->title == LP32_TITLE_PORTAL2 ? 6 : 5)) {
+                if (maximum != (lp32_profile_is_source() ? 6 : 5)) {
                     fprintf(stderr,
                             "gl-texture-selftest: incomplete cube chain was "
                             "not following the title policy: max=%d\n", maximum);
@@ -10442,7 +11123,7 @@ int objc_bridge32_run_gl_texture_self_test(void)
                 }
                 glGetTexParameteriv(GL_TEXTURE_CUBE_MAP,
                                     GL_TEXTURE_MAX_LEVEL, &maximum);
-                if (maximum != (lp32_profile()->title == LP32_TITLE_PORTAL2 ? 6 : 5)) {
+                if (maximum != (lp32_profile_is_source() ? 6 : 5)) {
                     fprintf(stderr,
                             "gl-texture-selftest: five-face cube level "
                             "violated the title policy: max=%d\n", maximum);

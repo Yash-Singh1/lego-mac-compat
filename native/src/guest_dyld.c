@@ -1,5 +1,6 @@
 #include "guest_dyld.h"
 #include "physics_trace.h"
+#include "source_patches.h"
 #include "crash_trace.h"
 #include "steam_bridge.h"
 #include "macho_file.h"
@@ -270,8 +271,10 @@ int guest_dyld32_initialize(const char *image_path)
     *slash = 0;
     char *support = strrchr(path, '/');
     if (support && !strcmp(support, "/SharedSupport")) {
-        if (strlen(path) + sizeof("/Portal2") > sizeof(path)) return fail("game path is too long");
-        strcat(path, "/Portal2");
+        const char *data = lp32_profile()->source->data_directory;
+        if (strlen(path) + strlen(data) + 2 > sizeof(path)) return fail("game path is too long");
+        strcat(path, "/");
+        strcat(path, data);
     }
     if (!realpath(path, game_root)) return fail("game directory: %s", strerror(errno));
     char launcher[PATH_MAX];
@@ -713,6 +716,7 @@ static int bind_module(struct module32 *m)
     }
     lp32_trace_module(m->path, m->base, m->end, m->slide, uuid);
     lp32_physics_trace_install(m->path, m->slide, uuid);
+    lp32_source_patches_install(m->path, m->slide, uuid);
     return 0;
 }
 
@@ -882,7 +886,7 @@ static void drop_server_classes(struct module32 *m)
 
 static int apply_source_overrides(struct module32 *m)
 {
-    if (lp32_profile()->title != LP32_TITLE_PORTAL2) return 0;
+    if (!lp32_profile_is_source()) return 0;
     const char *base = strrchr(m->path, '/');
     base = base ? base + 1 : m->path;
     if (!strcmp(base, "engine.dylib")) return apply_convar_overrides(m);

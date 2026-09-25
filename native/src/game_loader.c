@@ -697,14 +697,15 @@ static int configure_guest_breakpoint(const struct macho_image32 *image)
     return 0;
 }
 
-static int run_steam_helper(const char *operation, const char *game_root)
+static int run_steam_helper(const char *operation, const char *argument)
 {
     /* Probe Steam and show any UI outside the guest's event loop and locks.
        Call before guest startup or from normal error dispatch, never from
        a signal handler. */
     fflush(NULL);
     if (loader_executable[0]) {
-        char *arguments[] = {loader_executable, (char *)operation, (char *)game_root, NULL};
+        char *arguments[] = {loader_executable, (char *)operation, (char *)argument,
+                             (char *)lp32_profile()->name, NULL};
         extern char **environ;
         pid_t child;
         int error = posix_spawn(&child, loader_executable, NULL, NULL, arguments, environ);
@@ -722,7 +723,7 @@ static int run_steam_helper(const char *operation, const char *game_root)
 
 static void steam_startup_failure(void)
 {
-    (void)run_steam_helper("--steam-required", NULL);
+    (void)run_steam_helper("--steam-required", lp32_profile()->name);
     if (guest_diagnostic_fd >= 0) fsync(guest_diagnostic_fd);
     /* This is an explained startup failure, not a crash. Avoid running guest
        shutdown callbacks after Steam initialization failed. */
@@ -732,7 +733,7 @@ static void steam_startup_failure(void)
 static void runtime_diagnostic_line(const char *line)
 {
     GUEST_DIAGNOSTIC("%s", line);
-    if (lp32_profile()->title == LP32_TITLE_PORTAL2 &&
+    if (lp32_profile_is_source() &&
         strstr(line, "##### Sys_Error: Steam is not running. You must start Steam in order to play this game.")) {
         GUEST_DIAGNOSTIC("\ncompat32: Steam startup failed; showing instructions before exiting\n");
         steam_startup_failure();
@@ -744,7 +745,7 @@ static void runtime_diagnostic_line(const char *line)
 static const char *default_image_path(const char *argv0, char *buffer,
                                       size_t size)
 {
-    static const char *const candidates[] = {"LEGOPirates", "LEGOCloneWars", "Portal2"};
+    static const char *const candidates[] = {"LEGOPirates", "LEGOCloneWars", "Portal2", "Portal"};
     const char *slash = strrchr(argv0, '/');
     size_t directory_length = slash ? (size_t)(slash - argv0) : 0;
     for (size_t index = 0; index < sizeof(candidates) / sizeof(candidates[0]); ++index) {
@@ -764,12 +765,19 @@ static const char *default_image_path(const char *argv0, char *buffer,
 
 int main(int argc, char **argv)
 {
-    if (argc == 2 && !strcmp(argv[1], "--steam-required")) {
-        objc_bridge32_show_steam_required();
-        return EXIT_FAILURE;
+    /* Helper modes: <mode> <argument> [profile name]. */
+    if (argc >= 2 && argc <= 4 && (!strcmp(argv[1], "--steam-required") ||
+                                   !strcmp(argv[1], "--prepare-steam"))) {
+        const struct lp32_game_profile *profile = argc == 4 ? lp32_profile_named(argv[3]) : NULL;
+        if (!profile || !profile->source) profile = lp32_profile_named("Portal2");
+        if (!strcmp(argv[1], "--steam-required")) {
+            objc_bridge32_show_steam_required(profile->display_name);
+            return EXIT_FAILURE;
+        }
+        if (argc >= 3)
+            return objc_bridge32_prepare_steam(argv[2], profile->source->steam_app_id,
+                                               profile->display_name);
     }
-    if (argc == 3 && !strcmp(argv[1], "--prepare-steam"))
-        return objc_bridge32_prepare_steam(argv[2]);
     char executable[PATH_MAX];
     uint32_t executable_size = sizeof(executable);
     if (_NSGetExecutablePath(executable, &executable_size) != 0 ||
@@ -834,13 +842,14 @@ int main(int argc, char **argv)
         fprintf(stdout, "diagnostic fixture done\n");
         return EXIT_SUCCESS;
     }
-    if (lp32_profile()->title == LP32_TITLE_PORTAL2) {
+    if (lp32_profile_is_source()) {
         // Finder launches need the same app identity Steam supplies when it
-        // starts Portal 2. Authentication/ownership remain Steam's decision.
-        setenv("SteamAppId", "620", 1);
-        setenv("SteamGameId", "620", 1);
+        // starts the game. Authentication/ownership remain Steam's decision.
+        setenv("SteamAppId", lp32_profile()->source->steam_app_id, 1);
+        setenv("SteamGameId", lp32_profile()->source->steam_app_id, 1);
         if (guest_dyld32_initialize(image_path) || chdir(guest_dyld32_game_root())) {
-            fprintf(stderr, "game_loader: unable to select Portal 2 data directory\n");
+            fprintf(stderr, "game_loader: unable to select %s data directory\n",
+                    lp32_profile()->display_name);
             return EXIT_FAILURE;
         }
     }
@@ -876,7 +885,7 @@ int main(int argc, char **argv)
         return lp32_physics_trace_selftest() == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
     if (getenv("LP32_DYLD_SELFTEST")) {
-        return lp32_profile()->title == LP32_TITLE_PORTAL2 &&
+        return lp32_profile_is_source() &&
             guest_dyld32_self_test() == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
     if (getenv("LP32_FILE_SELFTEST")) {
@@ -934,7 +943,7 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    if (lp32_profile()->title == LP32_TITLE_PORTAL2 &&
+    if (lp32_profile_is_source() &&
         run_steam_helper("--prepare-steam", guest_dyld32_game_root()) != EXIT_SUCCESS) {
         macho_image32_unload(&image);
         return EXIT_FAILURE;
@@ -973,19 +982,20 @@ int main(int argc, char **argv)
         }
         uint32_t executable_path =
             compat_runtime32_copy_cstring(host_executable_path);
-        if (lp32_profile()->title == LP32_TITLE_PORTAL2) {
+        if (lp32_profile_is_source()) {
             int length = snprintf(host_executable_path, sizeof(host_executable_path),
-                                  "%s/portal2_osx", guest_dyld32_game_root());
+                                  "%s/%s", guest_dyld32_game_root(),
+                                  lp32_profile()->source->executable);
             if (length < 0 || (size_t)length >= sizeof(host_executable_path)) return EXIT_FAILURE;
             executable_path = compat_runtime32_copy_cstring(host_executable_path);
         }
         const char *extra_argument_text = getenv("LP32_GUEST_EXTRA_ARGUMENT");
         uint32_t extra_argument = extra_argument_text && extra_argument_text[0] ?
             compat_runtime32_copy_cstring(extra_argument_text) : 0;
-        bool portal2 = lp32_profile()->title == LP32_TITLE_PORTAL2;
+        bool source = lp32_profile_is_source();
         int argument_start = argc >= 2 && argv[1][0] != '-' ? 2 : 1;
-        uint32_t forwarded = portal2 ? (uint32_t)(argc - argument_start) : 0;
-        uint32_t guest_argc = 1 + (extra_argument ? 1 : 0) + (portal2 ? 3 : 0) + forwarded;
+        uint32_t forwarded = source ? (uint32_t)(argc - argument_start) : 0;
+        uint32_t guest_argc = 1 + (extra_argument ? 1 : 0) + (source ? 3 : 0) + forwarded;
         uint32_t argv_address = compat_runtime32_allocate(
             (guest_argc + 1) * sizeof(uint32_t), 1);
         uint32_t empty_vector = compat_runtime32_allocate(sizeof(uint32_t), 1);
@@ -997,9 +1007,10 @@ int main(int argc, char **argv)
         uint32_t *guest_argv = (void *)(uintptr_t)argv_address;
         guest_argv[0] = executable_path;
         uint32_t next_argument = 1;
-        if (portal2) {
+        if (source) {
             guest_argv[next_argument++] = compat_runtime32_copy_cstring("-game");
-            guest_argv[next_argument++] = compat_runtime32_copy_cstring("portal2");
+            guest_argv[next_argument++] = compat_runtime32_copy_cstring(
+                lp32_profile()->source->game_directory);
             /* Keep the existing direct-to-menu launch behavior. In-game Bink
                movies use the Sound Manager and Time Manager bridges. */
             guest_argv[next_argument++] = compat_runtime32_copy_cstring("-novid");
@@ -1026,7 +1037,7 @@ int main(int argc, char **argv)
             sizeof(main_arguments) / sizeof(main_arguments[0]));
         printf("game main returned/escaped: 0x%08" PRIx32 " trapped=%d\n",
                result, compat_runtime32_last_call_trapped());
-        if (lp32_profile()->title == LP32_TITLE_PORTAL2) {
+        if (lp32_profile_is_source()) {
             return compat_runtime32_last_call_trapped() ? EXIT_FAILURE : (int)result;
         }
     }

@@ -21,6 +21,7 @@ Supported and candidate games:
 | LEGO Batman 3: Beyond Gotham | Feral, 2014 | - |
 | The LEGO Movie Videogame | Feral, 2014 | - |
 | Portal 2 | Valve, 2011 | Experimental: main menu and first level render; gameplay checks ongoing |
+| Portal | Valve, 2010 | Experimental: main menu and first test chamber render |
 
 \* Not verified with a 100% run yet, report any bugs or problems in the issues tab.
 
@@ -124,6 +125,7 @@ make GAME=clonewars SOURCE_APP="/path/to/LEGO Star Wars III.app"           bundl
 make portal2-runtime
 make GAME=portal2   SOURCE_APP="/path/to/Portal 2.app"   bundle
 make GAME=portal2   SOURCE_GAME="/path/to/portal2"       bundle
+make GAME=portal    SOURCE_GAME="/path/to/steamapps/common/Portal" bundle
 ```
 
 For Portal 2, `make portal2-runtime` downloads Apple's 4.72 GB Lion installer
@@ -132,6 +134,11 @@ download in `native/build/runtime-downloads/` and places the libraries in
 `native/build/guest-runtime/`. The Portal 2 bundle target also prepares the runtime automatically, then copies it inside
 `Portal2-Compat.app`. Later runs verify and reuse the cached libraries. The
 installer is never run, and your Mac's system libraries are not changed.
+
+Portal (the 2010 Steam release) uses the same runtime. `SOURCE_GAME` defaults to
+`~/Library/Application Support/Steam/steamapps/common/Portal`, and the target
+builds `Portal-Compat.app`. Steam must be running and signed in to an account
+that owns Portal.
 
 This compiles the loader and assembles a self-contained app in
 `native/build/` (`LEGOPirates-Compat.app`, `LEGOCloneWars-Compat.app`) with
