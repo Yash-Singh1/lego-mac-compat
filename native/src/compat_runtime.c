@@ -4285,6 +4285,9 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
         if (arguments[1]) *(uint32_t *)(uintptr_t)arguments[1] = (uint32_t)(uintptr_t)end;
         return single ? return_guest_float((float)value) : return_guest_double(value);
     }
+    if (import_is(name, "_atof")) {
+        return return_guest_double(atof((const char *)(uintptr_t)arguments[0]));
+    }
     if (import_is(name, "_strchr")) {
         return (uint32_t)(uintptr_t)strchr((const char *)(uintptr_t)arguments[0],
                                            (int)arguments[1]);

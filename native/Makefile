@@ -3,8 +3,8 @@ BUILD_DIR := build
 CONTINUE_WHEN_INACTIVE ?= 0
 
 # One loader serves every supported title; the bundle targets pick the title
-# with GAME=pirates (default), GAME=clonewars, GAME=marvel, GAME=batman3 or
-# GAME=saga.
+# with GAME=pirates (default), GAME=clonewars, GAME=marvel, GAME=batman3,
+# GAME=movie or GAME=saga.
 GAME ?= pirates
 ifeq ($(GAME),clonewars)
 BUNDLE := $(BUILD_DIR)/LEGOCloneWars-Compat.app
@@ -52,6 +52,21 @@ EXTRA_RESOURCES := Frameworks/libsteam_api.dylib
 PLUGINS_SOURCE := $(SOURCE_CONTENTS)/PlugIns
 # Steam installs the framework without its top-level symlinks.
 CG_SOURCE := $(SOURCE_CONTENTS)/Frameworks/Cg.framework/Versions/A
+ICON := $(SOURCE_CONTENTS)/Resources/GameIcon.icns
+ICON_NAME := GameIcon.icns
+else ifeq ($(GAME),movie)
+BUNDLE := $(BUILD_DIR)/LEGOMovie-Compat.app
+SOURCE_APP := $(HOME)/Library/Application Support/Steam/steamapps/common/The LEGO Movie - Videogame/The LEGO Movie.app
+SOURCE_CONTENTS := $(SOURCE_APP)/Contents
+IMAGE_SOURCE := $(SOURCE_CONTENTS)/MacOS/The LEGO Movie
+IMAGE_PREREQ :=
+IMAGE_NAME := LEGOMovie.image
+LOADER_NAME := LEGOMovieCompat
+INFO_PLIST := Info-Movie.plist
+# Laid out like Marvel: GAME*.DAT, Content.loader and the Steam API all
+# arrive with the Resources ditto.
+GAME_DATA :=
+CG_SOURCE := $(SOURCE_CONTENTS)/Frameworks/Cg.framework
 ICON := $(SOURCE_CONTENTS)/Resources/GameIcon.icns
 ICON_NAME := GameIcon.icns
 else ifeq ($(GAME),saga)
@@ -112,7 +127,7 @@ GAME_DATA := GAME.DAT GAME0.DAT GAME1.DAT GAME2.DAT GAME3.DAT GAME4.DAT
 ICON := icons/LEGOPirates.icns
 ICON_NAME := icon.icns
 else
-$(error Unknown GAME "$(GAME)"; choose pirates, clonewars, marvel, batman3 or saga)
+$(error Unknown GAME "$(GAME)"; choose pirates, clonewars, marvel, batman3, movie or saga)
 endif
 CG_SOURCE ?= $(SOURCE_CONTENTS)/Library/Frameworks/Cg.framework
 # Python for the Pirates unpacker.  By default a venv under $(BUILD_DIR) with

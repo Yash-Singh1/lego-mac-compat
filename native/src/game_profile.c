@@ -364,6 +364,62 @@ static const struct lp32_game_profile batman3_profile = {
     .application_will_unhide = 0x004f97b0,
 };
 
+/* Feral Steam 1.0 RC3 (60647.16384, 2014), the same Feral runtime and GCC
+   HID Utilities library as Marvel, located by matching Marvel's code. */
+static const struct lp32_controller_layout movie_controller = {
+    .hid_device_list = 0x016b01c4,
+    .hid_last_error = 0x016b01b8,
+    .hid_get_element_value = {
+        .address = 0x01062f96,
+        .expected = {0x55, 0x89, 0xe5, 0x83, 0xec, 0x68},
+        .length = 6,
+    },
+    .hid_build_device_list = {
+        .address = 0x01069f1c,
+        .expected = {0x55, 0x89, 0xe5, 0x83, 0xec, 0x58},
+        .length = 6,
+    },
+    .hid_get_first_device = 0x01063229,
+    .hid_get_next_device = 0x0106323a,
+    .convert_hid_state = 0x004595b0,
+};
+
+/* ScreenWidth/Height/RefreshRate setters: 0x27bba0/0x27bbd0/0x27bc00. */
+static const struct lp32_display_layout movie_display = {
+    .screen_width = 0x016b4324,
+    .screen_height = 0x016b4328,
+    .refresh_rate = 0x016b432c,
+};
+
+/* Marvel's submitter with the stats pointer loaded into eax, not ecx. */
+static const struct lp32_steam_achievement_guard movie_steam_achievement_guard = {
+    .entry = 0x00285bd0,
+    .stats_pointer = 0x016b4988,
+    .enabled_check = {0x00285bdf, {0x80,0xbe,0xd0,0xe2,0x22,0x01,0x00}, 7},
+    .stats_load = {0x00285beb, {0x8b,0x86,0xac,0xed,0x42,0x01,0x8b,0x08}, 8},
+    .skip_return = {0x00285c27, {0x83,0xc4,0x14,0x5e,0x5d,0xc3}, 6},
+};
+
+/* Like Marvel, this crt calls main directly from start. */
+static const struct lp32_game_profile movie_profile = {
+    .title = LP32_TITLE_MOVIE,
+    .name = "LEGOMovie",
+    .display_name = "The LEGO Movie Videogame",
+    .log_directory = "LEGOMovieCompat",
+    .image_file = "LEGOMovie.image",
+    .entry_eip = 0x00002930,
+    .image_end = 0x01896000,
+    .main_address = 0x0027ae50,
+    .steam_app_id = 267530,
+    .callee_pops_struct_return = 1,
+    .thread_argument_is_direct = 1,
+    .controller = &movie_controller,
+    .steam_achievement_guard = &movie_steam_achievement_guard,
+    .display = &movie_display,
+    .application_should_terminate = 0x00463610,
+    .application_will_unhide = 0x00463690,
+};
+
 /* Feral Complete Saga 1.0 (R17), plain i386 Carbon executable. */
 static const struct lp32_game_profile saga_10_profile = {
     .title = LP32_TITLE_COMPLETE_SAGA,
@@ -445,6 +501,7 @@ static const struct lp32_game_profile *const known_profiles[] = {
     &saga_10_profile,
     &saga_steam_profile,
     &batman3_profile,
+    &movie_profile,
 };
 
 static const struct lp32_game_profile *current_profile = &unknown_profile;
@@ -469,6 +526,7 @@ const struct lp32_game_profile *lp32_profile_named(const char *name)
     /* Accept the friendlier spellings used on the command line. */
     if (strcasecmp(name, "marvel") == 0) return &marvel_profile;
     if (strcasecmp(name, "batman3") == 0) return &batman3_profile;
+    if (strcasecmp(name, "movie") == 0) return &movie_profile;
     if (strcasecmp(name, "pirates") == 0) return &pirates_profile;
     if (strcasecmp(name, "clonewars") == 0 || strcasecmp(name, "lsw3") == 0) {
         return &clone_wars_profile;
