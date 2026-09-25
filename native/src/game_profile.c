@@ -273,6 +273,11 @@ static const struct lp32_game_profile portal2_profile = {
     .source = &portal2_source,
 };
 
+/* SDL's warp-based mouse path (m_rawinput 0) occasionally counts a cursor
+   recentre as motion under the bridge, snapping the view; relative mode
+   reads event deltas and has no recentre to miscount. */
+static const char *const portal_default_arguments[] = {"+m_rawinput", "1", NULL};
+
 /* The Source 2013 Steam build shares Half-Life 2's hl2_osx launcher, which
    opens bin/launcher.dylib and jumps to LauncherMain. */
 static const struct lp32_source_layout portal_source = {
@@ -280,6 +285,7 @@ static const struct lp32_source_layout portal_source = {
     .executable = "hl2_osx",
     .game_directory = "portal",
     .steam_app_id = "400",
+    .default_arguments = portal_default_arguments,
 };
 
 static const struct lp32_game_profile portal_profile = {

@@ -995,7 +995,10 @@ int main(int argc, char **argv)
         bool source = lp32_profile_is_source();
         int argument_start = argc >= 2 && argv[1][0] != '-' ? 2 : 1;
         uint32_t forwarded = source ? (uint32_t)(argc - argument_start) : 0;
-        uint32_t guest_argc = 1 + (extra_argument ? 1 : 0) + (source ? 3 : 0) + forwarded;
+        const char *const *default_arguments = source ? lp32_profile()->source->default_arguments : NULL;
+        uint32_t defaults = 0;
+        while (default_arguments && default_arguments[defaults]) ++defaults;
+        uint32_t guest_argc = 1 + (extra_argument ? 1 : 0) + (source ? 3 : 0) + defaults + forwarded;
         uint32_t argv_address = compat_runtime32_allocate(
             (guest_argc + 1) * sizeof(uint32_t), 1);
         uint32_t empty_vector = compat_runtime32_allocate(sizeof(uint32_t), 1);
@@ -1014,6 +1017,8 @@ int main(int argc, char **argv)
             /* Keep the existing direct-to-menu launch behavior. In-game Bink
                movies use the Sound Manager and Time Manager bridges. */
             guest_argv[next_argument++] = compat_runtime32_copy_cstring("-novid");
+            for (uint32_t i = 0; i < defaults; ++i)
+                guest_argv[next_argument++] = compat_runtime32_copy_cstring(default_arguments[i]);
         }
         if (extra_argument) guest_argv[next_argument++] = extra_argument;
         for (uint32_t i = 0; i < forwarded; ++i) {

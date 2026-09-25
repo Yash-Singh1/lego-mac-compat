@@ -3076,6 +3076,26 @@ static void capture_game_frame(uint64_t swap_count)
 
 }
 
+/* SDL (Portal) calls -[NSOpenGLContext update] from the engine's render
+   thread after the window changes; current AppKit traps that off the main
+   thread. Run it asynchronously on the main thread instead, since the main
+   thread may itself be waiting on the render thread. */
+static bool portal_update_gl_context(id receiver, const char *selector_name)
+{
+    if (!lp32_profile_is_source() || strcmp(selector_name, "update") != 0 ||
+        ![receiver isKindOfClass:[NSOpenGLContext class]] || [NSThread isMainThread])
+        return false;
+    NSOpenGLContext *context = [receiver retain];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        CGLContextObj cgl = [context CGLContextObj];
+        CGLLockContext(cgl);
+        [context update];
+        CGLUnlockContext(cgl);
+        [context release];
+    });
+    return true;
+}
+
 /* Source owns its NSOpenGLContext instead of using OpenGLView.swapBuffers.
    Keep its presentation measurement separate from the LEGO frame pacer. */
 static void portal_flush_buffer(NSOpenGLContext *context)
@@ -9656,6 +9676,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         Class parent = sup ? (Class)object_for_receiver(sup[1]) : Nil;
         const char *name = (const char *)(uintptr_t)arguments[1];
         if (!receiver || !parent || !name) return 0;
+        if (portal_update_gl_context(receiver, name)) { *result = 0; return 1; }
         SEL selector = sel_registerName(name);
         struct objc_super super = {receiver, parent};
         Method method = class_getInstanceMethod(parent, selector);
@@ -9773,6 +9794,20 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             portal_flush_buffer(receiver);
             *result = 0;
             return 1;
+        }
+        if (portal_update_gl_context(receiver, selector_name)) { *result = 0; return 1; }
+        /* performSelector: is typed as returning id, but SDL uses it to call
+           void setters (setStyleMask:), leaving garbage in the host return
+           register that would be proxied as an object. Send the target
+           selector directly so its real signature decides the result. */
+        if (arguments[2] &&
+            (strcmp(selector_name, "performSelector:") == 0 ||
+             strcmp(selector_name, "performSelector:withObject:") == 0 ||
+             strcmp(selector_name, "performSelector:withObject:withObject:") == 0)) {
+            uint32_t forwarded[16] = {arguments[0], arguments[2]};
+            if (selector_name[16]) forwarded[2] = arguments[3];
+            if (strlen(selector_name) > 27) forwarded[3] = arguments[4];
+            return objc_bridge32_dispatch_body(import_name, import_length, forwarded, result);
         }
         if (strcmp(selector_name, "CGLContextObj") == 0) {
             CGLContextObj context = [(NSOpenGLContext *)receiver CGLContextObj];

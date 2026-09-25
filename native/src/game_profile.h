@@ -29,6 +29,8 @@ struct lp32_source_layout {
     const char *executable;       /* launcher inside the game root */
     const char *game_directory;   /* value passed with -game */
     const char *steam_app_id;
+    /* Extra launcher arguments, ahead of the user's own so theirs win. */
+    const char *const *default_arguments;
 };
 
 /* Splash-dismiss repeat latch (see game_loader.c). */
