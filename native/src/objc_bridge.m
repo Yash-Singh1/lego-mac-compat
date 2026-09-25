@@ -9785,6 +9785,14 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             *result = arguments[0];
             return 1;
         }
+        /* SDL builds (Portal) create their window through the generic
+           initWithContentRect:...screen: path; track focus once it is shown so
+           relative-mouse warps are not suppressed as background warps. */
+        if (lp32_profile_is_source() &&
+            strcmp(selector_name, "makeKeyAndOrderFront:") == 0 &&
+            receiver != portal_cursor_window &&
+            [receiver isKindOfClass:objc_getClass("SDLWindow")])
+            observe_portal_cursor_focus(receiver);
         if (strcmp(selector_name, "terminate:") == 0 &&
             [receiver isKindOfClass:[NSApplication class]]) {
             /* See the exit import handling in compat_runtime.c.  AppKit's
