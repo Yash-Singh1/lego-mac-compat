@@ -25,6 +25,19 @@ Supported and candidate games:
 
 \* Not verified with a 100% run yet, report any bugs or problems in the issues tab.
 
+## Portal converter
+
+The `portal1` branch extends the converter to Portal (the 2010 Steam release).
+Download
+[Portal Converter 0.0.0-dev.1](https://github.com/Yash-Singh1/lego-mac-compat/releases/tag/portal-converter-v0.0.0-dev.1),
+open **Portal-Converter.app**, drop `steamapps/common/Portal` onto it (the
+`common`, `steamapps` or Steam library folder also works), and choose an output
+folder. It builds **Portal-Compat.app**. Steam must be running and signed in to
+an account that owns Portal.
+
+The main menu and the first test chambers render and play; mouse look uses
+relative input (`m_rawinput 1`) by default. A full playthrough is unverified.
+
 ## Portal 2 converter
 
 The `portal2` branch includes a small native Mac app. Drop your original
