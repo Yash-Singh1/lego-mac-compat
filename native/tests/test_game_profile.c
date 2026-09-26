@@ -8,7 +8,7 @@
 int main(void)
 {
     unsetenv("LP32_GAME");
-    const char *names[] = {"pirates", "clonewars", "marvel", "saga-retail", "LEGOCompleteSaga10", "saga", "batman3", "movie"};
+    const char *names[] = {"pirates", "clonewars", "marvel", "saga-retail", "LEGOCompleteSaga10", "saga", "batman3", "movie", "hobbit"};
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
         const struct lp32_game_profile *profile = lp32_profile_named(names[i]);
         assert(profile);
@@ -27,8 +27,10 @@ int main(void)
         assert(profile->thread_argument_is_direct == (i >= 2));
         assert(profile->callee_pops_struct_return == (i == 2 || i == 5 || i >= 6));
         assert((profile->steam_achievement_guard != NULL) == (i == 2 || i >= 6));
+        assert((profile->subtitle_panel_patch != NULL) ==
+               (profile->title == LP32_TITLE_HOBBIT));
         assert(profile->steam_app_id == (i == 2 ? 249130u : i == 6 ? 313690u :
-                                       i == 7 ? 267530u : 0u));
+                                       i == 7 ? 267530u : i == 8 ? 285160u : 0u));
         if (profile->title != LP32_TITLE_COMPLETE_SAGA)
             assert(profile->controller && profile->display);
     }
@@ -38,6 +40,13 @@ int main(void)
     assert(lp32_profile_named("batman3")->title == LP32_TITLE_BATMAN3);
     assert(lp32_profile_named("LEGOMovie") == lp32_profile_named("movie"));
     assert(lp32_profile_named("movie")->title == LP32_TITLE_MOVIE);
+    assert(lp32_profile_named("LEGOHobbit") == lp32_profile_named("hobbit"));
+    assert(lp32_profile_named("HOBBIT")->title == LP32_TITLE_HOBBIT);
+    /* Marvel and Hobbit share the crt entry. Their image ends must keep
+       the patch layouts separate regardless of profile registration order. */
+    const struct lp32_game_profile *hobbit = lp32_profile_named("hobbit");
+    assert(hobbit->entry_eip == lp32_profile_named("marvel")->entry_eip);
+    assert(hobbit->image_end != lp32_profile_named("marvel")->image_end);
     assert(lp32_profile_named("lswc") == lp32_profile_named("saga"));
     assert(lp32_profile_named("completesaga") == lp32_profile_named("saga"));
     assert(lp32_profile_named("saga-steam") == lp32_profile_named("saga"));

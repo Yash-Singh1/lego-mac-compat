@@ -1,13 +1,7 @@
 # 32-bit LEGO games on modern macOS
 
-A native loader that runs the original 32-bit Intel Mac LEGO games on
-current macOS (Apple Silicon through Rosetta 2, or Intel). It maps the
-game's i386 executable into a 64-bit process, switches into a 32-bit code
-segment to run it, and bridges the OS, OpenGL, Cg, CoreAudio and controller
-interfaces the game expects. No SIP changes, kernel extensions, VMs or Wine.
-You need your own copy of the game.
-
-Support for the original 32-bit Mac releases:
+Run the original 32-bit Intel Mac LEGO releases on macOS 11 or later,
+including Apple Silicon through Rosetta 2. You need your own copy of each game.
 
 | Game | Mac release | Status |
 | --- | --- | --- |
@@ -24,7 +18,7 @@ Support for the original 32-bit Mac releases:
 | LEGO Harry Potter: Years 5-7 | Feral, 2012 | - |
 | LEGO The Lord of the Rings | Feral, 2013 | - |
 | LEGO Marvel Super Heroes | Feral, 2014 | ✓\* |
-| LEGO The Hobbit | Feral, 2014 | - |
+| LEGO The Hobbit | Feral, Steam 1.0 | Experimental |
 | LEGO Batman 3: Beyond Gotham | Feral, Steam 1.0.3 | Experimental |
 | The LEGO Movie Videogame | Feral, Steam 1.0 | Experimental |
 
@@ -32,199 +26,61 @@ Support for the original 32-bit Mac releases:
 
 ## Building
 
-Requirements: macOS 11 or later, Xcode command-line tools (`xcode-select
---install`), Rosetta 2 on Apple Silicon (`softwareupdate --install-rosetta`),
-and the original game application. Pirates additionally needs Python 3 (the
-one that comes with the command-line tools is fine) and network access the
-first time, to fetch the `unicorn` package.
+Requirements:
+
+- macOS 11 or later.
+- Xcode command-line tools, installed with `xcode-select --install`.
+- Rosetta 2 on Apple Silicon, installed with `softwareupdate --install-rosetta`.
+- The original game application, fully installed.
+- For Pirates, Python 3 and network access for the first build's `unicorn` dependency.
+
+The build detects the game from the source app's bundle identifier:
 
 ```sh
 cd native
-make GAME=pirates   SOURCE_APP="/path/to/LEGO Pirates of the Caribbean.app" bundle
-make GAME=clonewars SOURCE_APP="/path/to/LEGO Star Wars III.app"           bundle
-make GAME=marvel    SOURCE_APP="/path/to/LEGO Marvel Super Heroes.app"     bundle
-make GAME=saga      SOURCE_APP="/path/to/LEGO Star Wars Saga.app"         bundle
-make GAME=batman3   SOURCE_APP="/path/to/LEGO Batman 3.app"               bundle
-make GAME=movie     SOURCE_APP="/path/to/The LEGO Movie.app"              bundle
+make SOURCE_APP="/path/to/LEGO The Hobbit.app" bundle
 ```
 
-Complete Saga's build and current limitations are documented in
-[native/SAGA.md](native/SAGA.md). Muted probes reach the cantina and the first
-playable room of Negotiations. A connected DualShock 4's HID elements, with
-injected values, advanced through the title prompt and menus into New Game.
-Physical in-game controller play, save/reload and the full campaign remain
-unverified. The title, menus and cantina hold the 60 FPS cap on the test Mac.
-`GAME=saga` builds the Steam edition and requires an explicit `SOURCE_APP` path. Its output is
-`native/build/LEGOCompleteSaga-Steam-Compat.app`; keep the copied
-`LEGOStarWarsSagaData` directory beside it. The retail update is opt-in with
-`SAGA_EDITION=retail` and uses a separate bundle.
+You can also select the game explicitly:
 
-This compiles the loader and assembles a self-contained app in
-`native/build/` (`LEGOPirates-Compat.app`, `LEGOCloneWars-Compat.app`,
-`LEGOMarvel-Compat.app`, `LEGOBatman3-Compat.app`, or `LEGOMovie-Compat.app`) with
-the game's data, resources and Cg framework copied in. The original app is
-only read. Open the built app from Finder or the Dock.
+```sh
+make GAME=pirates   SOURCE_APP="/path/to/LEGO Pirates of the Caribbean.app" bundle
+make GAME=clonewars SOURCE_APP="/path/to/LEGO Star Wars III.app"            bundle
+make GAME=marvel    SOURCE_APP="/path/to/LEGO Marvel Super Heroes.app"      bundle
+make GAME=saga      SOURCE_APP="/path/to/LEGO Star Wars Saga.app"          bundle
+make GAME=batman3   SOURCE_APP="/path/to/LEGO Batman 3.app"                 bundle
+make GAME=movie     SOURCE_APP="/path/to/The LEGO Movie.app"              bundle
+make GAME=hobbit    SOURCE_APP="/path/to/LEGO The Hobbit.app"              bundle
+```
 
-To keep cutscenes and gameplay running when you switch to another app, build
-with `CONTINUE_WHEN_INACTIVE=1` (works with `bundle` and `promote-loader`).
-This setting is **off by default** and stored in the generated app, so Finder
-launches respect it. For personal builds, put `CONTINUE_WHEN_INACTIVE = 1`
-in the git-ignored `native/local.mk`; use `CONTINUE_WHEN_INACTIVE=0` on a make
-command to override that preference. A process environment override,
-`LP32_CONTINUE_WHEN_INACTIVE=0` or `1`, takes priority over the bundle setting.
-This does not enable unattended test mode or mute audio. Global keyboard
-polls and cursor warps are suppressed while the real app is inactive.
-Gameplay continues too, so pause manually before leaving an active level.
-Test with `make -C native test-focus-policy test-focus-bridge`.
+The generated compatibility app appears in `native/build/`. The build copies
+in the game's data and resources and leaves the original app unchanged.
+Open the generated app from Finder or the Dock.
 
-Pirates ships with a SecuROM-packed executable. The build recovers the plain
-Mach-O from it automatically: `native/tools/unpack_securom.py` emulates the
-packer's stub with Unicorn and writes `native/build/LEGOPirates.unpacked.macbin`
-(the activation code is left intact, nothing is bypassed). The first build
-creates a Python virtual environment in `native/build/venv` and installs
-`unicorn` into it; to use an interpreter that already has `unicorn`, pass
-`PYTHON=/path/to/python3`. Clone Wars and Marvel use their shipped binaries directly.
+Batman 3, The LEGO Movie, and The Hobbit default to their standard Steam
+library locations when `GAME` is specified without `SOURCE_APP`. For other
+install locations, pass `SOURCE_APP` explicitly. To check game detection before
+building, run `make SOURCE_APP="/path/to/Game.app" game-info`.
 
-Marvel supports the Feral 1.0.1 i386 build (`LEGOMarvel.macbin`). Its bundle
-copies the source app's x86_64 Steam API and forwards Steam initialization.
-Real Steam achievements require a genuine Steam library and Steam account
-access to Marvel (app 249130). A replacement library can return successful
-initialization without connecting to Steam: the earlier locally tested library
-contains the identifying string `Steam Emulator Version`. Those earlier save
-tests do **not** verify Steam Cloud. The genuine Steam build has now been
-tested separately: initialization succeeds, its success callback reaches the
-guest, and the game reads all 48 achievement entries. Uploading a newly earned
-achievement and Steam Cloud save/reload remain unverified.
-See [native/MARVEL-STEAM.md](native/MARVEL-STEAM.md) for the separate build
-command, the startup fix, and verification details.
-The same loader detects each
-title, with Marvel's thread and structure-return conventions kept in its
-own profile. Building Marvel leaves the other compatibility apps in place.
-Verified so far: menus, the opening sequence, and keyboard movement and
-Hulk/Bruce Banner transformation in Sand Central Station. Checkpoint files
-persist on disk; a bundled storage-library enumeration defect hid later slots
-after relaunch. The shared loader now repairs that directory walker, and fresh
-processes discover and fully read the existing saves. In-game resume and the
-full campaign remain unverified.
-Marvel's achievement submitter now skips a missing Steam stats interface
-instead of dereferencing NULL at `0x249374`. This is a crash guard, not Steam
-integration or an achievement retry queue. An unlock attempted while Steam
-is unavailable is not guaranteed to be uploaded later. Run
-`make -C native test-steam-achievement-guard` to exercise the mapped guest
-routine with NULL, disabled, successful, and failed mock interfaces without
-unlocking achievements or loading saves.
-The loader supplies the i386 character tables and Cg metadata queries needed
-for Marvel's shader constants. On the first launch after this fix, it backs up
-Marvel's `CachedShadersGL` folder alongside the original and rebuilds the cache;
-this corrects black intro logos and missing brick meshes. Saves are unaffected.
+`GAME=saga` defaults to the Steam edition and requires `SOURCE_APP`. Its output
+is `native/build/LEGOCompleteSaga-Steam-Compat.app`; keep the generated
+`LEGOStarWarsSagaData` directory beside it. The retail edition uses
+`SAGA_EDITION=retail`. See [native/SAGA.md](native/SAGA.md) for edition-specific
+build instructions and [native/MARVEL-STEAM.md](native/MARVEL-STEAM.md) for
+Marvel's Steam build instructions.
 
-The shared Cocoa bridge tracks owned and autoreleased string lifetimes instead
-of keeping every returned string permanently. This fixes a handle-table leak
-that can end in `persistent Objective-C proxy pool exhausted` followed by a
-crash. `make -C native test-objc-proxy` checks 100,000 string lifetime cycles,
-including retained values surviving pool drains, without launching a game.
+Pirates automatically unpacks its shipped executable during the build. The
+first build creates `native/build/venv` and installs `unicorn`. To use an
+existing Python environment with `unicorn`, pass `PYTHON=/path/to/python3`.
 
-The shared dispatcher also avoids searching Carbon's libraries for unrelated
-imports, caches native Carbon exports, and uses the fast path for both GL
-symbol spellings and the existing atomic-operation aliases. This removes
-dispatch overhead introduced while expanding Complete Saga support, without
-disabling that port. `make -C native GAME=marvel test-carbon-dispatch` checks
-foreign-call rejection, native export caching, and real guest atomic calls.
-Structure-return classification is also cached per import, preserving each
-profile's stack convention and Steam's argument-dependent return handling.
-`make -C native GAME=marvel test-import-return` checks static and dynamic imports.
+To update the loader in an existing compatibility app without copying the
+game data again:
 
-The storage repair is selected by the SDK library's UUID and a SHA-256 match
-of the entire defective routine, independently of the game profile. It keeps
-the parent directory path intact during recursion; it does not invent slot
-names or replace the SDK catalog. Only private process memory changes, and
-unrecognized library builds are left intact. Run `make -C native
-test-steam-storage-fix` for native filesystem regressions using temporary
-fixtures (override `STEAM_STORAGE_LIBRARY` to select the affected dylib).
-`LP32_STEAM_STORAGE_PROBE=1` on a compatibility app initializes its normal SDK,
-enumerates and reads saves without running the game or issuing save writes,
-and preserves the player's `last-run.log`.
+```sh
+make GAME=hobbit promote-loader
+```
 
-Batman 3 supports the Feral Steam 1.0.3 (RC5) i386 build. `SOURCE_APP` defaults
-to the standard Steam library location. The engine and Steam integration
-match Marvel's: the bundle carries the source app's `libsteam_api.dylib` and
-`PlugIns/Content.loader`, and the loader supplies `SteamAppId=313690`. The same
-NULL-stats achievement guard is installed at `0x2d8840`.
-Verified so far: the intro cutscene, title screen, save slot creation, and the
-first level, with keyboard movement and stud collection. Genuine Steam
-initialization and stats reach the game, and a new save was written to Steam
-Remote Storage and read back, including by a later process. Controllers,
-co-op, saves with real progress, and the rest of the campaign remain unverified.
-
-The LEGO Movie Videogame supports the Feral Steam 1.0 (RC3) i386 build.
-`SOURCE_APP` defaults to the standard Steam library location. Its bundle is
-laid out like Marvel's: `libsteam_api.dylib` and `Content.loader` arrive with
-the copied Resources, and the loader supplies `SteamAppId=267530`. The same
-NULL-stats achievement guard is installed at `0x285bd0`.
-Verified so far: the legal screen, intro video, main menu, save slot creation,
-and the first level, with keyboard movement and object breaking. Genuine Steam
-initialization and stats reach the game. The new save was written to Steam
-Remote Storage and read back, including by a later process. Controllers,
-co-op, saves with real progress, and the rest of the campaign remain unverified.
-
-Other targets: `make GAME=<game> promote-loader` replaces only the loader in
-an existing bundle (no source app needed), `make icons` regenerates the Dock
-icons from `native/icons/`, and `make` alone builds the loader and probes.
-
-Saves and settings stay where the original games put them
-(`~/Library/Application Support/...`). Controllers supported by the
-GameController framework work through the games' Xbox 360 mapping, including
-two-player co-op and controllers connected during play. Button prompts show PlayStation glyphs (✕ ○ □ △, L1/R1,
-Select/Start) when the pad connected at launch is a DualShock/DualSense, and
-Xbox glyphs otherwise; `LP32_BUTTON_GLYPHS=playstation|xbox` forces one.
-Marvel currently uses its shipped Xbox controller mapping and prompts.
-
-For silent testing, launch the bundle's executable with `LP32_MUTE_AUDIO=1`.
-This mutes only that process and does not change game settings or system volume.
-
-Marvel and Complete Saga automatically record occasional frame hitches during
-normal play. Reports go to `~/Library/Logs/LEGOMarvelCompat/` or
-`~/Library/Logs/LEGOCompleteSagaSteamCompat/` as
-`hitches-<pid>-<timestamp>.log`. Relaunch after updating the loader to enable
-recording. Each report contains 32 preceding frames,
-the slow frame, and 8 following frames, with draw counts, CPU time in draws,
-resource uploads, shader compilation, file I/O, waits, audio, GL state changes,
-Objective-C calls and other runtime imports. Nested imports count only toward
-their own categories; calls spanning presentation are omitted. It also
-records the three slowest measured calls per frame (guest caller address,
-vertex/fragment program IDs and draw count), plus recent slow worker calls.
-Presentation time is split into work, drawable flush, and deliberate pacing.
-These are CPU wall timings; they do not measure GPU execution or replay draws.
-Log headers include the Mac model, chip, RAM, macOS version, Rosetta status,
-loader build time and dispatch overrides. The session log also records the
-native GL renderer and initial power/thermal state. Native crashes include a
-bounded raw stack trace by default, with the loader UUID and load address in
-the session header for matching a report to its build.
-Steam storage calls are included in I/O attribution. Save requests, filenames,
-byte counts, enumeration results and SDK return values also appear as
-`compat32: save ...` lines in `last-run.log` for normal Finder/Dock launches
-(stderr for terminal launches), capped at 1024 lines per session. These logs
-do not contain save payloads and do not change storage behavior.
-
-The shared bridge reuses handles for repeated native pointer queries, including
-OpenGL contexts, instead of allocating a permanent handle on every query.
-`make -C native test-pointer-proxy` checks concurrent queries, context switching,
-and resource lifetime without launching a game.
-
-The recorder uses fixed memory and a background log writer, with no screenshot
-capture or GPU readback. Its timestamps use the Mach uptime clock directly,
-with nanosecond conversion checked against `CLOCK_UPTIME_RAW` in the tests.
-Reports trigger above 25 ms (or 1.5 times an intentional
-frame cap, whichever is larger), with a five-second cooldown and a limit of 128
-reports per session. Inactive frames do not trigger reports. A report finishes
-after its following frames arrive; abrupt termination can lose the pending
-report. `LP32_HITCH_MS=35` changes the threshold; `LP32_HITCH_LOG=0` disables it,
-or set `LP32_HITCH_LOG` to an unused absolute file path to redirect it. Other
-titles leave it disabled unless explicitly enabled.
-`make -C native test-hitch-recorder` runs synthetic timing tests without launching a game.
-`make -C native test-cf-import-coverage` compares all available compatibility
-app images' linked Core Foundation functions with the bridge's dispatch cases.
-The checked images currently have 43 linked calls in Clone Wars, 42 in Pirates,
-46 in Marvel, 48 in Batman 3, 46 in The LEGO Movie, 146 in retail Complete Saga, and 234 in Steam
-Complete Saga.
-All have dispatch cases. This static check does not exercise every game path.
+Add `CONTINUE_WHEN_INACTIVE=1` to `bundle` or `promote-loader` to keep the game
+running while another app is active. It defaults to `0`. To save a personal
+build preference, put `CONTINUE_WHEN_INACTIVE = 1` in the git-ignored
+`native/local.mk`.

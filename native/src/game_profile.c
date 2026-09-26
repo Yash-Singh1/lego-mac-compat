@@ -420,6 +420,75 @@ static const struct lp32_game_profile movie_profile = {
     .application_will_unhide = 0x00463690,
 };
 
+/* Feral Steam 1.0 RC5 (84019.17378, 2014). The HID Utilities and Steam
+   submitter match Marvel; pcconfig's name/setter table identifies display
+   globals. The crt's main (0x1d7e20) only hands argc, argv and NuMain to
+   Content.loader's FeralEntry. Start NuMain directly, as the other profiles
+   skip the Feral launcher, with the same argc/argv arguments. The callback
+   comes from the main wrapper's NuMain dictionary entry at 0x11d9d64. */
+static const struct lp32_controller_layout hobbit_controller = {
+    .hid_device_list = 0x0176a118,
+    .hid_last_error = 0x0176a10c,
+    .hid_get_element_value = {
+        .address = 0x011290ea,
+        .expected = {0x55, 0x89, 0xe5, 0x83, 0xec, 0x68},
+        .length = 6,
+    },
+    .hid_build_device_list = {
+        .address = 0x01130070,
+        .expected = {0x55, 0x89, 0xe5, 0x83, 0xec, 0x58},
+        .length = 6,
+    },
+    .hid_get_first_device = 0x0112937d,
+    .hid_get_next_device = 0x0112938e,
+    .convert_hid_state = 0x003d1af0,
+};
+
+/* ScreenWidth/Height/RefreshRate setters: 0x1d8b40/0x1d8b70/0x1d8ba0. */
+static const struct lp32_display_layout hobbit_display = {
+    .screen_width = 0x0177eda8,
+    .screen_height = 0x0177edac,
+    .refresh_rate = 0x0177edb0,
+};
+
+static const struct lp32_steam_achievement_guard hobbit_steam_achievement_guard = {
+    .entry = 0x001ea560,
+    .stats_pointer = 0x0177f47c,
+    .enabled_check = {0x001ea56f, {0x80,0xbe,0xe0,0x37,0x3a,0x01,0x00}, 7},
+    .stats_load = {0x001ea57e, {0x8b,0x8e,0x10,0x4f,0x59,0x01,0x8b,0x11}, 8},
+    .skip_return = {0x001ea5b7, {0x83,0xc4,0x14,0x5e,0x5d,0xc3}, 6},
+};
+
+/* The opening map uses a wider camera FOV than the normal 0.75-radian
+   cinematic camera. The panel drawer compensates its position for FOV,
+   but not its width, so its left border moves into the caption text. */
+static const struct lp32_subtitle_panel_patch hobbit_subtitle_panel = {
+    .draw_call = {0x0000e63b, {0xe8,0x10,0x68,0xde,0x00}, 5},
+    .draw_function = 0x00df4e50,
+    .camera_fov_offset = 0x340,
+    .reference_fov = 0.75f,
+};
+
+static const struct lp32_game_profile hobbit_profile = {
+    .title = LP32_TITLE_HOBBIT,
+    .name = "LEGOHobbit",
+    .display_name = "LEGO The Hobbit",
+    .log_directory = "LEGOHobbitCompat",
+    .image_file = "LEGOHobbit.image",
+    .entry_eip = 0x00002720,
+    .image_end = 0x019c8f54,
+    .main_address = 0x006f6ce0,
+    .steam_app_id = 285160,
+    .callee_pops_struct_return = 1,
+    .thread_argument_is_direct = 1,
+    .controller = &hobbit_controller,
+    .subtitle_panel_patch = &hobbit_subtitle_panel,
+    .steam_achievement_guard = &hobbit_steam_achievement_guard,
+    .display = &hobbit_display,
+    .application_should_terminate = 0x003dbe20,
+    .application_will_unhide = 0x003dbea0,
+};
+
 /* Feral Complete Saga 1.0 (R17), plain i386 Carbon executable. */
 static const struct lp32_game_profile saga_10_profile = {
     .title = LP32_TITLE_COMPLETE_SAGA,
@@ -502,6 +571,7 @@ static const struct lp32_game_profile *const known_profiles[] = {
     &saga_steam_profile,
     &batman3_profile,
     &movie_profile,
+    &hobbit_profile,
 };
 
 static const struct lp32_game_profile *current_profile = &unknown_profile;
@@ -527,6 +597,7 @@ const struct lp32_game_profile *lp32_profile_named(const char *name)
     if (strcasecmp(name, "marvel") == 0) return &marvel_profile;
     if (strcasecmp(name, "batman3") == 0) return &batman3_profile;
     if (strcasecmp(name, "movie") == 0) return &movie_profile;
+    if (strcasecmp(name, "hobbit") == 0) return &hobbit_profile;
     if (strcasecmp(name, "pirates") == 0) return &pirates_profile;
     if (strcasecmp(name, "clonewars") == 0 || strcasecmp(name, "lsw3") == 0) {
         return &clone_wars_profile;

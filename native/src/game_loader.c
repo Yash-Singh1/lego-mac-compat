@@ -560,6 +560,70 @@ static int install_steam_achievement_guard(void)
 
 #include "steam_achievement_selftest.h"
 
+enum { kSubtitlePanelStub = 0x7f00ee00, kSubtitlePanelConstants = 0x7f00ef00 };
+
+static int install_subtitle_panel_patch(void)
+{
+    const struct lp32_subtitle_panel_patch *patch = lp32_profile()->subtitle_panel_patch;
+    if (!patch) return 0;
+    const struct lp32_code_signature *call = &patch->draw_call;
+    int32_t target;
+    memcpy(&target, call->expected + 1, sizeof(target));
+    if (call->length != 5 || call->expected[0] != 0xe8 ||
+        call->address + 5 + target != patch->draw_function ||
+        memcmp((void *)(uintptr_t)call->address, call->expected, 5)) {
+        fprintf(stderr, "compat32: subtitle panel signature mismatch\n");
+        return -1;
+    }
+    /* The original drawer puts the panel at depth 1/FOV. Perspective then
+       scales its width by FOV/tan(FOV/2). Cancel that variation relative to
+       the normal cinematic camera. Text, wrapping, height and position are
+       untouched. Skip the reference FOV exactly, preserving normal scenes.
+       This call site belongs only to the subtitle background. */
+    float constants[] = {0.5f, patch->reference_fov / tanf(patch->reference_fov * 0.5f)};
+    uint32_t reference_bits;
+    memcpy(&reference_bits, &patch->reference_fov, 4);
+    unsigned char code[96];
+    size_t offset = 0;
+    const unsigned char prologue[] = {
+        0x50, 0x51,                  /* push eax; push ecx */
+        0x8b,0x44,0x24,0x0c,        /* mov eax,[esp+12]: camera */
+        0x8b,0x4c,0x24,0x18,        /* mov ecx,[esp+24]: size */
+        0x81,0xb8,                  /* cmp dword [eax+fov],reference */
+    };
+    memcpy(code, prologue, sizeof(prologue)); offset = sizeof(prologue);
+    emit_u32(code, &offset, patch->camera_fov_offset);
+    emit_u32(code, &offset, reference_bits);
+    emit_u8(code, &offset, 0x74);
+    size_t skip = offset++;
+    emit_u8(code, &offset, 0xd9); emit_u8(code, &offset, 0x80); /* fld [eax+fov] */
+    emit_u32(code, &offset, patch->camera_fov_offset);
+    emit_u8(code, &offset, 0xd8); emit_u8(code, &offset, 0x0d); /* fmul [half] */
+    emit_u32(code, &offset, kSubtitlePanelConstants);
+    emit_u8(code, &offset, 0xd9); emit_u8(code, &offset, 0xf2); /* fptan */
+    emit_u8(code, &offset, 0xdd); emit_u8(code, &offset, 0xd8); /* fstp st(0): pop 1 */
+    emit_u8(code, &offset, 0xd8); emit_u8(code, &offset, 0xb0); /* fdiv [eax+fov] */
+    emit_u32(code, &offset, patch->camera_fov_offset);
+    emit_u8(code, &offset, 0xd8); emit_u8(code, &offset, 0x0d); /* fmul [reference ratio] */
+    emit_u32(code, &offset, kSubtitlePanelConstants + 4);
+    emit_u8(code, &offset, 0xd8); emit_u8(code, &offset, 0x09); /* fmul [ecx]: width */
+    emit_u8(code, &offset, 0xd9); emit_u8(code, &offset, 0x19); /* fstp [ecx] */
+    code[skip] = (unsigned char)(offset - skip - 1);
+    emit_u8(code, &offset, 0x59); emit_u8(code, &offset, 0x58); /* pop ecx; pop eax */
+    emit_u8(code, &offset, 0xe9);
+    emit_rel32(code, &offset, kSubtitlePanelStub, patch->draw_function);
+    if (write_guest_code(kSubtitlePanelConstants, constants, sizeof(constants), "subtitle panel constants") ||
+        write_guest_code(kSubtitlePanelStub, code, offset, "subtitle panel stub")) return -1;
+    unsigned char hook[5] = {0xe8};
+    int32_t relative = (int32_t)(kSubtitlePanelStub - (call->address + 5));
+    memcpy(hook + 1, &relative, 4);
+    if (write_guest_code(call->address, hook, sizeof(hook), "subtitle panel hook")) return -1;
+    fprintf(stderr, "compat32: installed subtitle panel FOV correction\n");
+    return 0;
+}
+
+#include "subtitle_panel_selftest.h"
+
 static void flush_guest_instruction(uintptr_t address)
 {
     __builtin___clear_cache((char *)address, (char *)(address + 1));
@@ -811,7 +875,7 @@ static void runtime_diagnostic_line(const char *line)
 static const char *default_image_path(const char *argv0, char *buffer,
                                       size_t size)
 {
-    static const char *const candidates[] = {"LEGOPirates", "LEGOCloneWars", "LEGOMarvel", "LEGOCompleteSaga", "LEGOBatman3", "LEGOMovie"};
+    static const char *const candidates[] = {"LEGOPirates", "LEGOCloneWars", "LEGOMarvel", "LEGOCompleteSaga", "LEGOBatman3", "LEGOMovie", "LEGOHobbit"};
     const char *slash = strrchr(argv0, '/');
     size_t directory_length = slash ? (size_t)(slash - argv0) : 0;
     for (size_t index = 0; index < sizeof(candidates) / sizeof(candidates[0]); ++index) {
@@ -1014,6 +1078,11 @@ int main(int argc, char **argv)
         macho_image32_unload(&image);
         return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
+    if (getenv("LP32_SUBTITLE_PANEL_SELFTEST")) {
+        int result = subtitle_panel_selftest();
+        macho_image32_unload(&image);
+        return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
     if (getenv("LP32_SCREEN_ASPECT_SELFTEST")) {
         int result = install_screen_aspect_patch();
         if (result == 0 && lp32_profile()->screen_aspect_patch) {
@@ -1067,18 +1136,22 @@ int main(int argc, char **argv)
         macho_image32_unload(&image);
         return EXIT_FAILURE;
     }
-
     if (objc_bridge32_prepare_shader_cache() != 0) {
         macho_image32_unload(&image);
         return EXIT_FAILURE;
     }
+    if (install_subtitle_panel_patch() != 0) {
+        macho_image32_unload(&image);
+        return EXIT_FAILURE;
+    }
 
-    /* Automatic for Marvel, Batman 3, The LEGO Movie and Complete Saga; no full import profiling or draw dumps. */
+    /* Automatic for the newer Feral ports and Complete Saga; no full import profiling or draw dumps. */
     const char *hitch_option = getenv("LP32_HITCH_LOG");
     if ((hitch_option && strcmp(hitch_option, "0")) ||
         (!hitch_option && (lp32_profile()->title == LP32_TITLE_MARVEL ||
                            lp32_profile()->title == LP32_TITLE_BATMAN3 ||
                            lp32_profile()->title == LP32_TITLE_MOVIE ||
+                           lp32_profile()->title == LP32_TITLE_HOBBIT ||
                            lp32_profile()->title == LP32_TITLE_COMPLETE_SAGA))) {
         char path[PATH_MAX];
         const char *home = getenv("HOME");

@@ -5,7 +5,7 @@ CONTINUE_WHEN_INACTIVE ?= 0
 # One loader serves every supported title; the bundle targets pick the title
 # from the game app with SOURCE_APP=... (its bundle identifier names it, see
 # GAME_BUNDLE_IDS) or explicitly with GAME=pirates (default), GAME=clonewars,
-# GAME=marvel, GAME=batman3, GAME=movie or GAME=saga.
+# GAME=marvel, GAME=batman3, GAME=movie, GAME=hobbit or GAME=saga.
 GAME ?=
 
 # Accepted bundle identifiers, as <identifier>=<title>.  An entry without a dot
@@ -20,6 +20,7 @@ GAME_BUNDLE_IDS := \
 	legomarvelsuperheroes=marvel \
 	legobatman3=batman3 \
 	legomovie=movie \
+	legohobbit=hobbit \
 	saga=saga
 
 # CFBundleIdentifier of the app the caller pointed at, lowercased.  plutil
@@ -106,6 +107,23 @@ GAME_DATA :=
 CG_SOURCE := $(SOURCE_CONTENTS)/Frameworks/Cg.framework
 ICON := $(SOURCE_CONTENTS)/Resources/GameIcon.icns
 ICON_NAME := GameIcon.icns
+else ifeq ($(GAME),hobbit)
+BUNDLE := $(BUILD_DIR)/LEGOHobbit-Compat.app
+SOURCE_APP := $(HOME)/Library/Application Support/Steam/steamapps/common/LEGO - The Hobbit/LEGO The Hobbit.app
+SOURCE_CONTENTS := $(SOURCE_APP)/Contents
+IMAGE_SOURCE := $(SOURCE_CONTENTS)/MacOS/LEGO The Hobbit
+IMAGE_PREREQ :=
+IMAGE_NAME := LEGOHobbit.image
+LOADER_NAME := LEGOHobbitCompat
+INFO_PLIST := Info-Hobbit.plist
+GAME_DATA :=
+# Like Batman 3, Steam and Content.loader live outside Resources, and the
+# downloaded Cg framework has no top-level symlinks.
+EXTRA_RESOURCES := Frameworks/libsteam_api.dylib
+PLUGINS_SOURCE := $(SOURCE_CONTENTS)/Plugins
+CG_SOURCE := $(SOURCE_CONTENTS)/Frameworks/Cg.framework/Versions/A
+ICON := $(SOURCE_CONTENTS)/Resources/GameIcon.icns
+ICON_NAME := GameIcon.icns
 else ifeq ($(GAME),saga)
 SAGA_EDITION ?= steam
 ifeq ($(SAGA_EDITION),steam)
@@ -169,9 +187,9 @@ else
 # informational target still runs without a title.
 ifneq ($(filter-out game-info,$(MAKECMDGOALS)),)
 ifneq ($(strip $(SOURCE_BUNDLE_ID)),)
-$(error Bundle identifier "$(SOURCE_BUNDLE_ID)" of "$(SOURCE_APP)" is not in GAME_BUNDLE_IDS; add it there or pass GAME=pirates, clonewars, marvel, batman3, movie or saga)
+$(error Bundle identifier "$(SOURCE_BUNDLE_ID)" of "$(SOURCE_APP)" is not in GAME_BUNDLE_IDS; add it there or pass GAME=pirates, clonewars, marvel, batman3, movie, hobbit or saga)
 else
-$(error Unknown GAME "$(GAME)"; choose pirates, clonewars, marvel, batman3, movie or saga)
+$(error Unknown GAME "$(GAME)"; choose pirates, clonewars, marvel, batman3, movie, hobbit or saga)
 endif
 endif
 endif
@@ -471,8 +489,14 @@ test-steam-bridge: $(BUILD_DIR)/test_steam_bridge
 
 .PHONY: test-steam-achievement-guard
 MARVEL_TEST_IMAGE ?= $(BUILD_DIR)/LEGOMarvel-Compat.app/Contents/SharedSupport/LEGOMarvel.image
+# Preserve the original Marvel default; use GAME's image for the newer ports.
+ACHIEVEMENT_TEST_IMAGE ?= $(if $(filter hobbit batman3 movie,$(GAME)),$(BUNDLE)/Contents/SharedSupport/$(IMAGE_NAME),$(MARVEL_TEST_IMAGE))
 test-steam-achievement-guard: $(BUILD_DIR)/game_loader
-	env LP32_STEAM_ACHIEVEMENT_SELFTEST=1 LP32_NO_DIAGNOSTIC_LOG=1 arch -x86_64 ./$(BUILD_DIR)/game_loader "$(MARVEL_TEST_IMAGE)"
+	env LP32_STEAM_ACHIEVEMENT_SELFTEST=1 LP32_NO_DIAGNOSTIC_LOG=1 arch -x86_64 ./$(BUILD_DIR)/game_loader "$(ACHIEVEMENT_TEST_IMAGE)"
+
+.PHONY: test-subtitle-panel
+test-subtitle-panel: $(BUILD_DIR)/game_loader
+	env LP32_SUBTITLE_PANEL_SELFTEST=1 LP32_NO_DIAGNOSTIC_LOG=1 arch -x86_64 ./$(BUILD_DIR)/game_loader "$(BUNDLE)/Contents/SharedSupport/$(IMAGE_NAME)"
 
 .PHONY: test-dlfcn-bridge
 $(BUILD_DIR)/test_dlfcn_bridge: tests/test_dlfcn_bridge.c src/dlfcn_bridge.c src/dlfcn_bridge.h | $(BUILD_DIR)

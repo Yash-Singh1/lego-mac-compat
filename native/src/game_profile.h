@@ -23,6 +23,7 @@ enum lp32_title {
     LP32_TITLE_COMPLETE_SAGA,
     LP32_TITLE_BATMAN3,
     LP32_TITLE_MOVIE,
+    LP32_TITLE_HOBBIT,
 };
 
 /* Splash-dismiss repeat latch (see game_loader.c). */
@@ -39,6 +40,14 @@ struct lp32_code_signature {
     uint32_t address;
     uint8_t expected[8];
     uint8_t length;
+};
+
+/* Subtitle background drawn through the scene camera, independently of text. */
+struct lp32_subtitle_panel_patch {
+    struct lp32_code_signature draw_call;
+    uint32_t draw_function;
+    uint32_t camera_fov_offset;
+    float reference_fov;
 };
 
 /* Apple HID Utilities globals/functions and the input manager layout that
@@ -202,6 +211,7 @@ struct lp32_game_profile {
     const struct lp32_texture_bind_guard *texture_bind_guard; /* NULL = none */
     const struct lp32_screen_aspect_patch *screen_aspect_patch;
     const struct lp32_steam_achievement_guard *steam_achievement_guard;
+    const struct lp32_subtitle_panel_patch *subtitle_panel_patch;
     const struct lp32_display_layout *display;
     const struct lp32_render_pool *render_pool;
     const struct lp32_activator_layout *activator;
