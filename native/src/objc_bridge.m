@@ -661,6 +661,17 @@ static uint32_t proxy_for_autoreleased_object(id object)
     uint32_t token=proxy_for_object(object);creating_cf_object=previous;
     guest_autorelease_add(token);return token;
 }
+/* A CF value stored in a host container stays valid after the guest drops its
+ * own reference (MW2MP's registry keeps borrowed pointers to child nodes).
+ * Keep its handle, as for values the guest reads back from a container. */
+static void pin_contained_proxy(uint32_t token)
+{
+    pthread_mutex_lock(&proxy_mutex);
+    for(uint32_t i=0;i<proxy_count;++i)if(proxies[i].handle==token){
+        if(proxies[i].object)proxies[i].pinned=true;break;
+    }
+    pthread_mutex_unlock(&proxy_mutex);
+}
 static bool proxy_uses_guest_ownership(uint32_t token)
 {
     bool managed=false;
@@ -1965,6 +1976,13 @@ static void post_test_key_event_with_modifiers(NSWindow *window,
     if(key_code<128)__atomic_store_n(&test_key_states[key_code],is_down,__ATOMIC_RELAXED);
     NSString *characters = characters_for_test_key(key_code);
     NSTimeInterval timestamp = [[NSProcessInfo processInfo] systemUptime];
+    bool sdl = lp32_profile()->title == LP32_TITLE_MW2 || lp32_profile()->title == LP32_TITLE_MW2_MP;
+    /* A real keyboard reports Command going down before the key and up after
+       it. Send the same flags-changed events so scripted shortcuts see it. */
+    if (sdl && (modifiers & NSEventModifierFlagCommand) && is_down)
+        [NSApp postEvent:[NSEvent keyEventWithType:NSEventTypeFlagsChanged location:NSZeroPoint
+            modifierFlags:modifiers timestamp:timestamp windowNumber:[window windowNumber] context:nil
+            characters:@"" charactersIgnoringModifiers:@"" isARepeat:NO keyCode:55] atStart:NO];
     NSEvent *event = [NSEvent
         keyEventWithType:is_down ? NSEventTypeKeyDown : NSEventTypeKeyUp
                  location:NSZeroPoint
@@ -1978,10 +1996,13 @@ static void post_test_key_event_with_modifiers(NSWindow *window,
                   keyCode:key_code];
     /* MW2's SDL reads keys from the application queue in its event pump,
        before dispatch, so a key sent straight to the window never reaches it. */
-    bool sdl = lp32_profile()->title == LP32_TITLE_MW2 || lp32_profile()->title == LP32_TITLE_MW2_MP;
     if (getenv("LP32_BACKGROUND_TEST") && objc_legacy32_token(window) && !sdl)
         [window sendEvent:event];
     else [NSApp postEvent:event atStart:NO];
+    if (sdl && (modifiers & NSEventModifierFlagCommand) && !is_down)
+        [NSApp postEvent:[NSEvent keyEventWithType:NSEventTypeFlagsChanged location:NSZeroPoint
+            modifierFlags:0 timestamp:timestamp windowNumber:[window windowNumber] context:nil
+            characters:@"" charactersIgnoringModifiers:@"" isARepeat:NO keyCode:55] atStart:NO];
 }
 
 static void post_test_key_event(NSWindow *window, unsigned short key_code,
@@ -6706,6 +6727,40 @@ static uint32_t guest_gl_string(GLenum name)
     return guest_value;
 }
 
+/* MW2MP's registry emulation (InitMacRegistry) copies
+ * kCFCopyStringDictionaryKeyCallBacks and substitutes guest equal/hash
+ * functions that compare and hash string keys case-insensitively. Guest
+ * callbacks cannot run from inside host CF, so do the same thing natively. */
+static Boolean case_insensitive_key_equal(const void *left, const void *right)
+{
+    return CFStringCompare(left, right, kCFCompareCaseInsensitive) == kCFCompareEqualTo;
+}
+static CFHashCode case_insensitive_key_hash(const void *value)
+{
+    CFMutableStringRef lower = CFStringCreateMutableCopy(NULL, 0, value);
+    if (!lower) return 0;
+    CFStringLowercase(lower, NULL);
+    CFHashCode hash = CFHash(lower);
+    CFRelease(lower);
+    return hash;
+}
+static const CFDictionaryKeyCallBacks *case_insensitive_key_callbacks(uint32_t address)
+{
+    static CFDictionaryKeyCallBacks keys;
+    static dispatch_once_t once;
+    if (!address || compat_runtime32_pointer_import_matches(address, "_kCFTypeDictionaryKeyCallBacks") ||
+        compat_runtime32_pointer_import_matches(address, "_kCFCopyStringDictionaryKeyCallBacks")) return NULL;
+    const uint32_t *callbacks = (const void *)(uintptr_t)address;
+    if (!compat_runtime32_guest_symbol_matches(callbacks[4], "__Z28CaseInsensitiveStringIsEqualPKvS0_") ||
+        !compat_runtime32_guest_symbol_matches(callbacks[5], "__Z25CaseInsensitiveStringHashPKv")) return NULL;
+    dispatch_once(&once, ^{
+        keys = kCFCopyStringDictionaryKeyCallBacks;
+        keys.equal = case_insensitive_key_equal;
+        keys.hash = case_insensitive_key_hash;
+    });
+    return &keys;
+}
+
 static int objc_bridge32_dispatch_body(const char *import_name,
                                        size_t import_length,
                                        const uint32_t *arguments,
@@ -7484,6 +7539,14 @@ int objc_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
     if (!strcmp(import_name,"_CGDataProviderRetain") || !strcmp(import_name,"_CGImageRetain") ||
         !strcmp(import_name,"_CGColorSpaceRetain") || !strcmp(import_name,"_CGContextRetain"))
         return objc_bridge32_dispatch("_CFRetain",arguments,result);
+    /* Clang's @autoreleasepool form of the guest pools handled for
+       +[NSAutoreleasePool alloc]/-drain in the message path below. */
+    if (!strcmp(import_name,"_objc_autoreleasePoolPush")) {
+        guest_autorelease_push();*result=1;return 1;
+    }
+    if (!strcmp(import_name,"_objc_autoreleasePoolPop")) {
+        guest_autorelease_pop();*result=0;return 1;
+    }
     /*
      * The guest creates and drains its own NSAutoreleasePool objects, but
      * those pools cannot reliably describe the lifetime of temporary host
@@ -10257,10 +10320,15 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         unsigned key_index = mutable ? 2 : 4, value_index = mutable ? 3 : 5;
         /* Custom/raw callbacks require their own value representation. Trap
            unsupported tables instead of treating guest addresses as CF objects. */
-        if (!compat_runtime32_pointer_import_matches(arguments[key_index], "_kCFTypeDictionaryKeyCallBacks") ||
-            !compat_runtime32_pointer_import_matches(arguments[value_index], "_kCFTypeDictionaryValueCallBacks")) return 0;
+        const CFDictionaryKeyCallBacks *keys = &kCFTypeDictionaryKeyCallBacks;
+        if (compat_runtime32_pointer_import_matches(arguments[key_index], "_kCFCopyStringDictionaryKeyCallBacks"))
+            keys = &kCFCopyStringDictionaryKeyCallBacks;
+        else if (case_insensitive_key_callbacks(arguments[key_index]))
+            keys = case_insensitive_key_callbacks(arguments[key_index]);
+        else if (!compat_runtime32_pointer_import_matches(arguments[key_index], "_kCFTypeDictionaryKeyCallBacks")) return 0;
+        if (!compat_runtime32_pointer_import_matches(arguments[value_index], "_kCFTypeDictionaryValueCallBacks")) return 0;
         CFMutableDictionaryRef dictionary = CFDictionaryCreateMutable(NULL, mutable ? (int32_t)arguments[1] : 0,
-            &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+            keys, &kCFTypeDictionaryValueCallBacks);
         if (!mutable && dictionary) {
             const uint32_t *keys=(void *)(uintptr_t)arguments[1], *values=(void *)(uintptr_t)arguments[2];
             for(uint32_t i=0;i<arguments[3];++i)CFDictionaryAddValue(dictionary,object_for_argument(keys[i]),object_for_argument(values[i]));
@@ -10278,7 +10346,13 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFDictionaryAddValue")) {
         CFDictionaryAddValue((CFMutableDictionaryRef)object_for_argument(arguments[0]),object_for_argument(arguments[1]),object_for_argument(arguments[2]));
-        *result=0;return 1;
+        pin_contained_proxy(arguments[2]);*result=0;return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFDictionaryContainsKey") ||
+        LP32_NAME_IS(import_name, import_length, "_CFDictionaryContainsValue")) {
+        CFDictionaryRef dictionary=(CFDictionaryRef)object_for_argument(arguments[0]);const void *item=object_for_argument(arguments[1]);
+        *result=LP32_NAME_IS(import_name, import_length, "_CFDictionaryContainsKey") ?
+            CFDictionaryContainsKey(dictionary,item) : CFDictionaryContainsValue(dictionary,item);return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFDictionaryGetCountOfKey")) {
         *result=(uint32_t)CFDictionaryGetCountOfKey((CFDictionaryRef)object_for_argument(arguments[0]),object_for_argument(arguments[1]));return 1;
@@ -10313,7 +10387,10 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         NSMutableDictionary *dictionary = object_for_argument(arguments[0]);
         id key = object_for_argument(arguments[1]);
         id value = object_for_argument(arguments[2]);
-        if (key && value) [dictionary setObject:value forKey:key];
+        if (key && value) {
+            [dictionary setObject:value forKey:key];
+            pin_contained_proxy(arguments[2]);
+        }
         *result = 0;
         return 1;
     }
@@ -10693,7 +10770,12 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             __atomic_store_n(&presenting_context,
                              [(NSOpenGLContext *)receiver CGLContextObj], __ATOMIC_RELAXED);
             uint64_t swaps = ++objc_bridge_swap_count;
-            if (swaps == 1) fprintf(stderr, "compat32: MW2 presented its first frame\n");
+            if (swaps == 1) {
+                fprintf(stderr, "compat32: MW2 presented its first frame\n");
+                /* MW2 presents here, never through OpenGLView, so install the
+                   Dock/app-switcher quit handler from this first frame. */
+                dispatch_async(dispatch_get_main_queue(), ^{ install_termination_handler(); });
+            }
             if (getenv("LP32_TRACE_GL_FRAMES") && swaps % 300 == 0)
                 fprintf(stderr, "compat32: MW2 swap %llu t=%.1f\n", (unsigned long long)swaps,
                         CFAbsoluteTimeGetCurrent());
@@ -10765,10 +10847,9 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                 [(NSOpenGLContext *)receiver setView:view];
                 if (view) [(NSOpenGLContext *)receiver update];
 #pragma clang diagnostic pop
-                if (view.window && background_test_mode()) {
+                if (view.window && background_test_mode())
                     simulate_test_window_activation(view.window);
-                    install_window_test_input(view.window);
-                }
+                if (view.window) install_window_test_input(view.window);
             };
             if ([NSThread isMainThread]) attach();
             else dispatch_sync(dispatch_get_main_queue(),attach);

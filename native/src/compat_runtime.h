@@ -66,6 +66,7 @@ void compat_runtime32_check_mode_guards(uint64_t swap_count);
    (a first launch, so no launcher-chosen resolution exists yet). */
 int compat_runtime32_game_config_missing(void);
 int compat_runtime32_pointer_import_matches(uint32_t address, const char *name);
+int compat_runtime32_guest_symbol_matches(uint32_t address, const char *name);
 void compat_runtime32_set_diagnostic_sink(void (*sink)(const char *line));
 
 /*

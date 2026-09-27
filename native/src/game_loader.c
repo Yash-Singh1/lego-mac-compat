@@ -15,6 +15,7 @@
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <fcntl.h>
+#include <glob.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <mach-o/dyld.h>
@@ -968,6 +969,23 @@ int main(int argc, char **argv)
             }
             fprintf(stderr, "compat32: bound %u MW2 imports to %s\n", bound, libraries[library]);
         }
+    }
+    if (lp32_profile()->title == LP32_TITLE_MW2_MP) {
+        /* The playlist download creates its file before any data arrives.
+           Quitting mid-download leaves an empty file that the next launch
+           loads, and the fastfile reader waits forever for more data. */
+        char pattern[PATH_MAX];
+        int length = snprintf(pattern, sizeof(pattern), "%s/../GameData/zone/*/mp_playlists*.ff",
+                              guest_dyld32_game_root());
+        glob_t found = {0};
+        if (length > 0 && (size_t)length < sizeof(pattern) && glob(pattern, 0, NULL, &found) == 0) {
+            for (size_t i = 0; i < found.gl_pathc; ++i) {
+                struct stat info;
+                if (!stat(found.gl_pathv[i], &info) && info.st_size == 0 && !unlink(found.gl_pathv[i]))
+                    fprintf(stderr, "compat32: removed empty playlist %s\n", found.gl_pathv[i]);
+            }
+        }
+        globfree(&found);
     }
     if (getenv("LP32_BUNDLE_SELFTEST")) {
         int result = objc_bridge32_run_bundle_self_test();

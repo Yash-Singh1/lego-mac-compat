@@ -2,6 +2,7 @@
 #include "compat_runtime.h"
 #include <curl/curl.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -60,6 +61,14 @@ int curl_bridge32_dispatch(const char *name,const uint32_t *a,uint64_t *out) {
     else if(IS("_curl_multi_info_read")) {
         CURLMsg *msg=curl_multi_info_read(p,P(1));if(msg){
             uint32_t t=0;pthread_mutex_lock(&lock);for(struct handle *e=handles;e;e=e->next)if(e->p==msg->easy_handle)t=e->token;pthread_mutex_unlock(&lock);
+            if(getenv("LP32_TRACE_CURL")){
+                char *url=NULL;long status=0;curl_off_t bytes=0;
+                curl_easy_getinfo(msg->easy_handle,CURLINFO_EFFECTIVE_URL,&url);
+                curl_easy_getinfo(msg->easy_handle,CURLINFO_RESPONSE_CODE,&status);
+                curl_easy_getinfo(msg->easy_handle,CURLINFO_SIZE_DOWNLOAD_T,&bytes);
+                fprintf(stderr,"compat32: curl done url=%s result=%d status=%ld bytes=%lld\n",
+                        url?url:"",(int)msg->data.result,status,(long long)bytes);
+            }
             uint32_t words[]={msg->msg,t,(uint32_t)msg->data.result};uint32_t g=compat_runtime32_allocate(sizeof(words),0);memcpy((void *)(uintptr_t)g,words,sizeof(words));*out=g;
         }
     } else if(IS("_curl_slist_append")) {

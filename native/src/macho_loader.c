@@ -441,6 +441,33 @@ int macho_image32_load(const char *path, struct macho_image32 *image)
     return result;
 }
 
+uint32_t macho_image32_find_symbol(const struct macho_image32 *image, const char *name)
+{
+    const struct mach_header *header = image->header;
+    const struct symtab_command *symtab = NULL;
+    const struct segment_command *linkedit = NULL;
+    const uint8_t *cursor = (const uint8_t *)(header + 1);
+    for (uint32_t index = 0; index < header->ncmds; ++index) {
+        const struct load_command *command = (const void *)cursor;
+        if (command->cmd == LC_SYMTAB) symtab = (const void *)cursor;
+        if (command->cmd == LC_SEGMENT &&
+            strncmp(((const struct segment_command *)cursor)->segname, SEG_LINKEDIT, 16) == 0)
+            linkedit = (const void *)cursor;
+        cursor += command->cmdsize;
+    }
+    if (!symtab || !linkedit || linkedit->vmaddr < linkedit->fileoff) return 0;
+    uintptr_t linkedit_base = linkedit->vmaddr - linkedit->fileoff;
+    const struct nlist *symbols = (const void *)(linkedit_base + symtab->symoff);
+    const char *strings = (const void *)(linkedit_base + symtab->stroff);
+    for (uint32_t index = 0; index < symtab->nsyms; ++index) {
+        const struct nlist *symbol = &symbols[index];
+        if ((symbol->n_type & (N_STAB | N_TYPE)) != N_SECT) continue;
+        if (symbol->n_un.n_strx < symtab->strsize &&
+            strcmp(strings + symbol->n_un.n_strx, name) == 0) return symbol->n_value;
+    }
+    return 0;
+}
+
 void macho_image32_unload(const struct macho_image32 *image)
 {
     if (image->header && image->max_address > image->min_address) {

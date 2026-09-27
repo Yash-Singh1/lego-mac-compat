@@ -202,7 +202,7 @@ int libcpp_bridge32_dispatch(const char *name,const uint32_t *a,uint64_t *out){
         return assign(p,P(1),n,width,false,0);
     }
     if(IS("7reserveEm"))return reserve(p,a[1],width);
-    if(IS("6appendEPKc") || IS("6appendEPKcm"))return replace(p,length(p),0,P(1),IS("6appendEPKc")?(uint32_t)strlen(P(1)):a[2],width);
+    if(IS("6appendEPKc") || IS("6appendEPKcm") || IS("6appendEPKwm"))return replace(p,length(p),0,P(1),IS("6appendEPKc")?(uint32_t)strlen(P(1)):a[2],width);
     if(IS("6insertEmPKc") || IS("6insertEmPKcm"))return replace(p,a[1],0,P(2),IS("6insertEmPKc")?(uint32_t)strlen(P(2)):a[3],width);
     if(IS("5eraseEmm"))return replace(p,a[1],a[2],NULL,0,width);
     if(IS("9push_backEc") || IS("9push_backEw"))return replace(p,length(p),0,a+1,1,width);
@@ -213,10 +213,10 @@ int libcpp_bridge32_dispatch(const char *name,const uint32_t *a,uint64_t *out){
         else for(uint32_t i=len;i<n;++i)words(data(p,width))[i]=a[2];
         set_length(p,n);memset((char *)(uintptr_t)data(p,width)+(size_t)n*width,0,width);return 1;
     }
-    if(IS("7compareEPKc") || IS("7compareEmmPKc")){
+    if(IS("7compareEPKc") || IS("7compareEmmPKc") || IS("7compareEmmPKcm")){
         uint32_t pos=IS("7compareEPKc")?0:a[1],n=length(p);if(pos>n)return 0;n-=pos;
-        if(IS("7compareEmmPKc") && n>a[2])n=a[2];const char *s=IS("7compareEPKc")?P(1):P(3);
-        size_t right=strlen(s);int cmp=memcmp((char *)(uintptr_t)data(p,1)+pos,s,n<right?n:right);
+        if(!IS("7compareEPKc") && n>a[2])n=a[2];const char *s=IS("7compareEPKc")?P(1):P(3);
+        size_t right=IS("7compareEmmPKcm")?a[4]:strlen(s);int cmp=memcmp((char *)(uintptr_t)data(p,1)+pos,s,n<right?n:right);
         *out=(uint32_t)(cmp?cmp:n<right?-1:n>right?1:0);return 1;
     }
     if(IS("4findEcm") || IS("5rfindEcm")){

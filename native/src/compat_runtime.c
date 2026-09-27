@@ -167,6 +167,9 @@ int compat_runtime32_pointer_import_matches(uint32_t address, const char *name) 
     }
     return 0;
 }
+int compat_runtime32_guest_symbol_matches(uint32_t address, const char *name) {
+    return current_image && address && macho_image32_find_symbol(current_image, name) == address;
+}
 static _Thread_local int last_call_trapped;
 static uint32_t keymgr_slots[64];
 
@@ -1501,6 +1504,8 @@ static int build_transition_bridge(void)
         }
         if (strcmp(current_image->imports[index].name, "_vm_page_size") == 0)
             data_cell[data_cells] = (uint32_t)vm_page_size;
+        if (strcmp(current_image->imports[index].name, "_kCFAbsoluteTimeIntervalSince1970") == 0)
+            memcpy(&data_cell[data_cells], &kCFAbsoluteTimeIntervalSince1970, sizeof(double));
         uint32_t objc_pointer =
             objc_bridge32_pointer_import(current_image->imports[index].name);
         if (objc_pointer) data_cell[data_cells] = objc_pointer;

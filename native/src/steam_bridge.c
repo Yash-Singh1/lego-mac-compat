@@ -120,7 +120,7 @@ static int callback_size(struct steam_callback *callback)
 static const void *callback_vtable[] = {callback_run, callback_result, callback_size};
 
 enum { STEAM_USER, STEAM_STATS, STEAM_APPS, STEAM_UTILS, STEAM_STORAGE, STEAM_SCREENSHOTS,
-       STEAM_NETWORKING, STEAM_FRIENDS, STEAM_MATCHMAKING };
+       STEAM_NETWORKING, STEAM_FRIENDS, STEAM_MATCHMAKING, STEAM_GAMESERVER };
 static struct {
     const char *name;
     void *host;
@@ -132,6 +132,7 @@ static struct {
     {"_SteamScreenshots", NULL, 0},
     {"_SteamNetworking", NULL, 0}, {"_SteamFriends", NULL, 0},
     {"_SteamMatchmaking", NULL, 0},
+    {"_SteamGameServer", NULL, 0},
 };
 
 int steam_bridge32_call_uses_sret(const char *name,const uint32_t *args) {
@@ -184,6 +185,41 @@ static int interface_call(unsigned which, unsigned slot, const uint32_t *a, uint
             if(a[0] == interfaces[which].guest) *result = id;
             else {memcpy(PTR(0), &id, sizeof(id));*result = a[0];}
             return 1;
+        }
+        /* SteamUser017. CSteamID/CGameID occupy two i386 words; bool and
+           uint16 arguments are widened to one word each. */
+        uint64_t id1 = (uint64_t)a[1] | ((uint64_t)a[2] << 32);
+        uint64_t id3 = (uint64_t)a[3] | ((uint64_t)a[4] << 32);
+        switch (slot) {
+        case 3: {
+            int (*connect)(void *, void *, int, uint64_t, uint32_t, uint16_t, bool) = function;
+            *result = (uint32_t)connect(object, PTR(1), (int)a[2], id3, a[5], (uint16_t)a[6], a[7] != 0);
+            return 1;
+        }
+        case 4: CALL2(void, uint32_t, a[1], uint16_t, (uint16_t)a[2]); *result = 0; return 1;
+        case 5: CALL3(void, uint64_t, id1, int, (int)a[3], const char *, PTR(4)); *result = 0; return 1;
+        case 7: case 8: CALL0(void); *result = 0; return 1;
+        case 9: *result = (uint32_t)CALL3(int, uint32_t *, PTR(1), uint32_t *, PTR(2), uint32_t, a[3]); return 1;
+        case 10: {
+            int (*voice)(void *, bool, void *, uint32_t, uint32_t *, bool, void *, uint32_t, uint32_t *, uint32_t) = function;
+            *result = (uint32_t)voice(object, a[1] != 0, PTR(2), a[3], PTR(4), a[5] != 0, PTR(6), a[7], PTR(8), a[9]);
+            return 1;
+        }
+        case 11: {
+            int (*decompress)(void *, const void *, uint32_t, void *, uint32_t, uint32_t *, uint32_t) = function;
+            *result = (uint32_t)decompress(object, PTR(1), a[2], PTR(3), a[4], PTR(5), a[6]);
+            return 1;
+        }
+        case 12: *result = CALL0(uint32_t); return 1;
+        case 13: *result = CALL3(uint32_t, void *, PTR(1), int, (int)a[2], uint32_t *, PTR(3)); return 1;
+        case 14: *result = (uint32_t)CALL3(int, const void *, PTR(1), int, (int)a[2], uint64_t, id3); return 1;
+        case 15: CALL1(void, uint64_t, id1); *result = 0; return 1;
+        case 16: CALL1(void, uint32_t, a[1]); *result = 0; return 1;
+        case 17: *result = (uint32_t)CALL2(int, uint64_t, id1, uint32_t, a[3]); return 1;
+        case 18: *result = CALL0(bool); return 1;
+        case 19: CALL3(void, uint64_t, id1, uint32_t, a[3], uint16_t, (uint16_t)a[4]); *result = 0; return 1;
+        case 20: *result = CALL2(uint64_t, void *, PTR(1), int, (int)a[2]); return 1;
+        case 21: *result = CALL3(bool, void *, PTR(1), int, (int)a[2], uint32_t *, PTR(3)); return 1;
         }
     } else if (which == STEAM_APPS) {
         if (slot <= 3) { *result = CALL0(bool); return 1; }
@@ -258,6 +294,94 @@ static int interface_call(unsigned which, unsigned slot, const uint32_t *a, uint
         case 3: *result = (uint32_t)CALL1(int32_t, int32_t, (int32_t)a[1]); return 1;
         case 6: *result = (uint32_t)CALL1(int32_t, uint64_t, steam_id); return 1;
         case 7: *result = cached_guest_string(&friend_name, CALL1(const char *, uint64_t, steam_id)); return 1;
+        }
+    } else if (which == STEAM_MATCHMAKING) {
+        /* SteamMatchMaking009. CSteamID arguments take two i386 words;
+           CSteamID results return in EDX:EAX (Clang's trivial 8-byte class). */
+        uint64_t lobby = (uint64_t)a[1] | ((uint64_t)a[2] << 32);
+        uint64_t other = (uint64_t)a[3] | ((uint64_t)a[4] << 32);
+        switch (slot) {
+        case 0: *result = (uint32_t)CALL0(int); return 1;
+        case 1: {
+            bool (*get)(void *, int, uint32_t *, uint32_t *, uint16_t *, uint16_t *, uint32_t *, uint32_t *) = function;
+            *result = get(object, (int)a[1], PTR(2), PTR(3), PTR(4), PTR(5), PTR(6), PTR(7)); return 1;
+        }
+        case 2: {
+            int (*add)(void *, uint32_t, uint32_t, uint16_t, uint16_t, uint32_t, uint32_t) = function;
+            *result = (uint32_t)add(object, a[1], a[2], (uint16_t)a[3], (uint16_t)a[4], a[5], a[6]); return 1;
+        }
+        case 3: {
+            bool (*remove)(void *, uint32_t, uint32_t, uint16_t, uint16_t, uint32_t) = function;
+            *result = remove(object, a[1], a[2], (uint16_t)a[3], (uint16_t)a[4], a[5]); return 1;
+        }
+        case 4: *result = CALL0(uint64_t); return 1;
+        case 5: CALL3(void, const char *, PTR(1), const char *, PTR(2), int, (int)a[3]); *result = 0; return 1;
+        case 6: CALL3(void, const char *, PTR(1), int, (int)a[2], int, (int)a[3]); *result = 0; return 1;
+        case 7: CALL2(void, const char *, PTR(1), int, (int)a[2]); *result = 0; return 1;
+        case 8: case 9: case 10: CALL1(void, int, (int)a[1]); *result = 0; return 1;
+        case 11: CALL1(void, uint64_t, lobby); *result = 0; return 1;
+        case 12: *result = CALL1(uint64_t, int, (int)a[1]); return 1;
+        case 13: *result = CALL2(uint64_t, int, (int)a[1], int, (int)a[2]); return 1;
+        case 14: *result = CALL1(uint64_t, uint64_t, lobby); return 1;
+        case 15: CALL1(void, uint64_t, lobby); *result = 0; return 1;
+        case 16: *result = CALL2(bool, uint64_t, lobby, uint64_t, other); return 1;
+        case 17: case 21: case 32: *result = (uint32_t)CALL1(int, uint64_t, lobby); return 1;
+        case 18: *result = CALL2(uint64_t, uint64_t, lobby, int, (int)a[3]); return 1;
+        case 19: *result = compat_runtime32_copy_cstring(CALL2(const char *, uint64_t, lobby, const char *, PTR(3))); return 1;
+        case 20: *result = CALL3(bool, uint64_t, lobby, const char *, PTR(3), const char *, PTR(4)); return 1;
+        case 22: {
+            bool (*get)(void *, uint64_t, int, char *, int, char *, int) = function;
+            *result = get(object, lobby, (int)a[3], PTR(4), (int)a[5], PTR(6), (int)a[7]); return 1;
+        }
+        case 23: *result = CALL2(bool, uint64_t, lobby, const char *, PTR(3)); return 1;
+        case 24: *result = compat_runtime32_copy_cstring(CALL3(const char *, uint64_t, lobby, uint64_t, other, const char *, PTR(5))); return 1;
+        case 25: CALL3(void, uint64_t, lobby, const char *, PTR(3), const char *, PTR(4)); *result = 0; return 1;
+        case 26: *result = CALL3(bool, uint64_t, lobby, const void *, PTR(3), int, (int)a[4]); return 1;
+        case 27: {
+            int (*entry)(void *, uint64_t, int, uint64_t *, void *, int, int *) = function;
+            *result = (uint32_t)entry(object, lobby, (int)a[3], PTR(4), PTR(5), (int)a[6], PTR(7)); return 1;
+        }
+        case 28: *result = CALL1(bool, uint64_t, lobby); return 1;
+        case 29: {
+            void (*set)(void *, uint64_t, uint32_t, uint16_t, uint64_t) = function;
+            set(object, lobby, a[3], (uint16_t)a[4], (uint64_t)a[5] | ((uint64_t)a[6] << 32)); *result = 0; return 1;
+        }
+        case 30: *result = CALL4(bool, uint64_t, lobby, uint32_t *, PTR(3), uint16_t *, PTR(4), uint64_t *, PTR(5)); return 1;
+        case 31: case 33: *result = CALL2(bool, uint64_t, lobby, int, (int)a[3]); return 1;
+        case 34: *result = CALL2(bool, uint64_t, lobby, bool, a[3] != 0); return 1;
+        case 35: *result = CALL1(uint64_t, uint64_t, lobby); return 1;
+        case 36: *result = CALL2(bool, uint64_t, lobby, uint64_t, other); return 1;
+        }
+    } else if (which == STEAM_GAMESERVER) {
+        /* SteamGameServer011, used by MW2MP's listen server. */
+        uint64_t user = (uint64_t)a[1] | ((uint64_t)a[2] << 32);
+        switch (slot) {
+        case 0: {
+            bool (*init)(void *, uint32_t, uint16_t, uint16_t, uint32_t, uint32_t, const char *) = function;
+            *result = init(object, a[1], (uint16_t)a[2], (uint16_t)a[3], a[4], a[5], PTR(6)); return 1;
+        }
+        case 1: case 2: case 3: case 14: case 15: case 18: case 21: case 22: case 23:
+            CALL1(void, const char *, PTR(1)); *result = 0; return 1;
+        case 4: case 16: case 39: CALL1(void, bool, a[1] != 0); *result = 0; return 1;
+        case 5: case 20: CALL2(void, const char *, PTR(1), const char *, PTR(2)); *result = 0; return 1;
+        case 6: case 7: case 19: case 34: case 41: CALL0(void); *result = 0; return 1;
+        case 8: case 9: case 11: *result = CALL0(bool); return 1;
+        case 10: case 25: *result = CALL0(uint64_t); return 1;
+        case 12: case 13: case 40: CALL1(void, int, (int)a[1]); *result = 0; return 1;
+        case 17: CALL1(void, uint16_t, (uint16_t)a[1]); *result = 0; return 1;
+        case 24: *result = CALL4(bool, uint32_t, a[1], const void *, PTR(2), uint32_t, a[3], uint64_t *, PTR(4)); return 1;
+        case 26: case 30: CALL1(void, uint64_t, user); *result = 0; return 1;
+        case 27: *result = CALL3(bool, uint64_t, user, const char *, PTR(3), uint32_t, a[4]); return 1;
+        case 28: *result = CALL3(uint32_t, void *, PTR(1), int, (int)a[2], uint32_t *, PTR(3)); return 1;
+        case 29: *result = (uint32_t)CALL3(int, const void *, PTR(1), int, (int)a[2], uint64_t, (uint64_t)a[3] | ((uint64_t)a[4] << 32)); return 1;
+        case 31: CALL1(void, uint32_t, a[1]); *result = 0; return 1;
+        case 32: *result = (uint32_t)CALL2(int, uint64_t, user, uint32_t, a[3]); return 1;
+        case 33: *result = CALL2(bool, uint64_t, user, uint64_t, (uint64_t)a[3] | ((uint64_t)a[4] << 32)); return 1;
+        case 35: *result = CALL0(uint64_t); return 1;
+        case 36: *result = CALL0(uint32_t); return 1;
+        case 37: *result = CALL4(bool, const void *, PTR(1), int, (int)a[2], uint32_t, a[3], uint16_t, (uint16_t)a[4]); return 1;
+        case 38: *result = (uint32_t)CALL4(int, void *, PTR(1), int, (int)a[2], uint32_t *, PTR(3), uint16_t *, PTR(4)); return 1;
+        case 42: case 43: *result = CALL1(uint64_t, uint64_t, user); return 1;
         }
     } else if (which == STEAM_STORAGE) {
         /* RemoteStorage013 inserts three async methods after FileRead.
@@ -348,7 +472,7 @@ int steam_bridge32_dispatch(const char *name, const uint32_t *args, uint64_t *re
     if (strncmp(name, "_Steam", 6) != 0) return 0;
     for (unsigned i = 0; i < sizeof(interfaces) / sizeof(interfaces[0]); ++i) {
         if (strcmp(name, interfaces[i].name) != 0) continue;
-        if (!interfaces[i].guest) {
+        if (!interfaces[i].host) {
             void *(*function)(void) = steam_symbol(name + 1);
             interfaces[i].host = function ? function() : NULL;
             if (!interfaces[i].host) {
@@ -360,6 +484,8 @@ int steam_bridge32_dispatch(const char *name, const uint32_t *args, uint64_t *re
                 *result = 0;
                 return 1;
             }
+        }
+        if (!interfaces[i].guest) {
             uint32_t allocation = compat_runtime32_allocate(65 * sizeof(uint32_t), 1);
             if (!allocation) return 0;
             uint32_t *words = (void *)(uintptr_t)allocation;
@@ -458,6 +584,35 @@ int steam_bridge32_dispatch(const char *name, const uint32_t *args, uint64_t *re
         *result = function(args[0]);
         if (*result)
             fprintf(stderr, "compat32: Steam requested relaunch for app %u; the guest may skip SteamAPI_Init\n", args[0]);
+        return 1;
+    }
+    if (strcmp(name, "_SteamGameServer_Init") == 0) {
+        bool (*function)(uint32_t, uint16_t, uint16_t, uint16_t, int, const char *) = steam_symbol(name + 1);
+        if (!function) return 0;
+        *result = function(args[0], (uint16_t)args[1], (uint16_t)args[2], (uint16_t)args[3], (int)args[4],
+                           (const char *)(uintptr_t)args[5]);
+        fprintf(stderr, "compat32: SteamGameServer_Init %s\n", *result ? "succeeded" : "failed");
+        return 1;
+    }
+    if (strcmp(name, "_SteamGameServer_BSecure") == 0) {
+        bool (*function)(void) = steam_symbol(name + 1);
+        if (!function) return 0;
+        *result = function();
+        return 1;
+    }
+    if (strcmp(name, "_SteamGameServer_GetSteamID") == 0) {
+        uint64_t (*function)(void) = steam_symbol(name + 1);
+        if (!function) return 0;
+        *result = function();
+        return 1;
+    }
+    if (strcmp(name, "_SteamGameServer_RunCallbacks") == 0 || strcmp(name, "_SteamGameServer_Shutdown") == 0) {
+        void (*function)(void) = steam_symbol(name + 1);
+        if (!function) return 0;
+        function();
+        /* Shutdown releases the host interface; a later Init must reacquire it. */
+        if (strcmp(name, "_SteamGameServer_Shutdown") == 0) interfaces[STEAM_GAMESERVER].host = NULL;
+        *result = 0;
         return 1;
     }
     if (strcmp(name, "_SteamAPI_RunCallbacks") == 0 || strcmp(name, "_SteamAPI_Shutdown") == 0) {
