@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 
 char *arb_program_normalize_line_endings(const void *raw, size_t size, size_t *output_size)
 {
@@ -225,6 +226,35 @@ char *arb_program_guard_undefined_math(const void *raw_source,
     return output;
 }
 
+/* texture unit of the "texture[N]," that ends at this comma, or UINT_MAX. */
+static unsigned shadow_unit_before_comma(const char *text, size_t comma)
+{
+    size_t index = comma;
+    while (index > 0 && (text[index - 1] == ' ' || text[index - 1] == '\t'))
+        --index;
+    if (index == 0 || text[index - 1] != ']') return UINT_MAX;
+    size_t digit_end = index - 1;
+    size_t digit_begin = digit_end;
+    while (digit_begin > 0 &&
+           text[digit_begin - 1] >= '0' && text[digit_begin - 1] <= '9')
+        --digit_begin;
+    if (digit_begin == digit_end || digit_begin == 0 ||
+        text[digit_begin - 1] != '[')
+        return UINT_MAX;
+    static const char name[] = "texture";
+    size_t bracket = digit_begin - 1;
+    if (bracket < sizeof(name) - 1 ||
+        memcmp(text + bracket - (sizeof(name) - 1), name,
+               sizeof(name) - 1) != 0)
+        return UINT_MAX;
+    unsigned unit = 0;
+    for (size_t digit = digit_begin; digit < digit_end; ++digit) {
+        unit = unit * 10u + (unsigned)(text[digit] - '0');
+        if (unit >= 32) return UINT_MAX;
+    }
+    return unit;
+}
+
 /*
  * Rewrite SHADOW1D/SHADOW2D/SHADOWRECT texture targets to their plain forms.
  *
@@ -237,11 +267,17 @@ char *arb_program_guard_undefined_math(const void *raw_source,
  * the texel as if the target were 2D, Apple's returns black, which paints
  * every such surface black.  Only the target keyword is changed; the OPTION
  * line stays, which is harmless.
+ *
+ * Real shadow maps use the same keyword with GL_TEXTURE_COMPARE_MODE enabled.
+ * Stripping those samples the depth texel as a colour, and the shadow-map
+ * border projects as a hard diagonal across the sky. strip_units selects
+ * which texture[n] targets lose the SHADOW prefix. ~0u strips every one.
  */
-char *arb_program_plain_shadow_targets(const void *raw_source,
-                                       size_t source_size,
-                                       size_t *output_size,
-                                       size_t *rewrite_count)
+char *arb_program_plain_shadow_targets_masked(const void *raw_source,
+                                              size_t source_size,
+                                              uint32_t strip_units,
+                                              size_t *output_size,
+                                              size_t *rewrite_count)
 {
     static const char fragment_header[] = "!!ARBfp1.0";
     static const char keyword[] = "SHADOW";
@@ -269,9 +305,14 @@ char *arb_program_plain_shadow_targets(const void *raw_source,
                 --back;
             }
             if (back > 0 && output[back - 1] == ',') {
-                position += sizeof(keyword) - 1;
-                ++*rewrite_count;
-                continue;
+                unsigned unit = shadow_unit_before_comma(output, back - 1);
+                bool strip = unit < 32 ? (strip_units & (1u << unit)) != 0
+                                       : strip_units == ~0u;
+                if (strip) {
+                    position += sizeof(keyword) - 1;
+                    ++*rewrite_count;
+                    continue;
+                }
             }
         }
         output[used++] = source[position++];
@@ -283,6 +324,52 @@ char *arb_program_plain_shadow_targets(const void *raw_source,
     }
     *output_size = used;
     return output;
+}
+
+char *arb_program_plain_shadow_targets(const void *raw_source,
+                                       size_t source_size,
+                                       size_t *output_size,
+                                       size_t *rewrite_count)
+{
+    return arb_program_plain_shadow_targets_masked(
+        raw_source, source_size, ~0u, output_size, rewrite_count);
+}
+
+uint32_t arb_program_shadow_texture_units(const void *raw_source,
+                                          size_t source_size)
+{
+    static const char fragment_header[] = "!!ARBfp1.0";
+    static const char keyword[] = "SHADOW";
+    const char *source = raw_source;
+    uint32_t units = 0;
+    if (!source || source_size < sizeof(fragment_header) - 1 ||
+        memcmp(source, fragment_header, sizeof(fragment_header) - 1) != 0) {
+        return 0;
+    }
+    /* Walk a copy so the unit parser sees the same "texture[n]," prefix the
+       rewriter does. The copy is the source itself: the parser only reads
+       backward through text that has already been accepted. */
+    size_t position = 0;
+    size_t accepted = 0;
+    while (position < source_size) {
+        if (source_size - position > sizeof(keyword) - 1 + 2 &&
+            memcmp(source + position, keyword, sizeof(keyword) - 1) == 0 &&
+            (!memcmp(source + position + 6, "2D", 2) ||
+             !memcmp(source + position + 6, "1D", 2) ||
+             !memcmp(source + position + 6, "RECT", 4))) {
+            size_t back = accepted;
+            while (back > 0 && (source[back - 1] == ' ' ||
+                                source[back - 1] == '\t'))
+                --back;
+            if (back > 0 && source[back - 1] == ',') {
+                unsigned unit = shadow_unit_before_comma(source, back - 1);
+                if (unit < 32) units |= 1u << unit;
+            }
+        }
+        ++position;
+        ++accepted;
+    }
+    return units;
 }
 
 static int arb_identifier(unsigned char c) {

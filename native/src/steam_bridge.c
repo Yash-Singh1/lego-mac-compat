@@ -24,7 +24,7 @@ struct steam_callback {
     struct steam_callback *next;
 };
 static void *steam_library;
-static struct steam_callback *callbacks;
+static struct steam_callback *callbacks, *call_results;
 
 int steam_bridge32_prepare_environment(uint32_t app_id)
 {
@@ -119,7 +119,8 @@ static int callback_size(struct steam_callback *callback)
 }
 static const void *callback_vtable[] = {callback_run, callback_result, callback_size};
 
-enum { STEAM_USER, STEAM_STATS, STEAM_APPS, STEAM_UTILS, STEAM_STORAGE, STEAM_SCREENSHOTS };
+enum { STEAM_USER, STEAM_STATS, STEAM_APPS, STEAM_UTILS, STEAM_STORAGE, STEAM_SCREENSHOTS,
+       STEAM_NETWORKING, STEAM_FRIENDS, STEAM_MATCHMAKING };
 static struct {
     const char *name;
     void *host;
@@ -129,11 +130,23 @@ static struct {
     {"_SteamApps", NULL, 0}, {"_SteamUtils", NULL, 0},
     {"_SteamRemoteStorage", NULL, 0},
     {"_SteamScreenshots", NULL, 0},
+    {"_SteamNetworking", NULL, 0}, {"_SteamFriends", NULL, 0},
+    {"_SteamMatchmaking", NULL, 0},
 };
 
 int steam_bridge32_call_uses_sret(const char *name,const uint32_t *args) {
     return !strcmp(name,"_lp32_steam_0_2") && interfaces[STEAM_USER].guest &&
         args[0] != interfaces[STEAM_USER].guest && args[1] == interfaces[STEAM_USER].guest;
+}
+
+/* Persona names are polled; reuse the guest copy while the text is unchanged. */
+static uint32_t cached_guest_string(uint32_t *cache, const char *text)
+{
+    if (!text) return 0;
+    if (*cache && !strcmp((const char *)(uintptr_t)*cache, text)) return *cache;
+    uint32_t copy = compat_runtime32_copy_cstring(text);
+    if (copy) *cache = copy;
+    return copy;
 }
 
 /* Only known signatures are callable. Unimplemented slots trap through the
@@ -183,6 +196,7 @@ static int interface_call(unsigned which, unsigned slot, const uint32_t *a, uint
         if (slot == 14) { CALL1(void, uint32_t, a[1]); *result = 0; return 1; }
     } else if (which == STEAM_UTILS) {
         if (slot == 9) { *result = CALL0(uint32_t); return 1; } /* GetAppID */
+        if (slot == 10) { CALL1(void,int32_t,(int32_t)a[1]); *result=0; return 1; } /* SetOverlayNotificationPosition */
     } else if (which == STEAM_STATS) {
         switch (slot) {
         case 0: case 10:
@@ -218,6 +232,33 @@ static int interface_call(unsigned which, unsigned slot, const uint32_t *a, uint
         if (slot == 3) { CALL1(void,bool,a[1]!=0); *result=0; return 1; }
         if (slot == 4) { *result=CALL2(bool,uint32_t,a[1],const char *,PTR(2)); return 1; }
         if (slot == 5 || slot == 6) { *result=CALL2(bool,uint32_t,a[1],uint64_t,(uint64_t)a[2]|((uint64_t)a[3]<<32)); return 1; }
+    } else if (which == STEAM_NETWORKING) {
+        /* SteamNetworking005 P2P methods. CSteamID is passed by value in two
+           i386 words; P2PSessionState_t has the same 4-byte-aligned layout. */
+        uint64_t remote = (uint64_t)a[1] | ((uint64_t)a[2] << 32);
+        switch (slot) {
+        case 0: *result = CALL4(bool, uint64_t, remote, const void *, PTR(3), uint32_t, a[4], int32_t, (int32_t)a[5]); return 1;
+        case 1: *result = CALL2(bool, uint32_t *, PTR(1), int32_t, (int32_t)a[2]); return 1;
+        case 2: {
+            bool (*read)(void *, void *, uint32_t, uint32_t *, void *, int32_t) = function;
+            *result = read(object, PTR(1), a[2], PTR(3), PTR(4), (int32_t)a[5]); return 1;
+        }
+        case 3: case 4: *result = CALL1(bool, uint64_t, remote); return 1;
+        case 5: *result = CALL2(bool, uint64_t, remote, int32_t, (int32_t)a[3]); return 1;
+        case 6: *result = CALL2(bool, uint64_t, remote, void *, PTR(3)); return 1;
+        case 7: *result = CALL1(bool, bool, a[1] != 0); return 1;
+        }
+    } else if (which == STEAM_FRIENDS) {
+        /* SteamFriends014 accessors. */
+        static uint32_t persona, friend_name;
+        uint64_t steam_id = (uint64_t)a[1] | ((uint64_t)a[2] << 32);
+        switch (slot) {
+        case 0: *result = cached_guest_string(&persona, CALL0(const char *)); return 1;
+        case 2: *result = (uint32_t)CALL0(int32_t); return 1;
+        case 3: *result = (uint32_t)CALL1(int32_t, int32_t, (int32_t)a[1]); return 1;
+        case 6: *result = (uint32_t)CALL1(int32_t, uint64_t, steam_id); return 1;
+        case 7: *result = cached_guest_string(&friend_name, CALL1(const char *, uint64_t, steam_id)); return 1;
+        }
     } else if (which == STEAM_STORAGE) {
         /* RemoteStorage013 inserts three async methods after FileRead.
            Keep the earlier interface's slot mapping for older bundled SDKs. */
@@ -368,6 +409,37 @@ int steam_bridge32_dispatch(const char *name, const uint32_t *args, uint64_t *re
             free(callback);
             break;
         }
+        *result = 0;
+        return 1;
+    }
+    if (strcmp(name, "_SteamAPI_RegisterCallResult") == 0 ||
+        strcmp(name, "_SteamAPI_UnregisterCallResult") == 0) {
+        /* (CCallbackBase *, SteamAPICall_t). A guest CCallResult is reused
+           across calls, so its host wrapper persists; results arrive through
+           the wrapper's Run(data, failure, call) slot. */
+        void (*function)(struct steam_callback *, uint64_t) = steam_symbol(name + 1);
+        if (!function) return 0;
+        uint64_t call = (uint64_t)args[1] | ((uint64_t)args[2] << 32);
+        struct steam_callback *callback = NULL;
+        for (struct steam_callback *p = call_results; p; p = p->next)
+            if (p->guest == args[0]) { callback = p; break; }
+        bool registering = strcmp(name, "_SteamAPI_RegisterCallResult") == 0;
+        if (!callback && !registering) { *result = 0; return 1; }
+        if (!callback) {
+            callback = calloc(1, sizeof(*callback));
+            if (!callback) return 0;
+            callback->vtable = callback_vtable;
+            callback->guest = args[0];
+            const uint32_t *vtable = (void *)(uintptr_t)*(uint32_t *)(uintptr_t)args[0];
+            callback->size = (int32_t)compat_runtime32_call(vtable[2], args, 1);
+            if (callback->size <= 0 || callback->size > 65536) { free(callback); return 0; }
+            callback->next = call_results;
+            call_results = callback;
+        }
+        callback->id = *(int32_t *)(uintptr_t)(args[0] + 8);
+        callback->flags = *(uint8_t *)(uintptr_t)(args[0] + 4);
+        function(callback, call);
+        *(uint8_t *)(uintptr_t)(args[0] + 4) = callback->flags;
         *result = 0;
         return 1;
     }

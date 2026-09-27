@@ -10,15 +10,18 @@
 #include "game_profile.h"
 #include <Carbon/Carbon.h>
 #include <dlfcn.h>
+#include <dispatch/dispatch.h>
 #include <errno.h>
 #include <math.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 /* Carbon still supplies many 64-bit services, but its opaque references and
@@ -51,6 +54,15 @@ struct alert_params32 {
   uint16_t position;
   uint32_t flags, icon;
 };
+struct fork_io32 {
+  uint32_t link; int16_t type,trap; uint32_t command,completion;
+  int16_t result; uint32_t reserved1; int16_t reserved2,fork;
+  uint8_t reserved3; int8_t permissions; uint32_t ref,buffer,requested,actual;
+  uint16_t mode; int64_t offset;
+};
+_Static_assert(offsetof(struct fork_io32,result)==16 &&
+               offsetof(struct fork_io32,fork)==24 &&
+               offsetof(struct fork_io32,offset)==46,"i386 FSForkIOParam layout");
 struct pixmap32 {
   uint32_t pixels;
   int16_t row_bytes;
@@ -151,6 +163,18 @@ static void *symbol(const char *name) {
   }
   return function;
 }
+static unsigned pending_fork_reads;
+static void read_fork_async(void *opaque) {
+  struct fork_io32 *guest=opaque;
+  uint32_t completion=guest->completion,argument=(uint32_t)(uintptr_t)guest;
+  ByteCount actual=0;
+  OSErr status=((OSErr (*)(FSIORefNum,UInt16,SInt64,ByteCount,void *,ByteCount *))symbol("_FSReadFork"))(
+      guest->fork,guest->mode,guest->offset,guest->requested,(void *)(uintptr_t)guest->buffer,&actual);
+  guest->actual=(uint32_t)actual;
+  __atomic_store_n(&guest->result,status,__ATOMIC_RELEASE);
+  if(completion)compat_runtime32_call(completion,&argument,1);
+  __atomic_sub_fetch(&pending_fork_reads,1,__ATOMIC_RELEASE);
+}
 /* FSSpec disappeared from the 64-bit entry points. Preserve its packed
  * 70-byte ABI and resolve parent IDs via FSRefs obtained from File Manager. */
 struct __attribute__((packed)) spec32 {
@@ -177,6 +201,30 @@ static void remember_directory(int16_t volume, uint32_t id, const FSRef *ref) {
   *p = (struct directory_ref){volume, id, *ref, directories};
   directories = p;
 }
+/* i386 FSPermissionInfo ends in a 4-byte reserved field; x86_64 replaces it
+   with an 8-byte FSFileSecurityRef, so later FSCatalogInfo fields move by
+   four bytes (144 bytes on i386, 148 natively). The ACL reference is never
+   exposed to the guest. */
+enum { kCatalogInfo32Size = 144, kCatalogInfoCommonPrefix = 68 };
+static void catalog_info_to_guest(const FSCatalogInfo *host, void *guest) {
+  memcpy(guest, host, kCatalogInfoCommonPrefix);
+  memset((char *)guest + kCatalogInfoCommonPrefix, 0, 4);
+  memcpy((char *)guest + kCatalogInfoCommonPrefix + 4,
+         (const char *)host + kCatalogInfoCommonPrefix + 8,
+         kCatalogInfo32Size - kCatalogInfoCommonPrefix - 4);
+}
+static const FSCatalogInfo *catalog_info_from_guest(const void *guest, FSCatalogInfo *host) {
+  if (!guest)
+    return NULL;
+  memset(host, 0, sizeof(*host));
+  memcpy(host, guest, kCatalogInfoCommonPrefix);
+  memcpy((char *)host + kCatalogInfoCommonPrefix + 8,
+         (const char *)guest + kCatalogInfoCommonPrefix + 4,
+         kCatalogInfo32Size - kCatalogInfoCommonPrefix - 4);
+  return host;
+}
+_Static_assert(sizeof(FSCatalogInfo) == kCatalogInfo32Size + 4, "FSCatalogInfo layout");
+
 static int16_t spec_from_ref(const FSRef *ref, struct spec32 *spec) {
   FSCatalogInfo info;
   HFSUniStr255 name;
@@ -2854,8 +2902,12 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
     return 1;
   }
   if (IS("_FSGetCatalogInfo")) {
+    FSCatalogInfo info;
+    catalog_info_from_guest(P(2), &info);
     int16_t status = F(int16_t, const void *, uint32_t, void *, void *, void *,
-                       void *)(P(0), a[1], P(2), P(3), NULL, P(5));
+                       void *)(P(0), a[1], a[2] ? &info : NULL, P(3), NULL, P(5));
+    if (!status && a[2])
+      catalog_info_to_guest(&info, P(2));
     if (!status) {
       /* Legacy callers can query only a parent ID, then use that ID in a
          later parameter-block call without ever requesting an FSSpec. */
@@ -2897,14 +2949,16 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
   if (IS("_FSCreateDirectoryUnicode") || IS("_FSCreateFileUnicode")) {
     FSRef ref;
     int16_t status;
+    FSCatalogInfo info;
+    const FSCatalogInfo *initial = catalog_info_from_guest(P(4), &info);
     if (IS("_FSCreateDirectoryUnicode"))
       status = F(int16_t, const void *, uint32_t, const void *, uint32_t,
                  const void *, void *, void *,
-                 void *)(P(0), a[1], P(2), a[3], P(4), &ref, NULL, P(7));
+                 void *)(P(0), a[1], P(2), a[3], initial, &ref, NULL, P(7));
     else
       status = F(int16_t, const void *, uint32_t, const void *, uint32_t,
                  const void *, void *,
-                 void *)(P(0), a[1], P(2), a[3], P(4), &ref, NULL);
+                 void *)(P(0), a[1], P(2), a[3], initial, &ref, NULL);
     if (!status) {
       if (a[5])
         memcpy(P(5), &ref, sizeof(ref));
@@ -2915,9 +2969,23 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
     return 1;
   }
   if (IS("_FSOpenFork")) {
+    FSIORefNum file=0;
     *out = (uint32_t)(int32_t)F(int16_t, const void *, uint16_t, const void *,
                                 int8_t, void *)(P(0), (uint16_t)a[1], P(2),
-                                                (int8_t)a[3], P(4));
+                                                (int8_t)a[3], &file);
+    if(!*out && (file<0 || file>INT16_MAX)) {
+      ((OSErr (*)(FSIORefNum))symbol("_FSCloseFork"))(file);*out=(uint32_t)tmfoErr;
+    }
+    if(!*out && a[4])*(int16_t *)P(4)=(int16_t)file;
+    return 1;
+  }
+  if (IS("_PBReadForkAsync")) {
+    struct fork_io32 *guest=P(0);
+    if(!guest)return 0;
+    guest->actual=0;__atomic_store_n(&guest->result,1,__ATOMIC_RELEASE);
+    __atomic_add_fetch(&pending_fork_reads,1,__ATOMIC_RELAXED);
+    dispatch_async_f(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),guest,read_fork_async);
+    *out=0;
     return 1;
   }
   if (IS("_FSCloseFork") || IS("_FSFlushFork")) {
@@ -2970,8 +3038,9 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
     return 1;
   }
   if (IS("_FSSetCatalogInfo")) {
+    FSCatalogInfo info;
     *out = (uint32_t)(int32_t)F(int16_t, const void *, uint32_t,
-                                const void *)(P(0), a[1], P(2));
+                                const void *)(P(0), a[1], catalog_info_from_guest(P(2), &info));
     return 1;
   }
   if (IS("_FSOpenIterator")) {
@@ -3002,9 +3071,19 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
         return 1;
       }
     }
+    FSCatalogInfo *infos = a[5] ? calloc(a[1] ? a[1] : 1, sizeof(*infos)) : NULL;
+    if (a[5] && !infos) {
+      if (allocated)
+        free(refs);
+      *out = (uint32_t)-108;
+      return 1;
+    }
     int16_t status = F(int16_t, void *, ItemCount, ItemCount *, void *,
                        uint32_t, void *, void *, void *, void *)(
-        unwrap(a[0]), a[1], &count, P(3), a[4], P(5), refs, NULL, P(8));
+        unwrap(a[0]), a[1], &count, P(3), a[4], infos, refs, NULL, P(8));
+    for (ItemCount i = 0; infos && i < count && i < a[1]; ++i)
+      catalog_info_to_guest(infos + i, (char *)P(5) + i * kCatalogInfo32Size);
+    free(infos);
     if (a[2])
       *(uint32_t *)P(2) = (uint32_t)count;
     if (a[7])
@@ -3321,8 +3400,10 @@ int carbon_bridge32_run_file_self_test(void) {
   if (fd < 0) return -1;
   int passed = -1;
   uint32_t memory = compat_runtime32_allocate(256, 1);
-  uint32_t a[4] = {0}; uint64_t out = 0;
+  uint32_t a[8] = {0}; uint64_t out = 0;
   int16_t handle = 0;
+  int16_t fork=0;
+  void *completion=MAP_FAILED;
   if (!memory || write(fd, "abcdef", 6) != 6) goto done;
   close(fd); fd = -1;
   FSRef ref;
@@ -3347,13 +3428,35 @@ int carbon_bridge32_run_file_self_test(void) {
   if (!carbon_bridge32_dispatch("_FSClose",a,&out) || out) goto done;
   handle=0;
   if (!carbon_bridge32_dispatch("_GetFPos",a,&out) || (int32_t)out!=rfNumErr) goto done;
+  memcpy(bytes,&ref,sizeof(ref));memset(bytes+80,0xcc,8);
+  a[0]=memory;a[1]=0;a[2]=0;a[3]=fsRdPerm;a[4]=memory+80;
+  if(!carbon_bridge32_dispatch("_FSOpenFork",a,&out) || out || bytes[82]!=0xcc || bytes[83]!=0xcc)goto done;
+  memcpy(&fork,bytes+80,2);
+  /* A real i386 completion writes qType through its parameter-block argument. */
+  const unsigned char code[]={0x8b,0x44,0x24,0x04,0x66,0xc7,0x40,0x04,0x34,0x12,0xc3};
+  completion=mmap(NULL,4096,PROT_READ|PROT_WRITE|PROT_EXEC,MAP_PRIVATE|MAP_ANON|MAP_32BIT,-1,0);
+  if(completion==MAP_FAILED)goto done;
+  memcpy(completion,code,sizeof(code));
+  struct fork_io32 *io=(void *)(bytes+128);
+  for(unsigned pass=0;pass<2;++pass) {
+    memset(io,0,sizeof(*io));io->completion=(uint32_t)(uintptr_t)completion;
+    io->fork=fork;io->buffer=memory+96;io->mode=fsFromStart;io->offset=pass?4:1;
+    io->requested=pass?8:3;bytes[128+sizeof(*io)]=0xa5;a[0]=memory+128;
+    if(!carbon_bridge32_dispatch("_PBReadForkAsync",a,&out) || out)goto done;
+    for(unsigned tries=0;__atomic_load_n(&pending_fork_reads,__ATOMIC_ACQUIRE) && tries<5000;++tries)usleep(1000);
+    if(__atomic_load_n(&pending_fork_reads,__ATOMIC_ACQUIRE))return -1;
+    if(io->result!=(pass?eofErr:0) || io->actual!=(pass?2u:3u) || io->type!=0x1234 ||
+       memcmp(bytes+96,pass?"ef":"bcd",io->actual) || bytes[128+sizeof(*io)]!=0xa5)goto done;
+  }
   passed=0;
 done:
+  if(completion!=MAP_FAILED)munmap(completion,4096);
+  if(fork){a[0]=(uint16_t)fork;carbon_bridge32_dispatch("_FSCloseFork",a,&out);}
   if(handle){a[0]=(uint16_t)handle;carbon_bridge32_dispatch("_FSClose",a,&out);}
   if(memory)compat_runtime32_deallocate(memory);
   if(fd>=0)close(fd);
   unlink(path);
-  fprintf(stderr,"carbon-file-selftest: %s (open, read, seek, EOF, close, packed outputs)\n",passed?"FAIL":"PASS");
+  fprintf(stderr,"carbon-file-selftest: %s (open, read, seek, async completion, EOF, close, packed outputs)\n",passed?"FAIL":"PASS");
   return passed;
 }
 

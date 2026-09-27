@@ -95,11 +95,32 @@ int main(void) {
   assert(rtti_bridge32_cast(obj + 32, A, Diamond) == obj);
   assert(rtti_bridge32_cast(obj + 32, A, W) == obj + 16);
   assert(rtti_bridge32_cast(obj, V, A) == obj + 32); /* shared virtual A */
+  /* Cached results are displacements: another object with the same vtables
+     casts relative to itself, and a repeated cast still sees the same answer. */
+  uint32_t twin = alloc(64);
+  for (unsigned i = 0; i < 3; ++i)
+    *(uint32_t *)(uintptr_t)(twin + 16 * i) = *(uint32_t *)(uintptr_t)(obj + 16 * i);
+  assert(rtti_bridge32_cast(twin + 32, A, W) == twin + 16);
+  assert(rtti_bridge32_cast(obj + 32, A, W) == obj + 16);
+  assert(rtti_bridge32_cast(twin, V, A) == twin + 32);
+  assert(!rtti_bridge32_cast(twin, V, P));
+  assert(!rtti_bridge32_cast(twin, V, P));
   uint32_t Repeated = type(3, "Repeated", V, 2, V, (16 << 8) | 2);
   vptr(obj, Repeated, 0, 32);
   vptr(obj + 16, Repeated, 16, 16);
   vptr(obj + 32, Repeated, 32, 0);
   assert(!rtti_bridge32_cast(obj + 32, A, V)); /* two enclosing V objects */
+  /* Colliding cache slots and rebuilding the type registry must never reuse
+     the old kind. These addresses need not point to objects for kind lookup. */
+  type_count=2;
+  types[0].address=0x20000000;types[0].kind=1;
+  types[1].address=0x20001010;types[1].kind=2;
+  for(unsigned i=0;i<1000;++i) {
+    assert(kind_of(0x20000000)==1);
+    assert(kind_of(0x20001010)==2);
+  }
+  types[1].kind=3;assert(kind_of(0x20001010)==3);
+  type_count=0;assert(kind_of(0x20001010)==0);
   puts("RTTI bridge PASS (downcast, crosscast, private, ambiguous, virtual "
        "diamond and null)");
 }

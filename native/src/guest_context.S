@@ -70,5 +70,36 @@ _lp32_context_fast_longjmp:
     movl 20(%ecx), %edx
     movl 16(%ecx), %esp
     jmp *%edx
+/* Small, frequent libc operations stay in i386 mode. Read one byte at a
+   time so comparisons ending at a guard page never read beyond the NUL. */
+.globl _lp32_context_strcmp, _lp32_context_tolower, _lp32_context_lower_table
+_lp32_context_strcmp:
+    pushl %esi
+    pushl %edi
+    movl 12(%esp), %esi
+    movl 16(%esp), %edi
+4:
+    movzbl (%esi), %eax
+    movzbl (%edi), %edx
+    subl %edx, %eax
+    jne 5f
+    testl %edx, %edx
+    je 5f
+    incl %esi
+    incl %edi
+    jmp 4b
+5:
+    popl %edi
+    popl %esi
+    ret
+_lp32_context_tolower:
+    movl 4(%esp), %eax
+    cmpl $255, %eax
+    ja 6f
+    .byte 0x8b, 0x04, 0x85 /* movl lower_table(,%eax,4),%eax */
+_lp32_context_lower_table:
+    .long 0
+6:
+    ret
 _lp32_context_end:
 .code64

@@ -279,6 +279,27 @@ static int write_guest_code(uintptr_t address, const void *bytes, size_t length,
  * forwards only the first caller (atomic test-and-set on a latch byte); the
  * rest of the start method still runs for every worker object.
  */
+/* Apply the profile's verified byte patches; all signatures are checked
+   before any byte changes, and a mismatch (another build) skips them all. */
+static int install_code_patches(void)
+{
+    const struct lp32_code_patch *patches = lp32_profile()->code_patches;
+    if (!patches) return 0;
+    for (const struct lp32_code_patch *p = patches; p->address; ++p) {
+        if (p->length > sizeof(p->expected) ||
+            memcmp((const void *)(uintptr_t)p->address, p->expected, p->length)) {
+            fprintf(stderr, "compat32: code patch signature mismatch at %08x; skipping patches\n",
+                    p->address);
+            return 0;
+        }
+    }
+    for (const struct lp32_code_patch *p = patches; p->address; ++p) {
+        if (write_guest_code(p->address, p->replacement, p->length, p->reason)) return -1;
+        fprintf(stderr, "compat32: patched %08x: %s\n", p->address, p->reason);
+    }
+    return 0;
+}
+
 static int install_save_worker_patch(void)
 {
     const struct lp32_save_worker_patch *layout = lp32_profile()->save_worker;
@@ -771,7 +792,7 @@ static void runtime_diagnostic_line(const char *line)
 static const char *default_image_path(const char *argv0, char *buffer,
                                       size_t size)
 {
-    static const char *const candidates[] = {"LEGOPirates", "LEGOCloneWars", "LEGOMarvel", "LEGOCompleteSaga", "COD4", "COD4MP"};
+    static const char *const candidates[] = {"LEGOPirates", "LEGOCloneWars", "LEGOMarvel", "LEGOCompleteSaga", "COD4", "COD4MP", "MW2", "MW2MP"};
     const char *slash = strrchr(argv0, '/');
     size_t directory_length = slash ? (size_t)(slash - argv0) : 0;
     for (size_t index = 0; index < sizeof(candidates) / sizeof(candidates[0]); ++index) {
@@ -791,6 +812,10 @@ static const char *default_image_path(const char *argv0, char *buffer,
 
 int main(int argc, char **argv)
 {
+    /* A write to a socket whose peer has gone (e.g. the Steam client IPC)
+       must fail with EPIPE, not silently kill the game. Launched from Finder,
+       MW2 otherwise dies of SIGPIPE seconds after its first frame. */
+    signal(SIGPIPE, SIG_IGN);
     install_guest_crash_diagnostics();
     compat_runtime32_set_diagnostic_sink(runtime_diagnostic_line);
     if (getenv("LP32_FOCUS_SELFTEST")) {
@@ -803,6 +828,9 @@ int main(int argc, char **argv)
     }
     if (getenv("LP32_POINTER_SELFTEST")) {
         return objc_bridge32_run_pointer_self_test() == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (getenv("LP32_GAMMA_SELFTEST")) {
+        return objc_bridge32_run_gamma_self_test() == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
     if (getenv("LP32_OBJC_PROXY_SELFTEST")) {
         return objc_bridge32_run_proxy_self_test() == 0 ?
@@ -910,6 +938,41 @@ int main(int argc, char **argv)
             ++bound;
         }
         if (bink_imports) fprintf(stderr, "compat32: bound %u Bink imports to the original i386 library\n", bound);
+    }
+    if (lp32_profile()->title == LP32_TITLE_MW2 || lp32_profile()->title == LP32_TITLE_MW2_MP) {
+        if (guest_dyld32_initialize(image_path)) return EXIT_FAILURE;
+        const char *libraries[] = {"libBinkMacx86.dylib", "libMilesX86.dylib"};
+        /* Imports are matched by prefix; _RADSS_CAInstallDriver is Miles'
+           CoreAudio sound-system driver (Bink exports its own copy). */
+        const char *prefixes[][2] = {{"_Bink", NULL}, {"_AIL_", "_RADSS_"}};
+        for (unsigned library = 0; library < 2; ++library) {
+            char path[PATH_MAX];
+            int length = snprintf(path, sizeof(path), "%s/%s", guest_dyld32_game_root(), libraries[library]);
+            if (length < 0 || (size_t)length >= sizeof(path)) return EXIT_FAILURE;
+            uint32_t handle = guest_dyld32_open(path, RTLD_NOW);
+            if (!handle) {
+                fprintf(stderr, "game_loader: cannot load MW2 %s: %s\n", libraries[library],
+                        (char *)(uintptr_t)guest_dyld32_error());
+                return EXIT_FAILURE;
+            }
+            unsigned bound = 0;
+            for (unsigned i = 0; i < image.import_count; ++i) {
+                const struct macho_import32 *import = &image.imports[i];
+                bool matched = false;
+                for (unsigned p = 0; p < 2 && prefixes[library][p]; ++p)
+                    matched |= !strncmp(import->name, prefixes[library][p], strlen(prefixes[library][p]));
+                if (!matched) continue;
+                uint32_t address = guest_dyld32_symbol(handle, import->name + 1);
+                if (!address || macho_image32_bind_import(import, address)) return EXIT_FAILURE;
+                ++bound;
+            }
+            fprintf(stderr, "compat32: bound %u MW2 imports to %s\n", bound, libraries[library]);
+        }
+    }
+    if (getenv("LP32_BUNDLE_SELFTEST")) {
+        int result = objc_bridge32_run_bundle_self_test();
+        macho_image32_unload(&image);
+        return result ? EXIT_FAILURE : EXIT_SUCCESS;
     }
     if (getenv("LP32_OBJC_LIFETIME_SELFTEST")) {
         int result=objc_legacy32_run_lifetime_self_test();
@@ -1024,6 +1087,10 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
+    if (install_code_patches() != 0) {
+        macho_image32_unload(&image);
+        return EXIT_FAILURE;
+    }
     if (install_loading_screen_patch() != 0) {
         macho_image32_unload(&image);
         return EXIT_FAILURE;

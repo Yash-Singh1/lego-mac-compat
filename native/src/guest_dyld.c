@@ -854,6 +854,19 @@ int guest_dyld32_dispatch(const char *name, const uint32_t *a, uint64_t *result)
         *result = (uint32_t)guest_dyld32_close(a[0]);
     } else if (!strcmp(name, "_dlerror")) {
         *result = guest_dyld32_error();
+    } else if (!strcmp(name, "_NSIsSymbolNameDefined") ||
+               !strcmp(name, "_NSLookupAndBindSymbol")) {
+        /* MW2's Miles locates its own dylib through these legacy dyld APIs to
+           find its redist directory. An NSSymbol is the symbol's address. */
+        const char *symbol = (const void *)(uintptr_t)a[0];
+        pthread_mutex_lock(&loader_lock);
+        uint32_t address = symbol ? global_symbol(symbol) : 0;
+        pthread_mutex_unlock(&loader_lock);
+        *result = !strcmp(name, "_NSIsSymbolNameDefined") ? address != 0 : address;
+    } else if (!strcmp(name, "_NSModuleForSymbol")) {
+        *result = guest_dyld32_symbol_module(a[0]);
+    } else if (!strcmp(name, "_NSLibraryNameForModule")) {
+        *result = guest_dyld32_module_name(a[0]);
     } else return 0;
     return 1;
 }

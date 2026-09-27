@@ -4,11 +4,44 @@
 #include <OpenGL/gl3.h>
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+/* The index-buffer copies live in objc_bridge.m; this test has none bound. */
+int objc_bridge32_index_shadow_acquire(uint32_t offset,const void **pointer,uint32_t *buffer){(void)offset;(void)pointer;(void)buffer;return 0;}
+void objc_bridge32_reconcile_fragment_shadows(void){}
+void objc_bridge32_index_shadow_release(uint32_t buffer){(void)buffer;}
 static uint64_t call(const char *name,const uint32_t *args){uint64_t out=0;assert(gl_core_bridge32_dispatch(name,args,&out));return out;}
 extern void glGetMaterialfv(uint32_t, uint32_t, float *);
+extern void glBegin(uint32_t);
+extern void glEnd(void);
+extern void glVertex2f(float, float);
+static void check_shadow_rewrite(void) {
+    const char *plain = "#version 120\nvoid main(){gl_FragColor=vec4(1.0);}\n";
+    assert(gl_core_bridge32_rewrite_glsl_shadows(plain, strlen(plain)) == NULL);
+    const char *embedded = "#version 120\nvoid main(){float myshadow2DProj=1.0; gl_FragColor=vec4(myshadow2DProj);}\n";
+    assert(gl_core_bridge32_rewrite_glsl_shadows(embedded, strlen(embedded)) == NULL);
+    const char *projective =
+        "#version 120\n"
+        "uniform sampler2DShadow s;\n"
+        "uniform vec4 c;\n"
+        "void main(){gl_FragColor=shadow2DProj(s, c);}\n";
+    char *rewritten = gl_core_bridge32_rewrite_glsl_shadows(projective, strlen(projective));
+    assert(rewritten);
+    assert(strncmp(rewritten, "#version 120\n", 13) == 0);
+    assert(strstr(rewritten, "vec4 lp32_shadow2DProj"));
+    assert(strstr(rewritten, "#define shadow2DProj"));
+    assert(strstr(rewritten, "return vec4(1.0);"));
+    free(rewritten);
+    const char *rectangle = "#version 120\nshadow2DRectProj(s, c);\n";
+    rewritten = gl_core_bridge32_rewrite_glsl_shadows(rectangle, strlen(rectangle));
+    assert(rewritten);
+    assert(strstr(rewritten, "#define shadow2DRectProj"));
+    assert(!strstr(rewritten, "#define shadow2DProj("));
+    free(rewritten);
+}
 int main(void){
+    check_shadow_rewrite();
     uint8_t *memory=mmap((void *)0x10000000,4096,PROT_READ|PROT_WRITE,MAP_ANON|MAP_PRIVATE|MAP_FIXED,-1,0);
     assert(memory==(void *)0x10000000);
     CGLPixelFormatAttribute attrs[]={kCGLPFAOpenGLProfile,(CGLPixelFormatAttribute)kCGLOGLPVersion_3_2_Core,kCGLPFAAccelerated,0};
@@ -71,6 +104,93 @@ int main(void){
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
     call("_glPopClientAttrib", NULL);
     GLint restored; glGetIntegerv(GL_PACK_ALIGNMENT, &restored); assert(restored == 8);
+    assert(glGetError() == GL_NO_ERROR);
+    GLuint depth;
+    glGenTextures(1, &depth);
+    glBindTexture(GL_TEXTURE_2D, depth);
+    float texels[16];
+    for (int i = 0; i < 16; ++i) texels[i] = 0.25f;
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT, 4, 4, 0, GL_DEPTH_COMPONENT, GL_FLOAT, texels);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, 0x884E);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_FUNC, GL_LEQUAL);
+    float border[4] = {0, 0, 0, 1};
+    glTexParameterfv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, border);
+    GLuint shadow_color, shadow_fbo;
+    glGenTextures(1, &shadow_color);
+    glBindTexture(GL_TEXTURE_2D, shadow_color);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 4, 4, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glGenFramebuffers(1, &shadow_fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, shadow_fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, shadow_color, 0);
+    assert(glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
+    glBindTexture(GL_TEXTURE_2D, depth);
+    glViewport(0, 0, 4, 4);
+    const char *shadow_source =
+        "#version 120\n"
+        "uniform sampler2DShadow s;\n"
+        "uniform vec4 c;\n"
+        "void main(){gl_FragColor=shadow2DProj(s, c);}\n";
+    uint32_t shadow_shader = (uint32_t)call("_glCreateShader", (uint32_t[]){GL_FRAGMENT_SHADER});
+    strcpy((char *)memory + 128, shadow_source);
+    *(uint32_t *)memory = 0x10000080;
+    uint32_t shadow_text[] = {shadow_shader, 1, 0x10000000, 0};
+    call("_glShaderSource", shadow_text);
+    call("_glCompileShader", &shadow_shader);
+    GLint shadow_length = 0;
+    glGetShaderiv(shadow_shader, GL_SHADER_SOURCE_LENGTH, &shadow_length);
+    char *shadow_uploaded = calloc((size_t)shadow_length + 1, 1);
+    glGetShaderSource(shadow_shader, shadow_length, NULL, shadow_uploaded);
+    assert(strstr(shadow_uploaded, "lp32_shadow2DProj"));
+    free(shadow_uploaded);
+    uint32_t shadow_status[] = {shadow_shader, GL_COMPILE_STATUS, 0x10000300};
+    *(uint32_t *)(memory + 772) = 0xabcdef01;
+    call("_glGetShaderiv", shadow_status);
+    assert(*(uint32_t *)(memory + 768) == GL_TRUE);
+    const char *shadow_vertex = "void main(){gl_Position=gl_Vertex;}\n";
+    uint32_t shadow_vs = (uint32_t)call("_glCreateShader", (uint32_t[]){GL_VERTEX_SHADER});
+    strcpy((char *)memory + 128, shadow_vertex);
+    *(uint32_t *)memory = 0x10000080;
+    uint32_t shadow_vs_text[] = {shadow_vs, 1, 0x10000000, 0};
+    call("_glShaderSource", shadow_vs_text);
+    call("_glCompileShader", &shadow_vs);
+    uint32_t shadow_program = (uint32_t)call("_glCreateProgram", NULL);
+    uint32_t attach_fs[] = {shadow_program, shadow_shader};
+    uint32_t attach_vs[] = {shadow_program, shadow_vs};
+    call("_glAttachShader", attach_fs);
+    call("_glAttachShader", attach_vs);
+    call("_glLinkProgram", &shadow_program);
+    call("_glUseProgram", &shadow_program);
+    glUniform1i(glGetUniformLocation(shadow_program, "s"), 0);
+    GLint coord = glGetUniformLocation(shadow_program, "c");
+    unsigned char sample[4];
+    glUniform4f(coord, 0.5f, 0.5f, 2.0f, 1.0f);
+    glBegin(GL_QUADS);
+    glVertex2f(-1, -1); glVertex2f(1, -1); glVertex2f(1, 1); glVertex2f(-1, 1);
+    glEnd();
+    glReadPixels(1, 1, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, sample);
+    assert(sample[0] == 255);
+    glUniform4f(coord, 0.5f, 0.5f, 0.9f, 1.0f);
+    glBegin(GL_QUADS);
+    glVertex2f(-1, -1); glVertex2f(1, -1); glVertex2f(1, 1); glVertex2f(-1, 1);
+    glEnd();
+    glReadPixels(1, 1, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, sample);
+    assert(sample[0] == 0);
+    glUniform4f(coord, 0.5f, 0.5f, 0.1f, 1.0f);
+    glBegin(GL_QUADS);
+    glVertex2f(-1, -1); glVertex2f(1, -1); glVertex2f(1, 1); glVertex2f(-1, 1);
+    glEnd();
+    glReadPixels(1, 1, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, sample);
+    assert(sample[0] == 255);
+    call("_glDeleteProgram", &shadow_program);
+    call("_glDeleteShader", &shadow_shader);
+    call("_glDeleteShader", &shadow_vs);
+    glDeleteFramebuffers(1, &shadow_fbo);
+    glDeleteTextures(1, &shadow_color);
+    glDeleteTextures(1, &depth);
     assert(glGetError() == GL_NO_ERROR);
     CGLSetCurrentContext(NULL); CGLDestroyContext(context);
     puts("Core GL bridge PASS (rendered pixels, shader ABI, legacy material/point floats, client state restoration)");

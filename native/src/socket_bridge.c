@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netdb.h>
+#include <poll.h>
 #include <pthread.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -58,6 +59,16 @@ int socket_bridge32_dispatch(const char *name,const uint32_t *a,uint64_t *out) {
     else if(IS("_getsockname")) result=getsockname((int)a[0],P(1),P(2));
     else if(IS("_gethostname")) result=gethostname(P(0),a[1]);
     else if(IS("_inet_addr")) { *out=inet_addr(P(0));return 1; }
+    else if(IS("_inet_ntoa")) {
+        /* struct in_addr is passed by value; the result is a per-thread static. */
+        static _Thread_local uint32_t text;
+        if(!text) text=compat_runtime32_allocate(INET_ADDRSTRLEN,1);
+        struct in_addr address={.s_addr=a[0]};
+        if(text) strlcpy((char *)(uintptr_t)text,inet_ntoa(address),INET_ADDRSTRLEN);
+        *out=text;return 1;
+    }
+    /* struct pollfd is {int, short, short} on i386 and x86_64 alike. */
+    else if(IS("_poll")) result=poll(P(0),(nfds_t)a[1],(int)a[2]);
     else if(IS("_gethostbyname")) { *out=guest_gethostbyname(P(0));return 1; }
     else if(IS("_ioctl")) {
         if(a[1]==FIONBIO || a[1]==FIONREAD) result=ioctl((int)a[0],(unsigned long)a[1],P(2));

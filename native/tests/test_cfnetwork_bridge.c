@@ -4,6 +4,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <stdlib.h>
+#include <unistd.h>
 
 uint64_t compat_runtime32_return_double(double x){uint64_t result;memcpy(&result,&x,8);return result;}
 static CFTypeRef objects[128];
@@ -132,6 +134,50 @@ int main(void) {
   assert(released <= retained);
   dispatch("_CFReadStreamClose", a);
   CFRelease(stream);
+
+  /* MW2 reads its startup plist through file streams. Check 32-bit format
+     and error outputs with canaries, then exercise the inverse write path. */
+  char file_path[] = "/tmp/lp32-plist-XXXXXX";
+  int fd = mkstemp(file_path);
+  assert(fd >= 0);
+  close(fd);
+  CFURLRef file_url = CFURLCreateFromFileSystemRepresentation(NULL,
+      (const UInt8 *)file_path, strlen(file_path), false);
+  memset(a, 0, sizeof(a));
+  a[1] = token(file_url);
+  uint32_t output = dispatch("_CFWriteStreamCreateWithFile", a);
+  a[0] = output;
+  assert(dispatch("_CFWriteStreamOpen", a));
+  low[100] = 0xabcddcba; low[101] = 0xffffffff; low[102] = 0x12344321;
+  a[0] = token(CFSTR("MW2 plist round trip")); a[1] = output;
+  a[2] = kCFPropertyListXMLFormat_v1_0; a[3] = 0;
+  a[4] = (uint32_t)(uintptr_t)(low + 101);
+  assert((int32_t)dispatch("_CFPropertyListWrite", a) > 0);
+  assert(low[100] == 0xabcddcba && low[101] == 0 && low[102] == 0x12344321);
+  a[0] = output; dispatch("_CFWriteStreamClose", a);
+  a[0] = 0; a[1] = token(file_url);
+  uint32_t input = dispatch("_CFReadStreamCreateWithFile", a);
+  a[0] = input; assert(dispatch("_CFReadStreamOpen", a));
+  low[104] = 0xfeedbeef; low[105] = 0; low[106] = 0xcafebabe;
+  a[0] = 0; a[1] = input; a[2] = 0; a[3] = kCFPropertyListImmutable;
+  a[4] = (uint32_t)(uintptr_t)(low + 105);
+  a[5] = (uint32_t)(uintptr_t)(low + 101);
+  uint32_t value = dispatch("_CFPropertyListCreateWithStream", a);
+  assert(CFEqual(objc_bridge32_host_object(value), CFSTR("MW2 plist round trip")));
+  assert(low[105] == kCFPropertyListXMLFormat_v1_0 && !low[101]);
+  assert(low[104] == 0xfeedbeef && low[106] == 0xcafebabe);
+  assert(low[100] == 0xabcddcba && low[102] == 0x12344321);
+  a[0] = input; dispatch("_CFReadStreamClose", a);
+  FILE *bad = fopen(file_path, "w"); assert(bad); fputs("invalid plist", bad); fclose(bad);
+  a[0] = 0; a[1] = token(file_url);
+  input = dispatch("_CFReadStreamCreateWithFile", a);
+  a[0] = input; assert(dispatch("_CFReadStreamOpen", a));
+  a[0] = 0; a[1] = input;
+  assert(!dispatch("_CFPropertyListCreateWithStream", a));
+  assert(low[101] && CFGetTypeID(objc_bridge32_host_object(low[101])) == CFErrorGetTypeID());
+  assert(low[100] == 0xabcddcba && low[102] == 0x12344321);
+  a[0] = input; dispatch("_CFReadStreamClose", a);
+  CFRelease(file_url); unlink(file_path);
   CFRelease(data);
   CFRelease(url);
   for (unsigned i = 1; i <= count; ++i)
@@ -139,5 +185,5 @@ int main(void) {
   assert(released == retained);
   munmap(low, 4096);
   puts("CFNetwork bridge: HTTP data, constants, run loops, timers, stream "
-       "callbacks and ownership PASS");
+       "callbacks, file plists, error canaries and ownership PASS");
 }

@@ -344,9 +344,21 @@ int objc_legacy32_run_lifetime_self_test(void) {
     bool valid=token && objc_legacy32_object(token)==object;
     [object release];
     valid=valid && objc_legacy32_object(token)==NULL;
+    uint64_t pool = 0, result = 0;
+    uint32_t pool_alloc[] = {objc_bridge32_guest_object([NSAutoreleasePool class]),
+                            objc_bridge32_guest_selector("alloc")};
+    valid = valid && objc_bridge32_dispatch("_objc_msgSend", pool_alloc, &pool);
+    object = [[cls alloc] init];
+    token = objc_legacy32_token(object);
+    uint32_t autorelease[] = {token, objc_bridge32_guest_selector("autorelease")};
+    valid = valid && objc_bridge32_dispatch("_objc_msgSend", autorelease, &result);
+    valid = valid && result == token && objc_legacy32_object(token) == object;
+    uint32_t drain[] = {(uint32_t)pool, objc_bridge32_guest_selector("drain")};
+    valid = valid && objc_bridge32_dispatch("_objc_msgSend", drain, &result);
+    valid = valid && objc_legacy32_object(token) == NULL;
     --class_count;
     compat_runtime32_deallocate(guest->name);compat_runtime32_deallocate(metadata);
-    if(valid)puts("Legacy Objective-C lifetime self-test: PASS (identity map permits deallocation)");
+    if(valid)puts("Legacy Objective-C lifetime self-test: PASS (identity map permits deallocation; guest autorelease scope preserves subclasses)");
     return valid?0:-1;
 }
 

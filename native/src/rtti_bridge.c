@@ -15,6 +15,8 @@ static struct {
   unsigned kind;
 } types[4096];
 static unsigned type_count;
+/* Bumped whenever the registry is rebuilt; invalidates cached cast results. */
+static uint32_t registry_generation = 1;
 static unsigned rtti_kind(const char *name) {
   if (!strcmp(name, "__ZTVN10__cxxabiv117__class_type_infoE")) return 1;
   if (!strcmp(name, "__ZTVN10__cxxabiv120__si_class_type_infoE")) return 2;
@@ -83,6 +85,7 @@ static void bind_types(const uint8_t *p, const uint8_t *end,
 }
 void rtti_bridge32_initialize(const struct macho_image32 *image) {
   type_count = 0;
+  __atomic_add_fetch(&registry_generation, 1, __ATOMIC_RELAXED);
   const struct symtab_command *sym = NULL;
   const struct dysymtab_command *dysym = NULL;
   const struct segment_command *linkedit = NULL, *segments[16];
@@ -141,9 +144,19 @@ void rtti_bridge32_initialize(const struct macho_image32 *image) {
 }
 static const uint32_t *words(uint32_t p) { return (const void *)(uintptr_t)p; }
 static unsigned kind_of(uint32_t type) {
+  /* Rendering repeatedly casts the same few resource types. Cache the index,
+     not the cast result: virtual-base offsets still come from each object.
+     Validate the index against the live registry so rebuilding it is safe. */
+  static _Thread_local uint16_t recent[256];
+  unsigned slot = ((type >> 4) ^ (type >> 12)) & 255;
+  unsigned cached = recent[slot];
+  if (cached && cached <= type_count && types[cached - 1].address == type)
+    return types[cached - 1].kind;
   for (unsigned i = 0; i < type_count; ++i)
-    if (types[i].address == type)
+    if (types[i].address == type) {
+      recent[slot] = (uint16_t)(i + 1);
       return types[i].kind;
+    }
   return 0;
 }
 static bool same_type(uint32_t a, uint32_t b) {
@@ -190,20 +203,50 @@ static void visit(struct hierarchy *tree, uint32_t type, uint32_t object,
           depth + 1);
   }
 }
+static uint32_t cast_uncached(uint32_t object, uint32_t source, uint32_t target,
+                              uint32_t complete, uint32_t type);
+/* MW2's renderer casts thousands of objects per frame. Itanium vtables are
+   emitted per (complete type, subobject) pair, so an object's vtable pointer
+   and its complete object's vtable pointer fix the dynamic type and every
+   subobject position, including virtual-base offsets (which those vtables
+   store). The cast result is therefore a fixed displacement for that pair. */
+struct cast_entry {
+  uint32_t vtable, complete_vtable, source, target, generation;
+  int32_t delta;
+  bool found;
+};
 uint32_t rtti_bridge32_cast(uint32_t object, uint32_t source, uint32_t target) {
-  if (getenv("LP32_TRACE_RTTI")) {
+  static int trace = -1;
+  if (trace < 0) trace = getenv("LP32_TRACE_RTTI") != NULL;
+  if (trace) {
     fprintf(stderr,"compat32: cast object=%#x source=%#x(%u) target=%#x(%u) types=%u\n",object,source,kind_of(source),target,kind_of(target),type_count);
     if(object) {uint32_t v=words(object)[0];fprintf(stderr,"compat32: cast vtable=%#x type=%#x(%u)\n",v,v>=8?words(v-4)[0]:0,v>=8?kind_of(words(v-4)[0]):0);}
   }
-  if (!object || !kind_of(source) || !kind_of(target))
+  if (!object)
     return 0;
   uint32_t vtable = words(object)[0];
   if (vtable < 8)
     return 0;
-  uint32_t complete = object + (int32_t)words(vtable - 8)[0],
-           type = words(vtable - 4)[0];
-  if (!kind_of(type))
-    return 0;
+  uint32_t complete = object + (int32_t)words(vtable - 8)[0];
+  static _Thread_local struct cast_entry cache[512];
+  uint32_t complete_vtable = words(complete)[0];
+  uint32_t generation = __atomic_load_n(&registry_generation, __ATOMIC_RELAXED);
+  unsigned slot = ((vtable >> 3) ^ (source >> 4) * 7 ^ (target >> 4) * 13) & 511;
+  struct cast_entry *entry = &cache[slot];
+  if (entry->generation == generation && entry->vtable == vtable &&
+      entry->complete_vtable == complete_vtable && entry->source == source &&
+      entry->target == target)
+    return entry->found ? object + (uint32_t)entry->delta : 0;
+  uint32_t type = words(vtable - 4)[0];
+  uint32_t result = kind_of(source) && kind_of(target) && kind_of(type)
+                        ? cast_uncached(object, source, target, complete, type)
+                        : 0;
+  *entry = (struct cast_entry){vtable, complete_vtable, source, target, generation,
+                               (int32_t)(result - object), result != 0};
+  return result;
+}
+static uint32_t cast_uncached(uint32_t object, uint32_t source, uint32_t target,
+                              uint32_t complete, uint32_t type) {
   struct hierarchy all = {0};
   visit(&all, type, complete, true, 0);
   if (all.overflow)

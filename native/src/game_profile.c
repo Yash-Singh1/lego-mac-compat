@@ -401,6 +401,83 @@ static const struct lp32_game_profile cod4_mp_profile = {
     .thread_argument_is_direct = 1,
 };
 
+/* Aspyr's WaitForSingleObject shim treats any timeout below 2 ms as a poll
+   (`cmp $2,%ebx; jb timeout`). MW2's render workers wait on the backend
+   event with a 1 ms timeout, so they spin on the event mutex, contending
+   with the render thread that signals it. Windows sleeps for the timeout;
+   lowering the threshold to 1 makes it a real timed wait, and SetEvent's
+   broadcast still wakes the workers the moment work arrives. */
+static const struct lp32_code_patch mw2_code_patches[] = {
+    /* The original spin counts make millions of cross-ABI trylock calls
+       during shader loading. These routines already fall back to blocking
+       pthread_mutex_lock after the spin; use that path immediately. */
+    {
+        .address = 0x00082ce6,
+        .expected = {0xe8, 0xbb, 0xfb, 0x2d, 0x00},
+        .replacement = {0xe8, 0xb5, 0xfb, 0x2d, 0x00},
+        .length = 5,
+        .reason = "ASLCriticalSection waits for contended locks without spinning",
+    },
+    {
+        .address = 0x000af7d4,
+        .expected = {0xe8, 0xcd, 0x30, 0x2b, 0x00},
+        .replacement = {0xe8, 0xc7, 0x30, 0x2b, 0x00},
+        .length = 5,
+        .reason = "EnterCriticalSection waits for contended locks without spinning",
+    },
+    {
+        .address = 0x000af431,
+        .expected = {0x83, 0xfb, 0x02, 0x0f, 0x82},
+        .replacement = {0x83, 0xfb, 0x01, 0x0f, 0x82},
+        .length = 5,
+        .reason = "WaitForSingleObject 1 ms timeout waits instead of polling",
+    },
+    /* Load_CreateMaterialPixelShader/VertexShader Sleep(1) after every 10 ms
+       of shader creation so a single-core 2009 machine could still draw the
+       loading screen. Under translation that is hundreds of sleeps per
+       mission load; the render thread has its own core. */
+    {
+        .address = 0x0011a723,
+        .expected = {0xe8, 0xda, 0xcd, 0x1a, 0x00},
+        .replacement = {0x0f, 0x1f, 0x44, 0x00, 0x00},
+        .length = 5,
+        .reason = "pixel shader creation does not sleep between shaders",
+    },
+    {
+        .address = 0x0011a82f,
+        .expected = {0xe8, 0xce, 0xcc, 0x1a, 0x00},
+        .replacement = {0x0f, 0x1f, 0x44, 0x00, 0x00},
+        .length = 5,
+        .reason = "vertex shader creation does not sleep between shaders",
+    },
+    {0},
+};
+
+/* MW2's LC_MAIN identifies the game entry. No COD4 address-based patches
+   apply to either MW2 executable. The Aspyr Game Guide launcher is separate. */
+static const struct lp32_game_profile mw2_profile = {
+    .title = LP32_TITLE_MW2,
+    .name = "MW2",
+    .display_name = "Call of Duty: Modern Warfare 2",
+    .log_directory = "MW2Compat",
+    .image_file = "MW2.image",
+    .callee_pops_struct_return = 1,
+    .thread_argument_is_direct = 1,
+    .steam_app_id = 10180,
+    .code_patches = mw2_code_patches,
+};
+
+static const struct lp32_game_profile mw2_mp_profile = {
+    .title = LP32_TITLE_MW2_MP,
+    .name = "MW2MP",
+    .display_name = "Call of Duty: Modern Warfare 2 Multiplayer",
+    .log_directory = "MW2MPCompat",
+    .image_file = "MW2MP.image",
+    .callee_pops_struct_return = 1,
+    .thread_argument_is_direct = 1,
+    .steam_app_id = 10190,
+};
+
 static const struct lp32_game_profile *const known_profiles[] = {
     &pirates_profile,
     &clone_wars_profile,
@@ -410,6 +487,8 @@ static const struct lp32_game_profile *const known_profiles[] = {
     &saga_steam_profile,
     &cod4_profile,
     &cod4_mp_profile,
+    &mw2_profile,
+    &mw2_mp_profile,
 };
 
 static const struct lp32_game_profile *current_profile = &unknown_profile;
@@ -478,6 +557,8 @@ const struct lp32_game_profile *lp32_profile_named(const char *name)
     if (!name) return NULL;
     if (!strcasecmp(name, "cod") || !strcasecmp(name, "cod4")) return &cod4_profile;
     if (!strcasecmp(name, "cod4mp") || !strcasecmp(name, "cod4-mp")) return &cod4_mp_profile;
+    if (!strcasecmp(name, "mw2") || !strcasecmp(name, "codmw2")) return &mw2_profile;
+    if (!strcasecmp(name, "mw2mp") || !strcasecmp(name, "mw2-mp")) return &mw2_mp_profile;
     for (size_t index = 0; index < sizeof(known_profiles) / sizeof(known_profiles[0]); ++index) {
         if (strcasecmp(known_profiles[index]->name, name) == 0) {
             return known_profiles[index];
@@ -567,7 +648,7 @@ int lp32_profile_select(const struct macho_image32 *image, const char *image_pat
     } else {
         for (size_t index = 0; index < sizeof(known_profiles) / sizeof(known_profiles[0]); ++index) {
             const struct lp32_game_profile *candidate = known_profiles[index];
-            if (candidate->entry_eip == image->entry_eip &&
+            if (candidate->entry_eip && candidate->entry_eip == image->entry_eip &&
                 candidate->image_end == image->max_address) {
                 selected = candidate;
                 break;
@@ -581,6 +662,8 @@ int lp32_profile_select(const struct macho_image32 *image, const char *image_pat
     if (!selected && image_path) {
         const char *name = strrchr(image_path, '/');
         name = name ? name + 1 : image_path;
+        if (!strcmp(name, "MW2.image")) selected = &mw2_profile;
+        if (!strcmp(name, "MW2MP.image")) selected = &mw2_mp_profile;
         if (!strcmp(name, "COD4.image") || !strcmp(name, "COD4MP.image")) {
             /* Other Mac releases may place functions at different addresses.
                Retain title-level ABI handling, but never apply the tested

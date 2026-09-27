@@ -83,3 +83,13 @@ int tlv_bridge32_dispatch(const char *name,const uint32_t *a,uint64_t *out) {
     }
     *out=s->base+offset;return 1;
 }
+
+static uint64_t fast_tlv_get_addr(const uint32_t *a,uint32_t caller) {
+    uint64_t out=0;
+    if(!tlv_bridge32_dispatch("_lp32_tlv_get_addr",a,&out))
+        compat_runtime32_trap_import("_lp32_tlv_get_addr",a,caller);
+    return out;
+}
+lp32_fast_import_fn tlv_bridge32_fast_import(const char *name) {
+    return strcmp(name,"_lp32_tlv_get_addr")?NULL:fast_tlv_get_addr;
+}

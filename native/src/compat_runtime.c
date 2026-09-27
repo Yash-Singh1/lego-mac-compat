@@ -5,6 +5,7 @@
 #include "audio_converter_bridge.h"
 #include "sound_manager_bridge.h"
 #include "time_manager_bridge.h"
+#include "audio_queue_bridge.h"
 #include "openal_bridge.h"
 #include "curl_bridge.h"
 #include "controller_bridge.h"
@@ -16,9 +17,11 @@
 #include "quicktime_bridge.h"
 #include "stl_bridge.h"
 #include "libcpp_bridge.h"
+#include "libcpp_future_bridge.h"
 #include "blocks_bridge.h"
 #include "rtti_bridge.h"
 #include "regex_bridge.h"
+#include "iconv_bridge.h"
 #include "zlib_bridge.h"
 #include "socket_bridge.h"
 #include "dlfcn_bridge.h"
@@ -41,11 +44,13 @@
 #include <locale.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <mach/mach_vm.h>
 #include <mach-o/dyld.h>
 #include <math.h>
 #include <zlib.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -67,6 +72,7 @@ extern const uint8_t lp32_context_start[], lp32_context_end[];
 extern const uint8_t lp32_context_setjmp[], lp32_context_fast_setjmp[], lp32_context_sigsetjmp[];
 extern const uint8_t lp32_context_longjmp[], lp32_context_fast_longjmp[];
 extern const uint8_t lp32_context_save_helper[], lp32_context_restore_helper[];
+extern const uint8_t lp32_context_strcmp[], lp32_context_tolower[], lp32_context_lower_table[];
 static uint32_t guest_context_symbol(const char *name);
 
 uint16_t lp32_cs32;
@@ -113,9 +119,15 @@ enum {
     kGateway64Offset = kHost64PadsOffset + 0x040,
     kReturn64AltOffset = kHost64PadsOffset + 0x080,
     kGateway64AltOffset = kHost64PadsOffset + 0x0c0,
+    /* Further retry pads after the alternates: one 0x80 stride holds a
+       return and a gateway pad, 0x40 holds one landing trampoline. */
+    kHost64RetryOffset = kHost64PadsOffset + 0x100,
     kLanding32Offset = 0xe000,
     kLanding32AltOffset = 0xe040,
+    kLanding32RetryOffset = 0xe080,
+    kModeRetryPads = 28,
     kGuestContextOffset = 0xf000,
+    kGuestLowercaseOffset = 0x7000,
     /* Mode-guard event counters: the bridge data region holds import data
        cells from 0x0000, the rune locale from 0x6000, Cocoa proxy slots from
        0x8000 (objc_bridge) and the
@@ -127,6 +139,11 @@ enum {
     kModeGuardFailedCounter = kBridgeDataBase + kModeGuardCountersOffset + 8,
 };
 
+_Static_assert(kHost64RetryOffset + kModeRetryPads * 0x80 <= kLanding32Offset,
+               "64-bit retry pads overflow their page");
+/* game_loader places COD4's loading-screen stubs at 0x7f00e800. */
+_Static_assert(kLanding32RetryOffset + kModeRetryPads * 0x40 <= 0xe800,
+               "i386 retry trampolines overlap game_loader's stubs at 0xe800");
 _Static_assert(kImportThunksOffset + kInlineImportCapacity * kImportThunkSize <=
                kDynamicThunksOffset, "static import thunks overlap dynamic thunks");
 _Static_assert(kDynamicThunksOffset + kDynamicThunkCapacity * kImportThunkSize <=
@@ -404,7 +421,7 @@ static uint32_t guest_cond_count;
 static uint32_t guest_cond_capacity;
 static uint64_t guest_sync_released_count;
 static pthread_mutex_t guest_sync_table_lock = PTHREAD_MUTEX_INITIALIZER;
-static char dynamic_symbol_names[kDynamicThunkCapacity][96];
+static char dynamic_symbol_names[kDynamicThunkCapacity][256];
 static uint32_t dynamic_symbol_count;
 
 /*
@@ -707,6 +724,7 @@ struct host_sync_free_node {
 
 static struct host_sync_free_node *free_host_mutexes;
 static struct host_sync_free_node *free_host_conditions;
+static void recycle_host_mutex(pthread_mutex_t *mutex);
 
 static int initialize_host_mutex(pthread_mutex_t *mutex)
 {
@@ -718,6 +736,78 @@ static int initialize_host_mutex(pthread_mutex_t *mutex)
     return status;
 }
 
+/*
+ * Lock-free guest mutex lookup.  Every guest lock, trylock and unlock must
+ * find the host mutex for a guest address; doing that under
+ * guest_sync_table_lock serialized all guest threads (MW2's renderer makes
+ * millions of lock calls per second).  Host mutexes live in an arena that
+ * never moves or shrinks, so a 32-bit arena index names one, and each map
+ * slot packs (guest address << 32 | index + 1) into a single atomic word.
+ * Readers probe without locking; inserts and removals happen under
+ * guest_sync_table_lock, and removals leave a tombstone so probes continue.
+ * A miss simply falls back to the locked table, which stays authoritative.
+ */
+enum {
+    kHostMutexArenaCapacity = 1u << 20,
+    kGuestMutexMapBits = 20,
+    kGuestMutexMapSize = 1u << kGuestMutexMapBits,
+};
+static uint8_t *host_mutex_arena;
+static uint32_t host_mutex_arena_used;
+static _Atomic uint64_t guest_mutex_map[kGuestMutexMapSize];
+static const uint64_t kGuestMutexMapTombstone = UINT64_C(0xffffffff) << 32;
+
+static uint32_t guest_mutex_map_home(uint32_t address)
+{
+    return (uint32_t)(((address >> 2) * UINT32_C(2654435761)) >> (32 - kGuestMutexMapBits));
+}
+
+static pthread_mutex_t *guest_mutex_map_find(uint32_t address)
+{
+    if (!address || address == UINT32_MAX || !host_mutex_arena) return NULL;
+    uint32_t slot = guest_mutex_map_home(address);
+    for (uint32_t probe = 0; probe < kGuestMutexMapSize; ++probe) {
+        uint64_t entry = atomic_load_explicit(&guest_mutex_map[(slot + probe) & (kGuestMutexMapSize - 1)],
+                                              memory_order_acquire);
+        if (!entry) return NULL;
+        if ((uint32_t)(entry >> 32) == address)
+            return (pthread_mutex_t *)(void *)(host_mutex_arena +
+                (size_t)((uint32_t)entry - 1) * sizeof(pthread_mutex_t));
+    }
+    return NULL;
+}
+
+/* guest_sync_table_lock held. */
+static void guest_mutex_map_insert(uint32_t address, pthread_mutex_t *mutex)
+{
+    if (!address || address == UINT32_MAX) return;
+    uint32_t index = (uint32_t)(((uint8_t *)mutex - host_mutex_arena) / sizeof(pthread_mutex_t));
+    uint32_t slot = guest_mutex_map_home(address);
+    for (uint32_t probe = 0; probe < kGuestMutexMapSize / 2; ++probe) {
+        _Atomic uint64_t *cell = &guest_mutex_map[(slot + probe) & (kGuestMutexMapSize - 1)];
+        uint64_t entry = atomic_load_explicit(cell, memory_order_relaxed);
+        if (entry && entry != kGuestMutexMapTombstone && (uint32_t)(entry >> 32) != address) continue;
+        atomic_store_explicit(cell, (uint64_t)address << 32 | (index + 1), memory_order_release);
+        return;
+    }
+}
+
+/* guest_sync_table_lock held. */
+static void guest_mutex_map_remove(uint32_t address)
+{
+    if (!address || address == UINT32_MAX) return;
+    uint32_t slot = guest_mutex_map_home(address);
+    for (uint32_t probe = 0; probe < kGuestMutexMapSize; ++probe) {
+        _Atomic uint64_t *cell = &guest_mutex_map[(slot + probe) & (kGuestMutexMapSize - 1)];
+        uint64_t entry = atomic_load_explicit(cell, memory_order_relaxed);
+        if (!entry) return;
+        if ((uint32_t)(entry >> 32) == address) {
+            atomic_store_explicit(cell, kGuestMutexMapTombstone, memory_order_release);
+            return;
+        }
+    }
+}
+
 static pthread_mutex_t *create_host_mutex(void)
 {
     pthread_mutex_t *mutex;
@@ -726,12 +816,18 @@ static pthread_mutex_t *create_host_mutex(void)
         free_host_mutexes = node->next;
         mutex = (pthread_mutex_t *)node;
     } else {
-        mutex = malloc(sizeof(*mutex) > sizeof(struct host_sync_free_node) ?
-                       sizeof(*mutex) : sizeof(struct host_sync_free_node));
-        if (!mutex) return NULL;
+        if (!host_mutex_arena) {
+            void *arena = mmap(NULL, (size_t)kHostMutexArenaCapacity * sizeof(pthread_mutex_t),
+                               PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+            if (arena == MAP_FAILED) return NULL;
+            host_mutex_arena = arena;
+        }
+        if (host_mutex_arena_used == kHostMutexArenaCapacity) return NULL;
+        mutex = (pthread_mutex_t *)(void *)(host_mutex_arena +
+            (size_t)host_mutex_arena_used++ * sizeof(pthread_mutex_t));
     }
     if (initialize_host_mutex(mutex) != 0) {
-        free(mutex);
+        recycle_host_mutex(mutex);
         return NULL;
     }
     return mutex;
@@ -780,6 +876,8 @@ static uint32_t guest_mutex_index_cache[kGuestMutexIndexCacheSize];
 
 static pthread_mutex_t *host_mutex_for_guest(uint32_t address, bool create)
 {
+    pthread_mutex_t *mapped = guest_mutex_map_find(address);
+    if (mapped) return mapped;
     uint32_t *cached = &guest_mutex_index_cache[
         (address >> 3) % kGuestMutexIndexCacheSize];
     pthread_mutex_lock(&guest_sync_table_lock);
@@ -820,6 +918,7 @@ static pthread_mutex_t *host_mutex_for_guest(uint32_t address, bool create)
     struct guest_mutex_entry *entry = &guest_mutexes[guest_mutex_count++];
     entry->address = address;
     entry->mutex = mutex;
+    guest_mutex_map_insert(address, mutex);
     pthread_mutex_unlock(&guest_sync_table_lock);
     return mutex;
 }
@@ -852,6 +951,7 @@ static uint32_t guest_mutex_destroy(uint32_t address)
         if (entry->address != address) continue;
         int status = pthread_mutex_destroy(entry->mutex);
         if (status == 0) {
+            guest_mutex_map_remove(address);
             recycle_host_mutex(entry->mutex);
             *entry = guest_mutexes[--guest_mutex_count];
             ++guest_sync_released_count;
@@ -1240,6 +1340,16 @@ static void initialize_guest_rune_locale(void)
     memcpy(locale->mapupper, _DefaultRuneLocale.__mapupper, sizeof(locale->mapupper));
 }
 
+_Static_assert(kGuestRuneLocaleOffset + sizeof(struct guest_rune_locale32) <=
+               kGuestLowercaseOffset, "lowercase table overlaps rune locale");
+_Static_assert(kGuestLowercaseOffset + 256 * sizeof(uint32_t) <=
+               kModeGuardCountersOffset, "lowercase table overlaps counters");
+static void update_guest_lowercase_table(void)
+{
+    uint32_t *table = (void *)(uintptr_t)(kBridgeDataBase + kGuestLowercaseOffset);
+    for (unsigned i = 0; i < 256; ++i) table[i] = (uint32_t)tolower((unsigned char)i);
+}
+
 static int build_transition_bridge(void)
 {
     uint8_t *code = (void *)(uintptr_t)kBridgeCodeBase;
@@ -1267,9 +1377,20 @@ static int build_transition_bridge(void)
     };
     memcpy(code + kExitFarPointerOffset, &exit_far, sizeof(exit_far));
 
+    /* Each wrong-mode landing retries through the next pad in its chain
+       (primary, alternate, then kModeRetryPads more); the last one traps.
+       MW2's render workers make enough import calls during translation
+       churn to miss twice in a row, which a single alternate turned into a
+       crash. */
     emit_return64_pad(code + kReturn64Offset,
                       kBridgeCodeBase + kReturn64AltOffset, cs64);
-    emit_return64_pad(code + kReturn64AltOffset, 0, cs64);
+    emit_return64_pad(code + kReturn64AltOffset,
+                      kBridgeCodeBase + kHost64RetryOffset, cs64);
+    for (uint32_t pad = 0; pad < kModeRetryPads; ++pad) {
+        uint32_t next = pad + 1 < kModeRetryPads ?
+            kBridgeCodeBase + kHost64RetryOffset + (pad + 1) * 0x80 : 0;
+        emit_return64_pad(code + kHost64RetryOffset + pad * 0x80, next, cs64);
+    }
 
     const struct far_ptr32 gateway_far = {
         .offset = kBridgeCodeBase + kGateway64Offset,
@@ -1279,10 +1400,21 @@ static int build_transition_bridge(void)
 
     emit_gateway64_pad(code + kGateway64Offset,
                        kBridgeCodeBase + kGateway64AltOffset, cs64);
-    emit_gateway64_pad(code + kGateway64AltOffset, 0, cs64);
+    emit_gateway64_pad(code + kGateway64AltOffset,
+                       kBridgeCodeBase + kHost64RetryOffset + 0x40, cs64);
+    for (uint32_t pad = 0; pad < kModeRetryPads; ++pad) {
+        uint32_t next = pad + 1 < kModeRetryPads ?
+            kBridgeCodeBase + kHost64RetryOffset + (pad + 1) * 0x80 + 0x40 : 0;
+        emit_gateway64_pad(code + kHost64RetryOffset + pad * 0x80 + 0x40, next, cs64);
+    }
 
     emit_landing32(code + kLanding32Offset, kBridgeCodeBase + kLanding32AltOffset);
-    emit_landing32(code + kLanding32AltOffset, 0);
+    emit_landing32(code + kLanding32AltOffset, kBridgeCodeBase + kLanding32RetryOffset);
+    for (uint32_t pad = 0; pad < kModeRetryPads; ++pad) {
+        uint32_t next = pad + 1 < kModeRetryPads ?
+            kBridgeCodeBase + kLanding32RetryOffset + (pad + 1) * 0x40 : 0;
+        emit_landing32(code + kLanding32RetryOffset + pad * 0x40, next);
+    }
 
     for (uint32_t index = 0; index < current_image->import_count; ++index) {
         const struct macho_import32 *import = &current_image->imports[index];
@@ -1342,6 +1474,7 @@ static int build_transition_bridge(void)
     size_t data_cells = 0;
     memset(data_cell, 0, kBridgeDataSize);
     initialize_guest_rune_locale();
+    update_guest_lowercase_table();
     for (uint32_t index = 0; index < current_image->import_count; ++index) {
         if (current_image->imports[index].target) continue;
         if (current_image->imports[index].kind != MACHO_IMPORT32_POINTER) continue;
@@ -1366,6 +1499,8 @@ static int build_transition_bridge(void)
         if (strcmp(current_image->imports[index].name, "_mach_task_self_") == 0) {
             data_cell[data_cells] = mach_task_self();
         }
+        if (strcmp(current_image->imports[index].name, "_vm_page_size") == 0)
+            data_cell[data_cells] = (uint32_t)vm_page_size;
         uint32_t objc_pointer =
             objc_bridge32_pointer_import(current_image->imports[index].name);
         if (objc_pointer) data_cell[data_cells] = objc_pointer;
@@ -1379,6 +1514,8 @@ static int build_transition_bridge(void)
     if (context_size > kBridgeCodeSize - kGuestContextOffset)
         return runtime_error("guest context page overflow");
     memcpy(code + kGuestContextOffset, lp32_context_start, context_size);
+    emit_u32(code + kGuestContextOffset + (lp32_context_lower_table - lp32_context_start),
+             kBridgeDataBase + kGuestLowercaseOffset);
     uint32_t helper = compat_runtime32_guest_callback("_lp32_context_signal_mask");
     emit_u32(code + kGuestContextOffset + (lp32_context_save_helper - lp32_context_start), helper);
     emit_u32(code + kGuestContextOffset + (lp32_context_restore_helper - lp32_context_start), helper);
@@ -1394,13 +1531,19 @@ static int build_transition_bridge(void)
 
 static uint32_t guest_context_symbol(const char *name)
 {
-    if (lp32_profile()->title != LP32_TITLE_COD4 && lp32_profile()->title != LP32_TITLE_COD4_MP) return 0;
+    if (lp32_profile()->title != LP32_TITLE_COD4 && lp32_profile()->title != LP32_TITLE_COD4_MP &&
+        lp32_profile()->title != LP32_TITLE_MW2 && lp32_profile()->title != LP32_TITLE_MW2_MP) return 0;
     const uint8_t *entry = NULL;
     if (!strcmp(name, "_setjmp")) entry = lp32_context_setjmp;
     else if (!strcmp(name, "__setjmp")) entry = lp32_context_fast_setjmp;
     else if (!strcmp(name, "_sigsetjmp")) entry = lp32_context_sigsetjmp;
     else if (!strcmp(name, "_longjmp") || !strcmp(name, "_siglongjmp")) entry = lp32_context_longjmp;
     else if (!strcmp(name, "__longjmp")) entry = lp32_context_fast_longjmp;
+    else if ((lp32_profile()->title == LP32_TITLE_MW2 || lp32_profile()->title == LP32_TITLE_MW2_MP) &&
+             !getenv("LP32_NO_GUEST_LIBC")) {
+        if (!strcmp(name, "_strcmp")) entry = lp32_context_strcmp;
+        else if (!strcmp(name, "___tolower")) entry = lp32_context_tolower;
+    }
     return entry ? kBridgeCodeBase + kGuestContextOffset + (uint32_t)(entry - lp32_context_start) : 0;
 }
 
@@ -1413,7 +1556,7 @@ static uint32_t guest_thunk_for_dynamic_symbol(const char *name)
             return kBridgeCodeBase + kDynamicThunksOffset + index * kImportThunkSize;
         }
     }
-    if (dynamic_symbol_count >= kDynamicThunkCapacity || strlen(name) >= 96) return 0;
+    if (dynamic_symbol_count >= kDynamicThunkCapacity || strlen(name) >= sizeof(dynamic_symbol_names[0])) return 0;
     uint32_t index = dynamic_symbol_count++;
     strcpy(dynamic_symbol_names[index], name);
     return kBridgeCodeBase + kDynamicThunksOffset + index * kImportThunkSize;
@@ -1445,7 +1588,7 @@ uint32_t compat_runtime32_resolve_symbol(const char *name, int data_hint)
     uint32_t value = guest_standard_file_import(name);
     if (!value) value = objc_bridge32_pointer_import(name);
     bool data = value || !strcmp(name, "_errno") ||
-        !strcmp(name, "_mach_task_self_") || !strcmp(name, "_environ") ||
+        !strcmp(name, "_mach_task_self_") || !strcmp(name, "_vm_page_size") || !strcmp(name, "_environ") ||
         !strcmp(name, "___stack_chk_guard") || !strcmp(name, "___mb_cur_max") || !strcmp(name, "___CFConstantStringClassReference") ||
         !strcmp(name, "_kCFAllocatorDefault") || !strcmp(name, "_kIOMasterPortDefault") ||
         !strncmp(name, "__ZTV", 5) || !strncmp(name, "__ZTI", 5) ||
@@ -1462,6 +1605,7 @@ uint32_t compat_runtime32_resolve_symbol(const char *name, int data_hint)
     if (!address || !copy) { free(copy); return 0; }
     cells[count++] = (struct data_symbol){copy, address};
     if (!strcmp(name, "_mach_task_self_")) value = mach_task_self();
+    if (!strcmp(name, "_vm_page_size")) value = (uint32_t)vm_page_size;
     if (!strcmp(name, "___stack_chk_guard")) value = UINT32_C(0x6b71329a);
     if (!strcmp(name, "___mb_cur_max")) value = (uint32_t)MB_CUR_MAX;
     *(uint32_t *)(uintptr_t)address = value;
@@ -3139,6 +3283,8 @@ enum import_return_kind { kReturnUnknown, kReturnOrdinary, kReturnStruct,
 static unsigned import_return_kind(const char *name)
 {
     if (strcmp(name, "__ZNKSt3__18ios_base6getlocEv") == 0 ||
+        strcmp(name, "__ZNSt3__19to_stringEm") == 0 ||
+        strcmp(name, "__ZNSt3__17promiseIvE10get_futureEv") == 0 ||
         strcmp(name, "_CFAbsoluteTimeGetGregorianDate") == 0 ||
         strcmp(name, "_CTFontGetBoundingBox") == 0 ||
         strcmp(name, "_CFUUIDGetUUIDBytes") == 0 ||
@@ -3184,6 +3330,7 @@ static uint64_t dispatch_import_chained(uint32_t import_id, const char *name,
                                             return_address);
     if (fast_slot && !*fast_slot && !fast_imports_disabled) {
         lp32_fast_import_fn handler = runtime_fast_import(name);
+        if (!handler) handler = libcpp_bridge32_fast_import(name);
         if (!handler) handler = objc_bridge32_fast_import(name);
         *fast_slot = handler ? handler : kFastImportNone;
     }
@@ -3496,10 +3643,15 @@ static uint64_t fast_memcmp(const uint32_t *a, uint32_t caller)
     (void)caller;
     return (uint32_t)memcmp((const void *)(uintptr_t)a[0], (const void *)(uintptr_t)a[1], a[2]);
 }
+/* Quake-derived engines shift strings left in place with strcpy (for example
+ * Info_RemoveKey on objective configstrings).  The i386 libc they shipped
+ * against copied forward a byte at a time; the host's vectorized strcpy
+ * corrupts overlapping copies. */
 static uint64_t fast_strcpy(const uint32_t *a, uint32_t caller)
 {
     (void)caller;
-    strcpy((char *)(uintptr_t)a[0], (const char *)(uintptr_t)a[1]);
+    const char *source = (const char *)(uintptr_t)a[1];
+    memmove((char *)(uintptr_t)a[0], source, strlen(source) + 1);
     return a[0];
 }
 static uint64_t fast_strncpy(const uint32_t *a, uint32_t caller)
@@ -3518,6 +3670,16 @@ static uint64_t fast_pthread_self(const uint32_t *a, uint32_t caller)
     (void)a; (void)caller;
     return guest_pthread_self();
 }
+static uint64_t fast_pthread_getspecific(const uint32_t *a, uint32_t caller)
+{
+    (void)caller;
+    return a[0] < 128 ? guest_pthread_values[a[0]] : 0;
+}
+static uint64_t fast_dynamic_cast(const uint32_t *a, uint32_t caller)
+{
+    (void)caller;
+    return rtti_bridge32_cast(a[0], a[1], a[2]);
+}
 
 static uint64_t fast_logf(const uint32_t *arguments, uint32_t return_address)
 {
@@ -3531,11 +3693,54 @@ static uint64_t fast_expf(const uint32_t *arguments, uint32_t return_address)
     return return_guest_float(expf(guest_float(arguments[0])));
 }
 
+/* TEMPORARY contention profile (LP32_DEBUG_MUTEX_HOT). */
+static struct { uint32_t mutex, calls, contended; uint64_t wait_ns; uint32_t trace[6]; } hot_mutexes[4096];
+static void hot_mutex_report(void)
+{
+    for (int rank = 0; rank < 8; ++rank) {
+        int best = -1;
+        for (int i = 0; i < 4096; ++i)
+            if (hot_mutexes[i].calls && (best < 0 || hot_mutexes[i].wait_ns > hot_mutexes[best].wait_ns)) best = i;
+        if (best < 0) break;
+        fprintf(stderr, "HOT mutex=%08x calls=%u contended=%u wait=%.1fms trace=%08x %08x %08x %08x %08x %08x\n",
+                hot_mutexes[best].mutex, hot_mutexes[best].calls, hot_mutexes[best].contended,
+                hot_mutexes[best].wait_ns / 1e6, hot_mutexes[best].trace[0], hot_mutexes[best].trace[1],
+                hot_mutexes[best].trace[2], hot_mutexes[best].trace[3], hot_mutexes[best].trace[4], hot_mutexes[best].trace[5]);
+        hot_mutexes[best].calls = 0;
+    }
+    memset(hot_mutexes, 0, sizeof(hot_mutexes));
+}
+
 static uint64_t fast_pthread_mutex_lock(const uint32_t *arguments,
                                         uint32_t return_address)
 {
     pthread_mutex_t *mutex = host_mutex_for_guest(arguments[0], true);
     if (!mutex) return (uint32_t)ENOMEM;
+    static int hot = -1;
+    if (hot < 0) hot = getenv("LP32_DEBUG_MUTEX_HOT") != NULL;
+    if (hot) {
+        uint32_t slot = (arguments[0] >> 3) % 4096;
+        uint64_t start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        bool contended = pthread_mutex_trylock(mutex) != 0;
+        int status = contended ? pthread_mutex_lock(mutex) : 0;
+        hot_mutexes[slot].mutex = arguments[0];
+        ++hot_mutexes[slot].calls;
+        if (contended) {
+            ++hot_mutexes[slot].contended;
+            hot_mutexes[slot].wait_ns += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start;
+            if (!hot_mutexes[slot].trace[0])
+                for (unsigned i = 0, n = 0; i < 1024 && n < 6; ++i) {
+                    uint32_t v = arguments[i];
+                    if (v > 0x1005 && v < 0x3d4000 && *(const uint8_t *)(uintptr_t)(v - 5) == 0xe8)
+                        hot_mutexes[slot].trace[n++] = v;
+                }
+        }
+        static uint64_t last_report;
+        uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        if (!last_report) last_report = now;
+        if (now - last_report > 10000000000ull) { last_report = now; hot_mutex_report(); }
+        return (uint32_t)status;
+    }
     int status = pthread_mutex_lock(mutex);
     const struct lp32_render_pool *pool = lp32_profile()->render_pool;
     if (!pool) return (uint32_t)status;
@@ -3576,6 +3781,192 @@ static uint64_t fast_pthread_mutex_unlock(const uint32_t *arguments,
     return mutex ? (uint32_t)pthread_mutex_unlock(mutex) : (uint32_t)EINVAL;
 }
 
+enum guest_printf_kind {
+    kGuestPrintf, kGuestSprintf, kGuestSnprintf, kGuestVsprintf, kGuestVsnprintf,
+    kGuestSprintfChk, kGuestVsnprintfChk,
+};
+
+/* printf-family imports; also the direct handlers for the va_list forms. */
+static uint32_t guest_printf_family(enum guest_printf_kind kind, const uint32_t *arguments,
+                                    uint32_t return_address)
+{
+    char *destination = NULL;
+    size_t destination_size = 65536;
+    const char *format;
+    const uint32_t *values;
+    bool temporary = kind == kGuestPrintf;
+    if (kind == kGuestSprintf) {
+        destination = (void *)(uintptr_t)arguments[0];
+        format = (const void *)(uintptr_t)arguments[1];
+        values = arguments + 2;
+    } else if (kind == kGuestSnprintf) {
+        destination = (void *)(uintptr_t)arguments[0];
+        destination_size = arguments[1];
+        format = (const void *)(uintptr_t)arguments[2];
+        values = arguments + 3;
+    } else if (kind == kGuestVsprintf) {
+        destination = (void *)(uintptr_t)arguments[0];
+        format = (const void *)(uintptr_t)arguments[1];
+        values = (const void *)(uintptr_t)arguments[2];
+    } else if (kind == kGuestVsnprintf) {
+        destination = (void *)(uintptr_t)arguments[0];
+        destination_size = arguments[1];
+        format = (const void *)(uintptr_t)arguments[2];
+        values = (const void *)(uintptr_t)arguments[3];
+    } else if (kind == kGuestSprintfChk) {
+        /* (dst, flag, dstlen, format, ...) */
+        destination = (void *)(uintptr_t)arguments[0];
+        destination_size = arguments[2];
+        format = (const void *)(uintptr_t)arguments[3];
+        values = arguments + 4;
+    } else if (kind == kGuestVsnprintfChk) {
+        /* (dst, maxlen, flag, dstlen, format, va_list) */
+        destination = (void *)(uintptr_t)arguments[0];
+        destination_size = arguments[1] < arguments[3] ? arguments[1] : arguments[3];
+        format = (const void *)(uintptr_t)arguments[4];
+        values = (const void *)(uintptr_t)arguments[5];
+    } else {
+        format = (const void *)(uintptr_t)arguments[0];
+        values = arguments + 1;
+    }
+
+    char *scratch = temporary || kind == kGuestSprintf ||
+                    kind == kGuestVsprintf ? malloc(65536) : destination;
+    if ((!scratch && destination_size != 0) || !format || !values) {
+        if (scratch && scratch != destination) free(scratch);
+        return (uint32_t)-1;
+    }
+    int formatted = guest_vformat(scratch,
+                                  scratch == destination ? destination_size : 65536,
+                                  format, values);
+    static int trace_resolution = -1;
+    if (trace_resolution < 0) trace_resolution = getenv("LP32_TRACE_RESOLUTION") != NULL;
+    if (trace_resolution && scratch && formatted >= 0 &&
+        (strstr(scratch, " x ") || strstr(format, " x "))) {
+        fprintf(stderr,
+                "compat32: resolution format caller=0x%08" PRIx32
+                " format=\"%s\" output=\"%s\"\n",
+                return_address, format, scratch);
+    }
+    if (!temporary && scratch != destination && destination) strcpy(destination, scratch);
+    if (temporary && formatted >= 0) fputs(scratch, stdout);
+    if (scratch != destination) free(scratch);
+    return (uint32_t)formatted;
+}
+
+static uint64_t fast_vsnprintf(const uint32_t *a, uint32_t caller)
+{
+    return guest_printf_family(kGuestVsnprintf, a, caller);
+}
+static uint64_t fast_snprintf(const uint32_t *a, uint32_t caller)
+{
+    return guest_printf_family(kGuestSnprintf, a, caller);
+}
+static uint64_t fast_sprintf(const uint32_t *a, uint32_t caller)
+{
+    return guest_printf_family(kGuestSprintf, a, caller);
+}
+
+static uint64_t fast_operator_new(const uint32_t *a, uint32_t caller)
+{
+    return guest_allocate_at(a[0], false, caller);
+}
+static uint64_t fast_operator_delete(const uint32_t *a, uint32_t caller)
+{
+    (void)caller;
+    guest_deallocate(a[0]);
+    return 0;
+}
+static uint64_t fast_udivdi3(const uint32_t *a, uint32_t caller)
+{
+    (void)caller;
+    uint64_t dividend = (uint64_t)a[0] | ((uint64_t)a[1] << 32);
+    uint64_t divisor = (uint64_t)a[2] | ((uint64_t)a[3] << 32);
+    return divisor ? dividend / divisor : 0;
+}
+static uint64_t fast_umoddi3(const uint32_t *a, uint32_t caller)
+{
+    (void)caller;
+    uint64_t dividend = (uint64_t)a[0] | ((uint64_t)a[1] << 32);
+    uint64_t divisor = (uint64_t)a[2] | ((uint64_t)a[3] << 32);
+    return divisor ? dividend % divisor : 0;
+}
+static uint64_t fast_mach_absolute_time(const uint32_t *a, uint32_t caller)
+{
+    (void)a; (void)caller;
+    return mach_absolute_time();
+}
+
+/* Math, allocator and string helpers games call thousands of times per
+   frame; the same operations as their chained cases. */
+#define FAST_FLOAT1(fn, op) static uint64_t fast_##fn(const uint32_t *a, uint32_t caller) \
+    { (void)caller; return return_guest_float(op(guest_float(a[0]))); }
+#define FAST_FLOAT2(fn, op) static uint64_t fast_##fn(const uint32_t *a, uint32_t caller) \
+    { (void)caller; return return_guest_float(op(guest_float(a[0]), guest_float(a[1]))); }
+#define FAST_DOUBLE1(fn, op) static uint64_t fast_##fn(const uint32_t *a, uint32_t caller) \
+    { (void)caller; return return_guest_double(op(guest_double(a))); }
+#define FAST_DOUBLE2(fn, op) static uint64_t fast_##fn(const uint32_t *a, uint32_t caller) \
+    { (void)caller; return return_guest_double(op(guest_double(a), guest_double(a + 2))); }
+FAST_FLOAT1(floorf, floorf)
+FAST_FLOAT1(ceilf, ceilf)
+FAST_FLOAT1(acosf, acosf)
+FAST_FLOAT1(asinf, asinf)
+FAST_FLOAT1(sinf, sinf)
+FAST_FLOAT1(cosf, cosf)
+FAST_FLOAT1(atanf, atanf)
+FAST_FLOAT1(roundf, roundf)
+FAST_FLOAT2(powf, powf)
+FAST_FLOAT2(atan2f, atan2f)
+FAST_FLOAT2(fmodf, fmodf)
+FAST_DOUBLE1(floor, floor)
+FAST_DOUBLE1(ceil, ceil)
+FAST_DOUBLE1(sin, sin)
+FAST_DOUBLE1(cos, cos)
+FAST_DOUBLE2(pow, pow)
+FAST_DOUBLE2(atan2, atan2)
+FAST_DOUBLE2(fmod, fmod)
+#undef FAST_FLOAT1
+#undef FAST_FLOAT2
+#undef FAST_DOUBLE1
+#undef FAST_DOUBLE2
+static uint64_t fast_malloc(const uint32_t *a, uint32_t caller)
+{
+    return guest_allocate_at(a[0], false, caller);
+}
+static uint64_t fast_calloc(const uint32_t *a, uint32_t caller)
+{
+    uint64_t size = (uint64_t)a[0] * a[1];
+    return size <= SIZE_MAX ? guest_allocate_at((size_t)size, true, caller) : 0;
+}
+static uint64_t fast_bzero(const uint32_t *a, uint32_t caller)
+{
+    (void)caller;
+    memset((void *)(uintptr_t)a[0], 0, a[1]);
+    return 0;
+}
+static uint64_t fast_strncmp(const uint32_t *a, uint32_t caller)
+{
+    (void)caller;
+    return (uint32_t)strncmp((const char *)(uintptr_t)a[0], (const char *)(uintptr_t)a[1], a[2]);
+}
+static uint64_t fast_divdi3(const uint32_t *a, uint32_t caller)
+{
+    (void)caller;
+    int64_t dividend = (int64_t)((uint64_t)a[0] | ((uint64_t)a[1] << 32));
+    int64_t divisor = (int64_t)((uint64_t)a[2] | ((uint64_t)a[3] << 32));
+    if (!divisor) return 0;
+    if (dividend == INT64_MIN && divisor == -1) return (uint64_t)INT64_MIN;
+    return (uint64_t)(dividend / divisor);
+}
+static uint64_t fast_moddi3(const uint32_t *a, uint32_t caller)
+{
+    (void)caller;
+    int64_t dividend = (int64_t)((uint64_t)a[0] | ((uint64_t)a[1] << 32));
+    int64_t divisor = (int64_t)((uint64_t)a[2] | ((uint64_t)a[3] << 32));
+    if (!divisor || (dividend == INT64_MIN && divisor == -1)) return 0;
+    return (uint64_t)(dividend % divisor);
+}
+
 static lp32_fast_import_fn runtime_fast_import(const char *name)
 {
     static const struct {
@@ -3607,7 +3998,48 @@ static lp32_fast_import_fn runtime_fast_import(const char *name)
         {"_pthread_mutex_lock", fast_pthread_mutex_lock},
         {"_pthread_mutex_trylock", fast_pthread_mutex_trylock},
         {"_pthread_mutex_unlock", fast_pthread_mutex_unlock},
+        {"_pthread_getspecific", fast_pthread_getspecific},
+        {"___dynamic_cast", fast_dynamic_cast},
+        {"_vsnprintf", fast_vsnprintf},
+        {"_snprintf", fast_snprintf},
+        {"_sprintf", fast_sprintf},
+        {"__Znwm", fast_operator_new},
+        {"__Znam", fast_operator_new},
+        {"__ZdlPv", fast_operator_delete},
+        {"__ZdaPv", fast_operator_delete},
+        {"___udivdi3", fast_udivdi3},
+        {"___umoddi3", fast_umoddi3},
+        {"___divdi3", fast_divdi3},
+        {"___moddi3", fast_moddi3},
+        {"_malloc", fast_malloc},
+        {"_calloc", fast_calloc},
+        {"_free", fast_operator_delete},
+        {"_bzero", fast_bzero},
+        {"___bzero", fast_bzero},
+        {"_strncmp", fast_strncmp},
+        {"_floorf", fast_floorf},
+        {"_ceilf", fast_ceilf},
+        {"_acosf", fast_acosf},
+        {"_asinf", fast_asinf},
+        {"_sinf", fast_sinf},
+        {"_cosf", fast_cosf},
+        {"_atanf", fast_atanf},
+        {"_roundf", fast_roundf},
+        {"_powf", fast_powf},
+        {"_atan2f", fast_atan2f},
+        {"_fmodf", fast_fmodf},
+        {"_floor", fast_floor},
+        {"_ceil", fast_ceil},
+        {"_sin", fast_sin},
+        {"_cos", fast_cos},
+        {"_pow", fast_pow},
+        {"_atan2", fast_atan2},
+        {"_fmod", fast_fmod},
     };
+    /* Timing traces log from the chained handler. */
+    if (!timing_trace && strcmp(name, "_mach_absolute_time") == 0) return fast_mach_absolute_time;
+    lp32_fast_import_fn tlv = tlv_bridge32_fast_import(name);
+    if (tlv) return tlv;
     for (size_t index = 0; index < sizeof(table) / sizeof(table[0]); ++index) {
         if (strcmp(name, table[index].name) == 0) return table[index].handler;
     }
@@ -3670,6 +4102,8 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
     uint64_t blocks_result;
     if (strncmp(name, "__Block_", 8) == 0 && blocks_bridge32_dispatch(name, arguments, &blocks_result)) return blocks_result;
     uint64_t libcpp_result;
+    if ((!strncmp(name,"__ZNSt3__1",9) || !strncmp(name,"_lp32_future_",13)) &&
+        libcpp_future_bridge32_dispatch(name,arguments,&libcpp_result))return libcpp_result;
     if (name[1]=='l' && tlv_bridge32_dispatch(name,arguments,&libcpp_result)) return libcpp_result;
     if ((!strncmp(name, "__ZN", 4) || !strncmp(name, "_lp32_libcpp_", 13)) &&
         libcpp_stream_bridge32_dispatch(name, arguments, &libcpp_result)) return libcpp_result;
@@ -3678,6 +4112,7 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
     if (quicktime_bridge32_dispatch(name, arguments, &qt_result)) return qt_result;
     uint64_t crypto_result;
     if (crypto_bridge32_dispatch(name, arguments, &crypto_result)) return crypto_result;
+    if (!strncmp(name,"_iconv",6) && iconv_bridge32_dispatch(name, arguments, &crypto_result)) return crypto_result;
     uint64_t carbon_result;
     if (carbon_bridge32_dispatch(name, arguments, &carbon_result)) return carbon_result;
     uint64_t stl_result;
@@ -3985,6 +4420,12 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
     if (import_is(name, "__Znwm") || import_is(name, "__Znam")) {
         return guest_allocate_at(arguments[0], false, return_address);
     }
+    if (import_is(name, "_valloc")) {
+        /* Miles copies plugin code into valloc memory, marks it RWX, and later
+           frees it, so it must be a normal heap block. _mprotect widens the
+           unaligned range to whole pages. */
+        return guest_allocate_at(arguments[0], false, return_address);
+    }
     if (import_is(name, "_calloc")) {
         uint64_t size = (uint64_t)arguments[0] * arguments[1];
         return size <= SIZE_MAX ?
@@ -4006,7 +4447,7 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
         import_is(name, "__ZNSaIcED2Ev")) {
         return 0;
     }
-    if (import_is(name,"___dynamic_cast")) return rtti_bridge32_cast(arguments[0],arguments[1],arguments[2]);
+    if (import_is(name,"___dynamic_cast")) return fast_dynamic_cast(arguments, return_address);
     if (import_is(name, "__ZNSsC2Ev")) {
         guest_string_construct(arguments[0], "", 0, return_address);
         return arguments[0];
@@ -4188,6 +4629,9 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
                                  (const char *)(uintptr_t)arguments[1], arguments[2]);
     }
     if (import_is(name, "_strcpy")) {
+        return fast_strcpy(arguments, return_address);
+    }
+    if (import_is(name, "___strcpy_chk")) {
         return fast_strcpy(arguments, return_address);
     }
     if (import_is(name, "_strncpy")) {
@@ -4386,6 +4830,7 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
         const char *value = setlocale((int)arguments[0], (void *)(uintptr_t)arguments[1]);
         static _Thread_local uint32_t locale_string;
         if (!value) return 0;
+        if (arguments[1]) update_guest_lowercase_table();
         if (locale_string) guest_deallocate(locale_string);
         locale_string = compat_runtime32_copy_cstring(value);
         return locale_string;
@@ -4440,63 +4885,19 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
         *output = buffer;
         return (uint32_t)result;
     }
-    if (import_is(name, "_sprintf") || import_is(name, "_snprintf") ||
-        import_is(name, "_vsprintf") || import_is(name, "_vsnprintf") ||
-        import_is(name, "_printf")) {
-        char *destination = NULL;
-        size_t destination_size = 65536;
-        const char *format;
-        const uint32_t *values;
-        bool temporary = import_is(name, "_printf");
-        if (import_is(name, "_sprintf")) {
-            destination = (void *)(uintptr_t)arguments[0];
-            format = (const void *)(uintptr_t)arguments[1];
-            values = arguments + 2;
-        } else if (import_is(name, "_snprintf")) {
-            destination = (void *)(uintptr_t)arguments[0];
-            destination_size = arguments[1];
-            format = (const void *)(uintptr_t)arguments[2];
-            values = arguments + 3;
-        } else if (import_is(name, "_vsprintf")) {
-            destination = (void *)(uintptr_t)arguments[0];
-            format = (const void *)(uintptr_t)arguments[1];
-            values = (const void *)(uintptr_t)arguments[2];
-        } else if (import_is(name, "_vsnprintf")) {
-            destination = (void *)(uintptr_t)arguments[0];
-            destination_size = arguments[1];
-            format = (const void *)(uintptr_t)arguments[2];
-            values = (const void *)(uintptr_t)arguments[3];
-        } else {
-            format = (const void *)(uintptr_t)arguments[0];
-            values = arguments + 1;
-        }
-
-        char *scratch = temporary || import_is(name, "_sprintf") ||
-                        import_is(name, "_vsprintf") ? malloc(65536) : destination;
-        if ((!scratch && destination_size != 0) || !format || !values) {
-            if (scratch && scratch != destination) free(scratch);
-            return (uint32_t)-1;
-        }
-        int formatted = guest_vformat(scratch,
-                                      scratch == destination ? destination_size : 65536,
-                                      format, values);
-        if (getenv("LP32_TRACE_RESOLUTION") && scratch && formatted >= 0 &&
-            (strstr(scratch, " x ") || strstr(format, " x "))) {
-            fprintf(stderr,
-                    "compat32: resolution format caller=0x%08" PRIx32
-                    " format=\"%s\" output=\"%s\"\n",
-                    return_address, format, scratch);
-        }
-        if (!temporary && scratch != destination && destination) strcpy(destination, scratch);
-        if (temporary && formatted >= 0) fputs(scratch, stdout);
-        if (scratch != destination) free(scratch);
-        return (uint32_t)formatted;
-    }
-    if (import_is(name, "_sscanf")) {
+    if (import_is(name, "_sprintf")) return guest_printf_family(kGuestSprintf, arguments, return_address);
+    if (import_is(name, "_snprintf")) return guest_printf_family(kGuestSnprintf, arguments, return_address);
+    if (import_is(name, "_vsprintf")) return guest_printf_family(kGuestVsprintf, arguments, return_address);
+    if (import_is(name, "_vsnprintf")) return guest_printf_family(kGuestVsnprintf, arguments, return_address);
+    if (import_is(name, "___sprintf_chk")) return guest_printf_family(kGuestSprintfChk, arguments, return_address);
+    if (import_is(name, "___vsnprintf_chk")) return guest_printf_family(kGuestVsnprintfChk, arguments, return_address);
+    if (import_is(name, "_printf")) return guest_printf_family(kGuestPrintf, arguments, return_address);
+    if (import_is(name, "_sscanf") || import_is(name, "_vsscanf")) {
         const char *input = (const void *)(uintptr_t)arguments[0];
         const char *format = (const void *)(uintptr_t)arguments[1];
-        return input && format ? (uint32_t)guest_vscan(input, format,
-                                                        arguments + 2) : 0;
+        const uint32_t *values = import_is(name, "_vsscanf") ?
+            (const void *)(uintptr_t)arguments[2] : arguments + 2;
+        return input && format && values ? (uint32_t)guest_vscan(input, format, values) : 0;
     }
     if (import_is(name, "_fopen")) {
         const char *path = (const char *)(uintptr_t)arguments[0];
@@ -4701,6 +5102,11 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
             pread((int)arguments[0], buffer, arguments[2], offset) :
             pwrite((int)arguments[0], buffer, arguments[2], offset));
     }
+    if (import_is(name, "_lseek")) {
+        /* i386 off_t is 64-bit: (fd, offset_lo, offset_hi, whence) -> edx:eax. */
+        off_t offset = (off_t)((uint64_t)arguments[1] | ((uint64_t)arguments[2] << 32));
+        return (uint64_t)lseek((int)arguments[0], offset, (int)arguments[3]);
+    }
     if (import_is(name, "_read") || import_is(name, "_read$UNIX2003"))
         return (uint32_t)read((int)arguments[0], (void *)(uintptr_t)arguments[1], arguments[2]);
     if (import_is(name, "_write") || import_is(name, "_write$UNIX2003"))
@@ -4805,6 +5211,10 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
     }
     if (import_is(name, "_sigprocmask"))
         return (uint32_t)sigprocmask((int)arguments[0], (void *)(uintptr_t)arguments[1], (void *)(uintptr_t)arguments[2]);
+    if (import_is(name, "_pthread_sigmask"))
+        return (uint32_t)pthread_sigmask((int)arguments[0], (void *)(uintptr_t)arguments[1], (void *)(uintptr_t)arguments[2]);
+    if (import_is(name, "_pthread_setcanceltype"))
+        return (uint32_t)pthread_setcanceltype((int)arguments[0], (void *)(uintptr_t)arguments[1]);
     if (import_is(name, "_signal")) {
         /* A 32-bit signal handler cannot be installed as a host function.
            Until asynchronous guest contexts/unwinding are supported, report
@@ -4923,6 +5333,12 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
         import_is(name, "_OSAtomicCompareAndSwapPtrBarrier")) {
         return fast_OSAtomicCompareAndSwap32(arguments, return_address);
     }
+    if (import_is(name, "_OSAtomicCompareAndSwap64Barrier") || import_is(name,"_OSAtomicCompareAndSwap64")) {
+        uint64_t expected=(uint64_t)arguments[0]|(uint64_t)arguments[1]<<32;
+        uint64_t desired=(uint64_t)arguments[2]|(uint64_t)arguments[3]<<32;
+        return __atomic_compare_exchange_n((uint64_t *)(uintptr_t)arguments[4],&expected,desired,
+            false,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST);
+    }
     if (import_is(name, "_pthread_once")) {
         return guest_pthread_once(arguments[0], arguments[1]);
     }
@@ -4967,6 +5383,7 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
     if (import_is(name, "_floorf")) return return_guest_float(floorf(guest_float(arguments[0])));
     if (import_is(name, "_rintf")) return return_guest_float(rintf(guest_float(arguments[0])));
     if (import_is(name, "_fmin")) return return_guest_double(fmin(guest_double(arguments), guest_double(arguments + 2)));
+    if (import_is(name, "_fmodf")) return return_guest_float(fmodf(guest_float(arguments[0]), guest_float(arguments[1])));
     if (import_is(name, "_fmod")) return return_guest_double(fmod(guest_double(arguments), guest_double(arguments + 2)));
     if (import_is(name, "_atan2")) return return_guest_double(atan2(guest_double(arguments), guest_double(arguments + 2)));
     if (import_is(name, "_fmaxf")) return return_guest_float(fmaxf(guest_float(arguments[0]), guest_float(arguments[1])));
@@ -5052,6 +5469,113 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
     if (import_is(name,"__ZNSt3__15mutex6unlockEv")) return fast_pthread_mutex_unlock(arguments,return_address);
     if (import_is(name,"__ZNSt3__15mutexD1Ev")) return guest_mutex_destroy(arguments[0]);
     if (import_is(name,"__ZNSt3__118condition_variableD1Ev")) return guest_cond_destroy(arguments[0]);
+    if (import_is(name,"__ZNSt3__118condition_variable10notify_allEv") ||
+        import_is(name,"__ZNSt3__118condition_variable10notify_oneEv")) {
+        pthread_cond_t *condition=host_cond_for_guest(arguments[0],true);
+        if (!condition) abort();
+        if (import_is(name,"__ZNSt3__118condition_variable10notify_allEv"))
+            pthread_cond_broadcast(condition);
+        else pthread_cond_signal(condition);
+        return 0;
+    }
+    if (import_is(name,"__ZNSt3__118condition_variable15__do_timed_waitERNS_11unique_lockINS_5mutexEEENS_6chrono10time_pointINS5_12system_clockENS5_8durationIxNS_5ratioILx1ELx1000000000EEEEEEE")) {
+        /* i386 unique_lock contains a four-byte mutex pointer followed by
+           the owns-lock bool. The absolute deadline is int64 nanoseconds. */
+        const uint32_t *lock=(const void *)(uintptr_t)arguments[1];
+        if (!lock || !((const uint8_t *)lock)[4]) abort();
+        pthread_cond_t *condition=host_cond_for_guest(arguments[0],true);
+        pthread_mutex_t *mutex=host_mutex_for_guest(lock[0],true);
+        int64_t ns=(int64_t)((uint64_t)arguments[2]|(uint64_t)arguments[3]<<32);
+        if (ns<0)ns=0;
+        struct timespec deadline={ns/1000000000,ns%1000000000};
+        if (!condition || !mutex) abort();
+        int status=pthread_cond_timedwait(condition,mutex,&deadline);
+        if (status && status!=ETIMEDOUT) abort();
+        return 0;
+    }
+    if (import_is(name, "_mmap")) {
+        off_t offset=(off_t)((uint64_t)arguments[5]|(uint64_t)arguments[6]<<32);
+        int flags=(int)arguments[3];
+        uint64_t size=arguments[1];
+        void *mapping=MAP_FAILED;
+        if (flags&MAP_FIXED) {
+            mapping=mmap((void *)(uintptr_t)arguments[0],size,(int)arguments[2],flags,(int)arguments[4],offset);
+        } else {
+            /* Rosetta rejects MAP_32BIT. Offer successive hints in the upper
+               half of the guest's 4 GB space and keep the first mapping the
+               kernel places wholly below 4 GB. */
+            for (uint64_t hint=arguments[0]?arguments[0]:UINT64_C(0x80000000);
+                 hint<UINT64_C(0x100000000) && size<=UINT64_C(0x100000000)-hint;
+                 hint+=UINT64_C(0x08000000)) {
+                mapping=mmap((void *)(uintptr_t)hint,size,(int)arguments[2],flags,(int)arguments[4],offset);
+                if (mapping==MAP_FAILED) break;
+                if ((uintptr_t)mapping<=UINT32_MAX && size<=UINT64_C(0x100000000)-(uintptr_t)mapping) break;
+                munmap(mapping,size);mapping=MAP_FAILED;errno=ENOMEM;
+            }
+        }
+        if (mapping!=MAP_FAILED && ((uintptr_t)mapping>UINT32_MAX ||
+            size>UINT64_C(0x100000000)-(uintptr_t)mapping)) {
+            munmap(mapping,size);errno=ENOMEM;return UINT32_MAX;
+        }
+        return (uint32_t)(uintptr_t)mapping;
+    }
+    if (import_is(name, "_munmap"))
+        return (uint32_t)munmap((void *)(uintptr_t)arguments[0],arguments[1]);
+    if (import_is(name, "_mprotect")) {
+        uintptr_t start=arguments[0],end=start+arguments[1];
+        int protection=(int)arguments[2];
+        if ((protection&(PROT_READ|PROT_WRITE))==(PROT_READ|PROT_WRITE)) {
+            uintptr_t page=(uintptr_t)getpagesize();
+            start&=~(page-1);
+            end=(end+page-1)&~(page-1);
+        }
+        return (uint32_t)mprotect((void *)start,end-start,protection);
+    }
+    if (import_is(name, "_host_statistics")) {
+        /* Mach statistics are arrays of fixed-width integer_t values. */
+        return (uint32_t)host_statistics(arguments[0],(int)arguments[1],
+            (host_info_t)(uintptr_t)arguments[2],(mach_msg_type_number_t *)(uintptr_t)arguments[3]);
+    }
+    if (import_is(name, "_mach_vm_region")) {
+        mach_vm_address_t *address=(void *)(uintptr_t)arguments[1],start=*address;
+        mach_vm_size_t *size=(void *)(uintptr_t)arguments[2],length=0;
+        bool guest_task=arguments[0]==mach_task_self();
+        if (guest_task && start>=UINT64_C(0x100000000)) return KERN_INVALID_ADDRESS;
+        mach_port_t object=MACH_PORT_NULL;
+        kern_return_t status=mach_vm_region(arguments[0],&start,&length,(int)arguments[3],
+            (vm_region_info_t)(uintptr_t)arguments[4],(mach_msg_type_number_t *)(uintptr_t)arguments[5],&object);
+        /* A 32-bit process cannot enumerate the loader and Rosetta mappings
+           above 4 GiB. Aspyr's address-space counter otherwise wraps forever. */
+        if (!status && guest_task && start>=UINT64_C(0x100000000)) {
+            if(object)mach_port_deallocate(mach_task_self(),object);
+            return KERN_INVALID_ADDRESS;
+        }
+        if (!status) {
+            if (guest_task && length>UINT64_C(0x100000000)-start) length=UINT64_C(0x100000000)-start;
+            *address=start;*size=length;
+            *(mach_port_t *)(uintptr_t)arguments[6]=object;
+        }
+        return (uint32_t)status;
+    }
+    if (import_is(name, "_host_page_size")) {
+        /* Under Rosetta the host reports the 16 KB arm64 kernel page, but
+           this process (and the guest's mappings) use vm_page_size. */
+        vm_size_t size=0;
+        kern_return_t status=host_page_size(arguments[0],&size);
+        if (!status && arguments[1]) *(uint32_t *)(uintptr_t)arguments[1]=(uint32_t)vm_page_size;
+        return (uint32_t)status;
+    }
+    if (import_is(name, "_nanosleep")) {
+        if (!arguments[0]) { errno=EFAULT; return UINT32_MAX; }
+        const int32_t *guest=(const void *)(uintptr_t)arguments[0];
+        struct timespec request={guest[0],guest[1]},remaining={0};
+        int status=nanosleep(&request,arguments[1]?&remaining:NULL);
+        if (status && errno==EINTR && arguments[1]) {
+            int32_t *output=(void *)(uintptr_t)arguments[1];
+            output[0]=(int32_t)remaining.tv_sec;output[1]=(int32_t)remaining.tv_nsec;
+        }
+        return (uint32_t)status;
+    }
     if (import_is(name, "_pthread_setname_np")) return (uint32_t)pthread_setname_np((const char *)(uintptr_t)arguments[0]);
     if (import_is(name, "_pthread_self")) return fast_pthread_self(arguments, return_address);
     if (import_is(name, "_pthread_equal")) return arguments[0]==arguments[1];
@@ -5197,6 +5721,14 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
         pthread_cond_t *condition = host_cond_for_guest(arguments[0], true);
         return condition ? (uint32_t)pthread_cond_broadcast(condition) : (uint32_t)ENOMEM;
     }
+    if (import_is(name, "_pthread_cond_timedwait")) {
+        pthread_cond_t *condition = host_cond_for_guest(arguments[0], true);
+        pthread_mutex_t *mutex = host_mutex_for_guest(arguments[1], false);
+        const int32_t *guest = (const void *)(uintptr_t)arguments[2];
+        if (!condition || !mutex || !guest) return (uint32_t)EINVAL;
+        struct timespec deadline = {guest[0], guest[1]};
+        return (uint32_t)pthread_cond_timedwait(condition, mutex, &deadline);
+    }
     if (import_is(name, "_pthread_cond_wait") ||
         import_is(name, "_pthread_cond_wait$UNIX2003")) {
         pthread_cond_t *condition = host_cond_for_guest(arguments[0], true);
@@ -5218,7 +5750,7 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
         return 0;
     }
     if (import_is(name, "_pthread_getspecific")) {
-        return arguments[0] < 128 ? guest_pthread_values[arguments[0]] : 0;
+        return fast_pthread_getspecific(arguments, return_address);
     }
 
     if (import_is(name, "_MPCreateSemaphore")) {
@@ -5254,13 +5786,32 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
             guest_semaphore_acquire(arguments[0]);
         if (!semaphore) return (uint32_t)-1;
         uint32_t generation = semaphore->generation;
-        if ((int32_t)arguments[1] == 0 && semaphore->count <= 0) {
+        /* Carbon Duration: 0 immediate, INT32_MAX forever, positive values
+           milliseconds, negative values microseconds. Miles' mixer thread
+           ticks on a finite wait, so a timeout must return kMPTimeoutErr. */
+        int32_t duration = (int32_t)arguments[1];
+        if (duration == 0 && semaphore->count <= 0) {
             pthread_mutex_unlock(&semaphore->mutex);
             return (uint32_t)-1;
         }
+        uint64_t wait_ns = duration < 0 ? (uint64_t)-(int64_t)duration * 1000 :
+                                          (uint64_t)duration * 1000000;
+        uint64_t end = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + wait_ns;
         while (semaphore->initialized &&
                semaphore->generation == generation && semaphore->count <= 0) {
-            pthread_cond_wait(&semaphore->condition, &semaphore->mutex);
+            if (duration == INT32_MAX) {
+                pthread_cond_wait(&semaphore->condition, &semaphore->mutex);
+                continue;
+            }
+            uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            if (now >= end) {
+                pthread_mutex_unlock(&semaphore->mutex);
+                return (uint32_t)-29296; /* kMPTimeoutErr */
+            }
+            struct timespec remaining = {(time_t)((end - now) / 1000000000),
+                                         (long)((end - now) % 1000000000)};
+            pthread_cond_timedwait_relative_np(&semaphore->condition,
+                                               &semaphore->mutex, &remaining);
         }
         if (!semaphore->initialized || semaphore->generation != generation) {
             pthread_mutex_unlock(&semaphore->mutex);
@@ -5324,6 +5875,19 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
             (uint8_t)arguments[1], false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
     }
 
+    if (import_is(name, "_wcslen")) return wcslen((const wchar_t *)(uintptr_t)arguments[0]);
+    if (import_is(name, "_wcscpy")) return (uint32_t)(uintptr_t)wcscpy(
+        (wchar_t *)(uintptr_t)arguments[0],(const wchar_t *)(uintptr_t)arguments[1]);
+    if (import_is(name, "_wcscat")) return (uint32_t)(uintptr_t)wcscat(
+        (wchar_t *)(uintptr_t)arguments[0],(const wchar_t *)(uintptr_t)arguments[1]);
+    if (import_is(name, "_wcschr")) return (uint32_t)(uintptr_t)wcschr(
+        (const wchar_t *)(uintptr_t)arguments[0],(wchar_t)arguments[1]);
+    if (import_is(name, "_wcsrchr")) return (uint32_t)(uintptr_t)wcsrchr(
+        (const wchar_t *)(uintptr_t)arguments[0],(wchar_t)arguments[1]);
+    if (import_is(name, "_wcsstr")) return (uint32_t)(uintptr_t)wcsstr(
+        (const wchar_t *)(uintptr_t)arguments[0],(const wchar_t *)(uintptr_t)arguments[1]);
+    if (import_is(name, "_wmemcmp")) return (uint32_t)wmemcmp(
+        (const wchar_t *)(uintptr_t)arguments[0],(const wchar_t *)(uintptr_t)arguments[1],arguments[2]);
     if (import_is(name, "_wcscmp")) return (uint32_t)wcscmp(
         (const wchar_t *)(uintptr_t)arguments[0],(const wchar_t *)(uintptr_t)arguments[1]);
     if (import_is(name, "_wcsncmp")) return (uint32_t)wcsncmp(
@@ -5399,6 +5963,9 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
     }
     if (import_is(name, "_IONotificationPortCreate") ||
         import_is(name, "_IONotificationPortGetRunLoopSource")) return 0;
+    /* Creation above reports no legacy notification port. SDL also destroys
+       that NULL result while unwinding its optional joystick setup. */
+    if (import_is(name, "_IONotificationPortDestroy") && !arguments[0]) return 0;
     if (import_is(name, "_IODestroyPlugInInterface")) return 0;
     if (import_is(name, "_IOMasterPort")) {
         uint32_t *port = (void *)(uintptr_t)arguments[1];
@@ -5493,6 +6060,7 @@ static uint64_t dispatch_bridge_stages(uint32_t import_id, const char *name,
     }
 
     if (time_manager_bridge32_dispatch(name, arguments, &result)) return result;
+    if (audio_queue_bridge32_dispatch(name, arguments, &result)) return result;
     if (audio_converter_bridge32_dispatch(name, arguments, &result)) return result;
     if (sound_manager_bridge32_dispatch(name, arguments, &result)) return result;
     if (strncmp(name, "_al", 3) == 0 && openal_bridge32_dispatch(name, arguments, &result)) return result;
@@ -5520,6 +6088,20 @@ static uint64_t dispatch_bridge_stages(uint32_t import_id, const char *name,
     last_call_trapped = 1;
     lp32_leave_guest = 1;
     return 0;
+}
+
+/* A direct (fast) handler could not complete its call: stop the guest as the
+   named-import chain does for an unsupported call. */
+void compat_runtime32_trap_import(const char *name, const uint32_t *arguments,
+                                  uint32_t return_address)
+{
+    fprintf(stderr,
+            "compat32: trapped import %s from 0x%08" PRIx32
+            " args=%08" PRIx32 ",%08" PRIx32 ",%08" PRIx32 ",%08" PRIx32 "\n",
+            name, return_address, arguments[0], arguments[1], arguments[2], arguments[3]);
+    if (getenv("LP32_FAIL_ON_UNSUPPORTED_IMPORT")) _Exit(78);
+    last_call_trapped = 1;
+    lp32_leave_guest = 1;
 }
 
 static void release_guest_stack_slot(void *opaque)
@@ -6083,6 +6665,71 @@ int compat_runtime32_run_file_self_test(void)
         if (!valid) goto failure;
     }
 
+    /* Direct handlers return what the chained implementations return. */
+    {
+        float x = 0.37f, y = 2.5f;
+        double dx = -1.75, dy = 3.25;
+        uint32_t fx, fy, dxw[2], dyw[2];
+        memcpy(&fx, &x, 4); memcpy(&fy, &y, 4); memcpy(dxw, &dx, 8); memcpy(dyw, &dy, 8);
+        uint32_t float_args[] = {fx, fy}, double_args[] = {dxw[0], dxw[1], dyw[0], dyw[1]};
+        uint32_t wide[] = {0x89abcdefu, 0xfedcba98u, 7, 0};
+        uint32_t memory = guest_allocate(128, true);
+        if (!memory) goto failure;
+        char *bytes = (void *)(uintptr_t)memory;
+        strcpy(bytes, "%s-%u"); strcpy(bytes + 16, "abc"); strcpy(bytes + 24, "abd");
+        uint32_t *values = (void *)(bytes + 48);
+        values[0] = memory + 16; values[1] = 42;
+        uint32_t format_args[] = {memory + 64, 32, memory, memory + 48};
+        uint32_t compare_args[] = {memory + 16, memory + 24, 3};
+        static const struct { const char *name; int kind; } cases[] = {
+            {"_floorf", 1}, {"_ceilf", 1}, {"_acosf", 1}, {"_asinf", 1}, {"_sinf", 1},
+            {"_cosf", 1}, {"_atanf", 1}, {"_roundf", 1}, {"_powf", 1}, {"_atan2f", 1},
+            {"_fmodf", 1}, {"_floor", 2}, {"_ceil", 2}, {"_sin", 2}, {"_cos", 2},
+            {"_pow", 2}, {"_atan2", 2}, {"_fmod", 2}, {"___divdi3", 3}, {"___moddi3", 3},
+            {"___udivdi3", 3}, {"___umoddi3", 3}, {"_vsnprintf", 4}, {"_strncmp", 5},
+        };
+        bool valid = true;
+        for (unsigned i = 0; valid && i < sizeof(cases) / sizeof(cases[0]); ++i) {
+            lp32_fast_import_fn handler = runtime_fast_import(cases[i].name);
+            const uint32_t *args = cases[i].kind == 1 ? float_args : cases[i].kind == 2 ?
+                double_args : cases[i].kind == 3 ? wide : cases[i].kind == 4 ?
+                format_args : compare_args;
+            uint64_t expected = dispatch_named_import(0, cases[i].name, args, 0);
+            union { float f; double d; } expected_fp = {0};
+            memcpy(&expected_fp, (const void *)&lp32_fp_result, sizeof(expected_fp));
+            int expected_kind = lp32_return_fp_kind;
+            lp32_return_fp_kind = 0;
+            uint64_t actual = handler ? handler(args, 0) : ~expected;
+            valid = actual == expected && lp32_return_fp_kind == expected_kind &&
+                    (!expected_kind || !memcmp(&expected_fp, (const void *)&lp32_fp_result,
+                                                expected_kind == 1 ? 4 : 8));
+            lp32_return_fp_kind = 0;
+            if (!valid) fprintf(stderr, "runtime-selftest: direct %s differs\n", cases[i].name);
+        }
+        valid = valid && strcmp(bytes + 64, "abc-42") == 0;
+        guest_deallocate(memory);
+        if (!valid) goto failure;
+    }
+
+    /* Info_RemoveKey shifts the rest of an info string left in place with
+       strcpy; objective positions follow the removed key. */
+    {
+        static const char info[] =
+            "\\state\\1\\str\\ICBM_DESTROY_THE_POWER_TRANSMISSION\\org0\\-200 -16993 140\\icon\\7";
+        uint32_t memory = guest_allocate(256, true);
+        if (!memory) goto failure;
+        char *bytes = (void *)(uintptr_t)memory;
+        bool valid = true;
+        for (uint32_t shift = 1; valid && shift < 48; ++shift) {
+            memcpy(bytes, info, sizeof(info));
+            uint32_t args[] = {memory, memory + shift};
+            valid = (uint32_t)dispatch_named_import(0, "_strcpy", args, 0) == memory &&
+                    strcmp(bytes, info + shift) == 0;
+        }
+        guest_deallocate(memory);
+        if (!valid) goto failure;
+    }
+
     /* Save timestamps use the 44-byte i386 tm layout, including normalized
        calendar fields. A sentinel catches accidental host-structure writes. */
     {
@@ -6551,6 +7198,26 @@ static uint32_t sync_self_test_free_list_length(struct host_sync_free_node *node
 
 int compat_runtime32_run_sync_self_test(void)
 {
+    if (getenv("LP32_IMPORT_BENCH")) {  /* TEMPORARY: import round-trip cost */
+        uint32_t block = compat_runtime32_allocate(8192, 1);
+        uint32_t code = (block + 4095) & ~4095u;
+        uint32_t thunk = compat_runtime32_guest_callback(getenv("LP32_IMPORT_BENCH"));
+        uint8_t bytes[] = {0x53, 0xbb, 0,0,0,0, 0x6a,0x00, 0xe8,0,0,0,0, 0x83,0xc4,0x04, 0x4b, 0x75,0xf3, 0x5b, 0xc3};
+        uint32_t count = 1000000; memcpy(bytes + 2, &count, 4);
+        int32_t delta = (int32_t)(thunk - (code + 13)); memcpy(bytes + 9, &delta, 4);
+        memcpy((void *)(uintptr_t)code, bytes, sizeof(bytes));
+        mprotect((void *)(uintptr_t)code, 4096, PROT_READ | PROT_EXEC);
+        compat_runtime32_call(code, NULL, 0);
+        uint64_t start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        compat_runtime32_call(code, NULL, 0);
+        uint64_t elapsed = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start;
+        struct rusage usage; getrusage(RUSAGE_SELF, &usage);
+        fprintf(stderr, "import bench %s: %.0f ns/call (process sys=%.2fs user=%.2fs)\n",
+                getenv("LP32_IMPORT_BENCH"), elapsed / 1e6,
+                usage.ru_stime.tv_sec + usage.ru_stime.tv_usec / 1e6,
+                usage.ru_utime.tv_sec + usage.ru_utime.tv_usec / 1e6);
+        return 0;
+    }
     enum {
         object_total = 8192,
         semaphore_total = kGuestSemaphoreCapacity - 1,

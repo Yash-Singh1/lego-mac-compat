@@ -1,5 +1,6 @@
 #include "game_profile.h"
 #include "macho_loader.h"
+#include "mouse_buttons.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -37,6 +38,7 @@ int main(void)
         const struct lp32_game_profile *p = lp32_profile_named(cod_names[i]);
         assert(p && p->steam_app_id == 7940 && p->callee_pops_struct_return);
         assert(!p->controller && !p->startup_latch && !p->steam_achievement_guard);
+        assert(!p->code_patches); /* MW2 synchronization patches must not reach MW1. */
         assert((p->loading_screen != NULL) == (i == 0));
         struct macho_image32 image = {.entry_eip = p->entry_eip, .max_address = p->image_end,
                                      .import_count = 1};
@@ -57,6 +59,25 @@ int main(void)
         assert(lp32_profile()->main_address == 0);
         assert(lp32_profile()->loading_screen == NULL);
     }
+    const char *mw2_names[] = {"mw2", "mw2mp"};
+    for (unsigned i = 0; i < 2; ++i) {
+        const struct lp32_game_profile *p = lp32_profile_named(mw2_names[i]);
+        assert(p && p->steam_app_id == (i ? 10190u : 10180u));
+        assert(p->title == (i ? LP32_TITLE_MW2_MP : LP32_TITLE_MW2));
+        assert(p->callee_pops_struct_return && p->thread_argument_is_direct);
+        assert(!p->depth_capability_check.length && !p->loading_screen);
+        assert(!p->license_log_return_address && !p->server_name_compare.length);
+        assert(!p->main_address && !p->controller && !p->startup_latch);
+        assert((p->code_patches != NULL) == (i == 0));
+        struct macho_image32 image = {.entry_eip = 0x2ff7, .max_address = 0x21ee150};
+        assert(lp32_profile_select(&image, i ? "/tmp/MW2MP.image" : "/tmp/MW2.image") == 0);
+        assert(lp32_profile() == p);
+        assert(lp32_profile_select(&image, "/tmp/unknown.image") == -1);
+    }
+    struct macho_image32 empty = {0};
+    assert(lp32_profile_select(&empty, NULL) == -1);
+    assert(lp32_profile_named("codmw2") == lp32_profile_named("mw2"));
+    assert(lp32_profile_named("mw2-mp") == lp32_profile_named("mw2mp"));
     assert(lp32_profile_named("cod") == lp32_profile_named("cod4"));
     assert(lp32_profile_named("cod4-mp") == lp32_profile_named("cod4mp"));
     assert(lp32_profile_named("LEGOMARVEL") == lp32_profile_named("marvel"));
@@ -76,6 +97,14 @@ int main(void)
     assert(lp32_profile_select(&unknown, NULL) == 0);
     assert(lp32_profile()->title == LP32_TITLE_MARVEL);
     unsetenv("LP32_GAME");
+    uint32_t held = 0;
+    assert(lp32_released_mouse_buttons(&held, 0) == 0 && held == 0);
+    assert(lp32_released_mouse_buttons(&held, 0x1) == 0 && held == 0x1);
+    assert(lp32_released_mouse_buttons(&held, 0x1) == 0 && held == 0x1);
+    assert(lp32_released_mouse_buttons(&held, 0) == 0x1 && held == 0);
+    held = 0x1f;
+    assert(lp32_released_mouse_buttons(&held, 0x2) == 0x1d && held == 0x2);
+    assert(lp32_released_mouse_buttons(&held, 0x20) == 0x2 && held == 0);
     puts("game-profile PASS (fingerprints, aliases, overrides, ABI isolation)");
     return 0;
 }

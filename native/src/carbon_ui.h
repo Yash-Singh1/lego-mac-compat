@@ -8,6 +8,10 @@ void carbon_ui_geometry_changed(void *window);
 int carbon_ui_bind_gl(void *agl, void *cgl, void *window);
 int carbon_ui_update_gl(void *agl);
 int carbon_ui_swap_gl(void *agl);
+#ifdef __OBJC__
+@class NSOpenGLContext;
+void carbon_ui_capture_gl_frame(NSOpenGLContext *context, uint64_t swaps);
+#endif
 void carbon_ui_release_gl(void *agl);
 void carbon_ui_fullscreen(void *window, uint32_t display, int32_t width, int32_t height);
 void carbon_ui_show(void *window);

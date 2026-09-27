@@ -23,6 +23,8 @@ enum lp32_title {
     LP32_TITLE_COMPLETE_SAGA,
     LP32_TITLE_COD4,
     LP32_TITLE_COD4_MP,
+    LP32_TITLE_MW2,
+    LP32_TITLE_MW2_MP,
 };
 
 /* Splash-dismiss repeat latch (see game_loader.c). */
@@ -39,6 +41,15 @@ struct lp32_code_signature {
     uint32_t address;
     uint8_t expected[8];
     uint8_t length;
+};
+
+/* A verified in-place replacement of guest code bytes. */
+struct lp32_code_patch {
+    uint32_t address;
+    uint8_t expected[8];
+    uint8_t replacement[8];
+    uint8_t length;
+    const char *reason;
 };
 
 /* Apple HID Utilities globals/functions and the input manager layout that
@@ -199,6 +210,7 @@ struct lp32_game_profile {
     const struct lp32_save_worker_patch *save_worker;  /* NULL = single init */
     const struct lp32_texture_bind_guard *texture_bind_guard; /* NULL = none */
     const struct lp32_loading_screen_patch *loading_screen; /* NULL = none */
+    const struct lp32_code_patch *code_patches; /* terminated by address 0 */
     const struct lp32_steam_achievement_guard *steam_achievement_guard;
     const struct lp32_display_layout *display;
     const struct lp32_render_pool *render_pool;

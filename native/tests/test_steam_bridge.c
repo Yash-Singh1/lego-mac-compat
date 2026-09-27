@@ -25,6 +25,8 @@ static unsigned forget_calls;
 static bool forget(void *self,const char *name){assert(self==interfaces[STEAM_STORAGE].host&&!strcmp(name,"slot"));++forget_calls;return true;}
 static bool quota(void *self,int32_t *total,int32_t *available){assert(self==interfaces[STEAM_STORAGE].host);*total=200;*available=100;return true;}
 static bool hooked;
+static int overlay_position=-1;
+static void set_overlay_position(void *self,int32_t position){assert(self==interfaces[STEAM_UTILS].host);overlay_position=position;}
 static unsigned proof_requests;
 static void request_proof(void *self, uint32_t app_id) {
     assert(self == interfaces[STEAM_APPS].host && app_id == 7940);
@@ -70,6 +72,9 @@ int main(void){
     assert(forget_calls==2);
     void *screen_table[64]={0},**screen=screen_table;screen_table[3]=hook;interfaces[STEAM_SCREENSHOTS].host=&screen;a[1]=1;
     assert(interface_call(STEAM_SCREENSHOTS,3,a,&out)&&hooked);
+    void *utils_table[16]={0},**utils=utils_table;utils_table[10]=set_overlay_position;
+    interfaces[STEAM_UTILS].host=&utils;a[1]=1;
+    assert(interface_call(STEAM_UTILS,10,a,&out)&&out==0&&overlay_position==1);
     void *apps_table[16] = {0}, **apps = apps_table;
     apps_table[14] = request_proof;
     interfaces[STEAM_APPS].host = &apps;

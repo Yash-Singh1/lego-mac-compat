@@ -14,17 +14,20 @@
 @interface LP32Movie : NSObject {
 @public
   AVPlayer *player;
+  AVPlayerItem *item;
   AVPlayerItemVideoOutput *output;
   AVAsset *asset;
   Rect bounds;
   uint32_t world, callback, callback_data;
-  BOOL started;
+  BOOL started, seek_pending;
+  CMTime seek_target, seek_origin;
 }
 @end
 @implementation LP32Movie
 - (void)dealloc {
   [player pause];
   [player release];
+  [item release];
   [output release];
   [asset release];
   [super dealloc];
@@ -94,6 +97,11 @@ static uint32_t new_movie(NSString *path) {
       return 0;
     }
     AVPlayerItem *item = [AVPlayerItem playerItemWithAsset:m->asset];
+    /* QuickTime's SetMovieRate resamples audio, so pitch follows speed
+       (COD4's slow motion ramps stream rates every frame). AVPlayer's default
+       algorithm preserves pitch instead. */
+    item.audioTimePitchAlgorithm = AVAudioTimePitchAlgorithmVarispeed;
+    m->item = [item retain];
     m->output =
         [[AVPlayerItemVideoOutput alloc] initWithPixelBufferAttributes:@{
           (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA)
@@ -101,6 +109,11 @@ static uint32_t new_movie(NSString *path) {
     [item addOutput:m->output];
     m->player = [[AVPlayer alloc] initWithPlayerItem:item];
     m->player.muted = getenv("LP32_MUTE_AUDIO") != NULL;
+    /* COD4 loops a finished stream with GoToBeginningOfMovie and SetMovieRate
+       in the same frame. The default end action pauses the player shortly
+       afterwards, while rate still reads unchanged, so the restarted stream
+       would stay paused. */
+    m->player.actionAtItemEnd = AVPlayerActionAtItemEndNone;
     AVAssetTrack *track =
         [[m->asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
     CGSize size = track.naturalSize;
@@ -119,12 +132,34 @@ static uint32_t new_movie(NSString *path) {
   }
   return token;
 }
+/* -[AVPlayer currentTime] waits for any pending rate change to finish
+   (~25 ms per player natively, ~100 ms in game), and COD4 changes stream
+   rates every frame during slow motion. The item's timebase is the same
+   playback clock without that wait. It still shows the old position for a
+   few milliseconds after a seek, so report the seek target until it lands
+   nearer the target than the old position, as currentTime does; otherwise a looping stream would look finished again
+   right after GoToBeginningOfMovie. While prerolling after a seek it can
+   briefly read below zero. */
+static CMTime movie_time(LP32Movie *m) {
+  CMTimebaseRef timebase = m->item ? m->item.timebase : NULL;
+  if (!timebase)
+    return m->player.currentTime;
+  CMTime time = CMTimebaseGetTime(timebase);
+  if (m->seek_pending) {
+    CMTime to_target = CMTimeAbsoluteValue(CMTimeSubtract(time, m->seek_target));
+    CMTime to_origin = CMTimeAbsoluteValue(CMTimeSubtract(time, m->seek_origin));
+    if (CMTimeCompare(to_target, to_origin) > 0)
+      return m->seek_target;
+    m->seek_pending = NO;
+  }
+  return CMTimeCompare(time, kCMTimeZero) < 0 ? kCMTimeZero : time;
+}
 static void movie_task(uint32_t token) {
   LP32Movie *m = movie(token);
   struct world32 *w = m ? world(m->world) : NULL;
   if (!m || !w || !m->output)
     return;
-  CMTime time = m->player.currentTime;
+  CMTime time = movie_time(m);
   if (![m->output hasNewPixelBufferForItemTime:time])
     return;
   CVPixelBufferRef frame = [m->output copyPixelBufferForItemTime:time
@@ -729,9 +764,15 @@ int quicktime_bridge32_dispatch(const char *name, const uint32_t *a,
       return 1;
     }
     if (IS("_GoToBeginningOfMovie") || IS("_SetMovieTimeValue")) {
-      [m->player seekToTime:CMTimeMake(
-                                IS("_GoToBeginningOfMovie") ? 0 : (int32_t)a[1],
-                                600)
+      CMTime target = CMTimeMake(
+          IS("_GoToBeginningOfMovie") ? 0 : (int32_t)a[1], 600);
+      CMTimebaseRef timebase = m->item ? m->item.timebase : NULL;
+      if (timebase) {
+        m->seek_origin = CMTimebaseGetTime(timebase);
+        m->seek_target = target;
+        m->seek_pending = YES;
+      }
+      [m->player seekToTime:target
             toleranceBefore:kCMTimeZero
              toleranceAfter:kCMTimeZero];
       *out = 0;
@@ -740,7 +781,7 @@ int quicktime_bridge32_dispatch(const char *name, const uint32_t *a,
     if (IS("_IsMovieDone")) {
       *out = m->player.status == AVPlayerStatusFailed ||
              (m->started &&
-              CMTimeCompare(m->player.currentTime, m->asset.duration) >= 0);
+              CMTimeCompare(movie_time(m), m->asset.duration) >= 0);
       return 1;
     }
     if (IS("_GetMovieTimeScale")) {
@@ -758,7 +799,7 @@ int quicktime_bridge32_dispatch(const char *name, const uint32_t *a,
               ? 0
               : CMTimeConvertScale(IS("_GetTimeBaseStopTime")
                                        ? m->asset.duration
-                                       : m->player.currentTime,
+                                       : movie_time(m),
                                    600, kCMTimeRoundingMethod_Default)
                     .value;
       unsigned record_arg = IS("_GetMovieTime") ? 1 : 2;

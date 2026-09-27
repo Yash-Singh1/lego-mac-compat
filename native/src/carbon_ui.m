@@ -532,21 +532,40 @@ int carbon_ui_update_gl(void *agl) {
   [context update];
   return 1;
 }
-int carbon_ui_swap_gl(void *agl) {
-  carbon_ui_sync_focus();
-  NSOpenGLContext *context = [gl_contexts objectForKey:[NSValue valueWithPointer:agl]];
-  if (!context) return 0;
-  static uint64_t swaps;
-  ++swaps;
+static void write_capture_pixels(const char *path, const unsigned char *pixels,
+                                 GLint width, GLint height) {
+  NSString *temporary = [[NSString stringWithUTF8String:path] stringByAppendingString:@".tmp"];
+  FILE *file = fopen(temporary.fileSystemRepresentation, "wb");
+  if (!file) return;
+  size_t row = (size_t)width * 3;
+  fprintf(file, "P6\n%d %d\n255\n", width, height);
+  for (int y = height - 1; y >= 0; --y) fwrite(pixels + y * row, row, 1, file);
+  bool complete = !ferror(file);
+  if (fclose(file)) complete = false;
+  if (complete) rename(temporary.fileSystemRepresentation, path);
+}
+
+/* LP32_AGL_CAPTURE_FRAME=<path>: every LP32_AGL_CAPTURE_EVERY swaps
+   (default 60), write the back buffer as a PPM before it is presented. */
+void carbon_ui_capture_gl_frame(NSOpenGLContext *context, uint64_t swaps) {
   const char *capture = getenv("LP32_AGL_CAPTURE_FRAME");
   const char *interval_text = getenv("LP32_AGL_CAPTURE_EVERY");
+  const char *gate = getenv("LP32_AGL_CAPTURE_GATE");
+  if (gate && access(gate, F_OK) != 0) return;
   unsigned interval = interval_text ? (unsigned)strtoul(interval_text, NULL, 10) : 60;
   if (capture && interval && swaps % interval == 0) {
+    char sequence_path[PATH_MAX];
+    if (getenv("LP32_AGL_CAPTURE_SEQUENCE")) {
+      snprintf(sequence_path, sizeof(sequence_path), "%s.%09llu.ppm", capture,
+               (unsigned long long)swaps);
+      capture = sequence_path;
+    }
     CGLContextObj previous = CGLGetCurrentContext();
     CGLSetCurrentContext([context CGLContextObj]);
-    GLint viewport[4], framebuffer, buffer, pack, alignment, row_length, skip_rows, skip_pixels;
+    GLint viewport[4], framebuffer, read_framebuffer, buffer, pack, alignment, row_length, skip_rows, skip_pixels;
     glGetIntegerv(GL_VIEWPORT, viewport);
     glGetIntegerv(GL_FRAMEBUFFER_BINDING_EXT, &framebuffer);
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_framebuffer);
     glGetIntegerv(GL_READ_BUFFER, &buffer);
     glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pack);
     glGetIntegerv(GL_PACK_ALIGNMENT, &alignment);
@@ -565,19 +584,12 @@ int carbon_ui_swap_gl(void *agl) {
       unsigned char *pixels = malloc(row * viewport[3]);
       if (pixels) {
         glReadPixels(viewport[0], viewport[1], viewport[2], viewport[3], GL_RGB, GL_UNSIGNED_BYTE, pixels);
-        NSString *temporary = [[NSString stringWithUTF8String:capture] stringByAppendingString:@".tmp"];
-        FILE *file = fopen(temporary.fileSystemRepresentation, "wb");
-        if (file) {
-          fprintf(file, "P6\n%d %d\n255\n", viewport[2], viewport[3]);
-          for (int y = viewport[3] - 1; y >= 0; --y) fwrite(pixels + y * row, row, 1, file);
-          bool complete = !ferror(file);
-          if (fclose(file)) complete = false;
-          if (complete) rename(temporary.fileSystemRepresentation, capture);
-        }
+        write_capture_pixels(capture, pixels, viewport[2], viewport[3]);
         free(pixels);
       }
     }
     glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, framebuffer);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, read_framebuffer);
     glReadBuffer(buffer);
     glBindBuffer(GL_PIXEL_PACK_BUFFER, pack);
     glPixelStorei(GL_PACK_ALIGNMENT, alignment);
@@ -586,6 +598,15 @@ int carbon_ui_swap_gl(void *agl) {
     glPixelStorei(GL_PACK_SKIP_PIXELS, skip_pixels);
     CGLSetCurrentContext(previous);
   }
+}
+
+int carbon_ui_swap_gl(void *agl) {
+  carbon_ui_sync_focus();
+  NSOpenGLContext *context = [gl_contexts objectForKey:[NSValue valueWithPointer:agl]];
+  if (!context) return 0;
+  static uint64_t swaps;
+  ++swaps;
+  carbon_ui_capture_gl_frame(context, swaps);
   [context update];
   if (swaps <= 3) {
     CGLContextObj previous=CGLGetCurrentContext(),current=[context CGLContextObj];CGLSetCurrentContext(current);

@@ -3,7 +3,7 @@ BUILD_DIR := build
 CONTINUE_WHEN_INACTIVE ?= 0
 
 # One loader serves every supported title; the bundle targets pick the title
-# with GAME=pirates (default), clonewars, marvel, saga, cod4 or cod4mp.
+# with GAME=pirates (default), clonewars, marvel, saga, cod4, cod4mp, mw2 or mw2mp.
 GAME ?= pirates
 ifneq ($(filter $(GAME),cod cod4 cod4mp),)
 COD4_MODE := $(if $(filter cod4mp,$(GAME)),mp,sp)
@@ -15,6 +15,15 @@ LOADER_NAME := COD4$(COD4_SUFFIX)Compat
 CG_SOURCE :=
 ICON_NAME := $(if $(filter mp,$(COD4_MODE)),Game_mp.icns,Game.icns)
 GUEST_RUNTIME_DIR ?= $(BUILD_DIR)/guest-runtime
+else ifneq ($(filter $(GAME),mw2 mw2mp),)
+MW2_MODE := $(if $(filter mw2mp,$(GAME)),mp,sp)
+MW2_STEM := $(if $(filter mw2mp,$(GAME)),MW2MP,MW2)
+SOURCE_APP ?=
+BUNDLE := $(BUILD_DIR)/$(MW2_STEM)-Compat.app
+IMAGE_NAME := $(MW2_STEM).image
+LOADER_NAME := $(MW2_STEM)Compat
+CG_SOURCE :=
+ICON_NAME := AppIcon.icns
 else ifeq ($(GAME),clonewars)
 BUNDLE := $(BUILD_DIR)/LEGOCloneWars-Compat.app
 SOURCE_APP := /Volumes/Storage/games/mac/lsw3/LEGOCloneWars.app
@@ -102,7 +111,7 @@ GAME_DATA := GAME.DAT GAME0.DAT GAME1.DAT GAME2.DAT GAME3.DAT GAME4.DAT
 ICON := icons/LEGOPirates.icns
 ICON_NAME := icon.icns
 else
-$(error Unknown GAME "$(GAME)"; choose pirates, clonewars, marvel, saga, cod4 or cod4mp)
+$(error Unknown GAME "$(GAME)"; choose pirates, clonewars, marvel, saga, cod4, cod4mp, mw2 or mw2mp)
 endif
 CG_SOURCE ?= $(SOURCE_CONTENTS)/Library/Frameworks/Cg.framework
 # Python for the Pirates unpacker.  By default a venv under $(BUILD_DIR) with
@@ -174,8 +183,8 @@ $(BUILD_DIR)/mode32_probe: src/mode32_probe.c src/mode32_switch.S src/address_sp
 	$(CLANG) $(CFLAGS) $(LDFLAGS) $^ -o $@
 	codesign --force --sign - $@
 
-$(BUILD_DIR)/game_loader: src/game_loader.c src/guest_context.S src/guest_dyld.c src/macho_file.c src/hitch_recorder.c src/game_profile.c src/macho_loader.c src/compat_runtime.c src/audio_bridge.c src/audio_converter_bridge.c src/sound_manager_bridge.c src/time_manager_bridge.c src/openal_bridge.c src/hid_bridge.c src/dispatch_bridge.m src/dlfcn_bridge.c src/gl_core_bridge.c src/curl_bridge.c src/steam_bridge.c src/steam_storage_fix.c src/resource_bridge.c src/stl_bridge.c src/libcpp_bridge.c src/libcpp_stream_bridge.cpp src/tlv_bridge.c src/blocks_bridge.c src/socket_bridge.c src/zlib_bridge.c src/regex_bridge.c src/rtti_bridge.c src/carbon_bridge.c src/carbon_text.m src/carbon_ui.m src/cfnetwork_bridge.c src/crypto_bridge.c src/quicktime_bridge.m src/controller_bridge.m src/objc_bridge.m src/objc_legacy_bridge.m src/arb_program_guard.c src/arb_sampler_usage.c src/mode32_switch.S src/import_gateway.S src/address_space_reserve.S $(wildcard src/*.h) | $(BUILD_DIR)
-	$(CLANG) $(CFLAGS) $(LDFLAGS) $(filter %.c %.m %.cpp %.S,$^) -lc++ -lffi -lcurl -lz -framework CoreText -framework Security -framework ForceFeedback -framework OpenAL -framework CFNetwork -framework SystemConfiguration -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework Cocoa -framework Carbon -framework OpenGL -framework AudioToolbox -framework AudioUnit -framework CoreAudio -framework GameController -framework IOKit -o $@
+$(BUILD_DIR)/game_loader: src/game_loader.c src/guest_context.S src/guest_dyld.c src/macho_file.c src/hitch_recorder.c src/game_profile.c src/macho_loader.c src/compat_runtime.c src/audio_bridge.c src/audio_converter_bridge.c src/sound_manager_bridge.c src/audio_queue_bridge.c src/time_manager_bridge.c src/openal_bridge.c src/hid_bridge.c src/dispatch_bridge.m src/dlfcn_bridge.c src/gl_core_bridge.c src/curl_bridge.c src/steam_bridge.c src/steam_storage_fix.c src/resource_bridge.c src/stl_bridge.c src/libcpp_bridge.c src/libcpp_future_bridge.c src/libcpp_stream_bridge.cpp src/tlv_bridge.c src/blocks_bridge.c src/socket_bridge.c src/zlib_bridge.c src/regex_bridge.c src/iconv_bridge.c src/rtti_bridge.c src/carbon_bridge.c src/carbon_text.m src/carbon_ui.m src/cfnetwork_bridge.c src/crypto_bridge.c src/quicktime_bridge.m src/controller_bridge.m src/objc_bridge.m src/objc_legacy_bridge.m src/arb_program_guard.c src/arb_sampler_usage.c src/mode32_switch.S src/import_gateway.S src/address_space_reserve.S $(wildcard src/*.h) | $(BUILD_DIR)
+	$(CLANG) $(CFLAGS) $(LDFLAGS) $(filter %.c %.m %.cpp %.S,$^) -lc++ -lffi -lcurl -lz -liconv -framework CoreText -framework Security -framework ForceFeedback -framework OpenAL -framework CFNetwork -framework SystemConfiguration -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework Cocoa -framework Carbon -framework OpenGL -framework AudioToolbox -framework AudioUnit -framework CoreAudio -framework GameController -framework IOKit -o $@
 	codesign --force --sign - $@
 
 $(BUILD_DIR)/game_loader: src/focus_policy.m
@@ -237,7 +246,7 @@ mode-switch-stress: $(BUILD_DIR)/mode_switch_stress
 run: $(BUILD_DIR)/mode32_probe
 	arch -x86_64 ./$(BUILD_DIR)/mode32_probe
 
-ifneq ($(filter $(GAME),cod cod4 cod4mp),)
+ifneq ($(filter $(GAME),cod cod4 cod4mp mw2 mw2mp),)
 run-game: promote-loader
 	arch -x86_64 "./$(BUNDLE)/Contents/MacOS/$(LOADER_NAME)"
 else
@@ -265,6 +274,9 @@ saga-update:
 ifneq ($(filter $(GAME),cod cod4 cod4mp),)
 bundle: $(BUILD_DIR)/game_loader tools/bundle_cod4.py tools/prepare_guest_runtime.py
 	python3 tools/bundle_cod4.py --source-app "$(SOURCE_APP)" --mode "$(COD4_MODE)" --loader "$(BUILD_DIR)/game_loader" --bundle "$(BUNDLE)" --runtime "$(GUEST_RUNTIME_DIR)" --continue-when-inactive "$(CONTINUE_WHEN_INACTIVE)"
+else ifneq ($(filter $(GAME),mw2 mw2mp),)
+bundle: $(BUILD_DIR)/game_loader tools/bundle_mw2.py tools/bundle_cod4.py
+	python3 tools/bundle_mw2.py --source-app "$(SOURCE_APP)" --mode "$(MW2_MODE)" --loader "$(BUILD_DIR)/game_loader" --bundle "$(BUNDLE)" --continue-when-inactive "$(CONTINUE_WHEN_INACTIVE)"
 else ifeq ($(GAME):$(SAGA_EDITION),saga:steam)
 bundle: $(BUILD_DIR)/game_loader $(INFO_PLIST) tools/bundle_saga_steam.py
 	python3 tools/bundle_saga_steam.py "$(SOURCE_APP)" "$(SAGA_DATA_SOURCE)" "$(BUILD_DIR)/game_loader" "$(BUNDLE)" "$(INFO_PLIST)"
@@ -466,6 +478,14 @@ test-sound-manager-bridge: $(BUILD_DIR)/test_sound_manager_bridge
 test-pointer-proxy: $(BUILD_DIR)/game_loader
 	env LP32_POINTER_SELFTEST=1 LP32_NO_DIAGNOSTIC_LOG=1 LP32_MUTE_AUDIO=1 arch -x86_64 ./$(BUILD_DIR)/game_loader
 
+.PHONY: test-runtime-files
+test-runtime-files: $(BUILD_DIR)/game_loader
+	env LP32_FILE_SELFTEST=1 LP32_NO_DIAGNOSTIC_LOG=1 LP32_MUTE_AUDIO=1 arch -x86_64 ./$(BUILD_DIR)/game_loader "$(BUNDLE)/Contents/SharedSupport/$(IMAGE_NAME)"
+
+.PHONY: test-gamma-focus
+test-gamma-focus: $(BUILD_DIR)/game_loader
+	env -u LP32_BACKGROUND_TEST LP32_GAMMA_SELFTEST=1 LP32_NO_DIAGNOSTIC_LOG=1 LP32_MUTE_AUDIO=1 arch -x86_64 ./$(BUILD_DIR)/game_loader
+
 .PHONY: cod4-runtime
 cod4-runtime:
 	python3 tools/prepare_guest_runtime.py --output "$(BUILD_DIR)/guest-runtime"
@@ -516,6 +536,13 @@ $(BUILD_DIR)/test_audio_converter_bridge: tests/test_audio_converter_bridge.c sr
 test-audio-converter-bridge: $(BUILD_DIR)/test_audio_converter_bridge
 	arch -x86_64 ./$(BUILD_DIR)/test_audio_converter_bridge
 
+.PHONY: test-quicktime-bridge
+$(BUILD_DIR)/test_quicktime_bridge: tests/test_quicktime_bridge.m src/quicktime_bridge.m src/quicktime_bridge.h | $(BUILD_DIR)
+	$(CLANG) $(CFLAGS) -Wl,-pagezero_size,0x1000 -Isrc tests/test_quicktime_bridge.m src/quicktime_bridge.m -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework ImageIO -framework Carbon -framework Foundation -o $@
+
+test-quicktime-bridge: $(BUILD_DIR)/test_quicktime_bridge
+	arch -x86_64 ./$(BUILD_DIR)/test_quicktime_bridge
+
 .PHONY: test-audio-render-notify
 $(BUILD_DIR)/test_audio_render_notify: tests/test_audio_render_notify.c src/audio_bridge.c src/audio_bridge.h | $(BUILD_DIR)
 	$(CLANG) $(CFLAGS) -Wl,-no_pie,-pagezero_size,0x1000 -Isrc tests/test_audio_render_notify.c -framework AudioToolbox -framework CoreAudio -o $@
@@ -533,6 +560,8 @@ test-carbon-fullscreen: $(BUILD_DIR)/test_carbon_fullscreen
 .PHONY: test-gl-buffer
 test-gl-buffer: $(BUILD_DIR)/game_loader
 	env LP32_GL_BUFFER_SELFTEST=1 LP32_MUTE_AUDIO=1 LP32_BACKGROUND_TEST=1 LP32_NO_DIAGNOSTIC_LOG=1 arch -x86_64 ./$(BUILD_DIR)/game_loader "$(BUNDLE)/Contents/SharedSupport/$(IMAGE_NAME)"
+	@test ! -f "$(BUILD_DIR)/MW2-Compat.app/Contents/SharedSupport/MW2.image" || \
+	env LP32_GL_BUFFER_SELFTEST=1 LP32_MUTE_AUDIO=1 LP32_BACKGROUND_TEST=1 LP32_NO_DIAGNOSTIC_LOG=1 arch -x86_64 ./$(BUILD_DIR)/game_loader "$(BUILD_DIR)/MW2-Compat.app/Contents/SharedSupport/MW2.image"
 
 .PHONY: test-cod4-download
 test-cod4-download: $(BUILD_DIR)/game_loader

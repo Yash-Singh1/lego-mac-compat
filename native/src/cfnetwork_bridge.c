@@ -101,6 +101,27 @@ int cfnetwork_bridge32_dispatch(const char *name, const uint32_t *a,
     *out = (uint32_t)CFHTTPMessageGetResponseStatusCode(O(0));
     if (getenv("LP32_TRACE_NETWORK"))
       fprintf(stderr, "compat32: HTTP response status=%u\n", (uint32_t)*out);
+  } else if (IS("_CFReadStreamCreateWithFile"))
+    *out = copied(CFReadStreamCreateWithFile(NULL, O(1)));
+  else if (IS("_CFWriteStreamCreateWithFile"))
+    *out = copied(CFWriteStreamCreateWithFile(NULL, O(1)));
+  else if (IS("_CFWriteStreamOpen"))
+    *out = CFWriteStreamOpen(O(0));
+  else if (IS("_CFWriteStreamClose")) {
+    CFWriteStreamClose(O(0));
+    *out = 0;
+  } else if (IS("_CFPropertyListCreateWithStream")) {
+    CFPropertyListFormat format = 0;
+    CFErrorRef error = NULL;
+    *out = copied(CFPropertyListCreateWithStream(NULL, O(1), (int32_t)a[2], a[3], &format, &error));
+    if (a[4]) *(uint32_t *)P(4) = (uint32_t)format;
+    uint32_t token = copied(error);
+    if (a[5]) *(uint32_t *)P(5) = token;
+  } else if (IS("_CFPropertyListWrite")) {
+    CFErrorRef error = NULL;
+    *out = (uint32_t)CFPropertyListWrite(O(0), O(1), a[2], a[3], &error);
+    uint32_t token = copied(error);
+    if (a[4]) *(uint32_t *)P(4) = token;
   } else if (IS("_CFReadStreamCreateForHTTPRequest"))
     *out = copied(CFReadStreamCreateForHTTPRequest(NULL, O(1)));
   else if (IS("_CFReadStreamOpen"))

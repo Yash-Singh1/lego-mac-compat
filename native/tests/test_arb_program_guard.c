@@ -119,7 +119,6 @@ int main(void)
         ++failures;
     }
 
-    printf("arb-program-guard %s\n", failures ? "FAIL" : "PASS");
     /* The SM2 water samples its RGBA reflection target with SHADOW2D, which
        Apple's GL resolves to black; the target keyword is made plain. */
     static const char shadow_targets[] =
@@ -152,6 +151,25 @@ int main(void)
     failures += expect_contains(output, "OPTION ARB_fragment_program_shadow;\n");
     free(output);
 
+    /* A real shadow map stays SHADOW; only the colour unit is rewritten. */
+    uint32_t units = arb_program_shadow_texture_units(
+        shadow_targets, sizeof(shadow_targets) - 1);
+    if (units != ((1u << 3) | (1u << 2))) {
+        fprintf(stderr, "shadow units = %#x\n", units);
+        ++failures;
+    }
+    rewrites = 0;
+    output = arb_program_plain_shadow_targets_masked(
+        shadow_targets, sizeof(shadow_targets) - 1, 1u << 3,
+        &output_size, &rewrites);
+    if (!output || rewrites != 1 || strstr(output, "SHADOW2D") ||
+        !strstr(output, "SHADOWRECT")) {
+        fprintf(stderr, "selective shadow rewrite failed:\n%s\n",
+                output ? output : "(null)");
+        ++failures;
+    }
+    free(output);
+
     /* Programs without shadow targets, and vertex programs, are left alone. */
     output = arb_program_plain_shadow_targets(
         result_destination, sizeof(result_destination) - 1, &output_size,
@@ -162,5 +180,6 @@ int main(void)
         free(output);
     }
 
+    printf("arb-program-guard %s\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;
 }

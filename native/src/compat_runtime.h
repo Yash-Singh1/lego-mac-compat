@@ -79,6 +79,8 @@ void compat_runtime32_set_diagnostic_sink(void (*sink)(const char *line));
  */
 typedef uint64_t (*lp32_fast_import_fn)(const uint32_t *arguments,
                                         uint32_t return_address);
+void compat_runtime32_trap_import(const char *name, const uint32_t *arguments,
+                                  uint32_t return_address);
 
 uint32_t compat_runtime32_resolve_symbol(const char *name, int data_hint);
 

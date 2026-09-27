@@ -29,7 +29,27 @@ exports:
       _acosf, _atof, _getrlimit, _getrlimit$UNIX2003, _setrlimit,
       _setrlimit$UNIX2003, _getcwd, _free, _memset, _memcpy,
       _dlopen, _dlsym, _dlclose, _dlerror, ___maskrune, ___tolower,
-      _strlen, _strcmp, _memcmp, _strcpy, _strncpy, _pthread_self, dyld_stub_binder ]
+      _strlen, _strcmp, _memcmp, _strcpy, _strncpy, _pthread_self,
+      _pthread_mutex_lock, _pthread_mutex_unlock, _pthread_mutex_destroy,
+      _pthread_cond_destroy, _pthread_cond_timedwait, _pthread_cond_timedwait$UNIX2003,
+      _pthread_sigmask, _pthread_sigmask$UNIX2003,
+      _pthread_setcanceltype, _pthread_setcanceltype$UNIX2003, _vsscanf, _getenv, ___error,
+      _nanosleep, _nanosleep$UNIX2003,
+      _iconv_open, _iconv_close, _iconv, _iconvctl,
+      _wcslen, _wcscpy, _wcscat, _wcschr, _wcsrchr, _wcsstr, _wmemcmp,
+      _host_page_size, _mach_host_self, _mach_task_self_, _mach_vm_region, _vm_page_size,
+      _mmap, _mmap$UNIX2003, _munmap, _munmap$UNIX2003, _mprotect, _mprotect$UNIX2003,
+      _OSAtomicCompareAndSwap64Barrier,
+      __ZNSt3__19to_stringEm,
+      __ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEED1Ev,
+      __ZNSt3__16chrono12system_clock3nowEv, __ZNSt3__16chrono12steady_clock3nowEv,
+      __ZNSt3__118condition_variable10notify_allEv, __ZNSt3__118condition_variable10notify_oneEv,
+      __ZNSt3__118condition_variable15__do_timed_waitERNS_11unique_lockINS_5mutexEEENS_6chrono10time_pointINS5_12system_clockENS5_8durationIxNS_5ratioILx1ELx1000000000EEEEEEE,
+      __ZNSt3__16futureIvED1Ev, __ZNSt3__16futureIvE3getEv,
+      __ZNSt3__17promiseIvEC1Ev, __ZNSt3__17promiseIvED1Ev,
+      __ZNSt3__17promiseIvE10get_futureEv, __ZNSt3__17promiseIvE9set_valueEv,
+      _pthread_create, _pthread_join, _pthread_join$UNIX2003,
+      _pthread_key_create, _pthread_getspecific, _pthread_setspecific, _setlocale, dyld_stub_binder ]
 ...
 """)
     (root / "dep.c").write_text("""
@@ -47,9 +67,11 @@ int dependency_value(void) { return *value_pointer; }
         run(*flags, "-dynamiclib", "-Wl,-install_name,@loader_path/libfixture_dep.dylib",
             f"-Wl,-seg1addr,0x{address:x}", str(root / "dep.c"), "-o", str(root / "bin/libfixture_dep.dylib"))
         run(*flags, "-dynamiclib", "-Wl,-install_name,@loader_path/fixture.dylib",
-            str(NATIVE / "tests/fixtures/cod4_runtime.c"), "-L" + str(root / "bin"), "-lfixture_dep",
+            str(NATIVE / "tests/fixtures/cod4_runtime.c"),
+            str(NATIVE / "tests/fixtures/mw2_future.cpp"), "-fno-exceptions", "-fno-rtti",
+            "-L" + str(root / "bin"), "-lfixture_dep",
             "-o", str(root / "bin/fixture.dylib"))
-        run(*flags, "-Wl,-e,_start,-no_pie", str(root / "start.S"), "-o", str(root / "fixture"))
+        run(*flags, "-Wl,-e,_start,-no_pie", str(root / "start.S"), "-o", str(root / "COD4.image"))
         dep = root / "bin/libfixture_dep.dylib"
         thin = dep.read_bytes()
         cursor, commands = 28, []
@@ -64,5 +86,7 @@ int dependency_value(void) { return *value_pointer; }
         struct.pack_into("<I", malformed, 20, 0xFFFFFFFF)
         (root / "bin/broken.dylib").write_bytes(malformed)
         env = dict(os.environ, LP32_GAME="cod4", LP32_DYLD_FIXTURE_SELFTEST="1", LP32_NO_DIAGNOSTIC_LOG="1")
-        run("arch", "-x86_64", str(NATIVE / "build/game_loader"), str(root / "fixture"), env=env, timeout=30)
+        for profile in ("cod4", "mw2"):
+            env['LP32_GAME'] = profile
+            run("arch", "-x86_64", str(NATIVE / "build/game_loader"), str(root / "COD4.image"), env=env, timeout=30)
         print(f"COD4 runtime fixture PASS (macOS {version}, preferred base {address:#x})")
