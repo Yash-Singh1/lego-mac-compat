@@ -3,6 +3,7 @@
 
 #include "macho_loader.h"
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -27,8 +28,24 @@ int compat_runtime32_run_sync_self_test(void);
 int compat_runtime32_run_import_return_self_test(void);
 uint32_t compat_runtime32_cg_object_count(void);
 uint32_t compat_runtime32_cg_string_count(void);
+/* Reserve the free parts of 0x80000000-0xffffffff for guest mmap; call
+   first thing in main, before host allocators can claim them. */
+void compat_runtime32_reserve_guest_arena(void);
 uint64_t compat_runtime32_dispatch_import(const char *name,
                                           const uint32_t *arguments);
+
+/* i386 register state for resuming guest code somewhere other than an
+   import's return address (exception landing pads, longjmp targets). */
+struct guest_resume_context {
+    uint32_t ebx, ebp, esi, edi, esp, eip, eax, edx;
+};
+/* The guest frame that called the import now being dispatched: callee-saved
+   registers, esp just past the return address, eip = return address. False
+   for imports served by a direct (fast) handler. */
+bool compat_runtime32_import_frame(struct guest_resume_context *frame);
+/* When the current import returns, continue the guest at this context. Call
+   it last: a nested guest call would consume it. */
+void compat_runtime32_resume_guest(const struct guest_resume_context *context);
 
 /* A guest-callable (cdecl) entry point that dispatches to the host under the
    given import name, for function pointers the game expects to call back

@@ -33,7 +33,9 @@ static void value_callback(void *raw,IOReturn status,void *sender,IOHIDValueRef 
 static void removal_callback(void *raw,IOReturn status,void *sender){invoke(raw,status,sender,NULL,false);}
 int hid_bridge32_dispatch(const char *name,const uint32_t *a,uint64_t *out){
     if (!strcmp(name, "_FFIsForceFeedback")) {
-        *out = (uint32_t)FFIsForceFeedback(a[0]);
+        /* No FFCreateDevice/FFEffect bridge exists, so SDL must not open
+           haptics on a force-feedback controller. */
+        *out = (uint32_t)FFERR_NOINTERFACE;
         return 1;
     }
     /* io_object_t values are Mach port names, identical in the guest. */

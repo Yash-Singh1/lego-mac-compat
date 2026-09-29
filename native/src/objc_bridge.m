@@ -1,5 +1,6 @@
 #import <CoreText/CoreText.h>
 #import <Security/Security.h>
+#import <CoreAudio/CoreAudio.h>
 #include "objc_bridge.h"
 #include "focus_policy.h"
 #include "gl_core_bridge.h"
@@ -987,6 +988,21 @@ uint32_t objc_bridge32_guest_pointer(void *pointer)
     return token;
 }
 uint32_t objc_bridge32_guest_object(void *object) { return proxy_for_object((id)object); }
+
+/* objc_exception_match: exception is a guest object token, cls a class token. */
+uint32_t objc_bridge32_guest_is_kind_of_class(uint32_t exception, uint32_t cls)
+{
+    id object = object_for_argument(exception), class_object = object_for_argument(cls);
+    if (!object) return 0;
+    if (!class_object) return 1;
+    return object_isClass(class_object) && [object isKindOfClass:(Class)class_object];
+}
+
+const char *objc_bridge32_guest_class_name(uint32_t object)
+{
+    id value = object_for_argument(object);
+    return value ? object_getClassName(value) : "nil";
+}
 
 static void *event_proxy_test_worker(void *unused) {
     (void)unused;
@@ -3130,25 +3146,60 @@ static bool frame_gamma_redirect_blit(const uint32_t *a)
  * LP32_INACTIVE_FPS (default 15; 0 disables). Game time and audio continue
  * normally; only the frame rate drops. Scripted tests are never paced.
  */
-static int presenting_app_active = -1;
+/* Assume active until the main thread says otherwise: a wrong "inactive"
+   caps a game the user is playing at 15 FPS and adds visible input lag. */
+static int presenting_app_active = 1;
+
+static void inactive_pacing_set_active(int active)
+{
+    int previous = __atomic_exchange_n(&presenting_app_active, active, __ATOMIC_RELAXED);
+    if (previous != active)
+        fprintf(stderr, "compat32: background pacing %s\n", active ? "off (active)" : "on (inactive)");
+}
 
 static void inactive_pacing_track_focus(void)
 {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        __atomic_store_n(&presenting_app_active,
-                         [[NSRunningApplication currentApplication] isActive] ? 1 : 0,
-                         __ATOMIC_RELAXED);
+        /* Observe first, then read the state on the main thread, where
+           NSApp's activation state is current; reading it here first could
+           miss an activation between the read and the registration. */
         NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
         [center addObserverForName:NSApplicationDidResignActiveNotification object:nil queue:nil
-                        usingBlock:^(NSNotification *note) {
-            (void)note; __atomic_store_n(&presenting_app_active, 0, __ATOMIC_RELAXED);
-        }];
+                        usingBlock:^(NSNotification *note) { (void)note; inactive_pacing_set_active(0); }];
         [center addObserverForName:NSApplicationDidBecomeActiveNotification object:nil queue:nil
-                        usingBlock:^(NSNotification *note) {
-            (void)note; __atomic_store_n(&presenting_app_active, 1, __ATOMIC_RELAXED);
-        }];
+                        usingBlock:^(NSNotification *note) { (void)note; inactive_pacing_set_active(1); }];
+        dispatch_async(dispatch_get_main_queue(), ^{ inactive_pacing_set_active([NSApp isActive] ? 1 : 0); });
     });
+}
+
+/* Input diagnostics for the play log: a key event reaching AppKit late,
+   or a long gap between presented frames (a hitch keeps the last held
+   movement going), both while the game is in front. */
+static void log_late_key_event(NSEvent *event)
+{
+    if (!event || background_test_mode() || !__atomic_load_n(&presenting_app_active, __ATOMIC_RELAXED)) return;
+    NSEventType type = event.type;
+    if (type != NSEventTypeKeyDown && type != NSEventTypeKeyUp) return;
+    double age = [[NSProcessInfo processInfo] systemUptime] - event.timestamp;
+    static unsigned logged;
+    if (age < 0.1 || logged >= 200) return;
+    ++logged;
+    fprintf(stderr, "compat32: late key %s keyCode=%u age=%.0fms%s\n", type == NSEventTypeKeyUp ? "up" : "down",
+            (unsigned)event.keyCode, age * 1000, event.isARepeat ? " (repeat)" : "");
+}
+
+static void log_frame_hitch(void)
+{
+    static uint64_t last_ns;
+    static unsigned logged;
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    uint64_t gap = last_ns ? now - last_ns : 0;
+    last_ns = now;
+    if (gap < 250000000 || logged >= 500 || background_test_mode() ||
+        !__atomic_load_n(&presenting_app_active, __ATOMIC_RELAXED)) return;
+    ++logged;
+    fprintf(stderr, "compat32: frame hitch %.0fms\n", gap / 1e6);
 }
 
 static void inactive_pacing_before_present(void)
@@ -10167,6 +10218,91 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             (CFURLRef)object_for_argument(arguments[2]));
         *result=proxy_for_object((id)url);if(url)CFRelease(url);return 1;
     }
+    /* ShellExecuteA -> Sys_OpenURL (menu links, Steam app launches). */
+    if (LP32_NAME_IS(import_name, import_length, "_LSOpenCFURLRef")) {
+        NSURL *url=(NSURL *)object_for_argument(arguments[0]);
+        BOOL opened=[url isKindOfClass:[NSURL class]] && [[NSWorkspace sharedWorkspace] openURL:url];
+        if(arguments[1])*(uint32_t *)(uintptr_t)arguments[1]=0;
+        *result=opened?0:(uint32_t)(int32_t)-10814;return 1;
+    }
+    /* Deprecated CFURL resource read (Win32 resource emulation): file URLs
+       only; properties are not supported. */
+    if (LP32_NAME_IS(import_name, import_length, "_CFURLCreateDataAndPropertiesFromResource")) {
+        NSURL *url=(NSURL *)object_for_argument(arguments[1]);
+        NSData *data=[url isKindOfClass:[NSURL class]] && [url isFileURL] ?
+            [NSData dataWithContentsOfURL:url] : nil;
+        if(arguments[2])*(uint32_t *)(uintptr_t)arguments[2]=data?proxy_for_object(data):0;
+        if(arguments[3])*(uint32_t *)(uintptr_t)arguments[3]=0;
+        if(arguments[5])*(int32_t *)(uintptr_t)arguments[5]=data?0:-12; /* kCFURLResourceNotFoundError */
+        *result=data!=nil;return 1;
+    }
+    /* NSRectFill(NSRect): four i386 floats by value. */
+    if (LP32_NAME_IS(import_name, import_length, "_NSRectFill")) {
+        float r[4];memcpy(r,arguments,sizeof(r));
+        if([NSGraphicsContext currentContext])NSRectFill(NSMakeRect(r[0],r[1],r[2],r[3]));
+        *result=0;return 1;
+    }
+    /* SDL's CoreAudio device enumeration. Values are identical in both ABIs
+       except CFString results (a guest token) and AudioBufferList, whose
+       AudioBuffer holds a pointer. */
+    if (LP32_NAME_IS(import_name, import_length, "_AudioObjectGetPropertyDataSize") ||
+        LP32_NAME_IS(import_name, import_length, "_AudioObjectGetPropertyData")) {
+        bool size_only=LP32_NAME_IS(import_name, import_length, "_AudioObjectGetPropertyDataSize");
+        const AudioObjectPropertyAddress *address=(const void *)(uintptr_t)arguments[1];
+        const void *qualifier=(const void *)(uintptr_t)arguments[3];
+        uint32_t *guest_size=(void *)(uintptr_t)arguments[4];
+        if(!address || !guest_size){*result=(uint32_t)kAudioHardwareIllegalOperationError;return 1;}
+        UInt32 host_size=0;
+        OSStatus status=AudioObjectGetPropertyDataSize(arguments[0],address,arguments[2],qualifier,&host_size);
+        AudioObjectPropertySelector selector=address->mSelector;
+        bool string=selector==kAudioObjectPropertyName || selector==kAudioObjectPropertyModelName ||
+            selector==kAudioObjectPropertyManufacturer || selector==kAudioObjectPropertyElementName ||
+            selector==kAudioObjectPropertyElementCategoryName || selector==kAudioObjectPropertyElementNumberName ||
+            selector==kAudioDevicePropertyDeviceUID || selector==kAudioDevicePropertyModelUID;
+        bool buffers=selector==kAudioDevicePropertyStreamConfiguration;
+        uint32_t guest_needed=host_size;
+        if(string)guest_needed=4;
+        if(buffers && host_size>=offsetof(AudioBufferList,mBuffers))
+            guest_needed=4+12*(uint32_t)((host_size-offsetof(AudioBufferList,mBuffers))/sizeof(AudioBuffer));
+        if(status || size_only){if(!status)*guest_size=guest_needed;*result=(uint32_t)status;return 1;}
+        void *output=(void *)(uintptr_t)arguments[5];
+        if(!string && !buffers){
+            UInt32 size=*guest_size;
+            status=AudioObjectGetPropertyData(arguments[0],address,arguments[2],qualifier,&size,output);
+            if(!status)*guest_size=size;
+            *result=(uint32_t)status;return 1;
+        }
+        if(*guest_size<guest_needed){*result=(uint32_t)kAudioHardwareBadPropertySizeError;return 1;}
+        void *host=calloc(1,host_size?host_size:1);
+        if(!host){*result=(uint32_t)kAudioHardwareUnspecifiedError;return 1;}
+        UInt32 size=host_size;
+        status=AudioObjectGetPropertyData(arguments[0],address,arguments[2],qualifier,&size,host);
+        if(!status && string){
+            CFStringRef value=*(CFStringRef *)host;
+            *(uint32_t *)output=value?proxy_for_owned_object((id)value):0;
+            if(value)CFRelease(value);
+        } else if(!status){
+            const AudioBufferList *list=host;uint8_t *guest=output;
+            uint32_t count=(guest_needed-4)/12;
+            if(list->mNumberBuffers<count)count=list->mNumberBuffers;
+            memcpy(guest,&count,4);
+            for(uint32_t i=0;i<count;++i){
+                uint32_t words[3]={list->mBuffers[i].mNumberChannels,list->mBuffers[i].mDataByteSize,0};
+                memcpy(guest+4+12*i,words,12);
+            }
+            guest_needed=4+12*count;
+        }
+        free(host);
+        if(!status)*guest_size=guest_needed;
+        *result=(uint32_t)status;return 1;
+    }
+    /* The guest mutated a collection while fast-enumerating it (SDL window
+       and device teardown). Native code would raise; keep enumerating. */
+    if (LP32_NAME_IS(import_name, import_length, "_objc_enumerationMutation")) {
+        fprintf(stderr,"compat32: collection mutated during enumeration: %s\n",
+                object_getClassName(object_for_argument(arguments[0])));
+        *result=0;return 1;
+    }
     if (LP32_NAME_IS(import_name, import_length, "_CFURLCopyHostName")) {
         CFStringRef host=CFURLCopyHostName((CFURLRef)object_for_argument(arguments[0]));
         *result=proxy_for_object((id)host);if(host)CFRelease(host);return 1;
@@ -10935,6 +11071,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                 --mw2_gl_reattach_left;
             }
             frame_gamma_present((NSOpenGLContext *)receiver);
+            log_frame_hitch();
             inactive_pacing_before_present();
             texture_bind_cache_invalidate();
             __atomic_store_n(&presenting_context,
@@ -11131,6 +11268,10 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             fflush(NULL);
             _Exit(EXIT_SUCCESS);
         }
+        if (strcmp(selector_name, "sendEvent:") == 0 &&
+            (lp32_profile()->title == LP32_TITLE_MW2 || lp32_profile()->title == LP32_TITLE_MW2_MP) &&
+            [receiver isKindOfClass:[NSApplication class]])
+            log_late_key_event(object_for_argument(arguments[2]));
         if (strcmp(selector_name, "sendEvent:") == 0 &&
             [receiver isKindOfClass:[NSApplication class]] &&
             ![(NSApplication *)receiver mainMenu]) {

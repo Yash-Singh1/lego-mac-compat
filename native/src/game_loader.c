@@ -1,5 +1,6 @@
 #include "objc_legacy_bridge.h"
 #include "compat_runtime.h"
+#include "cxx_exception_bridge.h"
 #include "carbon_bridge.h"
 #include "controller_bridge.h"
 #include "game_profile.h"
@@ -882,6 +883,7 @@ int main(int argc, char **argv)
     /* A write to a socket whose peer has gone (e.g. the Steam client IPC)
        must fail with EPIPE, not silently kill the game. Launched from Finder,
        MW2 otherwise dies of SIGPIPE seconds after its first frame. */
+    compat_runtime32_reserve_guest_arena();
     signal(SIGPIPE, SIG_IGN);
     install_guest_crash_diagnostics();
     compat_runtime32_set_diagnostic_sink(runtime_diagnostic_line);
@@ -1096,6 +1098,11 @@ int main(int argc, char **argv)
     }
     if (getenv("LP32_CG_SELFTEST")) {
         int result = compat_runtime32_run_cg_self_test();
+        macho_image32_unload(&image);
+        return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (getenv("LP32_EXCEPTION_SELFTEST")) {
+        int result = cxx_exception_bridge32_run_self_test();
         macho_image32_unload(&image);
         return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }

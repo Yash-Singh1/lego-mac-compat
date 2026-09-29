@@ -216,6 +216,14 @@ static int inspect_commands(const struct source_file *source,
                     image->cstring_end = section[section_index].addr +
                                          section[section_index].size;
                 }
+                if (strncmp(section[section_index].sectname, "__unwind_info", 16) == 0 &&
+                    strncmp(segment->segname, SEG_TEXT, 16) == 0) {
+                    image->text_start = segment->vmaddr;
+                    image->text_end = segment->vmaddr + segment->vmsize;
+                    image->unwind_info_start = section[section_index].addr;
+                    image->unwind_info_end = section[section_index].addr +
+                                             section[section_index].size;
+                }
                 if (strncmp(section[section_index].sectname, "__cfstring", 16) == 0) {
                     image->cfstring_start = section[section_index].addr;
                     image->cfstring_end = section[section_index].addr +
@@ -372,6 +380,20 @@ static int collect_imports(struct macho_image32 *image)
     return 0;
 }
 
+/* The entry point or a module initializer lies in this segment. Runs after
+   the segment contents are copied in, so initializer pointers are readable. */
+static bool segment_holds_startup_code(const struct macho_image32 *image,
+                                       const struct segment_command *segment)
+{
+    uint32_t start = segment->vmaddr, end = segment->vmaddr + segment->vmsize;
+    if (image->entry_eip >= start && image->entry_eip < end) return true;
+    for (uint32_t i = 0; i < image->initializer_count && image->initializer_address; ++i) {
+        uint32_t function = ((const uint32_t *)(uintptr_t)image->initializer_address)[i];
+        if (function >= start && function < end) return true;
+    }
+    return false;
+}
+
 static int map_segments(const struct source_file *source,
                         struct macho_image32 *image)
 {
@@ -408,9 +430,24 @@ static int map_segments(const struct source_file *source,
         const struct load_command *command = (const void *)cursor;
         if (command->cmd == LC_SEGMENT) {
             const struct segment_command *segment = (const void *)cursor;
-            if (segment->vmsize && strncmp(segment->segname, SEG_PAGEZERO, 16) != 0 &&
-                mprotect((void *)(uintptr_t)segment->vmaddr, segment->vmsize,
-                         mmap_protection(segment->initprot)) != 0) {
+            if (!segment->vmsize || strncmp(segment->segname, SEG_PAGEZERO, 16) == 0) {
+                cursor += command->cmdsize;
+                continue;
+            }
+            int protection = mmap_protection(segment->initprot);
+            /* 32-bit Intel macOS only kept the stack non-executable: data
+               pages ran code. Some COD4 releases run their first initializer
+               from a writable __BOOKKEEPING segment, which faulted here
+               (SIGBUS at the initializer). Keep that behavior for segments
+               that hold the entry point or an initializer. */
+            if ((protection & PROT_READ) && !(protection & PROT_EXEC) &&
+                segment_holds_startup_code(image, segment)) {
+                char segment_name[17];
+                fprintf(stderr, "compat32: segment %s holds startup code; mapping it executable\n",
+                        fixed_name(segment->segname, segment_name));
+                protection |= PROT_EXEC;
+            }
+            if (mprotect((void *)(uintptr_t)segment->vmaddr, segment->vmsize, protection) != 0) {
                 return fail_errno("mprotect legacy segment");
             }
         }

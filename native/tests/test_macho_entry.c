@@ -1,6 +1,7 @@
 /* Exercise metadata validation without mapping or executing guest addresses. */
 #include "../src/macho_loader.c"
 #include <assert.h>
+#include <mach/mach_vm.h>
 
 static void test_defined_indirect_symbols(void)
 {
@@ -49,6 +50,52 @@ static void test_defined_indirect_symbols(void)
     symbols[0].n_value = base + 4096;
     assert(collect_imports(&image) == -1);
     munmap(bytes, 4096);
+}
+
+static vm_prot_t mapped_protection(uint32_t address)
+{
+    mach_vm_address_t region = address;
+    mach_vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object = MACH_PORT_NULL;
+    assert(mach_vm_region(mach_task_self(), &region, &size, VM_REGION_BASIC_INFO_64,
+                          (vm_region_info_t)&info, &count, &object) == KERN_SUCCESS);
+    assert(region <= address);
+    return info.protection;
+}
+
+/* A writable segment holding an initializer (a COD4 release's
+   __BOOKKEEPING) must run code, as on 32-bit macOS; plain data must not. */
+static void test_startup_code_in_writable_segment(void)
+{
+    enum { base = 0x20000000 };
+    static union { uint64_t alignment; uint8_t bytes[0x4000]; } file;
+    struct segment_command segments[] = {
+        {.cmd = LC_SEGMENT, .cmdsize = sizeof(struct segment_command), .segname = SEG_TEXT,
+         .vmaddr = base, .vmsize = 0x1000, .fileoff = 0, .filesize = 0x1000,
+         .initprot = VM_PROT_READ | VM_PROT_EXECUTE},
+        {.cmd = LC_SEGMENT, .cmdsize = sizeof(struct segment_command), .segname = "__BOOKKEEPING",
+         .vmaddr = base + 0x1000, .vmsize = 0x1000, .fileoff = 0x1000, .filesize = 0x1000,
+         .initprot = VM_PROT_READ | VM_PROT_WRITE},
+        {.cmd = LC_SEGMENT, .cmdsize = sizeof(struct segment_command), .segname = SEG_DATA,
+         .vmaddr = base + 0x2000, .vmsize = 0x1000, .fileoff = 0x2000, .filesize = 0x1000,
+         .initprot = VM_PROT_READ | VM_PROT_WRITE},
+    };
+    struct mach_header *header = (void *)file.bytes;
+    *header = (struct mach_header){.magic = MH_MAGIC, .cputype = CPU_TYPE_I386,
+        .filetype = MH_EXECUTE, .ncmds = 3, .sizeofcmds = sizeof(segments)};
+    memcpy(header + 1, segments, sizeof(segments));
+    uint32_t initializer = base + 0x1010;
+    memcpy(file.bytes + 0x2000, &initializer, sizeof(initializer));
+    struct source_file source = {.bytes = file.bytes, .size = sizeof(file.bytes)};
+    struct macho_image32 image = {.entry_eip = base + 0x10, .initializer_count = 1,
+                                  .initializer_address = base + 0x2000, .min_address = base};
+    assert(map_segments(&source, &image) == 0);
+    assert(mapped_protection(base) & VM_PROT_EXECUTE);
+    assert(mapped_protection(base + 0x1000) == (VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE));
+    assert(!(mapped_protection(base + 0x2000) & VM_PROT_EXECUTE));
+    munmap((void *)(uintptr_t)base, 0x3000);
 }
 
 int main(void)
@@ -107,6 +154,8 @@ int main(void)
     assert(inspect_commands(&source, &image) == 0);
     assert(image.entry_eip == 0x1234 && !image.main_address);
     test_defined_indirect_symbols();
-    puts("Mach-O PASS (LC_MAIN, LC_UNIXTHREAD, defined indirect symbols, invalid metadata)");
+    test_startup_code_in_writable_segment();
+    puts("Mach-O PASS (LC_MAIN, LC_UNIXTHREAD, defined indirect symbols, invalid metadata, "
+         "startup code in a writable segment)");
     return 0;
 }

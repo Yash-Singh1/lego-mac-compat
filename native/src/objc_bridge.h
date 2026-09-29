@@ -19,6 +19,10 @@ uint32_t objc_bridge32_guest_pointer(void *pointer);
 uint32_t objc_bridge32_guest_object(void *object);
 /* Bridge token that stays valid for the next several thousand such tokens. */
 uint32_t objc_bridge32_guest_recent_object(void *object);
+/* Fragile-ABI exception support: isKindOfClass: on guest tokens, and a
+   class name for diagnostics. */
+uint32_t objc_bridge32_guest_is_kind_of_class(uint32_t exception, uint32_t cls);
+const char *objc_bridge32_guest_class_name(uint32_t object);
 
 int objc_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
                            uint64_t *result);
