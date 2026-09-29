@@ -17,6 +17,8 @@ void objc_bridge32_reconcile_fragment_shadows(void);
 void objc_bridge32_display_size(uint32_t display, int32_t size[2]);
 uint32_t objc_bridge32_guest_pointer(void *pointer);
 uint32_t objc_bridge32_guest_object(void *object);
+/* Bridge token that stays valid for the next several thousand such tokens. */
+uint32_t objc_bridge32_guest_recent_object(void *object);
 
 int objc_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
                            uint64_t *result);

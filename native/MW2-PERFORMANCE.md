@@ -1,5 +1,17 @@
 # MW2 performance measurements
 
+## Background pacing
+
+While MW2 is not the active app, the loader limits it to `LP32_INACTIVE_FPS`
+presents per second: 15 by default, and 0 turns the limit off. A game left
+open in the background previously ran at full speed. One MW3 window left open
+for two hours used about 3.2 cores and a large share of the GPU while MW2 was
+being played. Scripted tests are exempt; with `LP32_TEST_INACTIVE_PACING=1`, a
+background test measured 14 FPS. `bench.py` can now use a copy of the user's
+profile (`--profile`, `--only-saves PREFIX`), run a custom key script with held
+keys (`--keys "T:KEY[:HOLD],..."`), record for a fixed time (`--fixed`,
+`--skip`) and sample at a set time (`--sample-at`).
+
 ## Fourth pass: mission loading and gamma
 
 Mission loading means the time from confirming "Resume Game" until the

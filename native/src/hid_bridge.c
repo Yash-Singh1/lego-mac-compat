@@ -7,6 +7,7 @@
 #include <IOKit/hid/IOHIDValue.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 #include <pthread.h>
 /* Callback contexts outlive manager closure: a queued native notification can
  * still hold one. They are bounded by registration count, not input events. */
@@ -19,13 +20,17 @@ static struct callback *registration(void *manager,unsigned kind,uint32_t fn,uin
     if(!c){c=calloc(1,sizeof(*c));if(c){c->manager=manager;c->kind=kind;c->next=callbacks;callbacks=c;}}
     if(c){c->function=fn;c->context=ctx;}pthread_mutex_unlock(&lock);return c;
 }
-static void invoke(void *raw,IOReturn status,void *sender,CFTypeRef value){
+/* Input values are new objects for every event and are only meaningful in
+   the callback; a persistent token for each filled the bridge's proxy pool. */
+static void invoke(void *raw,IOReturn status,void *sender,CFTypeRef value,bool transient){
     struct callback *c=raw;pthread_mutex_lock(&lock);uint32_t fn=c->function,ctx=c->context;pthread_mutex_unlock(&lock);
-    if(fn){uint32_t a[]={ctx,(uint32_t)status,objc_bridge32_guest_object(sender),objc_bridge32_guest_object((void *)value)};compat_runtime32_call(fn,a,4);}
+    if(fn){uint32_t a[]={ctx,(uint32_t)status,objc_bridge32_guest_object(sender),
+        transient?objc_bridge32_guest_recent_object((void *)value):objc_bridge32_guest_object((void *)value)};
+        compat_runtime32_call(fn,a,4);}
 }
-static void device_callback(void *raw,IOReturn status,void *sender,IOHIDDeviceRef device){invoke(raw,status,sender,device);}
-static void value_callback(void *raw,IOReturn status,void *sender,IOHIDValueRef value){invoke(raw,status,sender,value);}
-static void removal_callback(void *raw,IOReturn status,void *sender){invoke(raw,status,sender,NULL);}
+static void device_callback(void *raw,IOReturn status,void *sender,IOHIDDeviceRef device){invoke(raw,status,sender,device,false);}
+static void value_callback(void *raw,IOReturn status,void *sender,IOHIDValueRef value){invoke(raw,status,sender,value,true);}
+static void removal_callback(void *raw,IOReturn status,void *sender){invoke(raw,status,sender,NULL,false);}
 int hid_bridge32_dispatch(const char *name,const uint32_t *a,uint64_t *out){
     if (!strcmp(name, "_FFIsForceFeedback")) {
         *out = (uint32_t)FFIsForceFeedback(a[0]);
@@ -60,7 +65,7 @@ int hid_bridge32_dispatch(const char *name,const uint32_t *a,uint64_t *out){
     else if(IS("_IOHIDDeviceGetService"))*out=IOHIDDeviceGetService(O(0));
     else if(IS("_IOHIDDeviceGetValue")){
         IOHIDValueRef value=NULL;IOReturn status=IOHIDDeviceGetValue(O(0),O(1),&value);
-        if(a[2])*(uint32_t *)(uintptr_t)a[2]=status==kIOReturnSuccess?objc_bridge32_guest_object(value):0;
+        if(a[2])*(uint32_t *)(uintptr_t)a[2]=status==kIOReturnSuccess?objc_bridge32_guest_recent_object(value):0;
         *out=(uint32_t)status;
     }
     else if(IS("_IOHIDDeviceScheduleWithRunLoop")){IOHIDDeviceScheduleWithRunLoop(O(0),O(1),O(2));*out=0;}

@@ -21,6 +21,7 @@
 #include <mach-o/dyld.h>
 #include <signal.h>
 #include <stdio.h>
+#include <dispatch/dispatch.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -32,6 +33,8 @@ static unsigned char guest_breakpoint_original_byte;
 static volatile sig_atomic_t guest_breakpoint_stepping;
 static volatile sig_atomic_t guest_breakpoint_count;
 static unsigned guest_breakpoint_limit;
+static double guest_breakpoint_after;
+static uint64_t guest_breakpoint_armed_ns;
 static unsigned guest_breakpoint_skip;
 static int guest_diagnostic_fd = -1;
 
@@ -562,9 +565,27 @@ static void guest_crash_diagnostic(int signal_number, siginfo_t *info,
             return;
         }
         if (rip == guest_breakpoint_address + 1) {
-            unsigned count = ++guest_breakpoint_count;
+            /* LP32_TRACE_GUEST_AFTER=<seconds> ignores hits until then. */
+            bool early = guest_breakpoint_after > 0 &&
+                (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - guest_breakpoint_armed_ns) / 1e9 <
+                    guest_breakpoint_after;
+            unsigned count = early ? guest_breakpoint_count : ++guest_breakpoint_count;
+            if (early) {
+                *(volatile unsigned char *)guest_breakpoint_address = guest_breakpoint_original_byte;
+                flush_guest_instruction(guest_breakpoint_address);
+                context->uc_mcontext->__ss.__rip = guest_breakpoint_address;
+                context->uc_mcontext->__ss.__rflags |= UINT64_C(0x100);
+                guest_breakpoint_stepping = 1;
+                return;
+            }
             const uint32_t *words = (const void *)(uintptr_t)rsp;
-            if (count > guest_breakpoint_skip) {
+            static long every = -1;
+            if (every < 0) {
+                const char *text = getenv("LP32_TRACE_GUEST_EVERY");
+                every = text ? strtol(text, NULL, 0) : 1;
+                if (every < 1) every = 1;
+            }
+            if (count > guest_breakpoint_skip && count % (unsigned)every == 0) {
             GUEST_DIAGNOSTIC(
                     "compat32: guest breakpoint 0x%08llx hit %u "
                     "eax=%08llx ebx=%08llx ecx=%08llx edx=%08llx "
@@ -608,7 +629,10 @@ static void guest_crash_diagnostic(int signal_number, siginfo_t *info,
                     if (dump_address >= UINT32_C(0x1000) &&
                         dump_address < UINT32_C(0x80000000)) {
                         const uint32_t *dump = (const void *)dump_address;
-                        for (unsigned index = 0; index < 16; ++index) {
+                        const char *words_text = getenv("LP32_TRACE_GUEST_DUMP_WORDS");
+                        unsigned words = words_text ? (unsigned)strtoul(words_text, NULL, 0) : 16;
+                        if (words > 16384) words = 16384;
+                        for (unsigned index = 0; index < words; ++index) {
                             GUEST_DIAGNOSTIC(
                                     "compat32: breakpoint mem[%08llx]=0x%08x\n",
                                     (unsigned long long)(dump_address + index * 4),
@@ -763,6 +787,9 @@ static int configure_guest_breakpoint(const struct macho_image32 *image)
     guest_breakpoint_skip = parsed_skip < guest_breakpoint_limit ?
         (unsigned)parsed_skip : 0;
     guest_breakpoint_address = (uintptr_t)parsed;
+    const char *after_text = getenv("LP32_TRACE_GUEST_AFTER");
+    guest_breakpoint_after = after_text ? strtod(after_text, NULL) : 0;
+    guest_breakpoint_armed_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     size_t page_size = (size_t)getpagesize();
     uintptr_t page = guest_breakpoint_address & ~(page_size - 1);
     if (mprotect((void *)page, page_size,
@@ -773,14 +800,53 @@ static int configure_guest_breakpoint(const struct macho_image32 *image)
     }
     guest_breakpoint_original_byte =
         *(const unsigned char *)guest_breakpoint_address;
-    *(volatile unsigned char *)guest_breakpoint_address = 0xcc;
-    flush_guest_instruction(guest_breakpoint_address);
+    if (guest_breakpoint_after > 0) {
+        /* Insert the breakpoint only once the delay has passed, so earlier
+           hits cost nothing. */
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(guest_breakpoint_after * 1e9)),
+                       dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+            *(volatile unsigned char *)guest_breakpoint_address = 0xcc;
+            flush_guest_instruction(guest_breakpoint_address);
+        });
+        guest_breakpoint_after = 0;
+    } else {
+        *(volatile unsigned char *)guest_breakpoint_address = 0xcc;
+        flush_guest_instruction(guest_breakpoint_address);
+    }
     fprintf(stderr,
             "compat32: armed guest breakpoint 0x%08llx original=0x%02x "
             "skip=%u limit=%u\n",
             parsed, guest_breakpoint_original_byte, guest_breakpoint_skip,
             guest_breakpoint_limit);
     return 0;
+}
+
+/* LP32_TRACE_CONSOLE_PRINT=0xaddr:N replaces the guest function at addr with
+   a jump to _lp32_trace_print, which logs its Nth stack argument as a string
+   (for example the game's console print) and returns 0. Diagnostic only: the
+   original function no longer runs. */
+static void configure_console_print_trace(const struct macho_image32 *image)
+{
+    const char *text = getenv("LP32_TRACE_CONSOLE_PRINT");
+    if (!text || !text[0]) return;
+    char *end = NULL;
+    unsigned long address = strtoul(text, &end, 0);
+    unsigned argument = end && *end == ':' ? (unsigned)strtoul(end + 1, NULL, 0) : 0;
+    if (address < image->min_address || address + 5 > image->max_address || argument > 16) {
+        fprintf(stderr, "game_loader: invalid LP32_TRACE_CONSOLE_PRINT: %s\n", text);
+        return;
+    }
+    compat_runtime32_set_trace_print_argument(argument);
+    uint32_t thunk = compat_runtime32_guest_callback("_lp32_trace_print");
+    size_t page_size = (size_t)getpagesize();
+    uintptr_t page = address & ~(page_size - 1);
+    if (!thunk || mprotect((void *)page, page_size * 2, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return;
+    uint8_t *code = (uint8_t *)(uintptr_t)address;
+    int32_t displacement = (int32_t)(thunk - (uint32_t)(address + 5));
+    code[0] = 0xe9;
+    memcpy(code + 1, &displacement, 4);
+    flush_guest_instruction(address);
+    fprintf(stderr, "compat32: console print trace at 0x%08lx argument %u\n", address, argument);
 }
 
 static void runtime_diagnostic_line(const char *line)
@@ -879,6 +945,7 @@ int main(int argc, char **argv)
         macho_image32_unload(&image);
         return EXIT_FAILURE;
     }
+    configure_console_print_trace(&image);
 
     printf("image: segments=%" PRIu32 " range=0x%08" PRIx32 "-0x%08" PRIx32
            " entry=0x%08" PRIx32 " initializers=%" PRIu32 " imports=%" PRIu32 "\n",

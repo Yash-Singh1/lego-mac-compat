@@ -89,6 +89,9 @@ struct proxy_entry {
     id object;
     uint32_t cf_owners;
     bool pinned;
+    /* Owned by the recent-object ring (proxy_for_recent_object): seeing the
+       object again does not make its handle permanent. */
+    bool recent;
 };
 
 static _Thread_local bool creating_cf_object;
@@ -560,7 +563,7 @@ static uint32_t event_proxy_for_object(id object)
     } else ++pool->count;
     id previous=pool->entries[slot].object;
     uint32_t handle=kEventProxyBase+(event_pool_index*kEventProxyCapacity+slot)*kProxyStride;
-    pool->entries[slot]=(struct proxy_entry){handle,object,0,false};
+    pool->entries[slot]=(struct proxy_entry){handle,object,0,false,false};
     pool->cursor=(slot+1)%kEventProxyCapacity;
     if(proxy_object_is_retained(object))[object retain];
     if(proxy_object_is_retained(previous))[previous release];
@@ -587,7 +590,7 @@ static uint32_t proxy_for_object(id object)
     for (uint32_t index = 0; index < proxy_count; ++index) {
         if (proxies[index].object == object) {
             if (creating_cf_object) ++proxies[index].cf_owners;
-            else proxies[index].pinned = true;
+            else if (!proxies[index].recent) proxies[index].pinned = true;
             uint32_t handle = proxies[index].handle;
             pthread_mutex_unlock(&proxy_mutex);
             return handle;
@@ -612,7 +615,7 @@ static uint32_t proxy_for_object(id object)
         kOverflowProxyBase + (slot - kInlineProxyCapacity) * kProxyStride;
     proxies[slot] = (struct proxy_entry){handle, object,
                                        creating_cf_object ? 1u : 0u,
-                                       !creating_cf_object};
+                                       !creating_cf_object, false};
     static int trace_allocations=-1;
     if(trace_allocations<0)trace_allocations=getenv("LP32_TRACE_PROXY_ALLOC")!=NULL;
     if(trace_allocations)fprintf(stderr,
@@ -621,6 +624,28 @@ static uint32_t proxy_for_object(id object)
         proxy_origin?proxy_origin:"bridge",creating_cf_object);
     if (proxy_object_is_retained(object)) [object retain];
     if (slot == proxy_count) ++proxy_count;
+    /* Report what is filling the pool long before it runs out. */
+    static bool reported_half;
+    if (!reported_half && slot >= kProxyCapacity / 2) {
+        reported_half = true;
+        struct { Class cls; bool pinned; bool recent; unsigned count; } top[8] = {{0}};
+        for (uint32_t i = 0; i < proxy_count; ++i) {
+            if (!proxies[i].object) continue;
+            Class cls = object_getClass(proxies[i].object);
+            unsigned k = 0;
+            while (k < 8 && top[k].count && (top[k].cls != cls || top[k].pinned != proxies[i].pinned ||
+                                             top[k].recent != proxies[i].recent)) ++k;
+            if (k == 8) continue;
+            top[k].cls = cls; top[k].pinned = proxies[i].pinned; top[k].recent = proxies[i].recent;
+            ++top[k].count;
+        }
+        fprintf(stderr, "compat32: Objective-C proxy pool half full at swap %llu (latest origin=%s):",
+                (unsigned long long)objc_bridge_swap_count, proxy_origin ? proxy_origin : "bridge");
+        for (unsigned k = 0; k < 8 && top[k].count; ++k)
+            fprintf(stderr, " %s%s%s=%u", class_getName(top[k].cls), top[k].pinned ? "/pinned" : "",
+                    top[k].recent ? "/recent" : "", top[k].count);
+        fputc('\n', stderr);
+    }
     pthread_mutex_unlock(&proxy_mutex);
     return handle;
 }
@@ -654,6 +679,43 @@ static void guest_autorelease_pop(void)
     }
     free(scope);
 }
+/* Holds a +1 bridge reference on the most recent kRecentProxyCapacity
+ * objects and drops the oldest when a new one arrives. A guest retain keeps
+ * an object alive past that. */
+enum { kRecentProxyCapacity = 4096 };
+static uint32_t recent_proxies[kRecentProxyCapacity];
+static unsigned recent_proxy_cursor;
+static pthread_mutex_t recent_proxy_mutex = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t proxy_for_recent_object(id object)
+{
+    bool previous = creating_cf_object;
+    creating_cf_object = true;
+    uint32_t token = proxy_for_object(object);
+    creating_cf_object = previous;
+    if (!token) return 0;
+    pthread_mutex_lock(&proxy_mutex);
+    for (uint32_t i = 0; i < proxy_count; ++i)
+        if (proxies[i].handle == token) { proxies[i].recent = true; break; }
+    pthread_mutex_unlock(&proxy_mutex);
+    pthread_mutex_lock(&recent_proxy_mutex);
+    uint32_t oldest = recent_proxies[recent_proxy_cursor];
+    recent_proxies[recent_proxy_cursor] = token;
+    recent_proxy_cursor = (recent_proxy_cursor + 1) % kRecentProxyCapacity;
+    pthread_mutex_unlock(&recent_proxy_mutex);
+    if (oldest) {
+        uint64_t ignored;
+        objc_bridge32_dispatch("_CFRelease", &oldest, &ignored);
+    }
+    return token;
+}
+
+/* Short-lived callback arguments (HID input values) use the same bounded
+   ownership: they stay valid well past the callback without accumulating. */
+uint32_t objc_bridge32_guest_recent_object(void *object)
+{
+    return object ? proxy_for_recent_object((id)object) : 0;
+}
+
 static uint32_t proxy_for_autoreleased_object(id object)
 {
     if(!guest_autorelease_scope)return proxy_for_object(object);
@@ -983,6 +1045,31 @@ int objc_bridge32_run_proxy_self_test(void)
         if([(NSDate *)object_for_receiver(deadline) timeIntervalSince1970]!=12345 ||
            proxy_count>before_cf_count+2)return -1;
         objc_bridge32_dispatch("_CFRelease",&deadline,&ignored);
+        /* SDL wraps every key event in +[NSArray arrayWithObject:]. Scoped
+           convenience collections must not stay in the persistent pool. */
+        {
+            uint32_t array_class=proxy_for_object((id)[NSArray class]);
+            uint32_t selector=compat_runtime32_copy_cstring("arrayWithObject:");
+            uint32_t element=proxy_for_object(@"element");
+            uint32_t before_arrays=proxy_count, first=0;
+            for(unsigned i=0;i<100000;++i) {
+                @autoreleasepool {
+                    guest_autorelease_push();
+                    uint32_t a[]={array_class,selector,element};uint64_t result;
+                    if(!objc_bridge32_dispatch("_objc_msgSend",a,&result) || !result ||
+                       [(NSArray *)object_for_receiver((uint32_t)result) count]!=1)return -1;
+                    /* Real key events pass the array back through the bridge
+                       (text input); that must not make it permanent. */
+                    if(proxy_for_object(object_for_receiver((uint32_t)result))!=(uint32_t)result)return -1;
+                    guest_autorelease_pop();
+                    /* Still valid after the guest pool drains, as before. */
+                    if([(NSArray *)object_for_receiver((uint32_t)result) count]!=1)return -1;
+                    if(!i)first=(uint32_t)result;
+                    if(i==kRecentProxyCapacity/2 && [(NSArray *)object_for_receiver(first) count]!=1)return -1;
+                }
+            }
+            if(proxy_count>before_arrays+kRecentProxyCapacity+2)return -1;
+        }
         /* Exercise actual Cocoa selectors with long, heap-backed strings;
          * short tagged strings can conceal leaks by reusing their identity. */
         uint32_t string_class=proxy_for_object((id)[NSString class]);
@@ -1608,10 +1695,23 @@ static bool invoke_simple_message(id receiver, const char *selector_name,
                 *guest_result=proxy_for_string_result(receiver,guest_arguments[0],selector_name,value,string_init);
                 return true;
             }
+            /* SDL makes +[NSArray arrayWithObject:event] for every key event.
+               Pinning those filled the proxy pool after about an hour of play,
+               but releasing them when the guest's pool drains frees the key
+               event while macOS text input may still be using it (keys then
+               arrive only with the next event). Keep them alive for the next
+               several thousand constructions instead. */
+            bool class_receiver = class_isMetaClass(object_getClass(receiver));
+            bool collection = class_receiver &&
+                (([value isKindOfClass:[NSArray class]] && !strncmp(selector_name,"array",5)) ||
+                 ([value isKindOfClass:[NSDictionary class]] && !strncmp(selector_name,"dictionary",10)) ||
+                 ([value isKindOfClass:[NSSet class]] &&
+                  (!strcmp(selector_name,"set") || !strncmp(selector_name,"setWith",7))));
             bool temporary = ([value isKindOfClass:[NSDate class]] &&
                 (!strncmp(selector_name,"date",4) || !strcmp(selector_name,"distantPast") || !strcmp(selector_name,"distantFuture"))) ||
                 (!strcmp(selector_name,"deviceDescription") && [receiver isKindOfClass:[NSScreen class]]);
-            *guest_result = temporary ? proxy_for_autoreleased_object(value) :
+            *guest_result = collection ? proxy_for_recent_object(value) :
+                temporary ? proxy_for_autoreleased_object(value) :
                 proxy_for_returned_object(receiver, value);
             return true;
         }
@@ -1918,7 +2018,8 @@ static int read_test_key_fifo(double *hold_seconds, unsigned long *modifiers)
     memmove(test_key_fifo_buffer, newline + 1,
             test_key_fifo_length - consumed);
     test_key_fifo_length -= consumed;
-    if (end == test_key_fifo_buffer || key_code < 0 || key_code > 127) {
+    if (end == test_key_fifo_buffer || key_code < 0 ||
+        (key_code > 127 && (key_code < 1000 || key_code > 1002))) {
         return -1;
     }
     *hold_seconds = hold;
@@ -1973,6 +2074,20 @@ static void post_test_key_event_with_modifiers(NSWindow *window,
                                                unsigned long modifiers)
 {
     if (!window) return;
+    /* Test-only: codes 1000-1002 click the left, right and middle buttons. */
+    if (key_code >= 1000 && key_code <= 1002) {
+        unsigned button = key_code - 1000;
+        NSEventType type = button == 0 ? (is_down ? NSEventTypeLeftMouseDown : NSEventTypeLeftMouseUp) :
+                           button == 1 ? (is_down ? NSEventTypeRightMouseDown : NSEventTypeRightMouseUp) :
+                           (is_down ? NSEventTypeOtherMouseDown : NSEventTypeOtherMouseUp);
+        NSEvent *click = [NSEvent mouseEventWithType:type
+            location:NSMakePoint(NSMidX(window.contentView.bounds), NSMidY(window.contentView.bounds))
+            modifierFlags:modifiers timestamp:[[NSProcessInfo processInfo] systemUptime]
+            windowNumber:window.windowNumber context:nil eventNumber:0 clickCount:1
+            pressure:is_down ? 1 : 0];
+        if (click) [NSApp postEvent:click atStart:NO];
+        return;
+    }
     if(key_code<128)__atomic_store_n(&test_key_states[key_code],is_down,__ATOMIC_RELAXED);
     NSString *characters = characters_for_test_key(key_code);
     NSTimeInterval timestamp = [[NSProcessInfo processInfo] systemUptime];
@@ -3006,6 +3121,57 @@ static bool frame_gamma_redirect_blit(const uint32_t *a)
     if (read_framebuffer <= 0) return false;
     frame_gamma_done = frame_gamma_draw(cgl, width, height, (GLuint)read_framebuffer, a[9]);
     return frame_gamma_done;
+}
+
+/*
+ * MW2 keeps running when another app is in front, and at full speed it takes
+ * several cores and much of the GPU from whatever the user switched to (for
+ * example another game). While inactive, presents are paced to
+ * LP32_INACTIVE_FPS (default 15; 0 disables). Game time and audio continue
+ * normally; only the frame rate drops. Scripted tests are never paced.
+ */
+static int presenting_app_active = -1;
+
+static void inactive_pacing_track_focus(void)
+{
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        __atomic_store_n(&presenting_app_active,
+                         [[NSRunningApplication currentApplication] isActive] ? 1 : 0,
+                         __ATOMIC_RELAXED);
+        NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+        [center addObserverForName:NSApplicationDidResignActiveNotification object:nil queue:nil
+                        usingBlock:^(NSNotification *note) {
+            (void)note; __atomic_store_n(&presenting_app_active, 0, __ATOMIC_RELAXED);
+        }];
+        [center addObserverForName:NSApplicationDidBecomeActiveNotification object:nil queue:nil
+                        usingBlock:^(NSNotification *note) {
+            (void)note; __atomic_store_n(&presenting_app_active, 1, __ATOMIC_RELAXED);
+        }];
+    });
+}
+
+static void inactive_pacing_before_present(void)
+{
+    static int64_t interval_ns = -1;
+    if (interval_ns < 0) {
+        const char *text = getenv("LP32_INACTIVE_FPS");
+        double fps = text ? strtod(text, NULL) : 15.0;
+        interval_ns = (background_test_mode() && !getenv("LP32_TEST_INACTIVE_PACING")) || fps <= 0 ?
+                      0 : (int64_t)(1e9 / fps);
+    }
+    if (!interval_ns) return;
+    inactive_pacing_track_focus();
+    static uint64_t last_present_ns;
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (!__atomic_load_n(&presenting_app_active, __ATOMIC_RELAXED) && last_present_ns &&
+        now - last_present_ns < (uint64_t)interval_ns) {
+        uint64_t wait = (uint64_t)interval_ns - (now - last_present_ns);
+        struct timespec pause = {(time_t)(wait / 1000000000), (long)(wait % 1000000000)};
+        nanosleep(&pause, NULL);
+        now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    }
+    last_present_ns = now;
 }
 
 static struct { unsigned sets, restores; CGGammaValue first; } gamma_test_host;
@@ -7713,7 +7879,10 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         CFStringRef value=CFURLCopyScheme((CFURLRef)object_for_argument(arguments[0]));
         *result=proxy_for_object((id)value);if(value)CFRelease(value);return 1;
     }
-    if (LP32_NAME_IS(import_name, import_length, "_CFStringCreateWithCString")) {
+    /* The NoCopy form (used by Sys_Quit) gets a copy: the guest bytes may be
+       freed while the host string lives on. A guest deallocator is not run. */
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringCreateWithCString") ||
+        LP32_NAME_IS(import_name, import_length, "_CFStringCreateWithCStringNoCopy")) {
         CFStringRef string=CFStringCreateWithCString(NULL,(const char *)(uintptr_t)arguments[1],arguments[2]);
         *result=proxy_for_object((id)string);if(string)CFRelease(string);return 1;
     }
@@ -10766,6 +10935,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                 --mw2_gl_reattach_left;
             }
             frame_gamma_present((NSOpenGLContext *)receiver);
+            inactive_pacing_before_present();
             texture_bind_cache_invalidate();
             __atomic_store_n(&presenting_context,
                              [(NSOpenGLContext *)receiver CGLContextObj], __ATOMIC_RELAXED);

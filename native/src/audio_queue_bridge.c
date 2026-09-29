@@ -14,7 +14,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { kQueueHandleBase = 0x51a00000, kMaxQueues = 256, kMaxBuffers = 64 };
+/* Each movie and audio reinitialization makes a queue; slots are never
+   reused (see below), so allow for long sessions. */
+enum { kQueueHandleBase = 0x51a00000, kMaxQueues = 4096, kMaxBuffers = 64 };
 
 struct guest_buffer32 {
     uint32_t capacity, data, byte_size, user_data;
@@ -24,6 +26,10 @@ struct guest_buffer32 {
 struct queue {
     AudioQueueRef audio;
     uint32_t handle, callback, user_data;
+    /* Set, under lock, before the native queue is disposed. Callbacks still
+       arriving from the queue thread then neither reach the guest nor copy
+       into native buffers the disposal may already have freed. */
+    bool disposing;
     unsigned buffer_count;
     struct { uint32_t guest; AudioQueueBufferRef host; } buffers[kMaxBuffers];
 };
@@ -37,7 +43,10 @@ static struct queue *queue_for(uint32_t handle)
 {
     if (handle <= kQueueHandleBase || handle - kQueueHandleBase > queue_count) return NULL;
     struct queue *q = &queues[handle - kQueueHandleBase - 1];
-    return q->audio ? q : NULL;
+    pthread_mutex_lock(&lock);
+    bool live = q->audio && !q->disposing;
+    pthread_mutex_unlock(&lock);
+    return live ? q : NULL;
 }
 
 static AudioQueueBufferRef host_buffer(struct queue *q, uint32_t guest)
@@ -51,6 +60,10 @@ static void output(void *raw, AudioQueueRef audio, AudioQueueBufferRef buffer)
 {
     (void)audio;
     struct queue *q = raw;
+    pthread_mutex_lock(&lock);
+    bool live = q->audio && !q->disposing;
+    pthread_mutex_unlock(&lock);
+    if (!live) return;
     uint32_t arguments[] = {q->user_data, q->handle, (uint32_t)(uintptr_t)buffer->mUserData};
     if (getenv("LP32_TRACE_AUDIO_QUEUE")) {
         static unsigned calls;
@@ -92,30 +105,56 @@ static OSStatus allocate_buffer(struct queue *q, uint32_t capacity, uint32_t *ou
     struct guest_buffer32 *record = (void *)(uintptr_t)guest;
     record->capacity = capacity;
     record->data = guest + sizeof(*record);
-    q->buffers[q->buffer_count].guest = guest;
-    q->buffers[q->buffer_count++].host = host;
+    pthread_mutex_lock(&lock);
+    bool stored = !q->disposing && q->buffer_count < kMaxBuffers;
+    if (stored) {
+        q->buffers[q->buffer_count].guest = guest;
+        q->buffers[q->buffer_count++].host = host;
+    }
+    pthread_mutex_unlock(&lock);
+    if (!stored) { compat_runtime32_deallocate(guest); return kAudio_MemFullError; }
     *out = guest;
     return noErr;
 }
 
+/* The copy and native enqueue run under lock so that a disposal on another
+   thread cannot free the native buffer between them. */
 static OSStatus enqueue(struct queue *q, const uint32_t *a)
 {
-    AudioQueueBufferRef host = host_buffer(q, a[1]);
-    if (!host) return kAudioQueueErr_InvalidBuffer;
+    pthread_mutex_lock(&lock);
+    OSStatus status;
+    AudioQueueBufferRef host = q->audio && !q->disposing ? host_buffer(q, a[1]) : NULL;
     const struct guest_buffer32 *record = (const void *)(uintptr_t)a[1];
-    if (record->byte_size > host->mAudioDataBytesCapacity) return kAudioQueueErr_BufferEmpty;
-    memcpy(host->mAudioData, (const void *)(uintptr_t)record->data, record->byte_size);
-    host->mAudioDataByteSize = record->byte_size;
-    /* AudioStreamPacketDescription has the same 16-byte layout on i386. */
-    return AudioQueueEnqueueBuffer(q->audio, host, a[2], (const void *)(uintptr_t)a[3]);
+    if (!host) {
+        status = kAudioQueueErr_InvalidBuffer;
+    } else if (record->byte_size > host->mAudioDataBytesCapacity) {
+        status = kAudioQueueErr_BufferEmpty;
+    } else {
+        memcpy(host->mAudioData, (const void *)(uintptr_t)record->data, record->byte_size);
+        host->mAudioDataByteSize = record->byte_size;
+        /* AudioStreamPacketDescription has the same 16-byte layout on i386. */
+        status = AudioQueueEnqueueBuffer(q->audio, host, a[2], (const void *)(uintptr_t)a[3]);
+    }
+    pthread_mutex_unlock(&lock);
+    return status;
 }
 
 static void dispose(struct queue *q, bool immediate)
 {
-    AudioQueueDispose(q->audio, immediate);
+    pthread_mutex_lock(&lock);
+    AudioQueueRef audio = q->disposing ? NULL : q->audio;
+    q->disposing = true;
+    pthread_mutex_unlock(&lock);
+    if (!audio) return;
+    /* Not under lock: disposal waits for a running output callback, which
+       may itself be in enqueue(). */
+    AudioQueueDispose(audio, immediate);
+    pthread_mutex_lock(&lock);
     q->audio = NULL;
-    for (unsigned i = 0; i < q->buffer_count; ++i) compat_runtime32_deallocate(q->buffers[i].guest);
+    unsigned count = q->buffer_count;
     q->buffer_count = 0;
+    pthread_mutex_unlock(&lock);
+    for (unsigned i = 0; i < count; ++i) compat_runtime32_deallocate(q->buffers[i].guest);
 }
 
 int audio_queue_bridge32_dispatch(const char *name, const uint32_t *a, uint64_t *result)

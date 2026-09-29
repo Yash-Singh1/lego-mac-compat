@@ -395,6 +395,13 @@ $(BUILD_DIR)/test_libcpp_bridge: tests/test_libcpp_bridge.c src/libcpp_bridge.c 
 test-libcpp-bridge: $(BUILD_DIR)/test_libcpp_bridge
 	arch -x86_64 ./$(BUILD_DIR)/test_libcpp_bridge
 
+$(BUILD_DIR)/test_audio_queue_bridge: tests/test_audio_queue_bridge.c src/audio_queue_bridge.c src/audio_queue_bridge.h | $(BUILD_DIR)
+	$(CLANG) $(CFLAGS) -Wl,-pagezero_size,0x1000 -Isrc tests/test_audio_queue_bridge.c src/audio_queue_bridge.c -framework AudioToolbox -framework CoreAudio -o $@
+
+.PHONY: test-audio-queue-bridge
+test-audio-queue-bridge: $(BUILD_DIR)/test_audio_queue_bridge
+	arch -x86_64 ./$(BUILD_DIR)/test_audio_queue_bridge
+
 .PHONY: test-blocks-bridge
 $(BUILD_DIR)/test_blocks_bridge: tests/test_blocks_bridge.c src/blocks_bridge.c src/blocks_bridge.h | $(BUILD_DIR)
 	$(CLANG) $(CFLAGS) -Wl,-pagezero_size,0x1000 tests/test_blocks_bridge.c src/blocks_bridge.c -o $@

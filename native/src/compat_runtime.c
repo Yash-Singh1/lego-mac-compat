@@ -4071,6 +4071,9 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
     return result;
 }
 
+static unsigned trace_print_argument;
+void compat_runtime32_set_trace_print_argument(unsigned argument) { trace_print_argument = argument; }
+
 static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
                                       const uint32_t *arguments,
                                       uint32_t return_address)
@@ -4088,6 +4091,15 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
     }
     dispatch_name_length = strlen(name);
     dispatch_name_matched = false;
+    if (!strcmp(name, "_lp32_trace_print")) {
+        uint32_t text = arguments[trace_print_argument];
+        if (text >= 0x1000 && text < 0x7f000000) {
+            fprintf(stderr, "GAMEPRINT %.*s", 1000, (const char *)(uintptr_t)text);
+            size_t length = strnlen((const char *)(uintptr_t)text, 1000);
+            if (!length || ((const char *)(uintptr_t)text)[length - 1] != '\n') fputc('\n', stderr);
+        }
+        return 0;
+    }
     if (!strcmp(name, "_puts")) {
         /* Aspyr prints the Steam proof-of-purchase key before storing it.
            Keep the license callback intact without recording its secret. */
@@ -5426,6 +5438,9 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
     if (import_is(name, "_ceil")) return return_guest_double(ceil(guest_double(arguments)));
     if (import_is(name, "_floor")) return return_guest_double(floor(guest_double(arguments)));
     if (import_is(name, "_rint")) return return_guest_double(rint(guest_double(arguments)));
+    if (import_is(name, "_ldexpf")) {
+        return return_guest_float(ldexpf(guest_float(arguments[0]), (int)arguments[1]));
+    }
     if (import_is(name, "_ldexp")) {
         return return_guest_double(ldexp(guest_double(arguments), (int)arguments[2]));
     }

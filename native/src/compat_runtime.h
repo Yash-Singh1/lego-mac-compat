@@ -34,6 +34,8 @@ uint64_t compat_runtime32_dispatch_import(const char *name,
    given import name, for function pointers the game expects to call back
    (the same mechanism dlsym results use).  0 if the thunk table is full. */
 uint32_t compat_runtime32_guest_callback(const char *name);
+/* See LP32_TRACE_CONSOLE_PRINT in game_loader.c. */
+void compat_runtime32_set_trace_print_argument(unsigned argument);
 
 /* Guest callback standing in for Feral's Content.loader MainEntry (returns 1
    so the title proceeds to its own main). */
