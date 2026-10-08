@@ -14,10 +14,13 @@ _lp32_import_gateway:
     /* Let another thread execute guest code while this import runs in host. */
     callq _lp32_guest_execution_leave
 
-    /* dispatch(import_id, guest_arguments, guest_return_address) */
+    /* dispatch(import_id, guest_arguments, guest_return_address,
+       saved_registers): the last points at the i386 callee-saved registers
+       pushed above (edi, esi, ebp, ebx), which exception unwinding reads. */
     movl (%r14), %edi
     leaq 8(%r14), %rsi
     movl 4(%r14), %edx
+    movq %rsp, %rcx
     callq _lp32_dispatch_import
 
     /* Apply floating/escape state belonging to this host thread. */
@@ -36,6 +39,13 @@ _lp32_import_gateway:
     cmpl $0, 8(%rsp)
     jne 2f
     callq _lp32_guest_execution_enter
+    /* A thrown exception or longjmp from the import resumes the guest at a
+       different frame instead of the call's return address. */
+    cmpl $0, _lp32_resumes_pending(%rip)
+    je 2f
+    callq _lp32_take_resume_context
+    testq %rax, %rax
+    jnz 4f
 2:
     movl 8(%rsp), %ecx
     movq (%rsp), %rax
@@ -61,6 +71,29 @@ _lp32_import_gateway:
     movzwl _lp32_cs32(%rip), %ecx
     movl %ecx, 4(%rsp)
     leal 4(%r14), %r14d
+    xchgq %r14, %rsp
+    ljmp *(%r14)
+
+4:
+    /* rax = struct guest_resume_context {ebx, ebp, esi, edi, esp, eip, eax,
+       edx}. Drop the scratch slots and saved registers, put eip below the
+       new esp and let the landing trampoline's ret pop it. */
+    movq %rax, %rcx
+    addq $48, %rsp
+    movl 0(%rcx), %ebx
+    movl 4(%rcx), %ebp
+    movl 8(%rcx), %esi
+    movl 12(%rcx), %edi
+    movl 16(%rcx), %r14d
+    subl $4, %r14d
+    movl 20(%rcx), %r8d
+    movl %r8d, (%r14)
+    movl 24(%rcx), %eax
+    movl 28(%rcx), %edx
+    movl _lp32_landing32(%rip), %r8d
+    movl %r8d, (%rsp)
+    movzwl _lp32_cs32(%rip), %r8d
+    movl %r8d, 4(%rsp)
     xchgq %r14, %rsp
     ljmp *(%r14)
 

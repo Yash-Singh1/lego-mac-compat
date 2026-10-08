@@ -105,13 +105,15 @@ final class Converter {
     }
 
     let cancellation = Cancellation()
+    let game: GameTitle
     let resources: URL
     let cache: URL
     let progress: (String, String) -> Void
     private let fm = FileManager.default
 
-    init(resources: URL, cache: URL = Converter.defaultCache,
+    init(resources: URL, cache: URL = Converter.defaultCache, game: GameTitle = .current,
          progress: @escaping (String, String) -> Void) {
+        self.game = game
         self.resources = resources
         self.cache = cache
         self.progress = progress
@@ -264,6 +266,23 @@ final class Converter {
         return runtime
     }
 
+    func validateGLMetal() throws -> URL {
+        let directory = resources.deletingLastPathComponent().appendingPathComponent("Frameworks/GLMetal")
+        let manifest = try Data(contentsOf: resources.appendingPathComponent("GLMetal-build-info.json"))
+        guard let info = try JSONSerialization.jsonObject(with: manifest) as? [String: Any],
+              let files = info["files"] as? [String: [String: String]] else {
+            throw ConversionError.message("The converter's GLMetal package is incomplete. Rebuild or obtain a complete converter app.")
+        }
+        for name in ["libGLMetal.dylib", "glmetal-compiler"] {
+            let file = directory.appendingPathComponent(name)
+            guard fm.isExecutableFile(atPath: file.path), try sha256(file) == files[name]?["bundled_sha256"] else {
+                throw ConversionError.message("The converter's GLMetal package is missing or damaged: \(name).")
+            }
+            try run("/usr/bin/codesign", ["--verify", "--strict", "--all-architectures", file.path])
+        }
+        return directory
+    }
+
     func convert(source: URL, destination: URL, mode: GameMode = .sp) throws -> URL {
         try cancellation.check()
         let source = source.resolvingSymlinksInPath().standardizedFileURL
@@ -273,69 +292,95 @@ final class Converter {
               !(converterApp.pathExtension == "app" && isInside(destination, converterApp)) else {
             throw ConversionError.message("Choose an output folder outside the original game and the converter app.")
         }
-        let layout = try COD4Source.discover(source, mode: mode)
+        let layout = try game.discover(source, mode: mode)
+        let stem = game.stem(mode)
         try layout.checkDestination(destination)
-        progress("Checking Call of Duty 4…", "Reading the Mac \(mode.title.lowercased()) executable.")
+        progress("Checking \(game.title)…", "Reading the Mac \(mode.title.lowercased()) executable.")
         let gameImage = try machOSlice(Data(contentsOf: layout.image), cpu: 7)
         let steam = try layout.steamLibrary.map { try machOSlice(Data(contentsOf: $0), cpu: 0x01000007) }
         let loader = resources.appendingPathComponent("game_loader")
         guard fm.isExecutableFile(atPath: loader.path) else {
-            throw ConversionError.message("The converter is missing its game launcher. Use a complete copy of COD4-Converter.app.")
+            throw ConversionError.message("The converter is missing its game launcher. Use a complete copy of \(game.short)-Converter.app.")
         }
         // This also reports a missing Rosetta installation before downloading or copying.
         try run("/usr/bin/arch", ["-x86_64", "/usr/bin/true"])
-        let runtime = try prepareRuntime()
+        let metal = try validateGLMetal()
+        let runtime = game == .cod4 ? try prepareRuntime() : nil
         let temp = destination.appendingPathComponent(".cod4-converting-\(UUID().uuidString)")
         try fm.createDirectory(at: temp, withIntermediateDirectories: false)
         defer { try? fm.removeItem(at: temp) }
-        let app = temp.appendingPathComponent(mode.stem + ".app")
+        let app = temp.appendingPathComponent(stem + "-Compat.app")
         let output = app.appendingPathComponent("Contents")
         for directory in ["MacOS", "Resources", "SharedSupport"] {
             try fm.createDirectory(at: output.appendingPathComponent(directory), withIntermediateDirectories: true)
         }
-        progress("Copying Call of Duty 4…", "Creating your \(mode.title.lowercased()) app. This copies about 7 GB of game files.")
-        try copyGameTree(layout.gameData, to: output.appendingPathComponent("Call of Duty 4 Data"), check: cancellation.check)
+        progress("Copying \(game.title)…", "Creating your \(mode.title.lowercased()) app. This creates an independent copy of the game files.")
+        try copyGameTree(layout.gameData, to: output.appendingPathComponent(game == .cod4 ? "Call of Duty 4 Data" : "GameData"), check: cancellation.check)
         if fm.fileExists(atPath: layout.resources.path) {
             try copyGameTree(layout.resources, to: output.appendingPathComponent("Resources"),
                              excluding: layout.gameData, check: cancellation.check)
         }
-        try gameImage.write(to: output.appendingPathComponent("SharedSupport/" + mode.imageName))
-        try fm.setAttributes([.posixPermissions: 0o644], ofItemAtPath: output.appendingPathComponent("SharedSupport/" + mode.imageName).path)
-        if let bink = layout.binkLibrary {
-            try copyGameTree(bink, to: output.appendingPathComponent("SharedSupport/libBinkMachOx86.dylib"), check: cancellation.check)
+        try gameImage.write(to: output.appendingPathComponent("SharedSupport/" + stem + ".image"))
+        try fm.setAttributes([.posixPermissions: 0o644], ofItemAtPath: output.appendingPathComponent("SharedSupport/" + stem + ".image").path)
+        for library in layout.guestLibraries {
+            try copyGameTree(library, to: output.appendingPathComponent("SharedSupport/" + library.lastPathComponent), check: cancellation.check)
         }
-        try copyGameTree(runtime, to: output.appendingPathComponent("SharedSupport/compat-runtime"), check: cancellation.check)
-        try fm.copyItem(at: loader, to: output.appendingPathComponent("MacOS/" + mode.executable))
-        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: output.appendingPathComponent("MacOS/" + mode.executable).path)
+        if let runtime {
+            try copyGameTree(runtime, to: output.appendingPathComponent("SharedSupport/compat-runtime"), check: cancellation.check)
+        } else {
+            for file in try fm.contentsOfDirectory(at: layout.contents.appendingPathComponent("MacOS"), includingPropertiesForKeys: nil)
+                where ["asi", "flt", "mix"].contains(file.pathExtension) {
+                let handle = try FileHandle(forReadingFrom: file)
+                let magic = try handle.read(upToCount: 2)
+                try handle.close()
+                if magic == Data("MZ".utf8) {
+                    try copyGameTree(file, to: output.appendingPathComponent("SharedSupport/" + file.lastPathComponent), check: cancellation.check)
+                }
+            }
+        }
+        try copyGameTree(metal, to: output.appendingPathComponent("Frameworks/GLMetal"), check: cancellation.check)
+        try fm.copyItem(at: resources.appendingPathComponent("GLMetal-build-info.json"), to: output.appendingPathComponent("Resources/GLMetal-build-info.json"))
+        try fm.copyItem(at: loader, to: output.appendingPathComponent("MacOS/" + stem + "Compat"))
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: output.appendingPathComponent("MacOS/" + stem + "Compat").path)
         let steamOutput = output.appendingPathComponent("Resources/libsteam_api.dylib")
         if let steam {
             if fm.fileExists(atPath: steamOutput.path) { try fm.removeItem(at: steamOutput) }
             try steam.write(to: steamOutput)
         }
         var info = try layout.validateLayout()
-        info["CFBundleExecutable"] = mode.executable
+        info["CFBundleExecutable"] = stem + "Compat"
         let sourceID = info["CFBundleIdentifier"] as? String
-        info["CFBundleIdentifier"] = sourceID.map { $0 + ".compat" } ?? "org.32bitgoofy.cod4.\(mode.rawValue).compat"
-        let name = "Call of Duty 4\(mode == .mp ? " Multiplayer" : "") (Compatibility)"
+        info["CFBundleIdentifier"] = sourceID.map { $0 + ".compat" } ?? "org.32bitgoofy.\(game.rawValue).\(mode.rawValue).compat"
+        let name = "\(game.title)\(mode == .mp ? " Multiplayer" : "") (Compatibility)"
         info["CFBundleName"] = name
         info["CFBundleDisplayName"] = name
         info["LSMinimumSystemVersion"] = "11.0"
         info["NSHighResolutionCapable"] = false
-        info["LP32GeneratedGame"] = "cod4"
+        info["LP32GeneratedGame"] = game.rawValue
+        info["LP32GLMetal"] = true
+        var environment = info["LSEnvironment"] as? [String: String] ?? [:]
+        environment["LP32_GL_BACKEND"] = "metal"
+        environment.removeValue(forKey: "LP32_GLMETAL_PATH")
+        info["LSEnvironment"] = environment
+        if game != .cod4 {
+            info["LP32SteamAppID"] = game.appID(mode)
+            for key in ["NSMainNibFile", "GameGuide", "DefaultChildApp"] { info.removeValue(forKey: key) }
+        }
         info["LP32ContinueWhenInactive"] = false
-        if mode == .mp {
+        if game == .cod4 && mode == .mp {
             // Legacy servers choose their own HTTP mod-download hosts. The
             // original NSURLDownload path predates ATS; preserve that support.
             info["NSAppTransportSecurity"] = ["NSAllowsArbitraryLoads": true]
         }
         try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
             .write(to: output.appendingPathComponent("Info.plist"))
-        progress("Finishing your app…", "Preparing Call of Duty 4 to open from Finder.")
+        progress("Finishing your app…", "Preparing \(game.title) to open from Finder.")
         try run("/usr/bin/xattr", ["-cr", app.path])
         if steam != nil { try run("/usr/bin/codesign", ["--force", "--sign", "-", steamOutput.path]) }
         try run("/usr/bin/codesign", ["--force", "--sign", "-", app.path])
         try run("/usr/bin/codesign", ["--verify", "--strict", app.path])
+        _ = try layout.validateLayout()
         try cancellation.check()
-        return try publish(app, in: destination, name: mode.stem)
+        return try publish(app, in: destination, name: stem + "-Compat")
     }
 }

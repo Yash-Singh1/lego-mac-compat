@@ -204,6 +204,7 @@ int libcpp_bridge32_dispatch(const char *name,const uint32_t *a,uint64_t *out){
     if(IS("7reserveEm"))return reserve(p,a[1],width);
     if(IS("6appendEPKc") || IS("6appendEPKcm") || IS("6appendEPKwm"))return replace(p,length(p),0,P(1),IS("6appendEPKc")?(uint32_t)strlen(P(1)):a[2],width);
     if(IS("6insertEmPKc") || IS("6insertEmPKcm"))return replace(p,a[1],0,P(2),IS("6insertEmPKc")?(uint32_t)strlen(P(2)):a[3],width);
+    if(IS("7replaceEmmPKcm"))return replace(p,a[1],a[2],P(3),a[4],width);
     if(IS("5eraseEmm"))return replace(p,a[1],a[2],NULL,0,width);
     if(IS("9push_backEc") || IS("9push_backEw"))return replace(p,length(p),0,a+1,1,width);
     if(IS("6resizeEmc") || IS("6resizeEmw")){
@@ -223,6 +224,20 @@ int libcpp_bridge32_dispatch(const char *name,const uint32_t *a,uint64_t *out){
         uint32_t len=length(p);const unsigned char *s=(void *)(uintptr_t)data(p,1);*out=UINT32_MAX;
         if(IS("4findEcm")){for(uint32_t i=a[2];i<len;++i)if(s[i]==(uint8_t)a[1]){*out=i;break;}}
         else if(len){uint32_t i=a[2]<len?a[2]:len-1;do{if(s[i]==(uint8_t)a[1]){*out=i;break;}}while(i--);}
+        return 1;
+    }
+    if(IS("4findEPKcmm")){
+        uint32_t len=length(p),pos=a[2],needle_len=a[3];
+        const char *haystack=(const char *)(uintptr_t)data(p,1);
+        const char *needle=P(1);
+        *out=UINT32_MAX;
+        if(pos>len || needle_len>len-pos)return 1;
+        if(!needle_len){*out=pos;return 1;}
+        if(!needle)return 0;
+        for(uint32_t i=pos;i<=len-needle_len;++i)
+            if(haystack[i]==needle[0] && !memcmp(haystack+i,needle,needle_len)){
+                *out=i;break;
+            }
         return 1;
     }
     if(IS("9__grow_byEmmmmmm")){

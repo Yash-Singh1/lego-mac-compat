@@ -21,6 +21,19 @@ uint32_t compat_runtime32_call(uint32_t fn,const uint32_t *a,size_t n){
     return 0;
 }
 static uint64_t user_id(void *self){assert(self==interfaces[STEAM_USER].host);return UINT64_C(0x1122334455667788);}
+static uint64_t friend_id(void *self, int32_t index, int32_t flags) {
+    assert(self == interfaces[STEAM_FRIENDS].host && index == 2 && flags == 4);
+    return UINT64_C(0x1122334455667788);
+}
+static bool friend_playing;
+static bool friend_game(void *self, uint64_t id, void *output) {
+    assert(self == interfaces[STEAM_FRIENDS].host && id == UINT64_C(0x1122334455667788));
+    if (friend_playing) {
+        const uint32_t fields[] = {42680, 0, 0x01020304, 27015u | 27016u << 16, 0xaabbccdd, 0x01100001};
+        memcpy(output, fields, sizeof(fields));
+    }
+    return friend_playing;
+}
 static unsigned forget_calls;
 static bool forget(void *self,const char *name){assert(self==interfaces[STEAM_STORAGE].host&&!strcmp(name,"slot"));++forget_calls;return true;}
 static bool quota(void *self,int32_t *total,int32_t *available){assert(self==interfaces[STEAM_STORAGE].host);*total=200;*available=100;return true;}
@@ -61,6 +74,31 @@ int main(void){
     a[0]=0x10000010;a[1]=0x10000000;memory[6]=0xabcdef01;
     assert(steam_bridge32_call_uses_sret("_lp32_steam_0_2",a));
     assert(interface_call(STEAM_USER,2,a,&out)&&out==0x10000010);assert(*(uint64_t *)(memory+4)==UINT64_C(0x1122334455667788)&&memory[6]==0xabcdef01);
+    void *friends_table[64]={0}, **friends=friends_table;
+    friends_table[4]=friend_id;
+    interfaces[STEAM_FRIENDS].host=&friends;interfaces[STEAM_FRIENDS].guest=0x10000020;
+    a[0]=0x10000020;a[1]=2;a[2]=4;
+    assert(!steam_bridge32_call_uses_sret("_lp32_steam_7_4",a));
+    assert(steam_bridge32_dispatch("_lp32_steam_7_4",a,&out)&&out==UINT64_C(0x1122334455667788));
+    a[0]=0x10000010;a[1]=0x10000020;a[2]=2;a[3]=4;memory[6]=0xabcdef01;
+    assert(steam_bridge32_call_uses_sret("_lp32_steam_7_4",a));
+    assert(steam_bridge32_dispatch("_lp32_steam_7_4",a,&out)&&out==0x10000010);
+    assert(*(uint64_t *)(memory+4)==UINT64_C(0x1122334455667788)&&memory[6]==0xabcdef01);
+    a[1]=0x10000024;
+    assert(!steam_bridge32_call_uses_sret("_lp32_steam_7_4",a));
+    assert(!steam_bridge32_dispatch("_lp32_steam_7_4",a,&out));
+    friends_table[8]=friend_game;
+    a[0]=0x10000020;a[1]=0x55667788;a[2]=0x11223344;a[3]=0x100000a4;
+    for (unsigned playing=0;playing<2;++playing) {
+        friend_playing=playing;memory[40]=0xabcdef01;memory[47]=0xabcdef01;
+        memset(memory+41,0x5a,24);
+        assert(steam_bridge32_dispatch("_lp32_steam_7_8",a,&out)&&out==playing);
+        assert(memory[40]==0xabcdef01&&memory[47]==0xabcdef01);
+        if (playing) {
+            assert(memory[41]==42680&&memory[42]==0&&memory[43]==0x01020304);
+            assert(memory[44]==(27015u|27016u<<16)&&memory[45]==0xaabbccdd&&memory[46]==0x01100001);
+        } else assert(memory[41]==0x5a5a5a5a&&memory[46]==0x5a5a5a5a);
+    }
     void *storage_table[64]={0},**storage=storage_table;interfaces[STEAM_STORAGE].host=&storage;steam_library=(void *)1;
     strcpy((char *)memory+64,"slot");a[1]=0x10000040;
     for(unsigned version=0;version<2;++version){modern=version;memset(storage_table,0,sizeof(storage_table));unsigned f=modern?5:2,q=modern?20:17;

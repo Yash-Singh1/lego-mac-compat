@@ -626,8 +626,17 @@ int carbon_ui_swap_gl(void *agl) {
   }
   objc_bridge32_note_agl_frame();
   audio_bridge32_note_frame_presented();
-  if (swaps == 1 || (getenv("LP32_FRAME_STATS") && swaps % 300 == 0))
+  static int frame_stats = -1;
+  if (frame_stats < 0) frame_stats = getenv("LP32_FRAME_STATS") != NULL;
+  if (swaps == 1) {
     fprintf(stderr, "compat32: AGL presented frame %llu\n", (unsigned long long)swaps);
+  } else if (frame_stats && swaps % 300 == 0) {
+    static uint64_t interval_start_ns;
+    uint64_t now_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    double fps = interval_start_ns ? 300e9 / (double)(now_ns - interval_start_ns) : 0;
+    interval_start_ns = now_ns;
+    fprintf(stderr, "compat32: AGL presented frame %llu fps=%.1f\n", (unsigned long long)swaps, fps);
+  }
   return 1;
 }
 void carbon_ui_release_gl(void *agl) {

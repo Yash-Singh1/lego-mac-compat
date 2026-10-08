@@ -1,0 +1,13 @@
+diff --git a/src/mesa/state_tracker/st_program.c b/src/mesa/state_tracker/st_program.c
+index 129cb25..f032040 100644
+--- a/src/mesa/state_tracker/st_program.c
++++ b/src/mesa/state_tracker/st_program.c
+@@ -619,6 +619,8 @@ st_translate_vertex_program(struct st_context *st,
+       prog->serialized_nir = NULL;
+    }
+    free(prog->base_serialized_nir);
++   prog->base_serialized_nir = NULL;
++   prog->base_serialized_nir_size = 0;
+ 
+    prog->state.type = PIPE_SHADER_IR_NIR;
+    if (prog->arb.Instructions)

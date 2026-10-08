@@ -1,0 +1,45 @@
+--- a/external/openglcts/modules/gl/gl4cShaderSubroutineTests.cpp
++++ b/external/openglcts/modules/gl/gl4cShaderSubroutineTests.cpp
+@@ -2019,7 +2019,9 @@
+                                nullptr);                     /* name */
+     GLU_EXPECT_NO_ERROR(gl.getError(), "glGetActiveSubroutineName() call failed.");
+ 
+-    gl.getProgramInterfaceiv(m_po_id, GL_VERTEX_SUBROUTINE, GL_MAX_NAME_LENGTH, &reported_length);
++    // Program-interface queries require GL4.3. Subroutine stage queries
++    // provide the same name-length limit on every supported GL4.0 context.
++    gl.getProgramStageiv(m_po_id, GL_VERTEX_SHADER, GL_ACTIVE_SUBROUTINE_MAX_LENGTH, &reported_length);
+     GLU_EXPECT_NO_ERROR(gl.getError(), "glGetActiveSubroutineName() call failed.");
+ 
+     if ((reported_length != expected_length1) && (reported_length != expected_length2))
+--- a/external/openglcts/modules/common/glcTransformFeedbackTests.cpp
++++ b/external/openglcts/modules/common/glcTransformFeedbackTests.cpp
+@@ -377,22 +377,13 @@
+     gl.getIntegerv(GL_TRANSFORM_FEEDBACK_BUFFER_BINDING, &bbinding);
+     GLU_EXPECT_NO_ERROR(gl.getError(), "getIntegerv");
+ 
+-    if (m_isContextES)
+-    {
+-        gl.getInteger64i_v(GL_TRANSFORM_FEEDBACK_BUFFER_START, 0, &bstart);
+-        GLU_EXPECT_NO_ERROR(gl.getError(), "getInteger64i_v");
+-
+-        gl.getInteger64i_v(GL_TRANSFORM_FEEDBACK_BUFFER_SIZE, 0, &bsize);
+-        GLU_EXPECT_NO_ERROR(gl.getError(), "getInteger64i_v");
+-    }
+-    else
+-    {
+-        gl.getTransformFeedbacki64_v(m_tf_id, GL_TRANSFORM_FEEDBACK_BUFFER_START, 0, &bstart);
+-        GLU_EXPECT_NO_ERROR(gl.getError(), "getTransformFeedbacki64_v");
+-
+-        gl.getTransformFeedbacki64_v(m_tf_id, GL_TRANSFORM_FEEDBACK_BUFFER_SIZE, 0, &bsize);
+-        GLU_EXPECT_NO_ERROR(gl.getError(), "getTransformFeedbacki64_v");
+-    }
++    // The object is bound above. Indexed state queries work in desktop
++    // GL4.0 and ES3.0; named-object getters would require desktop GL4.5.
++    gl.getInteger64i_v(GL_TRANSFORM_FEEDBACK_BUFFER_START, 0, &bstart);
++    GLU_EXPECT_NO_ERROR(gl.getError(), "getInteger64i_v");
++
++    gl.getInteger64i_v(GL_TRANSFORM_FEEDBACK_BUFFER_SIZE, 0, &bsize);
++    GLU_EXPECT_NO_ERROR(gl.getError(), "getInteger64i_v");
+ 
+     if (bbinding >= 0 && ((GLuint)bbinding != m_tf_id) && (bstart != 0) && (bsize != sizeof(vertices)))
+     {

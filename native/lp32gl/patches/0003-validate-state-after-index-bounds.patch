@@ -1,0 +1,17 @@
+diff --git a/src/mesa/main/draw.c b/src/mesa/main/draw.c
+index a1d4e6a..a22b044 100644
+--- a/src/mesa/main/draw.c
++++ b/src/mesa/main/draw.c
+@@ -1697,6 +1697,12 @@ _mesa_validated_drawrangeelements(struct gl_context *ctx,
+    if (!validate_index_bounds(ctx, &info, &draw, 1))
+       return;
+ 
++   /* Index-bounds validation may dirty framebuffer state while mapping the
++    * index buffer.  The state tracker requires it to be current at draw time.
++    */
++   if (ctx->NewState)
++      _mesa_update_state(ctx);
++
+    ctx->Driver.DrawGallium(ctx, &info, ctx->DrawID, NULL, &draw, 1);
+ 
+    if (MESA_DEBUG_FLAGS & DEBUG_ALWAYS_FLUSH) {

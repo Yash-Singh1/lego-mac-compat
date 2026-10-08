@@ -46,6 +46,17 @@ int curl_bridge32_dispatch(const char *name,const uint32_t *a,uint64_t *out) {
 #define P(i) ((void *)(uintptr_t)a[i])
     struct handle *h=lookup(a[0]);void *p=h?h->p:NULL;*out=0;
     if(IS("_curl_global_init"))*out=curl_global_init((int32_t)a[0]);
+    /* The guest allocator callbacks cannot serve host curl, which owns every
+       allocation it makes; results reach the guest as copies or tokens. */
+    else if(IS("_curl_global_init_mem"))*out=curl_global_init((int32_t)a[0]);
+    else if(IS("_curl_easy_strerror")) {
+        /* One immutable guest copy per code, like curl's static strings. */
+        static uint32_t messages[CURL_LAST+1];
+        uint32_t code=a[0]<CURL_LAST?a[0]:CURL_LAST;
+        pthread_mutex_lock(&lock);
+        if(!messages[code])messages[code]=compat_runtime32_copy_cstring(curl_easy_strerror((CURLcode)a[0]));
+        *out=messages[code];pthread_mutex_unlock(&lock);
+    }
     else if(IS("_curl_global_cleanup"))curl_global_cleanup();
     else if(IS("_curl_multi_init") || IS("_curl_easy_init")) {
         bool multi=IS("_curl_multi_init"); h=wrap(multi?(void *)curl_multi_init():(void *)curl_easy_init(),multi?2:1);

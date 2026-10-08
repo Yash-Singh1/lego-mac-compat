@@ -136,8 +136,12 @@ static struct {
 };
 
 int steam_bridge32_call_uses_sret(const char *name,const uint32_t *args) {
-    return !strcmp(name,"_lp32_steam_0_2") && interfaces[STEAM_USER].guest &&
-        args[0] != interfaces[STEAM_USER].guest && args[1] == interfaces[STEAM_USER].guest;
+    unsigned which;
+    if (!strcmp(name,"_lp32_steam_0_2")) which = STEAM_USER;
+    else if (!strcmp(name,"_lp32_steam_7_4")) which = STEAM_FRIENDS;
+    else return 0;
+    return interfaces[which].guest && args[0] != interfaces[which].guest &&
+        args[1] == interfaces[which].guest;
 }
 
 /* Persona names are polled; reuse the guest copy while the text is unchanged. */
@@ -292,8 +296,23 @@ static int interface_call(unsigned which, unsigned slot, const uint32_t *a, uint
         case 0: *result = cached_guest_string(&persona, CALL0(const char *)); return 1;
         case 2: *result = (uint32_t)CALL0(int32_t); return 1;
         case 3: *result = (uint32_t)CALL1(int32_t, int32_t, (int32_t)a[1]); return 1;
+        case 4: {
+            /* GetFriendByIndex returns CSteamID either in EDX:EAX or through
+               a hidden result pointer, depending on the guest's C++ ABI. */
+            bool hidden = a[0] != interfaces[which].guest;
+            if (hidden && a[1] != interfaces[which].guest) return 0;
+            const uint32_t *call = a + hidden;
+            uint64_t id = CALL2(uint64_t, int32_t, (int32_t)call[1], int32_t, (int32_t)call[2]);
+            if (!hidden) *result = id;
+            else { memcpy(PTR(0), &id, sizeof(id)); *result = a[0]; }
+            return 1;
+        }
         case 6: *result = (uint32_t)CALL1(int32_t, uint64_t, steam_id); return 1;
         case 7: *result = cached_guest_string(&friend_name, CALL1(const char *, uint64_t, steam_id)); return 1;
+        /* GetFriendGamePlayed(CSteamID, FriendGameInfo_t *). The 24-byte
+           result has identical field offsets under the i386 and x64 ABIs:
+           game ID at 0, IP at 8, ports at 12/14 and lobby ID at 16. */
+        case 8: *result = CALL2(bool, uint64_t, steam_id, void *, PTR(3)); return 1;
         }
     } else if (which == STEAM_MATCHMAKING) {
         /* SteamMatchMaking009. CSteamID arguments take two i386 words;

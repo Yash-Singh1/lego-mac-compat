@@ -73,7 +73,27 @@ int main(void)
         assert(lp32_profile_select(&image, i ? "/tmp/MW2MP.image" : "/tmp/MW2.image") == 0);
         assert(lp32_profile() == p);
         assert(lp32_profile_select(&image, "/tmp/unknown.image") == -1);
+        assert(lp32_title_is_mw_sdl(p->title));
     }
+    const char *mw3_names[] = {"mw3", "mw3mp"};
+    for (unsigned i = 0; i < 2; ++i) {
+        const struct lp32_game_profile *p = lp32_profile_named(mw3_names[i]);
+        assert(p && p->steam_app_id == (i ? 42690u : 42680u));
+        assert(p->title == (i ? LP32_TITLE_MW3_MP : LP32_TITLE_MW3));
+        assert(p->callee_pops_struct_return && p->thread_argument_is_direct);
+        assert(lp32_title_is_mw_sdl(p->title));
+        /* Each MW3 executable carries its own byte-checked patches, never MW2's. */
+        assert(p->code_patches && p->code_patches != lp32_profile_named(i ? "mw3" : "mw3mp")->code_patches);
+        assert(p->code_patches != lp32_profile_named("mw2")->code_patches);
+        assert(!p->depth_capability_check.length && !p->loading_screen);
+        assert(!p->main_address && !p->controller && !p->startup_latch);
+        struct macho_image32 image = {.entry_eip = 0x2ff7, .max_address = 0x21ee150};
+        assert(lp32_profile_select(&image, i ? "/tmp/MW3MP.image" : "/tmp/MW3.image") == 0);
+        assert(lp32_profile() == p);
+    }
+    assert(!lp32_title_is_mw_sdl(LP32_TITLE_COD4) && !lp32_title_is_mw_sdl(LP32_TITLE_COD4_MP));
+    assert(lp32_profile_named("codmw3") == lp32_profile_named("mw3"));
+    assert(lp32_profile_named("mw3-mp") == lp32_profile_named("mw3mp"));
     struct macho_image32 empty = {0};
     assert(lp32_profile_select(&empty, NULL) == -1);
     assert(lp32_profile_named("codmw2") == lp32_profile_named("mw2"));

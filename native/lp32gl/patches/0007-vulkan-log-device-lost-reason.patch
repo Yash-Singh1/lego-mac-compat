@@ -1,0 +1,26 @@
+diff --git a/src/vulkan/runtime/vk_device.c b/src/vulkan/runtime/vk_device.c
+index 2d471bf..08fa356 100644
+--- a/src/vulkan/runtime/vk_device.c
++++ b/src/vulkan/runtime/vk_device.c
+@@ -22,6 +22,7 @@
+  */
+ 
+ #include "vk_device.h"
++#include "util/log.h"
+ 
+ #include "vk_alloc.h"
+ #include "vk_common_entrypoints.h"
+@@ -441,6 +442,13 @@ _vk_device_set_lost(struct vk_device *device,
+    __vk_errorv(device, VK_ERROR_DEVICE_LOST, file, line, msg, ap);
+    va_end(ap);
+ 
++   /* The reason otherwise only reaches a debug messenger. */
++   char reason[512];
++   va_start(ap, msg);
++   vsnprintf(reason, sizeof(reason), msg, ap);
++   va_end(ap);
++   mesa_loge("vulkan device lost (%s:%d): %s", file, line, reason);
++
+    vk_logd(VK_LOG_OBJS(device), "Timeline mode is %s.",
+            timeline_mode_str(device));
+ 

@@ -1,5 +1,7 @@
 #include "objc_legacy_bridge.h"
 #include "compat_runtime.h"
+#include "audio_queue_bridge.h"
+#include "cxx_exception_bridge.h"
 #include "carbon_bridge.h"
 #include "controller_bridge.h"
 #include "game_profile.h"
@@ -21,17 +23,22 @@
 #include <mach-o/dyld.h>
 #include <signal.h>
 #include <stdio.h>
+#include <dispatch/dispatch.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "gl_backend.h"
+
 static uintptr_t guest_breakpoint_address;
 static unsigned char guest_breakpoint_original_byte;
 static volatile sig_atomic_t guest_breakpoint_stepping;
 static volatile sig_atomic_t guest_breakpoint_count;
 static unsigned guest_breakpoint_limit;
+static double guest_breakpoint_after;
+static uint64_t guest_breakpoint_armed_ns;
 static unsigned guest_breakpoint_skip;
 static int guest_diagnostic_fd = -1;
 
@@ -562,9 +569,27 @@ static void guest_crash_diagnostic(int signal_number, siginfo_t *info,
             return;
         }
         if (rip == guest_breakpoint_address + 1) {
-            unsigned count = ++guest_breakpoint_count;
+            /* LP32_TRACE_GUEST_AFTER=<seconds> ignores hits until then. */
+            bool early = guest_breakpoint_after > 0 &&
+                (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - guest_breakpoint_armed_ns) / 1e9 <
+                    guest_breakpoint_after;
+            unsigned count = early ? guest_breakpoint_count : ++guest_breakpoint_count;
+            if (early) {
+                *(volatile unsigned char *)guest_breakpoint_address = guest_breakpoint_original_byte;
+                flush_guest_instruction(guest_breakpoint_address);
+                context->uc_mcontext->__ss.__rip = guest_breakpoint_address;
+                context->uc_mcontext->__ss.__rflags |= UINT64_C(0x100);
+                guest_breakpoint_stepping = 1;
+                return;
+            }
             const uint32_t *words = (const void *)(uintptr_t)rsp;
-            if (count > guest_breakpoint_skip) {
+            static long every = -1;
+            if (every < 0) {
+                const char *text = getenv("LP32_TRACE_GUEST_EVERY");
+                every = text ? strtol(text, NULL, 0) : 1;
+                if (every < 1) every = 1;
+            }
+            if (count > guest_breakpoint_skip && count % (unsigned)every == 0) {
             GUEST_DIAGNOSTIC(
                     "compat32: guest breakpoint 0x%08llx hit %u "
                     "eax=%08llx ebx=%08llx ecx=%08llx edx=%08llx "
@@ -578,7 +603,7 @@ static void guest_crash_diagnostic(int signal_number, siginfo_t *info,
                     context->uc_mcontext->__ss.__rdi & UINT32_MAX,
                     context->uc_mcontext->__ss.__rbp & UINT32_MAX,
                     rsp & UINT32_MAX);
-            if (rsp >= UINT32_C(0x1000) && rsp < UINT32_C(0x80000000)) {
+            if (rsp >= UINT32_C(0x1000) && rsp < UINT64_C(0xfffff000)) {
                 for (unsigned index = 0; index < 12; ++index) {
                     GUEST_DIAGNOSTIC(
                             "compat32: breakpoint stack[%u]=0x%08x\n",
@@ -608,7 +633,10 @@ static void guest_crash_diagnostic(int signal_number, siginfo_t *info,
                     if (dump_address >= UINT32_C(0x1000) &&
                         dump_address < UINT32_C(0x80000000)) {
                         const uint32_t *dump = (const void *)dump_address;
-                        for (unsigned index = 0; index < 16; ++index) {
+                        const char *words_text = getenv("LP32_TRACE_GUEST_DUMP_WORDS");
+                        unsigned words = words_text ? (unsigned)strtoul(words_text, NULL, 0) : 16;
+                        if (words > 16384) words = 16384;
+                        for (unsigned index = 0; index < words; ++index) {
                             GUEST_DIAGNOSTIC(
                                     "compat32: breakpoint mem[%08llx]=0x%08x\n",
                                     (unsigned long long)(dump_address + index * 4),
@@ -699,7 +727,12 @@ static void guest_crash_diagnostic(int signal_number, siginfo_t *info,
             context->uc_mcontext->__ss.__rdi,
             context->uc_mcontext->__ss.__rbp,
             context->uc_mcontext->__ss.__r14);
-    if (rsp >= UINT32_C(0x1000) && rsp < UINT32_C(0x80000000)) {
+    /* An allocator trap (caulk's maybe_create_free_node) leaves the bad
+       block in rsi/rax: say whether it is one of the bridge's audio buffers. */
+    const uint64_t suspects[] = {context->uc_mcontext->__ss.__rsi, context->uc_mcontext->__ss.__rax,
+                                 context->uc_mcontext->__ss.__rdi, context->uc_mcontext->__ss.__rbx};
+    audio_queue_bridge32_crash_report(STDERR_FILENO, guest_diagnostic_fd, suspects, 4);
+    if (rsp >= UINT32_C(0x1000) && rsp < UINT64_C(0xfffff000)) {
         const uint32_t *words = (const void *)(uintptr_t)rsp;
         for (unsigned index = 0; index < 16; ++index) {
             GUEST_DIAGNOSTIC("compat32: crash stack[%u]=0x%08x\n",
@@ -763,6 +796,9 @@ static int configure_guest_breakpoint(const struct macho_image32 *image)
     guest_breakpoint_skip = parsed_skip < guest_breakpoint_limit ?
         (unsigned)parsed_skip : 0;
     guest_breakpoint_address = (uintptr_t)parsed;
+    const char *after_text = getenv("LP32_TRACE_GUEST_AFTER");
+    guest_breakpoint_after = after_text ? strtod(after_text, NULL) : 0;
+    guest_breakpoint_armed_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     size_t page_size = (size_t)getpagesize();
     uintptr_t page = guest_breakpoint_address & ~(page_size - 1);
     if (mprotect((void *)page, page_size,
@@ -773,14 +809,83 @@ static int configure_guest_breakpoint(const struct macho_image32 *image)
     }
     guest_breakpoint_original_byte =
         *(const unsigned char *)guest_breakpoint_address;
-    *(volatile unsigned char *)guest_breakpoint_address = 0xcc;
-    flush_guest_instruction(guest_breakpoint_address);
+    if (guest_breakpoint_after > 0) {
+        /* Insert the breakpoint only once the delay has passed, so earlier
+           hits cost nothing. */
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(guest_breakpoint_after * 1e9)),
+                       dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+            *(volatile unsigned char *)guest_breakpoint_address = 0xcc;
+            flush_guest_instruction(guest_breakpoint_address);
+        });
+        guest_breakpoint_after = 0;
+    } else {
+        *(volatile unsigned char *)guest_breakpoint_address = 0xcc;
+        flush_guest_instruction(guest_breakpoint_address);
+    }
     fprintf(stderr,
             "compat32: armed guest breakpoint 0x%08llx original=0x%02x "
             "skip=%u limit=%u\n",
             parsed, guest_breakpoint_original_byte, guest_breakpoint_skip,
             guest_breakpoint_limit);
     return 0;
+}
+
+/* LP32_TRACE_CONSOLE_PRINT=0xaddr:N replaces the guest function at addr with
+   a jump to _lp32_trace_print, which logs its Nth stack argument as a string
+   (for example the game's console print) and returns 0. Diagnostic only: the
+   original function no longer runs. */
+static void configure_console_print_trace(const struct macho_image32 *image)
+{
+    const char *text = getenv("LP32_TRACE_CONSOLE_PRINT");
+    if (!text || !text[0]) return;
+    char *end = NULL;
+    unsigned long address = strtoul(text, &end, 0);
+    unsigned argument = end && *end == ':' ? (unsigned)strtoul(end + 1, NULL, 0) : 0;
+    if (address < image->min_address || address + 5 > image->max_address || argument > 16) {
+        fprintf(stderr, "game_loader: invalid LP32_TRACE_CONSOLE_PRINT: %s\n", text);
+        return;
+    }
+    compat_runtime32_set_trace_print_argument(argument);
+    uint32_t thunk = compat_runtime32_guest_callback("_lp32_trace_print");
+    size_t page_size = (size_t)getpagesize();
+    uintptr_t page = address & ~(page_size - 1);
+    if (!thunk || mprotect((void *)page, page_size * 2, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return;
+    uint8_t *code = (uint8_t *)(uintptr_t)address;
+    int32_t displacement = (int32_t)(thunk - (uint32_t)(address + 5));
+    code[0] = 0xe9;
+    memcpy(code + 1, &displacement, 4);
+    flush_guest_instruction(address);
+    fprintf(stderr, "compat32: console print trace at 0x%08lx argument %u\n", address, argument);
+}
+
+/* MW2 campaign: SV_AddServerCommand ends the game with "Reliable command
+   buffer overflow" when more than 4 KB of server commands, or 128 of them,
+   wait for the client. Route its two Com_Error calls through the loader so
+   the log shows which commands filled it; the game then errors as before. */
+static void configure_command_overflow_dump(const struct macho_image32 *image)
+{
+    if (lp32_profile()->title != LP32_TITLE_MW2) return;
+    uint32_t com_error = macho_image32_find_symbol(image, "__Z9Com_Error11errorParm_tPKcz");
+    static const uint32_t sites[] = {0x002ee211, 0x002ee24e};
+    if (!com_error) return;
+    for (size_t i = 0; i < sizeof(sites) / sizeof(sites[0]); ++i) {
+        const uint8_t *code = (const uint8_t *)(uintptr_t)sites[i];
+        int32_t displacement;
+        memcpy(&displacement, code + 1, 4);
+        if (code[0] != 0xe8 || sites[i] + 5 + (uint32_t)displacement != com_error) return;
+    }
+    uint32_t thunk = compat_runtime32_guest_callback("_lp32_mw2_command_overflow");
+    size_t page_size = (size_t)getpagesize();
+    uintptr_t page = sites[0] & ~(page_size - 1);
+    if (!thunk || mprotect((void *)page, page_size * 2, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return;
+    compat_runtime32_set_command_overflow_target(com_error);
+    for (size_t i = 0; i < sizeof(sites) / sizeof(sites[0]); ++i) {
+        int32_t displacement = (int32_t)(thunk - (sites[i] + 5));
+        memcpy((uint8_t *)(uintptr_t)sites[i] + 1, &displacement, 4);
+        flush_guest_instruction(sites[i]);
+    }
+    mprotect((void *)page, page_size * 2, PROT_READ | PROT_EXEC);
+    fprintf(stderr, "compat32: server command overflow dump installed\n");
 }
 
 static void runtime_diagnostic_line(const char *line)
@@ -793,7 +898,7 @@ static void runtime_diagnostic_line(const char *line)
 static const char *default_image_path(const char *argv0, char *buffer,
                                       size_t size)
 {
-    static const char *const candidates[] = {"LEGOPirates", "LEGOCloneWars", "LEGOMarvel", "LEGOCompleteSaga", "COD4", "COD4MP", "MW2", "MW2MP"};
+    static const char *const candidates[] = {"LEGOPirates", "LEGOCloneWars", "LEGOMarvel", "LEGOCompleteSaga", "COD4", "COD4MP", "MW2", "MW2MP", "MW3", "MW3MP"};
     const char *slash = strrchr(argv0, '/');
     size_t directory_length = slash ? (size_t)(slash - argv0) : 0;
     for (size_t index = 0; index < sizeof(candidates) / sizeof(candidates[0]); ++index) {
@@ -816,6 +921,7 @@ int main(int argc, char **argv)
     /* A write to a socket whose peer has gone (e.g. the Steam client IPC)
        must fail with EPIPE, not silently kill the game. Launched from Finder,
        MW2 otherwise dies of SIGPIPE seconds after its first frame. */
+    compat_runtime32_reserve_guest_arena();
     signal(SIGPIPE, SIG_IGN);
     install_guest_crash_diagnostics();
     compat_runtime32_set_diagnostic_sink(runtime_diagnostic_line);
@@ -855,6 +961,7 @@ int main(int argc, char **argv)
         macho_image32_unload(&image);
         return EXIT_FAILURE;
     }
+    lp32_gl_backend_select(lp32_profile()->prefers_lp32gl ? LP32_GL_BACKEND_MESA : LP32_GL_BACKEND_APPLE);
     open_guest_diagnostic_log(argc > 0 ? argv[0] : NULL);
     char host[768];
     lp32_host_description(host, sizeof(host));
@@ -879,6 +986,8 @@ int main(int argc, char **argv)
         macho_image32_unload(&image);
         return EXIT_FAILURE;
     }
+    configure_console_print_trace(&image);
+    configure_command_overflow_dump(&image);
 
     printf("image: segments=%" PRIu32 " range=0x%08" PRIx32 "-0x%08" PRIx32
            " entry=0x%08" PRIx32 " initializers=%" PRIu32 " imports=%" PRIu32 "\n",
@@ -940,12 +1049,12 @@ int main(int argc, char **argv)
         }
         if (bink_imports) fprintf(stderr, "compat32: bound %u Bink imports to the original i386 library\n", bound);
     }
-    if (lp32_profile()->title == LP32_TITLE_MW2 || lp32_profile()->title == LP32_TITLE_MW2_MP) {
+    if (lp32_title_is_mw_sdl(lp32_profile()->title)) {
         if (guest_dyld32_initialize(image_path)) return EXIT_FAILURE;
-        const char *libraries[] = {"libBinkMacx86.dylib", "libMilesX86.dylib"};
+        const char *libraries[] = {lp32_profile()->title == LP32_TITLE_MW3_MP ? "libBink2Macx86.dylib" : "libBinkMacx86.dylib", "libMilesX86.dylib"};
         /* Imports are matched by prefix; _RADSS_CAInstallDriver is Miles'
            CoreAudio sound-system driver (Bink exports its own copy). */
-        const char *prefixes[][2] = {{"_Bink", NULL}, {"_AIL_", "_RADSS_"}};
+        const char *prefixes[][3] = {{"_Bink", NULL, NULL}, {"_AIL_", "_RADSS_", "_RIB_"}};
         for (unsigned library = 0; library < 2; ++library) {
             char path[PATH_MAX];
             int length = snprintf(path, sizeof(path), "%s/%s", guest_dyld32_game_root(), libraries[library]);
@@ -960,7 +1069,7 @@ int main(int argc, char **argv)
             for (unsigned i = 0; i < image.import_count; ++i) {
                 const struct macho_import32 *import = &image.imports[i];
                 bool matched = false;
-                for (unsigned p = 0; p < 2 && prefixes[library][p]; ++p)
+                for (unsigned p = 0; p < 3 && prefixes[library][p]; ++p)
                     matched |= !strncmp(import->name, prefixes[library][p], strlen(prefixes[library][p]));
                 if (!matched) continue;
                 uint32_t address = guest_dyld32_symbol(handle, import->name + 1);
@@ -1029,6 +1138,11 @@ int main(int argc, char **argv)
     }
     if (getenv("LP32_CG_SELFTEST")) {
         int result = compat_runtime32_run_cg_self_test();
+        macho_image32_unload(&image);
+        return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (getenv("LP32_EXCEPTION_SELFTEST")) {
+        int result = cxx_exception_bridge32_run_self_test();
         macho_image32_unload(&image);
         return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
@@ -1187,9 +1301,22 @@ int main(int argc, char **argv)
         if (!extra_argument_text && (lp32_profile()->title == LP32_TITLE_COD4 ||
                                      lp32_profile()->title == LP32_TITLE_COD4_MP))
             extra_argument_text = "-g";
-        uint32_t extra_argument = extra_argument_text && extra_argument_text[0] ?
-            compat_runtime32_copy_cstring(extra_argument_text) : 0;
-        uint32_t guest_argc = extra_argument ? 2 : 1;
+        /* Space-separated, so tests can pass e.g. "-g +map killhouse". */
+        enum { kMaxExtraArguments = 16 };
+        uint32_t extra_arguments[kMaxExtraArguments];
+        uint32_t extra_count = 0;
+        for (const char *cursor = extra_argument_text; cursor && *cursor && extra_count < kMaxExtraArguments;) {
+            while (*cursor == ' ') ++cursor;
+            size_t length = strcspn(cursor, " ");
+            if (!length) break;
+            char argument[256];
+            snprintf(argument, sizeof argument, "%.*s", (int)length, cursor);
+            extra_arguments[extra_count] = compat_runtime32_copy_cstring(argument);
+            if (!extra_arguments[extra_count]) break;
+            ++extra_count;
+            cursor += length;
+        }
+        uint32_t guest_argc = 1 + extra_count;
         uint32_t argv_address = compat_runtime32_allocate(
             (guest_argc + 1) * sizeof(uint32_t), 1);
         uint32_t empty_vector = compat_runtime32_allocate(sizeof(uint32_t), 1);
@@ -1200,7 +1327,7 @@ int main(int argc, char **argv)
         }
         uint32_t *guest_argv = (void *)(uintptr_t)argv_address;
         guest_argv[0] = executable_path;
-        if (extra_argument) guest_argv[1] = extra_argument;
+        for (uint32_t i = 0; i < extra_count; ++i) guest_argv[1 + i] = extra_arguments[i];
 
         const uint32_t main_arguments[] = {
             guest_argc, argv_address, empty_vector, empty_vector,

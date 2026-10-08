@@ -223,8 +223,51 @@ static void initialize_resources(void) {
 int resource_bridge32_dispatch(const char *name, const uint32_t *a,
                                uint64_t *out) {
 #define IS(s) (!strcmp(name, s))
-  if (name[0] != '_' || !strchr("NDGHRPMCU", name[1]))
+  if (name[0] != '_' || !strchr("NDGHRPMCUTFLB", name[1]))
     return 0;
+  /* Bink's temporary-memory calls report status through an OSErr pointer. */
+  if (IS("_TempNewHandle")) {
+    *out = new_handle(a[0], false);
+    if (a[1]) *(int16_t *)(uintptr_t)a[1] = *out ? 0 : -108;
+    return 1;
+  }
+  if (IS("_TempHLock") || IS("_TempHUnlock") || IS("_TempDisposeHandle")) {
+    bool known = find_handle(a[0]) != NULL;
+    if (IS("_TempDisposeHandle")) dispose_handle(a[0]);
+    if (a[1]) *(int16_t *)(uintptr_t)a[1] = known ? 0 : -109;
+    *out = 0;
+    return 1;
+  }
+  if (IS("_MaxBlock")) {
+    *out = 64u << 20;
+    return 1;
+  }
+  /* No Code Fragment Manager: GetSharedLibrary finds no library
+     (cfragNoLibraryErr), FindSymbol no symbol (cfragNoSymbolErr). */
+  if (IS("_GetSharedLibrary")) {
+    if (a[3]) *(uint32_t *)(uintptr_t)a[3] = 0;
+    if (a[4]) *(uint32_t *)(uintptr_t)a[4] = 0;
+    *out = (uint32_t)(int32_t)-2804;
+    return 1;
+  }
+  if (IS("_FindSymbol")) {
+    if (a[2]) *(uint32_t *)(uintptr_t)a[2] = 0;
+    *out = (uint32_t)(int32_t)-2828;
+    return 1;
+  }
+  /* QuickDraw offscreen worlds no longer exist. NewGWorld fails like an
+     allocation failure (memFullErr), so BinkBufferOpen returns no buffer;
+     the pixel calls below can only follow a successful NewGWorld. */
+  if (IS("_NewGWorld")) {
+    if (a[0]) *(uint32_t *)(uintptr_t)a[0] = 0;
+    *out = (uint32_t)(int32_t)-108;
+    return 1;
+  }
+  if (IS("_LockPortBits") || IS("_UnlockPortBits") || IS("_GetPortBitMapForCopyBits") ||
+      IS("_GetPixRowBytes") || IS("_CopyBits") || IS("_BackColor") || IS("_LocalToGlobal")) {
+    *out = 0;
+    return 1;
+  }
   if (IS("_CopyPascalStringToC")) {
     const unsigned char *source = (void *)(uintptr_t)a[0];
     char *dest = (void *)(uintptr_t)a[1];

@@ -27,10 +27,12 @@
 #include "dlfcn_bridge.h"
 #include "guest_dyld.h"
 #include "objc_bridge.h"
+#include "cxx_exception_bridge.h"
 #include "name_match.h"
 
 #include <architecture/i386/table.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <CoreAudio/CoreAudio.h>
 #include <copyfile.h>
 #include <IOKit/IOKitLib.h>
 #include <ctype.h>
@@ -47,6 +49,7 @@
 #include <mach/mach_vm.h>
 #include <mach-o/dyld.h>
 #include <math.h>
+#include <netdb.h>
 #include <zlib.h>
 #include <pthread.h>
 #include <signal.h>
@@ -90,7 +93,9 @@ enum {
     kBridgeCodeSize = 0x00010000,
     kBridgeDataBase = 0x7f010000,
     kBridgeDataSize = 0x00010000,
-    kGuestStackBase = 0x7c000000,
+    kLegacyGuestStackBase = 0x7c000000,
+    /* Where 32-bit macOS placed secondary thread stacks. */
+    kNativeGuestStackBase = 0xb0000000,
     kGuestStackSize = 0x03000000,
     kGuestStackPerThread = 0x00100000,
     /* Pages 0x0000-0xcfff hold only i386 code and far-pointer data; the
@@ -151,6 +156,15 @@ _Static_assert(kDynamicThunksOffset + kDynamicThunkCapacity * kImportThunkSize <
 
 /* Where the 64-bit gateway sends a thread back into i386 code. */
 uint32_t lp32_landing32 = kBridgeCodeBase + kLanding32Offset;
+
+/* Stale stack words are read by MW2 code with mismatched varargs (e.g.
+   Scr_Objective_Position formats int zeros with %f). At 0x7c000000+ a stale
+   stack pointer read as a double's high word is ~1e300 and printed as a
+   300-digit number; at 32-bit macOS's 0xb0000000 it is a tiny negative value
+   and prints "-0.00", as the game shipped with. compat_runtime32_reserve_
+   guest_arena moves stacks there when the range is free. */
+static uint32_t guest_stack_base = kLegacyGuestStackBase;
+
 
 struct __attribute__((packed)) far_ptr32 {
     uint32_t offset;
@@ -500,6 +514,9 @@ static void cg_report(const char *reason)
             __atomic_load_n(&cg_string_count, __ATOMIC_RELAXED));
 }
 
+/* HIToolbox; declared here to avoid pulling Carbon headers in. */
+extern OSStatus SetSystemUIMode(UInt32 mode, UInt32 options);
+
 struct guest_thread_context {
     uint32_t token;
     uint32_t function;
@@ -507,6 +524,9 @@ struct guest_thread_context {
 };
 
 static _Thread_local uint32_t current_thread_token;
+/* Set only on threads the guest created; pthread_exit needs their cleanup. */
+static _Thread_local bool current_thread_is_guest;
+static _Thread_local uint32_t current_thread_owned_argument;
 /* pthread_t is a pointer even in i386. Public pthread_cleanup_push/pop
    macros access its cleanup-stack word at offset four. */
 static uint32_t allocate_thread_token(void) {
@@ -708,6 +728,16 @@ static struct guest_directory_entry *guest_directory_for_handle(uint32_t handle)
     if (index >= kGuestDirectoryCapacity) return NULL;
     struct guest_directory_entry *entry = &guest_directories[index];
     return entry->directory && entry->handle == handle ? entry : NULL;
+}
+
+/* Constant doubles exported as data. MW3 reads these through its imports;
+   AppKit reports the 10.9 release the game was linked against. */
+static bool guest_double_import(const char *name, double *value)
+{
+    if (!strcmp(name, "_kCFAbsoluteTimeIntervalSince1970")) *value = kCFAbsoluteTimeIntervalSince1970;
+    else if (!strcmp(name, "_NSAppKitVersionNumber")) *value = 1265.0;
+    else return false;
+    return true;
 }
 
 static uint32_t guest_standard_file_import(const char *name)
@@ -1504,8 +1534,9 @@ static int build_transition_bridge(void)
         }
         if (strcmp(current_image->imports[index].name, "_vm_page_size") == 0)
             data_cell[data_cells] = (uint32_t)vm_page_size;
-        if (strcmp(current_image->imports[index].name, "_kCFAbsoluteTimeIntervalSince1970") == 0)
-            memcpy(&data_cell[data_cells], &kCFAbsoluteTimeIntervalSince1970, sizeof(double));
+        double constant;
+        if (guest_double_import(current_image->imports[index].name, &constant))
+            memcpy(&data_cell[data_cells], &constant, sizeof(constant));
         uint32_t objc_pointer =
             objc_bridge32_pointer_import(current_image->imports[index].name);
         if (objc_pointer) data_cell[data_cells] = objc_pointer;
@@ -1537,14 +1568,14 @@ static int build_transition_bridge(void)
 static uint32_t guest_context_symbol(const char *name)
 {
     if (lp32_profile()->title != LP32_TITLE_COD4 && lp32_profile()->title != LP32_TITLE_COD4_MP &&
-        lp32_profile()->title != LP32_TITLE_MW2 && lp32_profile()->title != LP32_TITLE_MW2_MP) return 0;
+        !lp32_title_is_mw_sdl(lp32_profile()->title)) return 0;
     const uint8_t *entry = NULL;
     if (!strcmp(name, "_setjmp")) entry = lp32_context_setjmp;
     else if (!strcmp(name, "__setjmp")) entry = lp32_context_fast_setjmp;
     else if (!strcmp(name, "_sigsetjmp")) entry = lp32_context_sigsetjmp;
     else if (!strcmp(name, "_longjmp") || !strcmp(name, "_siglongjmp")) entry = lp32_context_longjmp;
     else if (!strcmp(name, "__longjmp")) entry = lp32_context_fast_longjmp;
-    else if ((lp32_profile()->title == LP32_TITLE_MW2 || lp32_profile()->title == LP32_TITLE_MW2_MP) &&
+    else if ((lp32_title_is_mw_sdl(lp32_profile()->title)) &&
              !getenv("LP32_NO_GUEST_LIBC")) {
         if (!strcmp(name, "_strcmp")) entry = lp32_context_strcmp;
         else if (!strcmp(name, "___tolower")) entry = lp32_context_tolower;
@@ -1592,7 +1623,9 @@ uint32_t compat_runtime32_resolve_symbol(const char *name, int data_hint)
     }
     uint32_t value = guest_standard_file_import(name);
     if (!value) value = objc_bridge32_pointer_import(name);
-    bool data = value || !strcmp(name, "_errno") ||
+    double constant;
+    bool is_double = guest_double_import(name, &constant);
+    bool data = value || is_double || !strcmp(name, "_errno") ||
         !strcmp(name, "_mach_task_self_") || !strcmp(name, "_vm_page_size") || !strcmp(name, "_environ") ||
         !strcmp(name, "___stack_chk_guard") || !strcmp(name, "___mb_cur_max") || !strcmp(name, "___CFConstantStringClassReference") ||
         !strcmp(name, "_kCFAllocatorDefault") || !strcmp(name, "_kIOMasterPortDefault") ||
@@ -1614,6 +1647,7 @@ uint32_t compat_runtime32_resolve_symbol(const char *name, int data_hint)
     if (!strcmp(name, "___stack_chk_guard")) value = UINT32_C(0x6b71329a);
     if (!strcmp(name, "___mb_cur_max")) value = (uint32_t)MB_CUR_MAX;
     *(uint32_t *)(uintptr_t)address = value;
+    if (is_double) memcpy((void *)(uintptr_t)address, &constant, sizeof(constant));
     if (!strcmp(name, "_errno")) guest_errno_address = address;
     return address;
 }
@@ -3085,6 +3119,8 @@ static void *run_guest_thread(void *opaque)
     struct guest_thread_context context = *(struct guest_thread_context *)opaque;
     free(opaque);
     current_thread_token = context.token;
+    current_thread_is_guest = true;
+    current_thread_owned_argument = lp32_profile()->thread_argument_is_direct ? 0 : context.argument;
     if (getenv("LP32_TRACE_THREADS")) {
         uint64_t thread_id = 0;
         pthread_threadid_np(NULL, &thread_id);
@@ -3197,6 +3233,8 @@ int compat_runtime32_initialize(struct macho_image32 *image)
         return runtime_error("x86_64 host is not running through Rosetta");
     }
     current_image = image;
+    cxx_exception_bridge32_register_image(image->text_start, image->text_end,
+                                          image->unwind_info_start, image->unwind_info_end);
     rtti_bridge32_initialize(image);
     /* Keep small titles at the original base; large BSS images need the heap
        above their last mapped page, never overlapping guest globals. */
@@ -3290,12 +3328,14 @@ static unsigned import_return_kind(const char *name)
     if (strcmp(name, "__ZNKSt3__18ios_base6getlocEv") == 0 ||
         strcmp(name, "__ZNSt3__19to_stringEm") == 0 ||
         strcmp(name, "__ZNSt3__17promiseIvE10get_futureEv") == 0 ||
+        strcmp(name, "__ZSt17current_exceptionv") == 0 ||
         strcmp(name, "_CFAbsoluteTimeGetGregorianDate") == 0 ||
         strcmp(name, "_CTFontGetBoundingBox") == 0 ||
         strcmp(name, "_CFUUIDGetUUIDBytes") == 0 ||
         strcmp(name, "_CTFontGetBoundingRectsForGlyphs") == 0 ||
         strcmp(name, "_CTLineGetImageBounds") == 0 ||
         strcmp(name, "_CGDisplayBounds") == 0 ||
+        strcmp(name, "_CVDisplayLinkGetNominalOutputVideoRefreshPeriod") == 0 ||
         strcmp(name, "_objc_msgSend_stret") == 0) return kReturnStruct;
     /* Steam's user-ID call selects its ABI from the arguments and interface
        state. Cache only that it needs a dynamic check, never its result. */
@@ -3363,6 +3403,7 @@ int compat_runtime32_run_import_return_self_test(void)
         {"_CTFontGetBoundingRectsForGlyphs", kReturnStruct},
         {"_CTLineGetImageBounds", kReturnStruct},
         {"_CGDisplayBounds", kReturnStruct},
+        {"_CVDisplayLinkGetNominalOutputVideoRefreshPeriod", kReturnStruct},
         {"_objc_msgSend_stret", kReturnStruct},
         {"_glDrawRangeElements", kReturnOrdinary},
         {"_OSAtomicAdd32Barrier", kReturnOrdinary},
@@ -3429,8 +3470,52 @@ static void record_hitch_import(unsigned kind, const char *name,
 
 extern int libcpp_stream_bridge32_dispatch(const char *, const uint32_t *, uint64_t *);
 
+/* The guest frame that called the chained import running on this thread;
+   saved_registers is the gateway's {edi, esi, ebp, ebx} (64-bit slots). */
+struct import_frame {
+    const uint64_t *saved_registers;
+    const uint32_t *arguments;
+    uint32_t return_address;
+};
+static _Thread_local struct import_frame current_import_frame;
+static _Thread_local struct guest_resume_context pending_resume;
+static _Thread_local bool resume_pending;
+/* Threads with a pending resume; the gateway only asks when nonzero. */
+int lp32_resumes_pending;
+
+bool compat_runtime32_import_frame(struct guest_resume_context *frame)
+{
+    const struct import_frame *current = &current_import_frame;
+    if (!current->saved_registers) return false;
+    *frame = (struct guest_resume_context){
+        .edi = (uint32_t)current->saved_registers[0],
+        .esi = (uint32_t)current->saved_registers[1],
+        .ebp = (uint32_t)current->saved_registers[2],
+        .ebx = (uint32_t)current->saved_registers[3],
+        .esp = (uint32_t)(uintptr_t)current->arguments,
+        .eip = current->return_address,
+    };
+    return true;
+}
+
+void compat_runtime32_resume_guest(const struct guest_resume_context *context)
+{
+    pending_resume = *context;
+    if (!resume_pending) __atomic_add_fetch(&lp32_resumes_pending, 1, __ATOMIC_RELAXED);
+    resume_pending = true;
+}
+
+const struct guest_resume_context *lp32_take_resume_context(void)
+{
+    if (!resume_pending) return NULL;
+    resume_pending = false;
+    __atomic_sub_fetch(&lp32_resumes_pending, 1, __ATOMIC_RELAXED);
+    return &pending_resume;
+}
+
 uint64_t lp32_dispatch_import(uint32_t import_id, const uint32_t *arguments,
-                              uint32_t return_address)
+                              uint32_t return_address,
+                              const uint64_t *saved_registers)
 {
     lp32_fast_import_fn *fast_slot = fast_import_slot(import_id);
     lp32_fast_import_fn fast = fast_slot ? *fast_slot : NULL;
@@ -3456,9 +3541,16 @@ uint64_t lp32_dispatch_import(uint32_t import_id, const uint32_t *arguments,
         }
     }
     if (!compat_runtime32_frame_profile_enabled) {
-        uint64_t result = (uintptr_t)fast > 1 ? fast(arguments, return_address) :
-            dispatch_import_chained(import_id, import_name_for_id(import_id),
-                                       arguments, return_address, fast_slot);
+        uint64_t result;
+        if ((uintptr_t)fast > 1) {
+            result = fast(arguments, return_address);
+        } else {
+            struct import_frame outer = current_import_frame;
+            current_import_frame = (struct import_frame){saved_registers, arguments, return_address};
+            result = dispatch_import_chained(import_id, import_name_for_id(import_id),
+                                             arguments, return_address, fast_slot);
+            current_import_frame = outer;
+        }
         if (hitch_name) record_hitch_import(hitch_kind, hitch_name, arguments,
                                           return_address, &hitch_scope, hitch_now());
         return result;
@@ -3474,10 +3566,13 @@ uint64_t lp32_dispatch_import(uint32_t import_id, const uint32_t *arguments,
         guest_last_hold_ns = 0;
     }
     uint64_t start = profile_now();
+    struct import_frame outer = current_import_frame;
+    current_import_frame = (struct import_frame){saved_registers, arguments, return_address};
     uint64_t result = (uintptr_t)fast > 1 ?
         fast(arguments, return_address) :
         dispatch_import_chained(import_id, name, arguments, return_address,
                                 fast_slot);
+    current_import_frame = outer;
     uint64_t elapsed = profile_now() - start;
     if (hitch_name) record_hitch_import(hitch_kind, hitch_name, arguments,
                                       return_address, &hitch_scope, hitch_now());
@@ -4051,6 +4146,214 @@ static lp32_fast_import_fn runtime_fast_import(const char *name)
     return NULL;
 }
 
+/* The guest's 32-bit address space above the 2 GB __LEGACY reservation.
+   Left unreserved, host allocators (libmalloc, CoreAudio's caulk heap) put
+   memory there, where MW2's VirtualAlloc emulation (MAP_FIXED commits and
+   decommits, munmap releases) can replace it: a caulk heap page there was
+   found zeroed and the next AudioQueueNewOutput trapped. At startup every
+   free hole in the range is reserved; guest mmap/munmap then only touch
+   those pages, and fixed mappings over anything else are refused. */
+enum { kGuestArenaStart = 0x80000000u, kGuestArenaMaxRanges = 1024 };
+struct guest_range { uint64_t start, end; };
+static struct guest_range guest_arena[kGuestArenaMaxRanges];   /* reserved spans */
+static unsigned guest_arena_count;
+static struct guest_range guest_arena_free[kGuestArenaMaxRanges];
+static unsigned guest_arena_free_count;
+static pthread_mutex_t guest_arena_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool guest_arena_ready;
+
+static bool range_within(const struct guest_range *ranges, unsigned count,
+                         uint64_t start, uint64_t end)
+{
+    for (unsigned i = 0; i < count; ++i) {
+        if (start >= ranges[i].end || end <= ranges[i].start) continue;
+        if (start < ranges[i].start) return false;
+        if (end <= ranges[i].end) return true;
+        start = ranges[i].end;
+    }
+    return start >= end;
+}
+
+static void arena_free_remove(uint64_t start, uint64_t end)
+{
+    struct guest_range kept[kGuestArenaMaxRanges];
+    unsigned count = 0;
+    for (unsigned i = 0; i < guest_arena_free_count; ++i) {
+        struct guest_range r = guest_arena_free[i];
+        if (end <= r.start || start >= r.end) { kept[count++] = r; continue; }
+        if (r.start < start && count < kGuestArenaMaxRanges) kept[count++] = (struct guest_range){r.start, start};
+        if (end < r.end && count < kGuestArenaMaxRanges) kept[count++] = (struct guest_range){end, r.end};
+    }
+    memcpy(guest_arena_free, kept, count * sizeof(kept[0]));
+    guest_arena_free_count = count;
+}
+
+static void arena_free_add(uint64_t start, uint64_t end)
+{
+    arena_free_remove(start, end);
+    unsigned i = 0;
+    while (i < guest_arena_free_count && guest_arena_free[i].start < start) ++i;
+    if (guest_arena_free_count == kGuestArenaMaxRanges) return;
+    memmove(guest_arena_free + i + 1, guest_arena_free + i,
+            (guest_arena_free_count - i) * sizeof(guest_arena_free[0]));
+    guest_arena_free[i] = (struct guest_range){start, end};
+    ++guest_arena_free_count;
+    /* Coalesce neighbours. */
+    unsigned out = 0;
+    for (unsigned j = 0; j < guest_arena_free_count; ++j) {
+        if (out && guest_arena_free[out - 1].end == guest_arena_free[j].start)
+            guest_arena_free[out - 1].end = guest_arena_free[j].end;
+        else
+            guest_arena_free[out++] = guest_arena_free[j];
+    }
+    guest_arena_free_count = out;
+}
+
+void compat_runtime32_reserve_guest_arena(void)
+{
+    pthread_mutex_lock(&guest_arena_lock);
+    if (guest_arena_ready) { pthread_mutex_unlock(&guest_arena_lock); return; }
+    uint64_t cursor = kGuestArenaStart, reserved = 0;
+    while (cursor < UINT64_C(0x100000000) && guest_arena_count < kGuestArenaMaxRanges) {
+        mach_vm_address_t region = cursor;
+        mach_vm_size_t length = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t object = MACH_PORT_NULL;
+        kern_return_t status = mach_vm_region(mach_task_self(), &region, &length, VM_REGION_BASIC_INFO_64,
+                                              (vm_region_info_t)&info, &count, &object);
+        uint64_t hole_end = status ? UINT64_C(0x100000000) :
+                            (region < UINT64_C(0x100000000) ? region : UINT64_C(0x100000000));
+        if (hole_end > cursor) {
+            mach_vm_address_t address = cursor;
+            if (mach_vm_allocate(mach_task_self(), &address, hole_end - cursor, VM_FLAGS_FIXED) == KERN_SUCCESS) {
+                mach_vm_protect(mach_task_self(), address, hole_end - cursor, false, VM_PROT_NONE);
+                guest_arena[guest_arena_count++] = (struct guest_range){cursor, hole_end};
+                arena_free_add(cursor, hole_end);
+                reserved += hole_end - cursor;
+            }
+        }
+        if (status) break;
+        cursor = region + length;
+    }
+    guest_arena_ready = true;
+    uint64_t stacks = kNativeGuestStackBase, stacks_end = stacks + kGuestStackSize;
+    if (range_within(guest_arena_free, guest_arena_free_count, stacks, stacks_end) &&
+        mmap((void *)(uintptr_t)stacks, kGuestStackSize, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0) == (void *)(uintptr_t)stacks) {
+        arena_free_remove(stacks, stacks_end);
+        guest_stack_base = kNativeGuestStackBase;
+    }
+    pthread_mutex_unlock(&guest_arena_lock);
+    if (getenv("LP32_TRACE_GUEST_VM"))
+        fprintf(stderr, "compat32: guest arena reserved %u ranges, %llu MB above 0x%08x; stacks at 0x%08x\n",
+                guest_arena_count, (unsigned long long)(reserved >> 20), kGuestArenaStart, guest_stack_base);
+}
+
+static bool trace_guest_vm(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("LP32_TRACE_GUEST_VM") != NULL;
+    return enabled;
+}
+
+static uint32_t guest_arena_mmap(uint32_t hint, uint64_t size, int protection, int flags,
+                                 int fd, off_t offset, uint32_t return_address)
+{
+    uint64_t page = (uint64_t)getpagesize();
+    uint64_t length = (size + page - 1) & ~(page - 1);
+    if (!length || length > UINT64_C(0x100000000)) { errno = EINVAL; return UINT32_MAX; }
+    void *mapping = MAP_FAILED;
+    pthread_mutex_lock(&guest_arena_lock);
+    uint64_t start = hint & ~(page - 1), end = start + length;
+    bool in_arena = guest_arena_ready && range_within(guest_arena, guest_arena_count, start, end);
+    if (flags & MAP_FIXED) {
+        if (!guest_arena_ready || start < kGuestArenaStart || in_arena) {
+            mapping = mmap((void *)(uintptr_t)hint, size, protection, flags, fd, offset);
+            if (mapping != MAP_FAILED && in_arena) arena_free_remove(start, end);
+        } else {
+            fprintf(stderr, "compat32: refused guest MAP_FIXED over host memory 0x%08llx-0x%08llx "
+                    "from 0x%08" PRIx32 "\n", (unsigned long long)start, (unsigned long long)end,
+                    return_address);
+            errno = ENOMEM;
+        }
+    } else if (guest_arena_ready) {
+        uint64_t chosen = 0;
+        if (hint && end <= UINT64_C(0x100000000) && range_within(guest_arena_free, guest_arena_free_count, start, end))
+            chosen = start;
+        for (unsigned i = 0; !chosen && i < guest_arena_free_count; ++i)
+            if (guest_arena_free[i].end - guest_arena_free[i].start >= length) chosen = guest_arena_free[i].start;
+        if (chosen) {
+            mapping = mmap((void *)(uintptr_t)chosen, size, protection, flags | MAP_FIXED, fd, offset);
+            if (mapping != MAP_FAILED) arena_free_remove(chosen, chosen + length);
+        } else {
+            errno = ENOMEM;
+        }
+    } else {
+        /* Before the arena exists (self-tests): let the kernel place it
+           in the upper half of the guest's space. */
+        for (uint64_t try = hint ? hint : kGuestArenaStart;
+             try < UINT64_C(0x100000000) && size <= UINT64_C(0x100000000) - try; try += 0x08000000) {
+            mapping = mmap((void *)(uintptr_t)try, size, protection, flags, fd, offset);
+            if (mapping == MAP_FAILED) break;
+            if ((uintptr_t)mapping <= UINT32_MAX && size <= UINT64_C(0x100000000) - (uintptr_t)mapping) break;
+            munmap(mapping, size); mapping = MAP_FAILED; errno = ENOMEM;
+        }
+    }
+    pthread_mutex_unlock(&guest_arena_lock);
+    if (mapping != MAP_FAILED && ((uintptr_t)mapping > UINT32_MAX ||
+        size > UINT64_C(0x100000000) - (uintptr_t)mapping)) {
+        munmap(mapping, size); mapping = MAP_FAILED; errno = ENOMEM;
+    }
+    if (trace_guest_vm())
+        fprintf(stderr, "compat32: guest mmap hint=0x%08" PRIx32 " size=0x%llx prot=%d flags=0x%x -> 0x%08lx from 0x%08" PRIx32 "\n",
+                hint, (unsigned long long)size, protection, flags,
+                mapping == MAP_FAILED ? 0xffffffffUL : (unsigned long)(uintptr_t)mapping, return_address);
+    return mapping == MAP_FAILED ? UINT32_MAX : (uint32_t)(uintptr_t)mapping;
+}
+
+static int guest_arena_munmap(uint32_t address, uint64_t size, uint32_t return_address)
+{
+    uint64_t page = (uint64_t)getpagesize();
+    uint64_t start = address, end = (start + size + page - 1) & ~(page - 1);
+    if (start & (page - 1) || !size) { errno = EINVAL; return -1; }
+    int status = 0;
+    pthread_mutex_lock(&guest_arena_lock);
+    if (!guest_arena_ready || start < kGuestArenaStart) {
+        status = munmap((void *)(uintptr_t)address, size);
+    } else if (range_within(guest_arena, guest_arena_count, start, end)) {
+        /* Keep the pages reserved for the guest instead of returning them. */
+        void *reserved = mmap((void *)(uintptr_t)start, end - start, PROT_NONE,
+                              MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+        if (reserved == MAP_FAILED) status = -1;
+        else arena_free_add(start, end);
+    } else {
+        fprintf(stderr, "compat32: refused guest munmap of host memory 0x%08llx-0x%08llx from 0x%08" PRIx32 "\n",
+                (unsigned long long)start, (unsigned long long)end, return_address);
+        errno = EINVAL;
+        status = -1;
+    }
+    pthread_mutex_unlock(&guest_arena_lock);
+    if (trace_guest_vm())
+        fprintf(stderr, "compat32: guest munmap 0x%08" PRIx32 " size=0x%llx -> %d from 0x%08" PRIx32 "\n",
+                address, (unsigned long long)size, status, return_address);
+    return status;
+}
+
+/* Free arena pages are reservations, not guest memory; hide them from the
+   guest's address-space walk as the holes they stand in for. */
+static bool guest_arena_free_end(uint64_t address, uint64_t *end)
+{
+    bool found = false;
+    pthread_mutex_lock(&guest_arena_lock);
+    for (unsigned i = 0; i < guest_arena_free_count; ++i)
+        if (address >= guest_arena_free[i].start && address < guest_arena_free[i].end) {
+            *end = guest_arena_free[i].end; found = true; break;
+        }
+    pthread_mutex_unlock(&guest_arena_lock);
+    return found;
+}
+
 static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
                                            const uint32_t *arguments,
                                            uint32_t return_address);
@@ -4071,6 +4374,12 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
     return result;
 }
 
+static uint32_t mw2_command_overflow_target;
+void compat_runtime32_set_command_overflow_target(uint32_t com_error) { mw2_command_overflow_target = com_error; }
+
+static unsigned trace_print_argument;
+void compat_runtime32_set_trace_print_argument(unsigned argument) { trace_print_argument = argument; }
+
 static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
                                       const uint32_t *arguments,
                                       uint32_t return_address)
@@ -4088,6 +4397,53 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
     }
     dispatch_name_length = strlen(name);
     dispatch_name_matched = false;
+    if (!strcmp(name, "_lp32_trace_print")) {
+        uint32_t text = arguments[trace_print_argument];
+        if (text >= 0x1000 && text < 0x7f000000) {
+            fprintf(stderr, "GAMEPRINT %.*s", 1000, (const char *)(uintptr_t)text);
+            size_t length = strnlen((const char *)(uintptr_t)text, 1000);
+            if (!length || ((const char *)(uintptr_t)text)[length - 1] != '\n') fputc('\n', stderr);
+        }
+        return 0;
+    }
+    if (name[1] == '_' || !strncmp(name, "_objc_exception_", 16)) {
+        uint64_t exception_result;
+        if (cxx_exception_bridge32_dispatch(name, arguments, return_address, &exception_result))
+            return exception_result;
+    }
+    if (!strcmp(name, "_lp32_mw2_command_overflow")) {
+        /* Replaces SV_AddServerCommand's two Com_Error calls: print the
+           commands still waiting for the client, then continue into
+           Com_Error with the original arguments, as if called directly. */
+        struct guest_resume_context frame;
+        if (!compat_runtime32_import_frame(&frame) || !mw2_command_overflow_target) {
+            compat_runtime32_trap_import(name, arguments, return_address);
+            return 0;
+        }
+        const uint32_t *caller = (const void *)(uintptr_t)frame.ebp;
+        uint32_t client = frame.ebp >= 0x1000 ? caller[2] : 0;
+        const char *adding = frame.ebp >= 0x1000 && caller[3] >= 0x1000 ? (const char *)(uintptr_t)caller[3] : "";
+        if (client >= 0x1000) {
+            const uint32_t *fields = (const void *)(uintptr_t)client;
+            uint32_t used = fields[1], sequence = fields[2], acknowledge = fields[3];
+            fprintf(stderr, "compat32: server command buffer full at 0x%08" PRIx32 ": %u bytes used, %d commands pending "
+                    "(sequence %u, acknowledged %u); adding %zu bytes: %.300s\n", return_address, used,
+                    (int)(sequence - acknowledge), sequence, acknowledge, strlen(adding), adding);
+            const char *text = (const char *)(uintptr_t)(client + 0x10);
+            const uint32_t *offsets = (const void *)(uintptr_t)(client + 0x1010);
+            for (uint32_t index = acknowledge + 1; (int32_t)(sequence - index) >= 0 && index - acknowledge <= 128; ++index) {
+                uint32_t offset = offsets[index & 0x7f];
+                if (offset >= 0x1000) continue;
+                fprintf(stderr, "compat32:   pending %u (%zu bytes): %.200s\n", index,
+                        strnlen(text + offset, 0x1000 - offset), text + offset);
+            }
+        }
+        fflush(stderr);
+        frame.esp -= 4; /* the call's return address is still in place */
+        frame.eip = mw2_command_overflow_target;
+        compat_runtime32_resume_guest(&frame);
+        return 0;
+    }
     if (!strcmp(name, "_puts")) {
         /* Aspyr prints the Steam proof-of-purchase key before storing it.
            Keep the license callback intact without recording its secret. */
@@ -4651,7 +5007,7 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
     if (import_is(name, "_strncasecmp")) return (uint32_t)strncasecmp((void *)(uintptr_t)arguments[0],(void *)(uintptr_t)arguments[1],arguments[2]);
     if (import_is(name, "_strcoll")) return (uint32_t)strcoll((void *)(uintptr_t)arguments[0],(void *)(uintptr_t)arguments[1]);
     if (import_is(name, "_strncat")) {strncat((void *)(uintptr_t)arguments[0],(void *)(uintptr_t)arguments[1],arguments[2]);return arguments[0];}
-    if (import_is(name, "_strlcpy")) return (uint32_t)strlcpy((void *)(uintptr_t)arguments[0],(void *)(uintptr_t)arguments[1],arguments[2]);
+    if (import_is(name, "_strlcpy") || import_is(name, "___strlcpy_chk")) return (uint32_t)strlcpy((void *)(uintptr_t)arguments[0],(void *)(uintptr_t)arguments[1],arguments[2]);
     if (import_is(name, "_strlcat")) return (uint32_t)strlcat((void *)(uintptr_t)arguments[0],(void *)(uintptr_t)arguments[1],arguments[2]);
     if (import_is(name, "_strnlen")) return (uint32_t)strnlen((void *)(uintptr_t)arguments[0],arguments[1]);
     if (import_is(name, "_strtol") || import_is(name, "_strtoll") ||
@@ -5130,7 +5486,7 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
     if (import_is(name, "_rmdir")) {
         return (uint32_t)rmdir((const char *)(uintptr_t)arguments[0]);
     }
-    if (import_is(name, "_atoi")) {
+    if (import_is(name, "_atoi") || import_is(name, "_atol")) {
         return (uint32_t)atoi((const char *)(uintptr_t)arguments[0]);
     }
     if (import_is(name, "___maskrune")) {
@@ -5177,6 +5533,74 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
             strsignal((int)arguments[0]) : strerror((int)arguments[0]));
         return text;
     }
+    /* swprintf(buffer, count, format, ...): only MW2's CRT invalid-parameter
+       handler calls it, with L"%hs". Format narrow, then widen. Windows'
+       %hs (narrow string in a wide format) is %s here. */
+    if (import_is(name, "_swprintf")) {
+        const wchar_t *wide_format = (const void *)(uintptr_t)arguments[2];
+        wchar_t *destination = (void *)(uintptr_t)arguments[0];
+        size_t count = arguments[1];
+        if (!wide_format || !destination || !count) return (uint32_t)-1;
+        char format[1024];
+        size_t length = 0;
+        for (const wchar_t *p = wide_format; *p && length + 1 < sizeof(format); ++p) {
+            if (p[0] == L'%' && p[1] == L'h' && p[2] == L's') { format[length++] = '%'; ++p; continue; }
+            format[length++] = *p < 0x80 ? (char)*p : '?';
+        }
+        format[length] = 0;
+        char *narrow = malloc(65536);
+        if (!narrow) return (uint32_t)-1;
+        int formatted = guest_vformat(narrow, 65536, format, arguments + 3);
+        size_t written = formatted < 0 ? (size_t)-1 : mbstowcs(destination, narrow, count - 1);
+        free(narrow);
+        if (written == (size_t)-1) { destination[0] = 0; return (uint32_t)-1; }
+        destination[written] = 0;
+        return (uint32_t)written;
+    }
+    if (import_is(name, "___stack_chk_fail")) {
+        fprintf(stderr, "compat32: guest stack buffer overflow detected at 0x%08" PRIx32 "\n", return_address);
+        compat_runtime32_trap_import(name, arguments, return_address);
+        return 0;
+    }
+    /* Error-path libc calls in MW2's UPnP and SDL code. The dispatcher has
+       already copied the guest errno into the host errno. */
+    if (import_is(name, "_perror")) { perror((const char *)(uintptr_t)arguments[0]); return 0; }
+    if (import_is(name, "_herror")) { herror((const char *)(uintptr_t)arguments[0]); return 0; }
+    /* Only SDL's assertion prompt locks stdin; guest FILE objects are not
+       host FILEs, and nothing else reads that stream concurrently. */
+    if (import_is(name, "_flockfile") || import_is(name, "_funlockfile")) return 0;
+    if (import_is(name, "_asctime")) {
+        const struct guest_tm32 *guest = (const void *)(uintptr_t)arguments[0];
+        static _Thread_local uint32_t text;
+        if (!guest) return 0;
+        struct tm host = {
+            .tm_sec = guest->tm_sec, .tm_min = guest->tm_min,
+            .tm_hour = guest->tm_hour, .tm_mday = guest->tm_mday,
+            .tm_mon = guest->tm_mon, .tm_year = guest->tm_year,
+            .tm_wday = guest->tm_wday, .tm_yday = guest->tm_yday,
+            .tm_isdst = guest->tm_isdst,
+        };
+        char buffer[64];
+        if (!asctime_r(&host, buffer)) return 0;
+        if (!text) text = guest_allocate(sizeof(buffer), true);
+        if (text) memcpy((void *)(uintptr_t)text, buffer, strlen(buffer) + 1);
+        return text;
+    }
+    /* Multiprocessing Services Duration: positive milliseconds, negative
+       microseconds. MW2's semaphore WaitForSingleObject uses it for timed
+       waits; Nanoseconds comes back in edx:eax. */
+    if (import_is(name, "_DurationToNanoseconds")) {
+        int32_t duration = (int32_t)arguments[0];
+        if (duration == INT32_MAX) return UINT64_MAX;
+        if (duration < 0) return (uint64_t)-(int64_t)duration * 1000;
+        return (uint64_t)duration * 1000000;
+    }
+    /* SDL's power query treats a missing power-source blob as unknown. */
+    if (import_is(name, "_IOPSCopyPowerSourcesInfo") ||
+        import_is(name, "_IOPSCopyPowerSourcesList") ||
+        import_is(name, "_IOPSGetPowerSourceDescription")) return 0;
+    if (import_is(name, "_SetSystemUIMode"))
+        return (uint32_t)SetSystemUIMode(arguments[0], arguments[1]);
     if (import_is(name, "_sigaltstack")) {
         stack_t next, previous;
         const uint32_t *g = (void *)(uintptr_t)arguments[0];
@@ -5426,6 +5850,9 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
     if (import_is(name, "_ceil")) return return_guest_double(ceil(guest_double(arguments)));
     if (import_is(name, "_floor")) return return_guest_double(floor(guest_double(arguments)));
     if (import_is(name, "_rint")) return return_guest_double(rint(guest_double(arguments)));
+    if (import_is(name, "_ldexpf")) {
+        return return_guest_float(ldexpf(guest_float(arguments[0]), (int)arguments[1]));
+    }
     if (import_is(name, "_ldexp")) {
         return return_guest_double(ldexp(guest_double(arguments), (int)arguments[2]));
     }
@@ -5498,34 +5925,21 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
         if (status && status!=ETIMEDOUT) abort();
         return 0;
     }
+    /* Mach semaphores are 32-bit port names on both sides. */
+    if (import_is(name, "_semaphore_create"))
+        return (uint32_t)semaphore_create((task_t)arguments[0], (semaphore_t *)(uintptr_t)arguments[1],
+                                          (int)arguments[2], (int)arguments[3]);
+    if (import_is(name, "_semaphore_destroy"))
+        return (uint32_t)semaphore_destroy((task_t)arguments[0], (semaphore_t)arguments[1]);
+    if (import_is(name, "_semaphore_signal")) return (uint32_t)semaphore_signal((semaphore_t)arguments[0]);
+    if (import_is(name, "_semaphore_wait")) return (uint32_t)semaphore_wait((semaphore_t)arguments[0]);
     if (import_is(name, "_mmap")) {
         off_t offset=(off_t)((uint64_t)arguments[5]|(uint64_t)arguments[6]<<32);
-        int flags=(int)arguments[3];
-        uint64_t size=arguments[1];
-        void *mapping=MAP_FAILED;
-        if (flags&MAP_FIXED) {
-            mapping=mmap((void *)(uintptr_t)arguments[0],size,(int)arguments[2],flags,(int)arguments[4],offset);
-        } else {
-            /* Rosetta rejects MAP_32BIT. Offer successive hints in the upper
-               half of the guest's 4 GB space and keep the first mapping the
-               kernel places wholly below 4 GB. */
-            for (uint64_t hint=arguments[0]?arguments[0]:UINT64_C(0x80000000);
-                 hint<UINT64_C(0x100000000) && size<=UINT64_C(0x100000000)-hint;
-                 hint+=UINT64_C(0x08000000)) {
-                mapping=mmap((void *)(uintptr_t)hint,size,(int)arguments[2],flags,(int)arguments[4],offset);
-                if (mapping==MAP_FAILED) break;
-                if ((uintptr_t)mapping<=UINT32_MAX && size<=UINT64_C(0x100000000)-(uintptr_t)mapping) break;
-                munmap(mapping,size);mapping=MAP_FAILED;errno=ENOMEM;
-            }
-        }
-        if (mapping!=MAP_FAILED && ((uintptr_t)mapping>UINT32_MAX ||
-            size>UINT64_C(0x100000000)-(uintptr_t)mapping)) {
-            munmap(mapping,size);errno=ENOMEM;return UINT32_MAX;
-        }
-        return (uint32_t)(uintptr_t)mapping;
+        return guest_arena_mmap(arguments[0],arguments[1],(int)arguments[2],(int)arguments[3],
+                                (int)arguments[4],offset,return_address);
     }
     if (import_is(name, "_munmap"))
-        return (uint32_t)munmap((void *)(uintptr_t)arguments[0],arguments[1]);
+        return (uint32_t)guest_arena_munmap(arguments[0],arguments[1],return_address);
     if (import_is(name, "_mprotect")) {
         uintptr_t start=arguments[0],end=start+arguments[1];
         int protection=(int)arguments[2];
@@ -5547,8 +5961,17 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
         bool guest_task=arguments[0]==mach_task_self();
         if (guest_task && start>=UINT64_C(0x100000000)) return KERN_INVALID_ADDRESS;
         mach_port_t object=MACH_PORT_NULL;
-        kern_return_t status=mach_vm_region(arguments[0],&start,&length,(int)arguments[3],
-            (vm_region_info_t)(uintptr_t)arguments[4],(mach_msg_type_number_t *)(uintptr_t)arguments[5],&object);
+        mach_msg_type_number_t info_count=*(mach_msg_type_number_t *)(uintptr_t)arguments[5];
+        kern_return_t status;
+        for (;;) {
+            *(mach_msg_type_number_t *)(uintptr_t)arguments[5]=info_count;
+            status=mach_vm_region(arguments[0],&start,&length,(int)arguments[3],
+                (vm_region_info_t)(uintptr_t)arguments[4],(mach_msg_type_number_t *)(uintptr_t)arguments[5],&object);
+            uint64_t free_end;
+            if (status || !guest_task || !guest_arena_free_end(start,&free_end)) break;
+            if(object)mach_port_deallocate(mach_task_self(),object);
+            object=MACH_PORT_NULL;start=free_end;length=0;
+        }
         /* A 32-bit process cannot enumerate the loader and Rosetta mappings
            above 4 GiB. Aspyr's address-space counter otherwise wraps forever. */
         if (!status && guest_task && start>=UINT64_C(0x100000000)) {
@@ -5621,6 +6044,14 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
             forget_thread(arguments[0]);
         }
         return (uint32_t)status;
+    }
+    /* MW2's _endthreadex reaches ExitThread -> pthread_exit when a worker
+       finishes. Do run_guest_thread's cleanup, then end the host thread. */
+    if (import_is(name, "_pthread_exit") && current_thread_is_guest) {
+        if (current_thread_owned_argument) guest_deallocate(current_thread_owned_argument);
+        current_thread_owned_argument = 0;
+        thread_finished(current_thread_token, false);
+        pthread_exit((void *)(uintptr_t)arguments[0]);
     }
     if (import_is(name, "_pthread_create") || import_is(name, "_pthread_create_suspended_np")) {
         pthread_attr_t native_attr, *attr = NULL;
@@ -5914,6 +6345,20 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
             case UINT32_C(0x73797331): value = 10; break; /* sys1: major */
             case UINT32_C(0x73797332): value = 7; break;  /* sys2: minor */
             case UINT32_C(0x73797333): value = 5; break;  /* sys3: bugfix */
+            case UINT32_C(0x72616d6d): /* ramm: physical RAM in MiB */
+            case UINT32_C(0x72616d20): /* ram : physical RAM in bytes */
+            case UINT32_C(0x6c72616d): { /* lram: logical RAM in bytes */
+                if (lp32_profile()->title != LP32_TITLE_MW3) return (uint32_t)-5551;
+                uint64_t memory_bytes = 0;
+                size_t memory_size = sizeof(memory_bytes);
+                if (sysctlbyname("hw.memsize", &memory_bytes, &memory_size, NULL, 0) != 0 ||
+                    memory_size != sizeof(memory_bytes) || !memory_bytes)
+                    return (uint32_t)-5551;
+                uint64_t scaled = arguments[0] == UINT32_C(0x72616d6d) ?
+                    memory_bytes >> 20 : memory_bytes;
+                value = (int32_t)(scaled > INT_MAX ? INT_MAX : scaled);
+                break;
+            }
             default: return (uint32_t)-5551;              /* gestaltUndefSelectorErr */
         }
         if (response) *response = value;
@@ -6025,12 +6470,18 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
         return 0;
     }
 
-    /* The old Objective-C zero-cost exception API no longer exists.  Normal
-       execution only needs the registration calls and setjmp's initial pass. */
-    if (import_is(name, "_objc_exception_try_enter") ||
-        import_is(name, "_objc_exception_try_exit")) return 0;
-    if (import_is(name, "__setjmp")) return 0;
-    if (import_is(name, "_objc_exception_match")) return 0;
+    /* Titles without the i386 _setjmp (guest_context_symbol) reach this one.
+       Record the caller's frame in lp32_context_fast_setjmp's layout so
+       objc_exception_throw can return to it. */
+    if (import_is(name, "__setjmp")) {
+        struct guest_resume_context frame;
+        uint32_t *buffer = (void *)(uintptr_t)arguments[0];
+        if (buffer && compat_runtime32_import_frame(&frame)) {
+            buffer[0] = frame.ebx; buffer[1] = frame.ebp; buffer[2] = frame.esi;
+            buffer[3] = frame.edi; buffer[4] = frame.esp; buffer[5] = frame.eip;
+        }
+        return 0;
+    }
 
     return dispatch_bridge_stages(import_id, name, arguments, return_address,
                                   kImportStageUnknown);
@@ -6165,7 +6616,7 @@ uint32_t compat_runtime32_call(uint32_t function, const uint32_t *arguments,
         last_call_trapped = 1;
         return 0;
     }
-    uintptr_t stack_top = kGuestStackBase + kGuestStackSize -
+    uintptr_t stack_top = guest_stack_base + kGuestStackSize -
                           guest_thread_slot * kGuestStackPerThread -
                           guest_call_depth * stack_slice_size;
     /* Entry goes through the i386 landing trampoline, whose `ret` pops the
@@ -7256,7 +7707,139 @@ int compat_runtime32_run_sync_self_test(void)
         if (compat_runtime32_dispatch_import("_pthread_join", join) ||
             *(uint32_t *)(uintptr_t)(thread_cells + 4) != token || host_thread(token)) return -1;
     }
+    /* A guest thread ending through pthread_exit, as MW2's _endthreadex does,
+       delivers its value to pthread_join and releases its token. */
+    uint32_t exit_thunk = compat_runtime32_guest_callback("_pthread_exit");
+    uint8_t exit_code[] = {0x83,0xec,0x08,0x68,0x34,0x12,0,0,0xe8,0,0,0,0,0x0f,0x0b};
+    relative = (int32_t)(exit_thunk - ((uintptr_t)thread_code + 13));
+    memcpy(exit_code + 9, &relative, 4); memcpy(thread_code, exit_code, sizeof(exit_code));
+    for (unsigned i = 0; i < 20; ++i) {
+        uint32_t create[] = {thread_cells, 0, (uint32_t)(uintptr_t)thread_code, thread_cells + 16};
+        if (compat_runtime32_dispatch_import("_pthread_create", create)) return -1;
+        uint32_t token = *(uint32_t *)(uintptr_t)thread_cells;
+        uint32_t join[] = {token, thread_cells + 4};
+        if (compat_runtime32_dispatch_import("_pthread_join", join) ||
+            *(uint32_t *)(uintptr_t)(thread_cells + 4) != 0x1234 || host_thread(token)) return -1;
+    }
     munmap(thread_code, 4096); guest_deallocate(thread_cells);
+    const uint32_t durations[] = {0, 250, (uint32_t)-750, INT32_MAX};
+    const uint64_t nanoseconds[] = {0, 250000000, 750000, UINT64_MAX};
+    for (unsigned i = 0; i < 4; ++i)
+        if (compat_runtime32_dispatch_import("_DurationToNanoseconds", &durations[i]) != nanoseconds[i]) return -1;
+
+    /* The guest arena: host allocations stay above 4 GB, guest mmap comes
+       from the arena, munmap keeps the pages reserved, and a freed range is
+       handed out again. */
+    if (guest_arena_ready) {
+        void *host = mmap(NULL, 1 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        bool host_low = host != MAP_FAILED && (uintptr_t)host < UINT64_C(0x100000000);
+        if (host != MAP_FAILED) munmap(host, 1 << 20);
+        if (host_low) return -1;
+        uint32_t map[] = {0, 0x200000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, UINT32_MAX, 0, 0};
+        uint32_t first = (uint32_t)compat_runtime32_dispatch_import("_mmap", map);
+        if (first == UINT32_MAX || first < kGuestArenaStart) return -1;
+        memset((void *)(uintptr_t)first, 0x5a, 0x200000);
+        uint32_t unmap[] = {first, 0x200000};
+        if (compat_runtime32_dispatch_import("_munmap", unmap)) return -1;
+        mach_vm_address_t probe = first; mach_vm_size_t probe_size = 0;
+        vm_region_basic_info_data_64_t probe_info; mach_msg_type_number_t probe_count = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t probe_object = MACH_PORT_NULL;
+        if (mach_vm_region(mach_task_self(), &probe, &probe_size, VM_REGION_BASIC_INFO_64,
+                           (vm_region_info_t)&probe_info, &probe_count, &probe_object) ||
+            probe > first || probe_info.protection != VM_PROT_NONE) return -1;
+        map[0] = first;
+        uint32_t again = (uint32_t)compat_runtime32_dispatch_import("_mmap", map);
+        if (again != first || *(volatile uint8_t *)(uintptr_t)again != 0) return -1;
+        compat_runtime32_dispatch_import("_munmap", unmap);
+    }
+
+    /* The command-overflow dump reads SV_AddServerCommand's frame, then
+       tail-calls its Com_Error target with the original arguments. */
+    {
+        uint8_t *code = mmap((void *)0x76200000, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                             MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+        uint32_t client = guest_allocate(0x1210, true);
+        if (code == MAP_FAILED || !client) return -1;
+        uint32_t base = (uint32_t)(uintptr_t)code;
+        uint32_t thunk = compat_runtime32_guest_callback("_lp32_mw2_command_overflow");
+        uint8_t frame_code[] = {0x55, 0x89, 0xe5, 0x83, 0xec, 0x08, 0xc7, 0x04, 0x24, 1, 0, 0, 0,
+            0xc7, 0x44, 0x24, 0x04, 0, 0, 0, 0, 0xe8, 0, 0, 0, 0, 0x89, 0xec, 0x5d, 0xc3};
+        uint32_t format = base + 0x80;
+        int32_t relative = (int32_t)(thunk - (base + 26));
+        memcpy(frame_code + 17, &format, 4);
+        memcpy(frame_code + 22, &relative, 4);
+        memcpy(code, frame_code, sizeof(frame_code));
+        const uint8_t target[] = {0x8b, 0x44, 0x24, 0x04, 0x83, 0xc0, 0x40, 0xc3}; /* return arg0 + 0x40 */
+        memcpy(code + 0x40, target, sizeof(target));
+        uint32_t *fields = (void *)(uintptr_t)client;
+        fields[1] = 10; fields[2] = 2; fields[3] = 0;
+        memcpy((char *)(uintptr_t)client + 0x10, "cmd1\0cmd2", 10);
+        fields[(0x1010 / 4) + 2] = 5;
+        uint32_t previous_target = mw2_command_overflow_target;
+        mw2_command_overflow_target = base + 0x40;
+        uint32_t call_arguments[] = {client, base + 0x90};
+        memcpy(code + 0x90, "next", 5);
+        uint32_t result = compat_runtime32_call(base, call_arguments, 2);
+        mw2_command_overflow_target = previous_target;
+        munmap(code, 4096);
+        guest_deallocate(client);
+        if (compat_runtime32_last_call_trapped() || result != 0x41) return -1;
+    }
+
+    /* Guest stacks sit where 32-bit macOS put thread stacks, so a stale
+       stack pointer read as a double (MW2's Scr_Objective_Position formats
+       int zeros with %.2f) is tiny, not a 300-digit number. */
+    if (guest_arena_ready) {
+        uint8_t *code = mmap((void *)0x76300000, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                             MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+        if (code == MAP_FAILED) return -1;
+        const uint8_t read_esp[] = {0x89, 0xe0, 0xc3}; /* mov eax, esp; ret */
+        memcpy(code, read_esp, sizeof(read_esp));
+        uint32_t esp = compat_runtime32_call((uint32_t)(uintptr_t)code, NULL, 0);
+        munmap(code, 4096);
+        if (esp < kNativeGuestStackBase || esp >= kNativeGuestStackBase + kGuestStackSize) return -1;
+        uint32_t stale[] = {0, 0, 0, 1, esp}; /* three int zeros, then stale words */
+        char text[128];
+        if (guest_vformat(text, sizeof(text), "%.2f %.2f %.2f", stale) < 0 || strlen(text) > 20) return -1;
+    }
+
+    /* Windows-style swprintf(L"%hs"), CoreAudio device queries across the
+       ABI, and Bink's Memory Manager calls. */
+    uint32_t scratch = guest_allocate(4096, true);
+    if (!scratch) return -1;
+    wchar_t *wide = (void *)(uintptr_t)scratch;
+    wcscpy(wide + 256, L"%hs-%d");
+    strcpy((char *)(uintptr_t)(scratch + 2048), "abc");
+    uint32_t swprintf_arguments[] = {scratch, 64, scratch + 1024, scratch + 2048, 7};
+    if (compat_runtime32_dispatch_import("_swprintf", swprintf_arguments) != 5 || wcscmp(wide, L"abc-7")) return -1;
+    uint32_t *audio = (void *)(uintptr_t)(scratch + 3072);
+    audio[0] = kAudioHardwarePropertyDefaultOutputDevice;
+    audio[1] = kAudioObjectPropertyScopeGlobal;
+    audio[2] = kAudioObjectPropertyElementMain;
+    audio[3] = 4;
+    uint32_t device_query[] = {kAudioObjectSystemObject, scratch + 3072, 0, 0, scratch + 3084, scratch + 3088};
+    if (compat_runtime32_dispatch_import("_AudioObjectGetPropertyData", device_query) == 0 && audio[4]) {
+        uint32_t device = audio[4];
+        audio[0] = kAudioObjectPropertyName;
+        audio[3] = 4;
+        uint32_t name_query[] = {device, scratch + 3072, 0, 0, scratch + 3084, scratch + 3088};
+        if (compat_runtime32_dispatch_import("_AudioObjectGetPropertyData", name_query) || audio[3] != 4 ||
+            audio[4] < 0x1000) return -1;
+        audio[0] = kAudioDevicePropertyStreamConfiguration;
+        audio[1] = kAudioObjectPropertyScopeOutput;
+        uint32_t size_query[] = {device, scratch + 3072, 0, 0, scratch + 3084};
+        if (compat_runtime32_dispatch_import("_AudioObjectGetPropertyDataSize", size_query) ||
+            audio[3] < 16 || (audio[3] - 4) % 12) return -1;
+    }
+    int16_t *error = (void *)(uintptr_t)(scratch + 3500);
+    uint32_t temp_arguments[] = {100, scratch + 3500};
+    uint32_t handle = (uint32_t)compat_runtime32_dispatch_import("_TempNewHandle", temp_arguments);
+    if (!handle || *error) return -1;
+    uint32_t dispose_arguments[] = {handle, scratch + 3500};
+    compat_runtime32_dispatch_import("_TempDisposeHandle", dispose_arguments);
+    uint32_t library_arguments[] = {0, 0, 0, scratch + 3504, scratch + 3508, 0};
+    if ((int32_t)compat_runtime32_dispatch_import("_GetSharedLibrary", library_arguments) != -2804 || *error) return -1;
+    guest_deallocate(scratch);
 
     pthread_mutex_lock(&guest_sync_table_lock);
     uint32_t initial_mutexes = guest_mutex_count;

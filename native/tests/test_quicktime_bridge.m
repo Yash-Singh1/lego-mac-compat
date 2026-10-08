@@ -142,6 +142,22 @@ static void test_loop_restart(const char *path) {
 
 int main(void) {
   @autoreleasepool {
+    /* An unrelated zero-argument import supplies a pointer at the guard
+       page above its guest stack. Dispatch must not read even arguments[0]. */
+    size_t page_size = (size_t)getpagesize();
+    const uint32_t *guard = mmap(NULL, page_size, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    assert(guard != MAP_FAILED);
+    const char *unrelated[] = {"_CGLGetCurrentContext", "_glFinish", "_UnknownNoArgumentImport"};
+    for (unsigned i = 0; i < sizeof unrelated / sizeof *unrelated; ++i) {
+      uint64_t result = 0xabcdef;
+      assert(!quicktime_bridge32_dispatch(unrelated[i], guard, &result));
+      assert(result == 0xabcdef);
+    }
+    assert(!munmap((void *)guard, page_size));
+    if (getenv("LP32_QUICKTIME_GUARD_SELFTEST")) {
+      puts("QuickTime unrelated-import guard-page PASS");
+      return 0;
+    }
     setenv("LP32_MUTE_AUDIO", "1", 1);
     guest = mmap((void *)0x30000000, 0x10000, PROT_READ | PROT_WRITE,
                  MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);

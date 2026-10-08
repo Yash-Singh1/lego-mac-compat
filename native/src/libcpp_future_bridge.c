@@ -1,5 +1,6 @@
 #include "libcpp_future_bridge.h"
 #include "compat_runtime.h"
+#include "cxx_exception_bridge.h"
 #include <stddef.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -45,8 +46,7 @@ static bool wait_locked(uint32_t p,uint32_t *unique_lock) {
 int libcpp_future_bridge32_dispatch(const char *name,const uint32_t *a,uint64_t *out) {
     *out=0;
     if(!strcmp(name,"_lp32_future_destroy") || !strcmp(name,"_lp32_future_delete")) {
-        /* Exception propagation needs the guest exception runtime. */
-        if(state(a[0])->exception)return 0;
+        cxx_exception_bridge32_release(state(a[0])->exception);state(a[0])->exception=0;
         call("_pthread_cond_destroy",a[0]+56,0);call("_pthread_mutex_destroy",a[0]+12,0);
         if(!strcmp(name,"_lp32_future_delete"))compat_runtime32_deallocate(a[0]);
         return 1;
@@ -71,6 +71,16 @@ int libcpp_future_bridge32_dispatch(const char *name,const uint32_t *a,uint64_t 
         if(available){state(p)->flags|=5;call("_pthread_cond_broadcast",p+56,0);}
         call("_pthread_mutex_unlock",p+12,0);return available;
     }
+    /* The exception_ptr argument is passed by address. */
+    if(!strcmp(name,"__ZNSt3__117__assoc_sub_state13set_exceptionESt13exception_ptr") ||
+       !strcmp(name,"__ZNSt3__17promiseIvE13set_exceptionESt13exception_ptr")) {
+        uint32_t p=strstr(name,"promise")?*word(a[0]):a[0],exception=*word(a[1]);if(!p)return 0;
+        call("_pthread_mutex_lock",p+12,0);
+        bool available=!(state(p)->flags&1) && !state(p)->exception;
+        if(available){cxx_exception_bridge32_retain(exception);state(p)->exception=exception;
+            state(p)->flags|=4;call("_pthread_cond_broadcast",p+56,0);}
+        call("_pthread_mutex_unlock",p+12,0);return available;
+    }
     if(!strcmp(name,"__ZNSt3__16futureIvED1Ev") || !strcmp(name,"__ZNSt3__17promiseIvED1Ev")) {
         uint32_t p=*word(a[0]);
         if(p && !strcmp(name,"__ZNSt3__17promiseIvED1Ev") &&
@@ -80,9 +90,14 @@ int libcpp_future_bridge32_dispatch(const char *name,const uint32_t *a,uint64_t 
     if(!strcmp(name,"__ZNSt3__16futureIvE3getEv")) {
         uint32_t p=*word(a[0]);if(!p)return 0;
         *word(a[0])=0;call("_pthread_mutex_lock",p+12,0);
-        uint32_t unique_lock[]={p+12,1};bool ok=wait_locked(p,unique_lock) && !state(p)->exception;
+        uint32_t unique_lock[]={p+12,1};bool ok=wait_locked(p,unique_lock);
+        uint32_t exception=ok?state(p)->exception:0;
         if(unique_lock[1])call("_pthread_mutex_unlock",p+12,0);
-        release(p);return ok;
+        /* Rethrow last: releasing the state can call guest code, which would
+           consume a pending resume. */
+        cxx_exception_bridge32_retain(exception);release(p);
+        if(exception){cxx_exception_bridge32_rethrow(exception,a,0);cxx_exception_bridge32_release(exception);}
+        return ok;
     }
     if(!strcmp(name,"__ZNSt3__117__assoc_sub_state10__sub_waitERNS_11unique_lockINS_5mutexEEE"))
         return wait_locked(a[0],word(a[1]));

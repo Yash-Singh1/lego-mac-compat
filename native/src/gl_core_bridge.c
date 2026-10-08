@@ -104,6 +104,10 @@ static uint64_t call_glCompileShader(const uint32_t *a,uint32_t site) {
     uint32_t shader = a[0];
     ((void (*)(uint32_t))symbols[21])(shader);
     gl_core_bridge32_shadow_compile_fallback(shader);
+    if (getenv("LP32_TRACE_SHADER_ERRORS")) { /* logs GLSL compile/link failures */
+        GLint ok = 1; glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+        if (!ok) { char log[1024] = {0}; glGetShaderInfoLog(shader, sizeof log - 1, NULL, log); fprintf(stderr, "SHADERERR compile %u: %s\n", shader, log); }
+    }
     return 0;
 }
 static uint64_t call_glCompressedTexImage1D(const uint32_t *a,uint32_t site) {
@@ -361,7 +365,12 @@ static uint64_t call_glLightfv(const uint32_t *a,uint32_t site) {
 }
 static uint64_t call_glLinkProgram(const uint32_t *a,uint32_t site) {
     (void)site; (void)a;
-    ((void (*)(uint32_t))symbols[85])((uint32_t)a[0]);return 0;
+    ((void (*)(uint32_t))symbols[85])((uint32_t)a[0]);
+    if (getenv("LP32_TRACE_SHADER_ERRORS")) { /* logs GLSL compile/link failures */
+        GLint ok = 1; glGetProgramiv(a[0], GL_LINK_STATUS, &ok);
+        if (!ok) { char log[1024] = {0}; glGetProgramInfoLog(a[0], sizeof log - 1, NULL, log); fprintf(stderr, "SHADERERR link %u: %s\n", a[0], log); }
+    }
+    return 0;
 }
 static uint64_t call_glLoadMatrixf(const uint32_t *a,uint32_t site) {
     (void)site; (void)a;

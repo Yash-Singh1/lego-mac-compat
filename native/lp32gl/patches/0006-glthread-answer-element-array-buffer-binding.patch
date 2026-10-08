@@ -1,0 +1,14 @@
+diff --git a/src/mesa/main/glthread_get.c b/src/mesa/main/glthread_get.c
+index e11e010..447a55e 100644
+--- a/src/mesa/main/glthread_get.c
++++ b/src/mesa/main/glthread_get.c
+@@ -53,6 +53,9 @@ _mesa_marshal_GetIntegerv(GLenum pname, GLint *p)
+    case GL_ARRAY_BUFFER_BINDING:
+       *p = ctx->GLThread.CurrentArrayBufferName;
+       return;
++   case GL_ELEMENT_ARRAY_BUFFER_BINDING:
++      *p = ctx->GLThread.CurrentVAO->CurrentElementBufferName;
++      return;
+    case GL_ATTRIB_STACK_DEPTH:
+       *p = ctx->GLThread.AttribStackDepth;
+       return;

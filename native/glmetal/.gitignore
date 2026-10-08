@@ -1,0 +1,4 @@
+/build/
+/third_party/
+__pycache__/
+.DS_Store

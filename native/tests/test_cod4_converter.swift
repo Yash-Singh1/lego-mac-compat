@@ -144,6 +144,114 @@ struct ConverterTests {
         try Data("game".utf8).write(to: layout.gameData.appendingPathComponent("main/iw_00.iwd"))
         print("PASS: SP/MP layouts, Steam discovery, other editions, copy, links, containment and missing data")
 
+        for game in [GameTitle.mw2, .mw3] {
+            let library = temp.appendingPathComponent("\(game.short) Steam Library")
+            let install = library.appendingPathComponent("steamapps/common/\(game.title)")
+            let data = install.appendingPathComponent("GameData/main")
+            try fm.createDirectory(at: data, withIntermediateDirectories: true)
+            try Data("original assets".utf8).write(to: data.appendingPathComponent("iw_00.iwd"))
+            for mode in GameMode.allCases {
+                let app = install.appendingPathComponent("COD_\(game.short)_\(mode.rawValue.uppercased()).app")
+                let mw = ModernWarfareSource(app: app, mode: mode, game: game)
+                try fm.createDirectory(at: mw.contents.appendingPathComponent("MacOS"), withIntermediateDirectories: true)
+                try fm.createDirectory(at: mw.resources, withIntermediateDirectories: true)
+                try thin.write(to: mw.image)
+                try thin64.write(to: mw.steamLibrary!)
+                for file in mw.guestLibraries { try thin.write(to: file) }
+                try Data("launcher must not be selected".utf8).write(to: mw.contents.appendingPathComponent("MacOS/" + mw.originalExecutable))
+                let info = ["CFBundleExecutable": mw.originalExecutable]
+                let plist = try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
+                try plist.write(to: mw.contents.appendingPathComponent("Info.plist"))
+                let acf = library.appendingPathComponent("steamapps/appmanifest_\(game.appID(mode)).acf")
+                let complete = "\"StateFlags\" \"4\" \"installdir\" \"\(game.title)\""
+                try complete.write(to: acf, atomically: true, encoding: .utf8)
+                for selection in [app, install] {
+                    let found = try game.discover(selection, mode: mode)
+                    try expect(found.image == mw.image && found.gameData == mw.gameData, "\(game.short) \(mode.rawValue) selects game sub executable and shared data")
+                }
+                let otherMode: GameMode = mode == .sp ? .mp : .sp
+                try rejects("wrong MW mode") { _ = try game.discover(app, mode: otherMode) }
+                let otherGame: GameTitle = game == .mw2 ? .mw3 : .mw2
+                try rejects("wrong MW title") { _ = try otherGame.discover(app, mode: mode) }
+                for unsafe in [app, app.appendingPathComponent("output"), mw.gameData, mw.gameData.appendingPathComponent("output")] {
+                    try rejects("output inside MW source or data") { try mw.checkDestination(unsafe) }
+                }
+                let alias = temp.appendingPathComponent("\(game.short)-\(mode.rawValue)-data-link")
+                try fm.createSymbolicLink(at: alias, withDestinationURL: mw.gameData)
+                try rejects("output symlink into MW data") { try mw.checkDestination(alias) }
+                try mw.checkDestination(destination)
+                let mwHome = temp.appendingPathComponent("\(game.short)-\(mode.rawValue)-home")
+                let mwSteam = mwHome.appendingPathComponent("Library/Application Support/Steam/steamapps")
+                try fm.createDirectory(at: mwSteam, withIntermediateDirectories: true)
+                try "\"path\" \"\(library.path)\"".write(to: mwSteam.appendingPathComponent("libraryfolders.vdf"), atomically: true, encoding: .utf8)
+                try expect(game.steamInstallation(mode: mode, home: mwHome)?.path == app.path, "MW external Steam library discovery")
+                try "\"StateFlags\" \"1026\" \"installdir\" \"\(game.title)\"".write(to: acf, atomically: true, encoding: .utf8)
+                try rejects("pending MW download") { _ = try game.discover(app, mode: mode) }
+                try expect(game.steamInstallation(mode: mode, home: mwHome) == nil, "pending MW installation excluded")
+                try complete.write(to: acf, atomically: true, encoding: .utf8)
+                let downloading = ModernWarfareSource(app: library.appendingPathComponent("steamapps/downloading/\(game.appID(mode))/\(app.lastPathComponent)"), mode: mode, game: game)
+                try rejects("Steam downloading tree") { _ = try downloading.validateLayout() }
+                if game == .mw3 && mode == .mp {
+                    try expect(mw.guestLibraries.first?.lastPathComponent == "libBink2Macx86.dylib", "MW3 MP uses Bink 2")
+                    try expect(!fm.fileExists(atPath: mw.contents.appendingPathComponent("MacOS/libBinkMacx86.dylib").path), "MW3 MP does not require Bink 1")
+                }
+                let required = mw.guestLibraries[0]
+                try fm.removeItem(at: required)
+                try rejects("missing MW Bink library") { _ = try mw.validateLayout() }
+                try thin64.write(to: required)
+                try rejects("wrong MW guest library architecture") { _ = try mw.validateLayout() }
+                try thin.write(to: required)
+                var generated: [String: Any] = info
+                generated["LP32GeneratedGame"] = game.rawValue
+                try PropertyListSerialization.data(fromPropertyList: generated, format: .xml, options: 0).write(to: mw.contents.appendingPathComponent("Info.plist"))
+                try rejects("converted MW input") { _ = try mw.validateLayout() }
+                try plist.write(to: mw.contents.appendingPathComponent("Info.plist"))
+            }
+        }
+        print("PASS: MW2/MW3 SP/MP layouts, Bink 2, Steam downloads, modes and destination preservation")
+
+        let metal = resources.deletingLastPathComponent().appendingPathComponent("Frameworks/GLMetal")
+        try fm.createDirectory(at: metal, withIntermediateDirectories: true)
+        let metalManifest = resources.appendingPathComponent("GLMetal-build-info.json")
+        try rejects("missing GLMetal manifest") { _ = try converter.validateGLMetal() }
+        try Data("invalid JSON".utf8).write(to: metalManifest)
+        try rejects("malformed GLMetal manifest") { _ = try converter.validateGLMetal() }
+        try Data("{}".utf8).write(to: metalManifest)
+        try rejects("missing GLMetal manifest entries") { _ = try converter.validateGLMetal() }
+        var files: [String: [String: String]] = [:]
+        for name in ["libGLMetal.dylib", "glmetal-compiler"] {
+            let file = metal.appendingPathComponent(name)
+            try fm.copyItem(at: URL(fileURLWithPath: "/usr/bin/true"), to: file)
+            try converter.run("/usr/bin/codesign", ["--force", "--sign", "-", file.path])
+            let hash = try converter.sha256(file)
+            files[name] = ["source_sha256": hash, "bundled_sha256": hash]
+        }
+        let validManifest = try JSONSerialization.data(withJSONObject: ["files": files])
+        try validManifest.write(to: metalManifest)
+        try expect(try converter.validateGLMetal().path == metal.path, "packaged hashes and signatures validate without running GPU code")
+        for name in ["libGLMetal.dylib", "glmetal-compiler"] {
+            let file = metal.appendingPathComponent(name)
+            let original = try Data(contentsOf: file)
+            try fm.removeItem(at: file)
+            try rejects("missing packaged GLMetal file") { _ = try converter.validateGLMetal() }
+            try original.write(to: file)
+            try fm.setAttributes([.posixPermissions: 0o644], ofItemAtPath: file.path)
+            try rejects("nonexecutable packaged GLMetal file") { _ = try converter.validateGLMetal() }
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: file.path)
+            var damaged = original
+            damaged.append(0)
+            try damaged.write(to: file)
+            try rejects("damaged packaged GLMetal file") { _ = try converter.validateGLMetal() }
+            try original.write(to: file)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: file.path)
+        }
+        var wrongFiles = files
+        wrongFiles["glmetal-compiler"]?["bundled_sha256"] = String(repeating: "0", count: 64)
+        try JSONSerialization.data(withJSONObject: ["files": wrongFiles]).write(to: metalManifest)
+        try rejects("incorrect packaged GLMetal manifest digest") { _ = try converter.validateGLMetal() }
+        try validManifest.write(to: metalManifest)
+        print("PASS: GLMetal manifests, hashes, executable files and signatures without GPU access")
+
         let existing = destination.appendingPathComponent("COD4-Compat.app")
         try fm.createDirectory(at: existing, withIntermediateDirectories: false)
         let save = existing.appendingPathComponent("SAVE")

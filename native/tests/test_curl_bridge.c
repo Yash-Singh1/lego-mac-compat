@@ -17,7 +17,12 @@ int main(void){
  void *low=mmap((void *)0x30000000,0x100000,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON|MAP_FIXED,-1,0);assert(low!=MAP_FAILED);
  char path[]="/tmp/lp32-curl-XXXXXX";int fd=mkstemp(path);assert(fd>=0);const char data[]="curl\0callback";assert(write(fd,data,sizeof(data))==sizeof(data));close(fd);
  char url[256];snprintf(url,sizeof(url),"file://%s",path);uint32_t u=compat_runtime32_copy_cstring(url);
- uint32_t a[8]={CURL_GLOBAL_DEFAULT};assert(call("_curl_global_init",a)==0);
+ uint32_t a[8]={CURL_GLOBAL_DEFAULT,0xdead0001,0xdead0002,0xdead0003,0xdead0004,0xdead0005};
+ /* Host curl must never execute the guest allocator addresses. */
+ assert(call("_curl_global_init_mem",a)==0);
+ a[0]=CURLE_COULDNT_CONNECT;uint32_t error_text=call("_curl_easy_strerror",a);
+ assert(error_text&&!strcmp((char *)(uintptr_t)error_text,curl_easy_strerror(CURLE_COULDNT_CONNECT)));
+ assert(call("_curl_easy_strerror",a)==error_text);
  uint32_t easy=call("_curl_easy_init",a),multi=call("_curl_multi_init",a);assert(easy&&multi);
  a[0]=easy;a[1]=CURLOPT_URL;a[2]=u;assert(call("_curl_easy_setopt",a)==0);
  a[1]=CURLOPT_WRITEFUNCTION;a[2]=1;assert(call("_curl_easy_setopt",a)==0);

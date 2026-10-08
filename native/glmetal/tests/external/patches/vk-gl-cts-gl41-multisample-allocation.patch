@@ -1,0 +1,29 @@
+--- a/external/openglcts/modules/common/glcFramebufferBlitTests.cpp
++++ b/external/openglcts/modules/common/glcFramebufferBlitTests.cpp
+@@ -602,8 +602,24 @@
+         }
+         else if (E == GL_TEXTURE_2D_MULTISAMPLE)
+         {
+-            gl.texStorage2DMultisample(E, samples, format, m_fullRect.w, m_fullRect.h, GL_TRUE);
+-            GLU_EXPECT_NO_ERROR(gl.getError(), "texStorage2DMultisample");
++            const auto contextType = m_context.getRenderContext().getType();
++            const bool immutableSupported =
++                glu::contextSupports(contextType, glu::ApiType::es(3, 1)) ||
++                glu::contextSupports(contextType, glu::ApiType::core(4, 3)) ||
++                m_context.getContextInfo().isExtensionSupported("GL_ARB_texture_storage_multisample");
++            if (immutableSupported && gl.texStorage2DMultisample)
++            {
++                gl.texStorage2DMultisample(E, samples, format, m_fullRect.w, m_fullRect.h, GL_TRUE);
++                GLU_EXPECT_NO_ERROR(gl.getError(), "texStorage2DMultisample");
++            }
++            else if (!m_isContextES && gl.texImage2DMultisample)
++            {
++                // Desktop GL 3.2 provides the same multisample image without immutable storage.
++                gl.texImage2DMultisample(E, samples, format, m_fullRect.w, m_fullRect.h, GL_TRUE);
++                GLU_EXPECT_NO_ERROR(gl.getError(), "texImage2DMultisample");
++            }
++            else
++                TCU_THROW(NotSupportedError, "Multisample texture allocation is unavailable");
+         }
+         else if (E == GL_RENDERBUFFER)
+         {

@@ -106,7 +106,7 @@ struct COD4Source {
         return nil
     }
 
-    private static func vdfValues(_ key: String, in text: String) -> [String] {
+    static func vdfValues(_ key: String, in text: String) -> [String] {
         let pattern = "\"" + NSRegularExpression.escapedPattern(for: key) + "\"\\s+\"((?:\\\\.|[^\"\\\\])*)\""
         guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
         return regex.matches(in: text, range: NSRange(text.startIndex..., in: text)).compactMap {

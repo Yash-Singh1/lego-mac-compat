@@ -1,0 +1,145 @@
+--- a/external/openglcts/modules/gl/gl3cTransformFeedbackTests.cpp
++++ b/external/openglcts/modules/gl/gl3cTransformFeedbackTests.cpp
+@@ -42,6 +42,30 @@
+ #include <cmath>
+ #include <cstdlib>
+ #include <sstream>
++
++/* Preserve the exception details without changing the existing test verdict. */
++static void logTransformFeedbackException(tcu::TestLog &log, const char *function, int line)
++{
++    try
++    {
++        throw;
++    }
++    catch (const tcu::Exception &error)
++    {
++        log << tcu::TestLog::Message << function << ":" << line << ": " << error.what()
++            << tcu::TestLog::EndMessage;
++    }
++    catch (const std::exception &error)
++    {
++        log << tcu::TestLog::Message << function << ":" << line << ": " << error.what()
++            << tcu::TestLog::EndMessage;
++    }
++    catch (...)
++    {
++        log << tcu::TestLog::Message << function << ":" << line << ": Unknown non-standard exception"
++            << tcu::TestLog::EndMessage;
++    }
++}
+ 
+ /* Stringify macro. */
+ #define _STR(s) STR(s)
+@@ -260,6 +284,7 @@
+     }
+     catch (...)
+     {
++        logTransformFeedbackException(m_testCtx.getLog(), __func__, __LINE__);
+         is_ok      = false;
+         test_error = true;
+     }
+@@ -289,6 +314,7 @@
+     }
+     catch (...)
+     {
++        logTransformFeedbackException(m_testCtx.getLog(), __func__, __LINE__);
+         is_ok      = false;
+         test_error = true;
+     }
+@@ -1784,6 +1810,7 @@
+     }
+     catch (...)
+     {
++        logTransformFeedbackException(m_testCtx.getLog(), __func__, __LINE__);
+         is_ok      = false;
+         test_error = true;
+     }
+@@ -2134,6 +2161,7 @@
+     }
+     catch (...)
+     {
++        logTransformFeedbackException(m_testCtx.getLog(), __func__, __LINE__);
+         is_ok      = false;
+         test_error = true;
+     }
+@@ -2366,6 +2394,7 @@
+     }
+     catch (...)
+     {
++        logTransformFeedbackException(m_testCtx.getLog(), __func__, __LINE__);
+         is_ok      = false;
+         test_error = true;
+     }
+@@ -2913,6 +2942,7 @@
+     }
+     catch (...)
+     {
++        logTransformFeedbackException(m_testCtx.getLog(), __func__, __LINE__);
+         is_ok      = false;
+         test_error = true;
+     }
+@@ -3509,6 +3539,7 @@
+     }
+     catch (...)
+     {
++        logTransformFeedbackException(m_testCtx.getLog(), __func__, __LINE__);
+         is_ok      = false;
+         test_error = true;
+ 
+@@ -4284,6 +4315,7 @@
+     }
+     catch (...)
+     {
++        logTransformFeedbackException(m_testCtx.getLog(), __func__, __LINE__);
+         is_ok      = false;
+         test_error = true;
+         clean();
+@@ -4793,6 +4825,7 @@
+     }
+     catch (...)
+     {
++        logTransformFeedbackException(m_testCtx.getLog(), __func__, __LINE__);
+         is_ok      = false;
+         test_error = true;
+     }
+@@ -5081,6 +5114,7 @@
+     }
+     catch (...)
+     {
++        logTransformFeedbackException(m_testCtx.getLog(), __func__, __LINE__);
+         is_ok      = false;
+         test_error = true;
+     }
+@@ -5381,6 +5415,7 @@
+     }
+     catch (...)
+     {
++        logTransformFeedbackException(m_testCtx.getLog(), __func__, __LINE__);
+         is_ok      = false;
+         test_error = true;
+     }
+@@ -5833,6 +5868,7 @@
+     }
+     catch (...)
+     {
++        logTransformFeedbackException(m_testCtx.getLog(), __func__, __LINE__);
+         is_ok      = false;
+         test_error = true;
+     }
+@@ -6273,6 +6309,7 @@
+     }
+     catch (...)
+     {
++        logTransformFeedbackException(m_testCtx.getLog(), __func__, __LINE__);
+         is_ok      = false;
+         test_error = true;
+     }
+@@ -6757,6 +6794,7 @@
+     }
+     catch (...)
+     {
++        logTransformFeedbackException(m_testCtx.getLog(), __func__, __LINE__);
+         is_ok      = false;
+         test_error = true;
+     }

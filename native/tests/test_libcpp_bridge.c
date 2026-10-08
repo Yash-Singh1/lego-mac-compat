@@ -28,6 +28,28 @@ int main(void){
     run("6__initEPKcm",a);assert(!(s[0]&1)&&length(s)==6&&!strcmp(data(s),"abcdef"));
     a[1]=(uint32_t)(uintptr_t)data(s);a[2]=6;run("6appendEPKcm",a);
     assert((s[0]&1)&&length(s)==12&&!strcmp(data(s),"abcdefabcdef"));
+    {
+        uint64_t found;
+        char *needle=(char *)s+256;memcpy(needle,"cde",3);
+        uint32_t find_args[]={(uint32_t)(uintptr_t)s,(uint32_t)(uintptr_t)needle,0,3};
+        const char *name="__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE4findEPKcmm";
+        assert(libcpp_bridge32_dispatch(name,find_args,&found)&&found==2);
+        find_args[2]=3;assert(libcpp_bridge32_dispatch(name,find_args,&found)&&found==8);
+        find_args[2]=12;find_args[3]=0;
+        assert(libcpp_bridge32_dispatch(name,find_args,&found)&&found==12);
+        find_args[3]=3;assert(libcpp_bridge32_dispatch(name,find_args,&found)&&found==UINT32_MAX);
+    }
+    {
+        uint32_t *replace_string=s+240;
+        uint32_t init[]={(uint32_t)(uintptr_t)replace_string,(uint32_t)(uintptr_t)input,6};
+        run("6__initEPKcm",init);
+        memcpy(input,"XYZ",3);
+        uint32_t args[]={(uint32_t)(uintptr_t)replace_string,2,3,(uint32_t)(uintptr_t)input,3};
+        assert(run("7replaceEmmPKcm",args)==args[0]);
+        assert(!strcmp(data(replace_string),"abXYZf"));
+        run("D1Ev",args);
+        memcpy(input,"abcdef",7);
+    }
     a[1]=2;a[2]=UINT32_MAX;run("5eraseEmm",a);assert(length(s)==2&&!strcmp(data(s),"ab"));
     memcpy(input,"x\0y",3);a[1]=1;a[2]=(uint32_t)(uintptr_t)input;a[3]=3;run("6insertEmPKcm",a);
     assert(length(s)==5&&!memcmp(data(s),"ax\0yb\0",6));

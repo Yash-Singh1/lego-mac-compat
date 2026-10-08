@@ -1,5 +1,6 @@
 #import <CoreText/CoreText.h>
 #import <Security/Security.h>
+#import <CoreAudio/CoreAudio.h>
 #include "objc_bridge.h"
 #include "focus_policy.h"
 #include "gl_core_bridge.h"
@@ -12,10 +13,12 @@
 #include "hitch_recorder.h"
 #include "arb_program_guard.h"
 #include "audio_bridge.h"
+#include "audio_queue_bridge.h"
 #include "arb_sampler_usage.h"
 #include "compat_runtime.h"
 #include "controller_bridge.h"
 #include "game_profile.h"
+#include "gl_backend.h"
 #include "mouse_buttons.h"
 #include "name_match.h"
 
@@ -89,6 +92,9 @@ struct proxy_entry {
     id object;
     uint32_t cf_owners;
     bool pinned;
+    /* Owned by the recent-object ring (proxy_for_recent_object): seeing the
+       object again does not make its handle permanent. */
+    bool recent;
 };
 
 static _Thread_local bool creating_cf_object;
@@ -102,6 +108,7 @@ struct guest_autorelease_scope {
     struct guest_autorelease_scope *parent;
 };
 static _Thread_local struct guest_autorelease_scope *guest_autorelease_scope;
+static _Thread_local uint32_t guest_autorelease_depth;
 struct event_pool {
     struct proxy_entry entries[kEventProxyCapacity];
     uint32_t count, cursor;
@@ -560,7 +567,7 @@ static uint32_t event_proxy_for_object(id object)
     } else ++pool->count;
     id previous=pool->entries[slot].object;
     uint32_t handle=kEventProxyBase+(event_pool_index*kEventProxyCapacity+slot)*kProxyStride;
-    pool->entries[slot]=(struct proxy_entry){handle,object,0,false};
+    pool->entries[slot]=(struct proxy_entry){handle,object,0,false,false};
     pool->cursor=(slot+1)%kEventProxyCapacity;
     if(proxy_object_is_retained(object))[object retain];
     if(proxy_object_is_retained(previous))[previous release];
@@ -587,7 +594,7 @@ static uint32_t proxy_for_object(id object)
     for (uint32_t index = 0; index < proxy_count; ++index) {
         if (proxies[index].object == object) {
             if (creating_cf_object) ++proxies[index].cf_owners;
-            else proxies[index].pinned = true;
+            else if (!proxies[index].recent) proxies[index].pinned = true;
             uint32_t handle = proxies[index].handle;
             pthread_mutex_unlock(&proxy_mutex);
             return handle;
@@ -612,7 +619,7 @@ static uint32_t proxy_for_object(id object)
         kOverflowProxyBase + (slot - kInlineProxyCapacity) * kProxyStride;
     proxies[slot] = (struct proxy_entry){handle, object,
                                        creating_cf_object ? 1u : 0u,
-                                       !creating_cf_object};
+                                       !creating_cf_object, false};
     static int trace_allocations=-1;
     if(trace_allocations<0)trace_allocations=getenv("LP32_TRACE_PROXY_ALLOC")!=NULL;
     if(trace_allocations)fprintf(stderr,
@@ -621,6 +628,28 @@ static uint32_t proxy_for_object(id object)
         proxy_origin?proxy_origin:"bridge",creating_cf_object);
     if (proxy_object_is_retained(object)) [object retain];
     if (slot == proxy_count) ++proxy_count;
+    /* Report what is filling the pool long before it runs out. */
+    static bool reported_half;
+    if (!reported_half && slot >= kProxyCapacity / 2) {
+        reported_half = true;
+        struct { Class cls; bool pinned; bool recent; unsigned count; } top[8] = {{0}};
+        for (uint32_t i = 0; i < proxy_count; ++i) {
+            if (!proxies[i].object) continue;
+            Class cls = object_getClass(proxies[i].object);
+            unsigned k = 0;
+            while (k < 8 && top[k].count && (top[k].cls != cls || top[k].pinned != proxies[i].pinned ||
+                                             top[k].recent != proxies[i].recent)) ++k;
+            if (k == 8) continue;
+            top[k].cls = cls; top[k].pinned = proxies[i].pinned; top[k].recent = proxies[i].recent;
+            ++top[k].count;
+        }
+        fprintf(stderr, "compat32: Objective-C proxy pool half full at swap %llu (latest origin=%s):",
+                (unsigned long long)objc_bridge_swap_count, proxy_origin ? proxy_origin : "bridge");
+        for (unsigned k = 0; k < 8 && top[k].count; ++k)
+            fprintf(stderr, " %s%s%s=%u", class_getName(top[k].cls), top[k].pinned ? "/pinned" : "",
+                    top[k].recent ? "/recent" : "", top[k].count);
+        fputc('\n', stderr);
+    }
     pthread_mutex_unlock(&proxy_mutex);
     return handle;
 }
@@ -632,6 +661,7 @@ static void guest_autorelease_push(void)
     struct guest_autorelease_scope *scope=calloc(1,sizeof(*scope));
     if(!scope)abort();
     scope->parent=guest_autorelease_scope;guest_autorelease_scope=scope;
+    ++guest_autorelease_depth;
 }
 static void guest_autorelease_add(uint32_t token)
 {
@@ -646,6 +676,7 @@ static void guest_autorelease_pop(void)
     struct guest_autorelease_scope *scope=guest_autorelease_scope;
     if(!scope)return;
     guest_autorelease_scope=scope->parent;
+    --guest_autorelease_depth;
     while(scope->objects){
         struct guest_autorelease_entry *entry=scope->objects;
         scope->objects=entry->next;
@@ -654,6 +685,43 @@ static void guest_autorelease_pop(void)
     }
     free(scope);
 }
+/* Holds a +1 bridge reference on the most recent kRecentProxyCapacity
+ * objects and drops the oldest when a new one arrives. A guest retain keeps
+ * an object alive past that. */
+enum { kRecentProxyCapacity = 4096 };
+static uint32_t recent_proxies[kRecentProxyCapacity];
+static unsigned recent_proxy_cursor;
+static pthread_mutex_t recent_proxy_mutex = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t proxy_for_recent_object(id object)
+{
+    bool previous = creating_cf_object;
+    creating_cf_object = true;
+    uint32_t token = proxy_for_object(object);
+    creating_cf_object = previous;
+    if (!token) return 0;
+    pthread_mutex_lock(&proxy_mutex);
+    for (uint32_t i = 0; i < proxy_count; ++i)
+        if (proxies[i].handle == token) { proxies[i].recent = true; break; }
+    pthread_mutex_unlock(&proxy_mutex);
+    pthread_mutex_lock(&recent_proxy_mutex);
+    uint32_t oldest = recent_proxies[recent_proxy_cursor];
+    recent_proxies[recent_proxy_cursor] = token;
+    recent_proxy_cursor = (recent_proxy_cursor + 1) % kRecentProxyCapacity;
+    pthread_mutex_unlock(&recent_proxy_mutex);
+    if (oldest) {
+        uint64_t ignored;
+        objc_bridge32_dispatch("_CFRelease", &oldest, &ignored);
+    }
+    return token;
+}
+
+/* Short-lived callback arguments (HID input values) use the same bounded
+   ownership: they stay valid well past the callback without accumulating. */
+uint32_t objc_bridge32_guest_recent_object(void *object)
+{
+    return object ? proxy_for_recent_object((id)object) : 0;
+}
+
 static uint32_t proxy_for_autoreleased_object(id object)
 {
     if(!guest_autorelease_scope)return proxy_for_object(object);
@@ -926,6 +994,21 @@ uint32_t objc_bridge32_guest_pointer(void *pointer)
 }
 uint32_t objc_bridge32_guest_object(void *object) { return proxy_for_object((id)object); }
 
+/* objc_exception_match: exception is a guest object token, cls a class token. */
+uint32_t objc_bridge32_guest_is_kind_of_class(uint32_t exception, uint32_t cls)
+{
+    id object = object_for_argument(exception), class_object = object_for_argument(cls);
+    if (!object) return 0;
+    if (!class_object) return 1;
+    return object_isClass(class_object) && [object isKindOfClass:(Class)class_object];
+}
+
+const char *objc_bridge32_guest_class_name(uint32_t object)
+{
+    id value = object_for_argument(object);
+    return value ? object_getClassName(value) : "nil";
+}
+
 static void *event_proxy_test_worker(void *unused) {
     (void)unused;
     @autoreleasepool {
@@ -939,6 +1022,15 @@ static void *event_proxy_test_worker(void *unused) {
 int objc_bridge32_run_proxy_self_test(void)
 {
     @autoreleasepool {
+        /* Modern Warfare 3 MP mixes runtime pools with NSAutoreleasePool. */
+        uint32_t initial_depth = guest_autorelease_depth;
+        uint64_t pool_token = 0, pool_result = 0;
+        if (!objc_bridge32_dispatch("_objc_autoreleasePoolPush", NULL, &pool_token) ||
+            pool_token != initial_depth + 1) return -1;
+        guest_autorelease_push();
+        uint32_t pool_argument = (uint32_t)pool_token;
+        if (!objc_bridge32_dispatch("_objc_autoreleasePoolPop", &pool_argument, &pool_result) ||
+            guest_autorelease_depth != initial_depth) return -1;
         NSString *persistent = [[[NSString alloc]
             initWithUTF8String:"persistent-proxy"] autorelease];
         uint32_t persistent_handle = proxy_for_object(persistent);
@@ -983,6 +1075,31 @@ int objc_bridge32_run_proxy_self_test(void)
         if([(NSDate *)object_for_receiver(deadline) timeIntervalSince1970]!=12345 ||
            proxy_count>before_cf_count+2)return -1;
         objc_bridge32_dispatch("_CFRelease",&deadline,&ignored);
+        /* SDL wraps every key event in +[NSArray arrayWithObject:]. Scoped
+           convenience collections must not stay in the persistent pool. */
+        {
+            uint32_t array_class=proxy_for_object((id)[NSArray class]);
+            uint32_t selector=compat_runtime32_copy_cstring("arrayWithObject:");
+            uint32_t element=proxy_for_object(@"element");
+            uint32_t before_arrays=proxy_count, first=0;
+            for(unsigned i=0;i<100000;++i) {
+                @autoreleasepool {
+                    guest_autorelease_push();
+                    uint32_t a[]={array_class,selector,element};uint64_t result;
+                    if(!objc_bridge32_dispatch("_objc_msgSend",a,&result) || !result ||
+                       [(NSArray *)object_for_receiver((uint32_t)result) count]!=1)return -1;
+                    /* Real key events pass the array back through the bridge
+                       (text input); that must not make it permanent. */
+                    if(proxy_for_object(object_for_receiver((uint32_t)result))!=(uint32_t)result)return -1;
+                    guest_autorelease_pop();
+                    /* Still valid after the guest pool drains, as before. */
+                    if([(NSArray *)object_for_receiver((uint32_t)result) count]!=1)return -1;
+                    if(!i)first=(uint32_t)result;
+                    if(i==kRecentProxyCapacity/2 && [(NSArray *)object_for_receiver(first) count]!=1)return -1;
+                }
+            }
+            if(proxy_count>before_arrays+kRecentProxyCapacity+2)return -1;
+        }
         /* Exercise actual Cocoa selectors with long, heap-backed strings;
          * short tagged strings can conceal leaks by reusing their identity. */
         uint32_t string_class=proxy_for_object((id)[NSString class]);
@@ -1410,7 +1527,7 @@ static volatile int mw2_gl_reattach_logged;
 static bool mw2_profile_active(void)
 {
     enum lp32_title title = lp32_profile()->title;
-    return title == LP32_TITLE_MW2 || title == LP32_TITLE_MW2_MP;
+    return lp32_title_is_mw_sdl(title);
 }
 
 static void mw2_request_gl_reattach(void)
@@ -1608,10 +1725,23 @@ static bool invoke_simple_message(id receiver, const char *selector_name,
                 *guest_result=proxy_for_string_result(receiver,guest_arguments[0],selector_name,value,string_init);
                 return true;
             }
+            /* SDL makes +[NSArray arrayWithObject:event] for every key event.
+               Pinning those filled the proxy pool after about an hour of play,
+               but releasing them when the guest's pool drains frees the key
+               event while macOS text input may still be using it (keys then
+               arrive only with the next event). Keep them alive for the next
+               several thousand constructions instead. */
+            bool class_receiver = class_isMetaClass(object_getClass(receiver));
+            bool collection = class_receiver &&
+                (([value isKindOfClass:[NSArray class]] && !strncmp(selector_name,"array",5)) ||
+                 ([value isKindOfClass:[NSDictionary class]] && !strncmp(selector_name,"dictionary",10)) ||
+                 ([value isKindOfClass:[NSSet class]] &&
+                  (!strcmp(selector_name,"set") || !strncmp(selector_name,"setWith",7))));
             bool temporary = ([value isKindOfClass:[NSDate class]] &&
                 (!strncmp(selector_name,"date",4) || !strcmp(selector_name,"distantPast") || !strcmp(selector_name,"distantFuture"))) ||
                 (!strcmp(selector_name,"deviceDescription") && [receiver isKindOfClass:[NSScreen class]]);
-            *guest_result = temporary ? proxy_for_autoreleased_object(value) :
+            *guest_result = collection ? proxy_for_recent_object(value) :
+                temporary ? proxy_for_autoreleased_object(value) :
                 proxy_for_returned_object(receiver, value);
             return true;
         }
@@ -1918,7 +2048,8 @@ static int read_test_key_fifo(double *hold_seconds, unsigned long *modifiers)
     memmove(test_key_fifo_buffer, newline + 1,
             test_key_fifo_length - consumed);
     test_key_fifo_length -= consumed;
-    if (end == test_key_fifo_buffer || key_code < 0 || key_code > 127) {
+    if (end == test_key_fifo_buffer || key_code < 0 ||
+        (key_code > 127 && (key_code < 1000 || key_code > 1002))) {
         return -1;
     }
     *hold_seconds = hold;
@@ -1953,11 +2084,29 @@ static NSString *characters_for_test_key(unsigned short key_code)
         case 2: return @"d";
         case 13: return @"w";
         case 12: return @"q";
-        case 123: character = NSLeftArrowFunctionKey; break;
-        case 124: character = NSRightArrowFunctionKey; break;
-        case 125: character = NSDownArrowFunctionKey; break;
-        case 126: character = NSUpArrowFunctionKey; break;
+        case 123: character = NSLeftArrowFunctionKey; return [NSString stringWithCharacters:&character length:1];
+        case 124: character = NSRightArrowFunctionKey; return [NSString stringWithCharacters:&character length:1];
+        case 125: character = NSDownArrowFunctionKey; return [NSString stringWithCharacters:&character length:1];
+        case 126: character = NSUpArrowFunctionKey; return [NSString stringWithCharacters:&character length:1];
         case 0: return @"a";
+        default: break;
+    }
+    /* The rest of the ANSI letters and digits by virtual key code, so
+       scripted game binds (F, G, K...) arrive with their characters. */
+    static const char ansi[] = {
+        [3] = 'f', [4] = 'h', [5] = 'g', [6] = 'z', [7] = 'x', [8] = 'c', [9] = 'v', [11] = 'b', [14] = 'e',
+        [15] = 'r', [16] = 'y', [17] = 't', [18] = '1', [19] = '2', [20] = '3', [21] = '4', [22] = '6', [23] = '5',
+        [25] = '9', [26] = '7', [28] = '8', [29] = '0', [31] = 'o', [34] = 'i', [35] = 'p', [37] = 'l', [38] = 'j',
+        [40] = 'k', [45] = 'n', [46] = 'm', [48] = '\t'};
+    if (key_code < sizeof ansi && ansi[key_code]) {
+        character = (unichar)ansi[key_code];
+        return [NSString stringWithCharacters:&character length:1];
+    }
+    switch (key_code) {
+        case 115: character = NSHomeFunctionKey; break;
+        case 119: character = NSEndFunctionKey; break;
+        case 116: character = NSPageUpFunctionKey; break;
+        case 121: character = NSPageDownFunctionKey; break;
         default: return @"";
     }
     return [NSString stringWithCharacters:&character length:1];
@@ -1973,10 +2122,28 @@ static void post_test_key_event_with_modifiers(NSWindow *window,
                                                unsigned long modifiers)
 {
     if (!window) return;
+    /* Test-only: codes 1000-1002 click the left, right and middle buttons. */
+    if (key_code >= 1000 && key_code <= 1002) {
+        unsigned button = key_code - 1000;
+        NSEventType type = button == 0 ? (is_down ? NSEventTypeLeftMouseDown : NSEventTypeLeftMouseUp) :
+                           button == 1 ? (is_down ? NSEventTypeRightMouseDown : NSEventTypeRightMouseUp) :
+                           (is_down ? NSEventTypeOtherMouseDown : NSEventTypeOtherMouseUp);
+        NSEvent *click = [NSEvent mouseEventWithType:type
+            location:NSMakePoint(NSMidX(window.contentView.bounds), NSMidY(window.contentView.bounds))
+            modifierFlags:modifiers timestamp:[[NSProcessInfo processInfo] systemUptime]
+            windowNumber:window.windowNumber context:nil eventNumber:0 clickCount:1
+            pressure:is_down ? 1 : 0];
+        if (click) [NSApp postEvent:click atStart:NO];
+        return;
+    }
     if(key_code<128)__atomic_store_n(&test_key_states[key_code],is_down,__ATOMIC_RELAXED);
     NSString *characters = characters_for_test_key(key_code);
+    /* Cocoa marks arrow keys as function/numeric-pad events. SDL uses
+       these flags to distinguish them from ordinary character input. */
+    if (key_code >= 123 && key_code <= 126)
+        modifiers |= NSEventModifierFlagFunction | NSEventModifierFlagNumericPad;
     NSTimeInterval timestamp = [[NSProcessInfo processInfo] systemUptime];
-    bool sdl = lp32_profile()->title == LP32_TITLE_MW2 || lp32_profile()->title == LP32_TITLE_MW2_MP;
+    bool sdl = lp32_title_is_mw_sdl(lp32_profile()->title);
     /* A real keyboard reports Command going down before the key and up after
        it. Send the same flags-changed events so scripted shortcuts see it. */
     if (sdl && (modifiers & NSEventModifierFlagCommand) && is_down)
@@ -2228,7 +2395,9 @@ static uint64_t frame_pacer_choose_interval(double display_fps, uint64_t work_ns
 {
     uint64_t full_ns = (uint64_t)(1e9 / display_fps);
     pacer_work_history[pacer_work_index++ % kPacerHistory] = work_ns;
-    if (display_fps < 100.0) return full_ns;
+    /* SDL titles only enter this pacer for an explicit LP32_MAX_FPS.
+       Treat it as a ceiling, without the Feral view's half-rate policy. */
+    if (display_fps < 100.0 || lp32_title_is_mw_sdl(lp32_profile()->title)) return full_ns;
 
     uint64_t worst = 0;
     for (unsigned index = 0; index < kPacerHistory; ++index) {
@@ -2359,8 +2528,7 @@ static bool handle_test_activation(id receiver, const char *selector, uint64_t *
                 /* MW2's SDL asks during Cocoa window construction, before
                    attaching its driver data. A hidden new window cannot
                    already have keyboard focus, even in an unattended test. */
-                if ((lp32_profile()->title == LP32_TITLE_MW2 ||
-                     lp32_profile()->title == LP32_TITLE_MW2_MP) &&
+                if ((lp32_title_is_mw_sdl(lp32_profile()->title)) &&
                     [receiver isKindOfClass:[NSWindow class]] && ![receiver isVisible]) {
                     *result = 0;
                     return true;
@@ -2497,7 +2665,7 @@ static bool guest_gamma_in_frame(void)
     static int enabled = -1;
     if (enabled < 0) {
         enum lp32_title title = lp32_profile()->title;
-        enabled = (title == LP32_TITLE_MW2 || title == LP32_TITLE_MW2_MP) &&
+        enabled = (lp32_title_is_mw_sdl(title)) &&
                   !getenv("LP32_DISPLAY_GAMMA");
     }
     return enabled;
@@ -3006,6 +3174,249 @@ static bool frame_gamma_redirect_blit(const uint32_t *a)
     if (read_framebuffer <= 0) return false;
     frame_gamma_done = frame_gamma_draw(cgl, width, height, (GLuint)read_framebuffer, a[9]);
     return frame_gamma_done;
+}
+
+/*
+ * MW2 keeps running when another app is in front, and at full speed it takes
+ * several cores and much of the GPU from whatever the user switched to (for
+ * example another game). While inactive, presents are paced to
+ * LP32_INACTIVE_FPS (default 15; 0 disables). Bink movie playback is exempt:
+ * its game-loop service feeds the audio queue, so pacing can cause underruns.
+ * Bink keeps its own movie timing. Scripted tests are not paced by default.
+ */
+/* Assume active until the main thread says otherwise: a wrong "inactive"
+   caps a game the user is playing at 15 FPS and adds visible input lag. */
+static int presenting_app_active = 1;
+
+static void inactive_pacing_set_active(int active)
+{
+    int previous = __atomic_exchange_n(&presenting_app_active, active, __ATOMIC_RELAXED);
+    if (previous != active)
+        fprintf(stderr, "compat32: background pacing %s\n", active ? "off (active)" : "on (inactive)");
+}
+
+static void inactive_pacing_track_focus(void)
+{
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        /* Observe first, then read the state on the main thread, where
+           NSApp's activation state is current; reading it here first could
+           miss an activation between the read and the registration. */
+        NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+        [center addObserverForName:NSApplicationDidResignActiveNotification object:nil queue:nil
+                        usingBlock:^(NSNotification *note) { (void)note; inactive_pacing_set_active(0); }];
+        [center addObserverForName:NSApplicationDidBecomeActiveNotification object:nil queue:nil
+                        usingBlock:^(NSNotification *note) { (void)note; inactive_pacing_set_active(1); }];
+        dispatch_async(dispatch_get_main_queue(), ^{ inactive_pacing_set_active([NSApp isActive] ? 1 : 0); });
+    });
+}
+
+/* Input diagnostics for the play log: a key event reaching AppKit late,
+   or a long gap between presented frames (a hitch keeps the last held
+   movement going), both while the game is in front. */
+/* LP32_INPUT_JOURNAL=1: key/button transitions and one motion/frame summary
+   per second. The sampler keeps reporting if the event or render thread stalls.
+   Engine reads are limited to recognized MW2 SP static image data. */
+static bool input_journal_enabled(void)
+{
+    static dispatch_once_t once;
+    static bool enabled;
+    dispatch_once(&once, ^{
+        enabled = getenv("LP32_INPUT_JOURNAL") != NULL &&
+            (lp32_title_is_mw_sdl(lp32_profile()->title));
+    });
+    return enabled;
+}
+
+static pthread_mutex_t input_journal_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct input_journal_totals {
+    unsigned motions, frames;
+    double dx, dy, travel_x, travel_y, max_age_ms;
+    uint64_t motion_gap_ns, frame_gap_ns;
+    uint64_t last_motion_ns, last_frame_ns;
+} input_journal_totals;
+static bool input_journal_engine;
+
+static void input_journal_frame(uint64_t now)
+{
+    if (!input_journal_enabled()) return;
+    pthread_mutex_lock(&input_journal_mutex);
+    struct input_journal_totals *s = &input_journal_totals;
+    uint64_t gap = s->last_frame_ns ? now - s->last_frame_ns : 0;
+    if (gap > s->frame_gap_ns) s->frame_gap_ns = gap;
+    s->last_frame_ns = now;
+    ++s->frames;
+    pthread_mutex_unlock(&input_journal_mutex);
+}
+
+static void *input_journal_sampler(void *unused)
+{
+    (void)unused;
+    const uint8_t *buttons = (const void *)(uintptr_t)0x0072fe98;
+    /* _clients is static image storage, never a heap pointer. Do not follow
+       the engine's client pointer unless it still names this exact storage. */
+    const int32_t *mouse = (const void *)(uintptr_t)0x019d7c68;
+    uint32_t previous = 0;
+    int previous_index = -1;
+    unsigned flips = 0;
+    uint64_t last_flip_ns = 0, flip_gap_ns = 0;
+    uint64_t last_summary_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    for (;;) {
+        uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        uint32_t mask = 0;
+        int index = -1, dx = 0, dy = 0;
+        if (input_journal_engine) {
+            for (unsigned i = 0; i < 27; ++i)
+                if (__atomic_load_n(&buttons[i * 0x14 + 0x10], __ATOMIC_RELAXED)) mask |= 1u << i;
+            if (mask != previous) {
+                fprintf(stderr, "input: t=%.1f engine buttons=0x%07x (changed 0x%07x)\n",
+                        now / 1e6, mask, mask ^ previous);
+                previous = mask;
+            }
+            if (__atomic_load_n((const uint32_t *)(uintptr_t)0x003d4b58, __ATOMIC_RELAXED) == 0x019d7c68) {
+                index = __atomic_load_n(&mouse[5], __ATOMIC_RELAXED);
+                if (index == 0 || index == 1) {
+                    dx = __atomic_load_n(&mouse[1 + index], __ATOMIC_RELAXED);
+                    dy = __atomic_load_n(&mouse[3 + index], __ATOMIC_RELAXED);
+                    if (previous_index >= 0 && index != previous_index) {
+                        uint64_t gap = last_flip_ns ? now - last_flip_ns : 0;
+                        if (gap > flip_gap_ns) flip_gap_ns = gap;
+                        last_flip_ns = now;
+                        ++flips;
+                    }
+                } else index = -1;
+            }
+            if (index < 0) last_flip_ns = 0;
+            previous_index = index;
+        }
+        if (now - last_summary_ns >= 1000000000) {
+            pthread_mutex_lock(&input_journal_mutex);
+            struct input_journal_totals s = input_journal_totals;
+            input_journal_totals = (struct input_journal_totals){
+                .last_motion_ns = s.last_motion_ns, .last_frame_ns = s.last_frame_ns
+            };
+            pthread_mutex_unlock(&input_journal_mutex);
+            /* Read the timestamp after the snapshot so concurrent producers
+               cannot give negative ages. No formatting or I/O under the lock. */
+            uint64_t report_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            fprintf(stderr, "input: t=%.1f summary span=%.1fms active=%d "
+                    "motion=%u delta=%.1f,%.1f travel=%.1f,%.1f ageMax=%.1fms "
+                    "motionGap=%.1fms motionIdle=%.1fms frames=%u frameGap=%.1fms frameIdle=%.1fms "
+                    "engine=%d buttons=0x%07x mouseIndex=%d pending=%d,%d "
+                    "sampledFlips=%u flipGap=%.1fms flipIdle=%.1fms\n",
+                    report_ns / 1e6, (now - last_summary_ns) / 1e6,
+                    __atomic_load_n(&presenting_app_active, __ATOMIC_RELAXED),
+                    s.motions, s.dx, s.dy, s.travel_x, s.travel_y, s.max_age_ms,
+                    s.motion_gap_ns / 1e6, s.last_motion_ns ? (report_ns - s.last_motion_ns) / 1e6 : -1.0,
+                    s.frames, s.frame_gap_ns / 1e6, s.last_frame_ns ? (report_ns - s.last_frame_ns) / 1e6 : -1.0,
+                    input_journal_engine, mask, index, dx, dy, flips,
+                    flip_gap_ns / 1e6, last_flip_ns ? (report_ns - last_flip_ns) / 1e6 : -1.0);
+            last_summary_ns = now;
+            flips = 0;
+            flip_gap_ns = 0;
+        }
+        /* Index flips are sampled, not an exact count: two flips between
+           samples can cancel. Pending deltas are an approximate snapshot. */
+        struct timespec pause = {0, input_journal_engine ? 2000000 : 20000000};
+        nanosleep(&pause, NULL);
+    }
+    return NULL;
+}
+
+static void input_journal_event(NSEvent *event)
+{
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        static const uint8_t buttons_ref[] = {0x8d, 0x88, 0x98, 0xfe, 0x72, 0x00};
+        static const uint8_t mouse_ref[] = {0x8b, 0x15, 0x58, 0x4b, 0x3d, 0x00, 0x8b, 0x7a, 0x14};
+        const struct macho_image32 *image = compat_runtime32_image();
+        input_journal_engine = lp32_profile()->title == LP32_TITLE_MW2 && image && image->header &&
+            macho_image32_find_symbol(image, "__ZL9playersKb") == 0x0072fe98 &&
+            macho_image32_find_symbol(image, "_clients") == 0x019d7c68 &&
+            macho_image32_find_symbol(image, "__Z13CL_MouseEventiiii") == 0x001ad9b4 &&
+            !memcmp((const void *)(uintptr_t)0x001af43b, buttons_ref, sizeof(buttons_ref)) &&
+            !memcmp((const void *)(uintptr_t)0x001ada1d, mouse_ref, sizeof(mouse_ref));
+        pthread_t thread;
+        int error = pthread_create(&thread, NULL, input_journal_sampler, NULL);
+        if (!error) {
+            pthread_detach(thread);
+            fprintf(stderr, "input: journal started (motion/frame summaries every second; engine sampling %s)\n",
+                    input_journal_engine ? "2 ms" : "unavailable for this image");
+        } else fprintf(stderr, "input: journal sampler unavailable: %s\n", strerror(error));
+    });
+    NSEventType type = event.type;
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (type == NSEventTypeMouseMoved || type == NSEventTypeLeftMouseDragged ||
+        type == NSEventTypeRightMouseDragged || type == NSEventTypeOtherMouseDragged) {
+        double dx = event.deltaX, dy = event.deltaY;
+        double age_ms = ([[NSProcessInfo processInfo] systemUptime] - event.timestamp) * 1000;
+        pthread_mutex_lock(&input_journal_mutex);
+        struct input_journal_totals *s = &input_journal_totals;
+        uint64_t gap = s->last_motion_ns ? now - s->last_motion_ns : 0;
+        if (gap > s->motion_gap_ns) s->motion_gap_ns = gap;
+        if (age_ms > s->max_age_ms) s->max_age_ms = age_ms;
+        s->last_motion_ns = now;
+        ++s->motions;
+        s->dx += dx; s->dy += dy;
+        s->travel_x += fabs(dx); s->travel_y += fabs(dy);
+        pthread_mutex_unlock(&input_journal_mutex);
+    } else if (type == NSEventTypeKeyDown || type == NSEventTypeKeyUp) {
+        fprintf(stderr, "input: t=%.1f cocoa key=%u %s%s event=%.1f\n",
+                now / 1e6, (unsigned)event.keyCode,
+                type == NSEventTypeKeyUp ? "up" : "down", event.isARepeat ? " repeat" : "",
+                event.timestamp * 1000);
+    }
+}
+
+static void log_late_key_event(NSEvent *event)
+{
+    if (!event || background_test_mode() || !__atomic_load_n(&presenting_app_active, __ATOMIC_RELAXED)) return;
+    NSEventType type = event.type;
+    if (type != NSEventTypeKeyDown && type != NSEventTypeKeyUp) return;
+    double age = [[NSProcessInfo processInfo] systemUptime] - event.timestamp;
+    static unsigned logged;
+    if (age < 0.1 || logged >= 200) return;
+    ++logged;
+    fprintf(stderr, "compat32: late key %s keyCode=%u age=%.0fms%s\n", type == NSEventTypeKeyUp ? "up" : "down",
+            (unsigned)event.keyCode, age * 1000, event.isARepeat ? " (repeat)" : "");
+}
+
+static void log_frame_hitch(void)
+{
+    static uint64_t last_ns;
+    static unsigned logged;
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    input_journal_frame(now);
+    uint64_t gap = last_ns ? now - last_ns : 0;
+    last_ns = now;
+    if (gap < 250000000 || logged >= 500 || background_test_mode() ||
+        !__atomic_load_n(&presenting_app_active, __ATOMIC_RELAXED)) return;
+    ++logged;
+    fprintf(stderr, "compat32: frame hitch %.0fms\n", gap / 1e6);
+}
+
+static void inactive_pacing_before_present(void)
+{
+    static int64_t interval_ns = -1;
+    if (interval_ns < 0) {
+        const char *text = getenv("LP32_INACTIVE_FPS");
+        double fps = text ? strtod(text, NULL) : 15.0;
+        interval_ns = (background_test_mode() && !getenv("LP32_TEST_INACTIVE_PACING")) || fps <= 0 ?
+                      0 : (int64_t)(1e9 / fps);
+    }
+    if (!interval_ns) return;
+    inactive_pacing_track_focus();
+    static uint64_t last_present_ns;
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (!__atomic_load_n(&presenting_app_active, __ATOMIC_RELAXED) &&
+        !audio_queue_bridge32_movie_playing() && last_present_ns &&
+        now - last_present_ns < (uint64_t)interval_ns) {
+        uint64_t wait = (uint64_t)interval_ns - (now - last_present_ns);
+        struct timespec pause = {(time_t)(wait / 1000000000), (long)(wait % 1000000000)};
+        nanosleep(&pause, NULL);
+        now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    }
+    last_present_ns = now;
 }
 
 static struct { unsigned sets, restores; CGGammaValue first; } gamma_test_host;
@@ -4634,8 +5045,11 @@ static bool append_ring_enabled(void)
     static int enabled = -1;
     if (enabled < 0) {
         enum lp32_title title = lp32_profile()->title;
-        enabled = (title == LP32_TITLE_MW2 || title == LP32_TITLE_MW2_MP) &&
-                  !getenv("LP32_NO_APPEND_RING");
+        /* Works around Apple's synchronous BufferSubData. On LP32GL a
+           BufferSubData is queued asynchronously, while the map this uses
+           stalls Mesa's GL thread. */
+        enabled = (lp32_title_is_mw_sdl(title)) &&
+                  !lp32_gl_backend_is_replacement() && !getenv("LP32_NO_APPEND_RING");
     }
     return enabled;
 }
@@ -4734,7 +5148,7 @@ static struct guest_buffer_mapping *begin_buffer_mapping(
             mapping->scratch_capacity = capacity;
             enum lp32_title title = lp32_profile()->title;
             mapping->persistent_storage = target == GL_ELEMENT_ARRAY_BUFFER &&
-                (title == LP32_TITLE_MW2 || title == LP32_TITLE_MW2_MP);
+                (lp32_title_is_mw_sdl(title));
             mapping->storage = mapping->persistent_storage ?
                 state->retained_storage : scratch;
             mapping->capacity = mapping->persistent_storage ?
@@ -4804,6 +5218,7 @@ struct index_shadow {
     size_t size;
     GLenum usage;
     bool dirty;
+    bool native_required; /* Also used through a non-element binding. */
 };
 enum { kIndexShadowCapacity = 64, kIndexShadowMaxSize = 16 << 20 };
 static struct index_shadow index_shadows[kIndexShadowCapacity];
@@ -4814,7 +5229,9 @@ static bool index_shadow_enabled(void)
     static int enabled = -1;
     if (enabled < 0) {
         enum lp32_title title = lp32_profile()->title;
-        enabled = (title == LP32_TITLE_MW2 || title == LP32_TITLE_MW2_MP) &&
+        /* Also needed on LP32GL: without it MW2 MP's element buffer maps
+           exhaust the guest's address space (Hunk_UserCreate fails). */
+        enabled = (lp32_title_is_mw_sdl(title)) &&
                   !getenv("LP32_NO_INDEX_SHADOW");
     }
     return enabled;
@@ -4837,13 +5254,14 @@ static CGLShareGroupObj current_share_group(void)
 }
 
 /* glBufferData on GL_ELEMENT_ARRAY_BUFFER: (re)create or drop the copy. */
-static void index_shadow_buffer_data(GLsizeiptr size, const void *data, GLenum usage)
+static void index_shadow_buffer_data(GLenum target, GLsizeiptr size, const void *data, GLenum usage)
 {
     if (!index_shadow_enabled()) return;
-    GLuint buffer = bound_buffer_for_target(GL_ELEMENT_ARRAY_BUFFER);
+    GLuint buffer = bound_buffer_for_target(target);
     if (!buffer) return;
     CGLShareGroupObj share_group = current_share_group();
     bool dynamic = usage == GL_DYNAMIC_DRAW || usage == GL_STREAM_DRAW;
+    bool array_alias = bound_buffer_for_target(GL_ARRAY_BUFFER) == buffer;
     pthread_mutex_lock(&index_shadow_lock);
     struct index_shadow *shadow = index_shadow_find(share_group, buffer);
     if (!dynamic || size <= 0 || size > kIndexShadowMaxSize) {
@@ -4851,6 +5269,11 @@ static void index_shadow_buffer_data(GLsizeiptr size, const void *data, GLenum u
         pthread_mutex_unlock(&index_shadow_lock);
         return;
     }
+    if (!shadow && target != GL_ELEMENT_ARRAY_BUFFER) {
+        pthread_mutex_unlock(&index_shadow_lock);
+        return;
+    }
+    bool native_required = array_alias || target != GL_ELEMENT_ARRAY_BUFFER || (shadow && shadow->native_required);
     if (!shadow) {
         for (unsigned i = 0; i < kIndexShadowCapacity && !shadow; ++i)
             if (!index_shadows[i].buffer) shadow = &index_shadows[i];
@@ -4864,7 +5287,7 @@ static void index_shadow_buffer_data(GLsizeiptr size, const void *data, GLenum u
                must publish the copy. A BufferData that carried bytes already
                matches the GPU. */
             *shadow = (struct index_shadow){
-                share_group, buffer, copy, (size_t)size, usage, data == NULL,
+                share_group, buffer, copy, (size_t)size, usage, data == NULL, native_required,
             };
         } else {
             free(shadow->data);
@@ -4895,16 +5318,52 @@ static bool index_shadow_copy(GLuint buffer, GLintptr offset, GLsizeiptr size,
             memcpy(bytes, slot, (size_t)size);
         }
     }
+    if (into_shadow && shadow && shadow->native_required) ok = false;
     pthread_mutex_unlock(&index_shadow_lock);
     return ok;
 }
 
-/* glBufferSubData on GL_ELEMENT_ARRAY_BUFFER: true when the copy absorbed it. */
-static bool index_shadow_sub_data(GLintptr offset, GLsizeiptr size, const void *data)
+static bool index_shadow_native_required(GLuint buffer)
+{
+    if (!index_shadow_enabled() || !buffer) return false;
+    pthread_mutex_lock(&index_shadow_lock);
+    struct index_shadow *shadow = index_shadow_find(current_share_group(), buffer);
+    bool required = shadow && shadow->native_required;
+    pthread_mutex_unlock(&index_shadow_lock);
+    return required;
+}
+
+/* Publish deferred element writes before this object is used through another
+   target. Keep its index mirror, but future patches also reach native storage. */
+static void index_shadow_alias(GLenum target, GLuint buffer)
+{
+    if (target == GL_ELEMENT_ARRAY_BUFFER || !index_shadow_enabled() || !buffer) return;
+    pthread_mutex_lock(&index_shadow_lock);
+    struct index_shadow *shadow = index_shadow_find(current_share_group(), buffer);
+    if (shadow) {
+        if (shadow->dirty) {
+            glBufferSubData(target, 0, (GLsizeiptr)shadow->size, shadow->data);
+            shadow->dirty = false;
+        }
+        if (!shadow->native_required && getenv("LP32_TRACE_INDEX_ALIAS"))
+            fprintf(stderr, "compat32: index buffer alias buffer=%u target=%04x size=%zu\n", buffer, target, shadow->size);
+        shadow->native_required = true;
+    }
+    pthread_mutex_unlock(&index_shadow_lock);
+}
+
+/* True only when a dedicated element buffer absorbed the native upload. */
+static bool index_shadow_sub_data(GLenum target, GLintptr offset, GLsizeiptr size, const void *data)
 {
     if (!index_shadow_enabled() || offset < 0 || size < 0) return false;
-    return index_shadow_copy(bound_buffer_for_target(GL_ELEMENT_ARRAY_BUFFER),
-                             offset, size, (void *)data, true);
+    GLuint buffer = bound_buffer_for_target(target);
+    index_shadow_alias(target, buffer);
+    if (!index_shadow_copy(buffer, offset, size, (void *)data, true)) return false;
+    pthread_mutex_lock(&index_shadow_lock);
+    struct index_shadow *shadow = index_shadow_find(current_share_group(), buffer);
+    bool absorbed = target == GL_ELEMENT_ARRAY_BUFFER && shadow && !shadow->native_required;
+    pthread_mutex_unlock(&index_shadow_lock);
+    return absorbed;
 }
 
 /* Before mapping, or when a buffer is deleted: upload (if requested) and drop. */
@@ -5092,6 +5551,7 @@ void objc_bridge32_note_agl_frame(void) {
     static bool initialized;
     ++objc_bridge_swap_count;
     if (!initialized) { initialize_gl_trace_output(); install_gl_trace_signal(); initialized = true; }
+    trace_gl_frame_boundary();
     arm_pending_gl_trace();
 }
 
@@ -6244,14 +6704,17 @@ static GLenum canonical_mipmap_target(GLenum target)
     return 0;
 }
 
+static bool mipmap_repair_disabled(void)
+{
+    static int disabled = -1;
+    if (disabled < 0) disabled = getenv("LP32_DISABLE_MIPMAP_REPAIR") != NULL;
+    return disabled;
+}
+
 static void repair_bound_texture_mipmap_range(GLenum upload_target)
 {
     GLenum target = canonical_mipmap_target(upload_target);
-    static int repair_disabled = -1;
-    if (repair_disabled < 0) {
-        repair_disabled = getenv("LP32_DISABLE_MIPMAP_REPAIR") != NULL;
-    }
-    if (!target || repair_disabled) return;
+    if (!target || mipmap_repair_disabled()) return;
 
     /* Read before the scan: a level added by another context mid-scan then
        leaves the entry stale rather than wrongly current. */
@@ -6392,7 +6855,7 @@ static void repair_mipmap_range_for_parameter(GLenum upload_target,
                                               GLenum parameter, GLint value)
 {
     GLenum target = canonical_mipmap_target(upload_target);
-    if (!target) return;
+    if (!target || mipmap_repair_disabled()) return;
     GLint texture = 0;
     glGetIntegerv(target == GL_TEXTURE_2D ? GL_TEXTURE_BINDING_2D :
                   GL_TEXTURE_BINDING_CUBE_MAP, &texture);
@@ -6523,6 +6986,8 @@ static void trace_draw_call(const char *kind, GLenum mode, GLint first,
     GLfloat alpha_reference = 0.0f;
     GLint depth_function = 0;
     GLint cull_mode = 0;
+    GLint front_face = 0;
+    GLint current_program = 0;
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &framebuffer);
     glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &array_buffer);
     glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &element_buffer);
@@ -6533,6 +6998,8 @@ static void trace_draw_call(const char *kind, GLenum mode, GLint first,
     glGetFloatv(GL_ALPHA_TEST_REF, &alpha_reference);
     glGetIntegerv(GL_DEPTH_FUNC, &depth_function);
     glGetIntegerv(GL_CULL_FACE_MODE, &cull_mode);
+    glGetIntegerv(GL_FRONT_FACE, &front_face);
+    glGetIntegerv(GL_CURRENT_PROGRAM, &current_program);
     if (framebuffer) {
         framebuffer_status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
     }
@@ -6565,19 +7032,19 @@ static void trace_draw_call(const char *kind, GLenum mode, GLint first,
         (GLuint)first + (GLuint)(count - 1) : minimum;
     gl_trace_printf(
         "compat32: %s swap=%llu mode=%04x first=%d count=%d fbo=%d "
-        "fboStatus=%04x vbo=%d ibo=%d vp=%u fp=%u vpEnabled=%d "
+        "fboStatus=%04x vbo=%d ibo=%d program=%d vp=%u fp=%u vpEnabled=%d "
         "fpEnabled=%d blend=%d blendFunc={%04x,%04x} blendEq=%04x "
         "alphaTest=%d alphaFunc=%04x alphaRef=%.7g depthTest=%d "
-        "depthFunc=%04x cull=%d cullMode=%04x\n",
+        "depthFunc=%04x cull=%d cullMode=%04x frontFace=%04x\n",
         kind, (unsigned long long)objc_bridge_swap_count, mode, first, count,
-        framebuffer, framebuffer_status, array_buffer, element_buffer,
+        framebuffer, framebuffer_status, array_buffer, element_buffer, current_program,
         (GLuint)actual_vp, (GLuint)actual_fp,
         glIsEnabled(GL_VERTEX_PROGRAM_ARB),
         glIsEnabled(GL_FRAGMENT_PROGRAM_ARB), glIsEnabled(GL_BLEND),
         blend_source, blend_destination, blend_equation,
         glIsEnabled(GL_ALPHA_TEST), alpha_function, alpha_reference,
         glIsEnabled(GL_DEPTH_TEST), depth_function,
-        glIsEnabled(GL_CULL_FACE), cull_mode);
+        glIsEnabled(GL_CULL_FACE), cull_mode, front_face);
     gl_trace_printf(
         "compat32: framebuffer-state swap=%llu fbo=%d "
         "drawBuffers={%04x,%04x,%04x,%04x} "
@@ -6798,7 +7265,7 @@ static struct texture_bind_cache *texture_bind_cache_current(void)
     static int enabled = -1;
     if (enabled < 0) {
         enum lp32_title title = lp32_profile()->title;
-        enabled = (title == LP32_TITLE_MW2 || title == LP32_TITLE_MW2_MP) &&
+        enabled = (lp32_title_is_mw_sdl(title)) &&
                   !getenv("LP32_NO_BIND_FILTER");
     }
     if (!enabled) return NULL;
@@ -6875,12 +7342,15 @@ FAST_GL(glVertexAttribPointer)
     (void)return_address;
     if (trace_gl_render_call()) {
         GLint array_buffer = 0;
+        GLint vertex_array = 0;
         glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &array_buffer);
+        glGetIntegerv(0x85B5 /* GL_VERTEX_ARRAY_BINDING */, &vertex_array);
         gl_trace_printf(
-            "compat32: glVertexAttribPointer swap=%llu index=%u "
+            "compat32: glVertexAttribPointer swap=%llu tid=%p vao=%d index=%u "
             "size=%d type=%04x normalized=%u stride=%d pointer=%08x "
             "buffer=%d\n",
-            (unsigned long long)objc_bridge_swap_count, arguments[0],
+            (unsigned long long)objc_bridge_swap_count, (void *)pthread_self(),
+            vertex_array, arguments[0],
             (GLint)arguments[1], arguments[2], arguments[3],
             (GLsizei)arguments[4], arguments[5], array_buffer);
 
@@ -7061,6 +7531,7 @@ FAST_GL(glBindBuffer)
             arguments[0], arguments[1]);
     }
     glBindBuffer(arguments[0], arguments[1]);
+    index_shadow_alias(arguments[0], bound_buffer_for_target(arguments[0]));
     return 0;
 }
 
@@ -7381,7 +7852,7 @@ static uint32_t mw2_buttons_held;
 static bool mw2_mouse_title(void)
 {
     enum lp32_title title = lp32_profile()->title;
-    return title == LP32_TITLE_MW2 || title == LP32_TITLE_MW2_MP;
+    return lp32_title_is_mw_sdl(title);
 }
 
 static uint32_t host_mouse_button_mask(void)
@@ -7542,10 +8013,11 @@ int objc_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
     /* Clang's @autoreleasepool form of the guest pools handled for
        +[NSAutoreleasePool alloc]/-drain in the message path below. */
     if (!strcmp(import_name,"_objc_autoreleasePoolPush")) {
-        guest_autorelease_push();*result=1;return 1;
+        guest_autorelease_push();*result=guest_autorelease_depth;return 1;
     }
     if (!strcmp(import_name,"_objc_autoreleasePoolPop")) {
-        guest_autorelease_pop();*result=0;return 1;
+        while(arguments[0] && guest_autorelease_depth>=arguments[0])guest_autorelease_pop();
+        *result=0;return 1;
     }
     /*
      * The guest creates and drains its own NSAutoreleasePool objects, but
@@ -7621,6 +8093,9 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         id receiver = object_for_argument(super[0]);
         Class parent = (Class)object_for_argument(super[1]);
         const char *selector = (const void *)(uintptr_t)arguments[1];
+        if (lp32_gl_backend_is_replacement() && parent == [NSOpenGLContext class] &&
+            [receiver isKindOfClass:objc_getClass(lp32_gl_backend_context_class())])
+            parent = objc_getClass(lp32_gl_backend_context_class());
         Method method = parent ? class_getInstanceMethod(parent, sel_registerName(selector)) : NULL;
         if (!receiver || !method) return 0;
         NSMethodSignature *signature = [NSMethodSignature signatureWithObjCTypes:method_getTypeEncoding(method)];
@@ -7646,6 +8121,34 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         id object = object_for_argument(arguments[0]);
         *result = (uint32_t)(LP32_NAME_IS(import_name, import_length, "_objc_sync_enter") ?
                             objc_sync_enter(object) : objc_sync_exit(object));
+        return 1;
+    }
+    /* MW3 only asks a display link for the refresh period. The guest handle
+       is a cell holding the display ID; each query uses a short-lived link. */
+    if (LP32_NAME_IS(import_name, import_length, "_CVDisplayLinkCreateWithCGDisplay")) {
+        uint32_t handle = compat_runtime32_allocate(sizeof(uint32_t), 0);
+        if (!handle) { *result = kCVReturnAllocationFailed; return 1; }
+        *(uint32_t *)(uintptr_t)handle = arguments[0];
+        *(uint32_t *)(uintptr_t)arguments[1] = handle;
+        *result = kCVReturnSuccess;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CVDisplayLinkRelease")) {
+        if (arguments[0]) compat_runtime32_deallocate(arguments[0]);
+        *result = 0;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CVDisplayLinkGetNominalOutputVideoRefreshPeriod")) {
+        /* Structure return: arguments[0] is the i386 CVTime (same 16-byte layout). */
+        CVTime period = kCVZeroTime;
+        CVDisplayLinkRef link = NULL;
+        if (arguments[1] &&
+            CVDisplayLinkCreateWithCGDisplay(*(uint32_t *)(uintptr_t)arguments[1], &link) == kCVReturnSuccess) {
+            period = CVDisplayLinkGetNominalOutputVideoRefreshPeriod(link);
+            CVDisplayLinkRelease(link);
+        }
+        memcpy((void *)(uintptr_t)arguments[0], &period, sizeof(period));
+        *result = 0;
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFDictionaryApplyFunction")) {
@@ -7713,7 +8216,10 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         CFStringRef value=CFURLCopyScheme((CFURLRef)object_for_argument(arguments[0]));
         *result=proxy_for_object((id)value);if(value)CFRelease(value);return 1;
     }
-    if (LP32_NAME_IS(import_name, import_length, "_CFStringCreateWithCString")) {
+    /* The NoCopy form (used by Sys_Quit) gets a copy: the guest bytes may be
+       freed while the host string lives on. A guest deallocator is not run. */
+    if (LP32_NAME_IS(import_name, import_length, "_CFStringCreateWithCString") ||
+        LP32_NAME_IS(import_name, import_length, "_CFStringCreateWithCStringNoCopy")) {
         CFStringRef string=CFStringCreateWithCString(NULL,(const char *)(uintptr_t)arguments[1],arguments[2]);
         *result=proxy_for_object((id)string);if(string)CFRelease(string);return 1;
     }
@@ -8534,8 +9040,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         if (arguments[0] == GL_ARRAY_BUFFER)
             append_ring_buffer_data((GLsizeiptr)(int32_t)arguments[1],
                                     (const void *)(uintptr_t)arguments[2], arguments[3]);
-        if (arguments[0] == GL_ELEMENT_ARRAY_BUFFER)
-            index_shadow_buffer_data((GLsizeiptr)(int32_t)arguments[1],
+        index_shadow_buffer_data(arguments[0], (GLsizeiptr)(int32_t)arguments[1],
                                      (const void *)(uintptr_t)arguments[2], arguments[3]);
         *result = 0; return 1;
     }
@@ -8548,12 +9053,12 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                 (unsigned long long)objc_bridge_swap_count, arguments[0],
                 (int32_t)arguments[1], (int32_t)arguments[2], arguments[3]);
         }
-        if (arguments[0] == GL_ELEMENT_ARRAY_BUFFER &&
-            index_shadow_sub_data((GLintptr)(int32_t)arguments[1], (GLsizeiptr)(int32_t)arguments[2],
+        if (index_shadow_sub_data(arguments[0], (GLintptr)(int32_t)arguments[1], (GLsizeiptr)(int32_t)arguments[2],
                                   (const void *)(uintptr_t)arguments[3])) {
             *result = 0; return 1;
         }
         if (arguments[0] == GL_ARRAY_BUFFER &&
+            !index_shadow_native_required(bound_buffer_for_target(GL_ARRAY_BUFFER)) &&
             append_ring_sub_data((GLintptr)(int32_t)arguments[1],
                                  (GLsizeiptr)(int32_t)arguments[2],
                                  (const void *)(uintptr_t)arguments[3])) {
@@ -9033,8 +9538,9 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         ++gl_frame_diagnostics.framebuffer_binds;
         if (trace_gl_render_call()) {
             fprintf(stderr,
-                    "compat32: glBindFramebuffer swap=%llu target=%04x fbo=%u\n",
+                    "compat32: glBindFramebuffer swap=%llu tid=%p target=%04x fbo=%u\n",
                     (unsigned long long)objc_bridge_swap_count,
+                    (void *)pthread_self(),
                     arguments[0], arguments[1]);
         }
         glBindFramebuffer(arguments[0], arguments[1]);
@@ -9115,6 +9621,13 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     if (LP32_NAME_IS(import_name, import_length, "glFramebufferRenderbuffer") ||
         LP32_NAME_IS(import_name, import_length, "glFramebufferRenderbufferEXT")) {
         ++gl_frame_diagnostics.framebuffer_attachments;
+        if (trace_gl_render_call()) {
+            GLint framebuffer = 0;
+            glGetIntegerv(GL_FRAMEBUFFER_BINDING, &framebuffer);
+            fprintf(stderr, "compat32: glFramebufferRenderbuffer swap=%llu tid=%p fbo=%d attachment=%04x renderbuffer=%u\n",
+                    (unsigned long long)objc_bridge_swap_count, (void *)pthread_self(),
+                    framebuffer, arguments[1], arguments[3]);
+        }
         glFramebufferRenderbuffer(arguments[0], arguments[1], arguments[2],
                                   arguments[3]);
         *result = 0; return 1;
@@ -9998,6 +10511,91 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             (CFURLRef)object_for_argument(arguments[2]));
         *result=proxy_for_object((id)url);if(url)CFRelease(url);return 1;
     }
+    /* ShellExecuteA -> Sys_OpenURL (menu links, Steam app launches). */
+    if (LP32_NAME_IS(import_name, import_length, "_LSOpenCFURLRef")) {
+        NSURL *url=(NSURL *)object_for_argument(arguments[0]);
+        BOOL opened=[url isKindOfClass:[NSURL class]] && [[NSWorkspace sharedWorkspace] openURL:url];
+        if(arguments[1])*(uint32_t *)(uintptr_t)arguments[1]=0;
+        *result=opened?0:(uint32_t)(int32_t)-10814;return 1;
+    }
+    /* Deprecated CFURL resource read (Win32 resource emulation): file URLs
+       only; properties are not supported. */
+    if (LP32_NAME_IS(import_name, import_length, "_CFURLCreateDataAndPropertiesFromResource")) {
+        NSURL *url=(NSURL *)object_for_argument(arguments[1]);
+        NSData *data=[url isKindOfClass:[NSURL class]] && [url isFileURL] ?
+            [NSData dataWithContentsOfURL:url] : nil;
+        if(arguments[2])*(uint32_t *)(uintptr_t)arguments[2]=data?proxy_for_object(data):0;
+        if(arguments[3])*(uint32_t *)(uintptr_t)arguments[3]=0;
+        if(arguments[5])*(int32_t *)(uintptr_t)arguments[5]=data?0:-12; /* kCFURLResourceNotFoundError */
+        *result=data!=nil;return 1;
+    }
+    /* NSRectFill(NSRect): four i386 floats by value. */
+    if (LP32_NAME_IS(import_name, import_length, "_NSRectFill")) {
+        float r[4];memcpy(r,arguments,sizeof(r));
+        if([NSGraphicsContext currentContext])NSRectFill(NSMakeRect(r[0],r[1],r[2],r[3]));
+        *result=0;return 1;
+    }
+    /* SDL's CoreAudio device enumeration. Values are identical in both ABIs
+       except CFString results (a guest token) and AudioBufferList, whose
+       AudioBuffer holds a pointer. */
+    if (LP32_NAME_IS(import_name, import_length, "_AudioObjectGetPropertyDataSize") ||
+        LP32_NAME_IS(import_name, import_length, "_AudioObjectGetPropertyData")) {
+        bool size_only=LP32_NAME_IS(import_name, import_length, "_AudioObjectGetPropertyDataSize");
+        const AudioObjectPropertyAddress *address=(const void *)(uintptr_t)arguments[1];
+        const void *qualifier=(const void *)(uintptr_t)arguments[3];
+        uint32_t *guest_size=(void *)(uintptr_t)arguments[4];
+        if(!address || !guest_size){*result=(uint32_t)kAudioHardwareIllegalOperationError;return 1;}
+        UInt32 host_size=0;
+        OSStatus status=AudioObjectGetPropertyDataSize(arguments[0],address,arguments[2],qualifier,&host_size);
+        AudioObjectPropertySelector selector=address->mSelector;
+        bool string=selector==kAudioObjectPropertyName || selector==kAudioObjectPropertyModelName ||
+            selector==kAudioObjectPropertyManufacturer || selector==kAudioObjectPropertyElementName ||
+            selector==kAudioObjectPropertyElementCategoryName || selector==kAudioObjectPropertyElementNumberName ||
+            selector==kAudioDevicePropertyDeviceUID || selector==kAudioDevicePropertyModelUID;
+        bool buffers=selector==kAudioDevicePropertyStreamConfiguration;
+        uint32_t guest_needed=host_size;
+        if(string)guest_needed=4;
+        if(buffers && host_size>=offsetof(AudioBufferList,mBuffers))
+            guest_needed=4+12*(uint32_t)((host_size-offsetof(AudioBufferList,mBuffers))/sizeof(AudioBuffer));
+        if(status || size_only){if(!status)*guest_size=guest_needed;*result=(uint32_t)status;return 1;}
+        void *output=(void *)(uintptr_t)arguments[5];
+        if(!string && !buffers){
+            UInt32 size=*guest_size;
+            status=AudioObjectGetPropertyData(arguments[0],address,arguments[2],qualifier,&size,output);
+            if(!status)*guest_size=size;
+            *result=(uint32_t)status;return 1;
+        }
+        if(*guest_size<guest_needed){*result=(uint32_t)kAudioHardwareBadPropertySizeError;return 1;}
+        void *host=calloc(1,host_size?host_size:1);
+        if(!host){*result=(uint32_t)kAudioHardwareUnspecifiedError;return 1;}
+        UInt32 size=host_size;
+        status=AudioObjectGetPropertyData(arguments[0],address,arguments[2],qualifier,&size,host);
+        if(!status && string){
+            CFStringRef value=*(CFStringRef *)host;
+            *(uint32_t *)output=value?proxy_for_owned_object((id)value):0;
+            if(value)CFRelease(value);
+        } else if(!status){
+            const AudioBufferList *list=host;uint8_t *guest=output;
+            uint32_t count=(guest_needed-4)/12;
+            if(list->mNumberBuffers<count)count=list->mNumberBuffers;
+            memcpy(guest,&count,4);
+            for(uint32_t i=0;i<count;++i){
+                uint32_t words[3]={list->mBuffers[i].mNumberChannels,list->mBuffers[i].mDataByteSize,0};
+                memcpy(guest+4+12*i,words,12);
+            }
+            guest_needed=4+12*count;
+        }
+        free(host);
+        if(!status)*guest_size=guest_needed;
+        *result=(uint32_t)status;return 1;
+    }
+    /* The guest mutated a collection while fast-enumerating it (SDL window
+       and device teardown). Native code would raise; keep enumerating. */
+    if (LP32_NAME_IS(import_name, import_length, "_objc_enumerationMutation")) {
+        fprintf(stderr,"compat32: collection mutated during enumeration: %s\n",
+                object_getClassName(object_for_argument(arguments[0])));
+        *result=0;return 1;
+    }
     if (LP32_NAME_IS(import_name, import_length, "_CFURLCopyHostName")) {
         CFStringRef host=CFURLCopyHostName((CFURLRef)object_for_argument(arguments[0]));
         *result=proxy_for_object((id)host);if(host)CFRelease(host);return 1;
@@ -10740,8 +11338,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         /* MW2's SDL shows its window from the WinMain worker once rendering
            starts. AppKit throws from off-main ordering, and the main thread
            keeps pumping Cocoa events, so it can service the message. */
-        if ((lp32_profile()->title == LP32_TITLE_MW2 ||
-             lp32_profile()->title == LP32_TITLE_MW2_MP) &&
+        if ((lp32_title_is_mw_sdl(lp32_profile()->title)) &&
             ![NSThread isMainThread] && [receiver isKindOfClass:[NSWindow class]]) {
             __block int handled = 0;
             dispatch_sync(dispatch_get_main_queue(), ^{
@@ -10757,15 +11354,20 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             texture_bind_cache_invalidate();
         /* MW2 presents with a plain -[NSOpenGLContext flushBuffer], not the
            Feral view's swapBuffers, so count and capture frames here. */
-        if ((lp32_profile()->title == LP32_TITLE_MW2 ||
-             lp32_profile()->title == LP32_TITLE_MW2_MP) &&
+        if ((lp32_title_is_mw_sdl(lp32_profile()->title)) &&
             !strcmp(selector_name, "flushBuffer") &&
             [receiver isKindOfClass:[NSOpenGLContext class]]) {
             if (mw2_gl_reattach_left > 0) {
                 mw2_repair_gl_drawable((NSOpenGLContext *)receiver);
                 --mw2_gl_reattach_left;
             }
+            /* SDL presents outside OpenGLView, so honor an explicit test
+               or user frame cap here too. Leave its normal pacing intact. */
+            if (getenv("LP32_MAX_FPS"))
+                frame_pacer_wait(nil);
             frame_gamma_present((NSOpenGLContext *)receiver);
+            log_frame_hitch();
+            inactive_pacing_before_present();
             texture_bind_cache_invalidate();
             __atomic_store_n(&presenting_context,
                              [(NSOpenGLContext *)receiver CGLContextObj], __ATOMIC_RELAXED);
@@ -10808,6 +11410,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                     interval_start_ns = now_ns; interval_frames = 0; frame_max_ns = 0;
                 }
             }
+            trace_gl_frame_boundary();
             carbon_ui_capture_gl_frame(receiver, swaps);
         }
         /* performSelector: is typed to return an object, but MW2's SDL uses it
@@ -10960,6 +11563,14 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             compat_runtime32_heap_report("AppKit-terminate");
             fflush(NULL);
             _Exit(EXIT_SUCCESS);
+        }
+        if (strcmp(selector_name, "sendEvent:") == 0 &&
+            (lp32_title_is_mw_sdl(lp32_profile()->title)) &&
+            [receiver isKindOfClass:[NSApplication class]])
+        {
+            NSEvent *dispatched = object_for_argument(arguments[2]);
+            log_late_key_event(dispatched);
+            if (input_journal_enabled() && dispatched) input_journal_event(dispatched);
         }
         if (strcmp(selector_name, "sendEvent:") == 0 &&
             [receiver isKindOfClass:[NSApplication class]] &&
@@ -11805,8 +12416,7 @@ int objc_bridge32_run_gl_buffer_self_test(void)
        and every element buffer on other titles, still upload immediately. */
     {
         bool expect_shadow =
-            (lp32_profile()->title == LP32_TITLE_MW2 ||
-             lp32_profile()->title == LP32_TITLE_MW2_MP) &&
+            (lp32_title_is_mw_sdl(lp32_profile()->title)) &&
             !getenv("LP32_NO_INDEX_SHADOW");
         enum { kElementSize = 32, kPatch = 8, kPatchAt = 4 };
         unsigned char initial[kElementSize];
@@ -11920,7 +12530,7 @@ int objc_bridge32_run_gl_buffer_self_test(void)
         /* MW2's mark draw list keeps this CPU index pointer after unmap.
            A later vertex map must not recycle and overwrite its storage. */
         enum lp32_title title = lp32_profile()->title;
-        if (title == LP32_TITLE_MW2 || title == LP32_TITLE_MW2_MP) {
+        if (lp32_title_is_mw_sdl(title)) {
             glBindBuffer(GL_ARRAY_BUFFER, buffers[1]);
             objc_bridge32_dispatch("glMapBuffer", map_arguments, &dispatch_result);
             uint32_t vertex_mapping = (uint32_t)dispatch_result;
@@ -11941,6 +12551,54 @@ int objc_bridge32_run_gl_buffer_self_test(void)
             objc_bridge32_dispatch("glUnmapBuffer", unmap_element, &dispatch_result);
         }
 
+        /* A target alias must publish earlier deferred bytes, mirror later
+           ARRAY writes, and keep native storage current for vertex users. */
+        objc_bridge32_dispatch("glBufferData", dynamic_data, &dispatch_result);
+        objc_bridge32_dispatch("glBufferSubData", sub_data, &dispatch_result);
+        const uint32_t bind_alias[] = {GL_ARRAY_BUFFER, element};
+        objc_bridge32_dispatch("glBindBuffer", bind_alias, &dispatch_result);
+        memset(gpu, 0, sizeof(gpu));
+        glGetBufferSubData(GL_ARRAY_BUFFER, 0, kElementSize, gpu);
+        if (memcmp(gpu + kPatchAt, patch, kPatch)) {
+            fputs("gl-buffer-selftest: alias bind lost deferred index bytes\n", stderr);
+            status = -1; goto cleanup;
+        }
+        memset((void *)(uintptr_t)guest_patch, 0x5e, kPatch);
+        const uint32_t alias_sub[] = {GL_ARRAY_BUFFER, kPatchAt, kPatch, guest_patch};
+        objc_bridge32_dispatch("glBufferSubData", alias_sub, &dispatch_result);
+        glGetBufferSubData(GL_ARRAY_BUFFER, 0, kElementSize, gpu);
+        if (memcmp(gpu + kPatchAt, (void *)(uintptr_t)guest_patch, kPatch)) {
+            fputs("gl-buffer-selftest: alias subdata failed native publication\n", stderr);
+            status = -1; goto cleanup;
+        }
+        objc_bridge32_dispatch("glBindBuffer", bind_element, &dispatch_result);
+        indices = NULL; shadowed = 0;
+        acquired = objc_bridge32_index_shadow_acquire(kPatchAt, kPatch / 2, GL_UNSIGNED_SHORT, &indices, &shadowed);
+        unsigned char alias_slice[kPatch];
+        glGetBufferSubData(GL_ELEMENT_ARRAY_BUFFER, acquired ? 0 : kPatchAt, kPatch, alias_slice);
+        if (shadowed) objc_bridge32_index_shadow_release(shadowed);
+        if (memcmp(alias_slice, (void *)(uintptr_t)guest_patch, kPatch)) {
+            fputs("gl-buffer-selftest: alias write left stale draw indices\n", stderr);
+            status = -1; goto cleanup;
+        }
+        memset((void *)(uintptr_t)guest_patch, 0x71, kPatch);
+        objc_bridge32_dispatch("glBufferSubData", sub_data, &dispatch_result);
+        glGetBufferSubData(GL_ARRAY_BUFFER, kPatchAt, kPatch, alias_slice);
+        if (memcmp(alias_slice, (void *)(uintptr_t)guest_patch, kPatch)) {
+            fputs("gl-buffer-selftest: aliased element update failed native publication\n", stderr);
+            status = -1; goto cleanup;
+        }
+        /* Reallocation via ARRAY must replace the old-sized CPU index copy. */
+        const uint32_t alias_data[] = {GL_ARRAY_BUFFER, kPatch, guest_patch, GL_DYNAMIC_DRAW};
+        objc_bridge32_dispatch("glBufferData", alias_data, &dispatch_result);
+        acquired = objc_bridge32_index_shadow_acquire(0, kPatch / 2, GL_UNSIGNED_SHORT, &indices, &shadowed);
+        glGetBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, kPatch, alias_slice);
+        if (shadowed) objc_bridge32_index_shadow_release(shadowed);
+        if (memcmp(alias_slice, (void *)(uintptr_t)guest_patch, kPatch)) {
+            fputs("gl-buffer-selftest: alias reallocation left stale draw indices\n", stderr);
+            status = -1; goto cleanup;
+        }
+        memcpy((void *)(uintptr_t)guest_patch, patch, kPatch);
         const uint32_t static_data[] = {
             GL_ELEMENT_ARRAY_BUFFER, kElementSize, guest_initial, GL_STATIC_DRAW,
         };

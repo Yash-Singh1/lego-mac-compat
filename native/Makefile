@@ -3,7 +3,7 @@ BUILD_DIR := build
 CONTINUE_WHEN_INACTIVE ?= 0
 
 # One loader serves every supported title; the bundle targets pick the title
-# with GAME=pirates (default), clonewars, marvel, saga, cod4, cod4mp, mw2 or mw2mp.
+# with GAME=pirates (default), clonewars, marvel, saga, cod4, cod4mp, mw2, mw2mp, mw3 or mw3mp.
 GAME ?= pirates
 ifneq ($(filter $(GAME),cod cod4 cod4mp),)
 COD4_MODE := $(if $(filter cod4mp,$(GAME)),mp,sp)
@@ -15,9 +15,10 @@ LOADER_NAME := COD4$(COD4_SUFFIX)Compat
 CG_SOURCE :=
 ICON_NAME := $(if $(filter mp,$(COD4_MODE)),Game_mp.icns,Game.icns)
 GUEST_RUNTIME_DIR ?= $(BUILD_DIR)/guest-runtime
-else ifneq ($(filter $(GAME),mw2 mw2mp),)
-MW2_MODE := $(if $(filter mw2mp,$(GAME)),mp,sp)
-MW2_STEM := $(if $(filter mw2mp,$(GAME)),MW2MP,MW2)
+else ifneq ($(filter $(GAME),mw2 mw2mp mw3 mw3mp),)
+MW2_GAME := $(if $(filter mw3 mw3mp,$(GAME)),mw3,mw2)
+MW2_MODE := $(if $(filter mw2mp mw3mp,$(GAME)),mp,sp)
+MW2_STEM := $(if $(filter mw3 mw3mp,$(GAME)),MW3,MW2)$(if $(filter mp,$(MW2_MODE)),MP,)
 SOURCE_APP ?=
 BUNDLE := $(BUILD_DIR)/$(MW2_STEM)-Compat.app
 IMAGE_NAME := $(MW2_STEM).image
@@ -111,7 +112,7 @@ GAME_DATA := GAME.DAT GAME0.DAT GAME1.DAT GAME2.DAT GAME3.DAT GAME4.DAT
 ICON := icons/LEGOPirates.icns
 ICON_NAME := icon.icns
 else
-$(error Unknown GAME "$(GAME)"; choose pirates, clonewars, marvel, saga, cod4, cod4mp, mw2 or mw2mp)
+$(error Unknown GAME "$(GAME)"; choose pirates, clonewars, marvel, saga, cod4, cod4mp, mw2, mw2mp, mw3 or mw3mp)
 endif
 CG_SOURCE ?= $(SOURCE_CONTENTS)/Library/Frameworks/Cg.framework
 # Python for the Pirates unpacker.  By default a venv under $(BUILD_DIR) with
@@ -131,9 +132,11 @@ SDK := $(shell xcrun --sdk macosx --show-sdk-path)
 CFLAGS := -arch x86_64 -isysroot $(SDK) -mmacosx-version-min=11.0 -O2 -g -Wall -Wextra -Werror
 LDFLAGS := -Wl,-no_pie,-pagezero_size,0x1000,-segaddr,__TEXT,0x100000000,-segaddr,__LEGACY,0x1000,-segprot,__LEGACY,rwx,rwx
 
+include lp32gl/lp32gl.mk
+
 # Standalone converter, adapted from tfu/portal2. Users need no developer tools.
 COD4_CONVERTER_APP := $(BUILD_DIR)/COD4-Converter.app
-COD4_CONVERTER_CORE := cod4-converter/Conversion.swift cod4-converter/Source.swift
+COD4_CONVERTER_CORE := cod4-converter/Conversion.swift cod4-converter/Source.swift cod4-converter/ModernWarfare.swift
 COD4_CONVERTER_SOURCES := $(COD4_CONVERTER_CORE) cod4-converter/App.swift cod4-converter/main.swift
 SWIFTC := $(shell xcrun --find swiftc)
 
@@ -143,15 +146,16 @@ $(BUILD_DIR)/cod4-converter-arm64: $(COD4_CONVERTER_SOURCES) | $(BUILD_DIR)
 $(BUILD_DIR)/cod4-converter-x86_64: $(COD4_CONVERTER_SOURCES) | $(BUILD_DIR)
 	$(SWIFTC) -O -swift-version 5 -warnings-as-errors -target x86_64-apple-macosx11.0 -sdk $(SDK) $^ -o $@
 
-.PHONY: cod4-converter test-cod4-converter
-cod4-converter: $(BUILD_DIR)/cod4-converter-arm64 $(BUILD_DIR)/cod4-converter-x86_64 $(BUILD_DIR)/game_loader cod4-converter/Info.plist
-	mkdir -p "$(COD4_CONVERTER_APP)/Contents/MacOS" "$(COD4_CONVERTER_APP)/Contents/Resources"
-	lipo -create $(BUILD_DIR)/cod4-converter-arm64 $(BUILD_DIR)/cod4-converter-x86_64 -output "$(COD4_CONVERTER_APP)/Contents/MacOS/COD4Converter"
-	cp cod4-converter/Info.plist "$(COD4_CONVERTER_APP)/Contents/Info.plist"
-	cp $(BUILD_DIR)/game_loader "$(COD4_CONVERTER_APP)/Contents/Resources/"
-	codesign --force --sign - "$(COD4_CONVERTER_APP)/Contents/Resources/game_loader"
-	codesign --force --sign - "$(COD4_CONVERTER_APP)"
-	codesign --verify --deep --strict "$(COD4_CONVERTER_APP)"
+# Always ask GLMetal's own dependency graph to refresh its driver/helper pair.
+GLMETAL_SOURCE ?= glmetal
+GLMETAL_BUILD ?= $(GLMETAL_SOURCE)/build
+.PHONY: glmetal-lib cod-converters cod4-converter mw2-converter mw3-converter test-cod4-converter
+glmetal-lib:
+	$(MAKE) -C "$(GLMETAL_SOURCE)" lib
+
+cod-converters: cod4-converter mw2-converter mw3-converter
+cod4-converter mw2-converter mw3-converter: $(BUILD_DIR)/cod4-converter-arm64 $(BUILD_DIR)/cod4-converter-x86_64 $(BUILD_DIR)/game_loader glmetal-lib cod4-converter/Info.plist
+	python3 tools/package_converter.py --game "$(@:-converter=)" --build "$(BUILD_DIR)" --glmetal "$(GLMETAL_BUILD)"
 
 $(BUILD_DIR)/test_cod4_converter: $(COD4_CONVERTER_CORE) tests/test_cod4_converter.swift | $(BUILD_DIR)
 	$(SWIFTC) -O -swift-version 5 -warnings-as-errors -target $(shell uname -m)-apple-macosx11.0 -sdk $(SDK) $^ -o $@
@@ -183,11 +187,16 @@ $(BUILD_DIR)/mode32_probe: src/mode32_probe.c src/mode32_switch.S src/address_sp
 	$(CLANG) $(CFLAGS) $(LDFLAGS) $^ -o $@
 	codesign --force --sign - $@
 
-$(BUILD_DIR)/game_loader: src/game_loader.c src/guest_context.S src/guest_dyld.c src/macho_file.c src/hitch_recorder.c src/game_profile.c src/macho_loader.c src/compat_runtime.c src/audio_bridge.c src/audio_converter_bridge.c src/sound_manager_bridge.c src/audio_queue_bridge.c src/time_manager_bridge.c src/openal_bridge.c src/hid_bridge.c src/dispatch_bridge.m src/dlfcn_bridge.c src/gl_core_bridge.c src/curl_bridge.c src/steam_bridge.c src/steam_storage_fix.c src/resource_bridge.c src/stl_bridge.c src/libcpp_bridge.c src/libcpp_future_bridge.c src/libcpp_stream_bridge.cpp src/tlv_bridge.c src/blocks_bridge.c src/socket_bridge.c src/zlib_bridge.c src/regex_bridge.c src/iconv_bridge.c src/rtti_bridge.c src/carbon_bridge.c src/carbon_text.m src/carbon_ui.m src/cfnetwork_bridge.c src/crypto_bridge.c src/quicktime_bridge.m src/controller_bridge.m src/objc_bridge.m src/objc_legacy_bridge.m src/arb_program_guard.c src/arb_sampler_usage.c src/mode32_switch.S src/import_gateway.S src/address_space_reserve.S $(wildcard src/*.h) | $(BUILD_DIR)
-	$(CLANG) $(CFLAGS) $(LDFLAGS) $(filter %.c %.m %.cpp %.S,$^) -lc++ -lffi -lcurl -lz -liconv -framework CoreText -framework Security -framework ForceFeedback -framework OpenAL -framework CFNetwork -framework SystemConfiguration -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework Cocoa -framework Carbon -framework OpenGL -framework AudioToolbox -framework AudioUnit -framework CoreAudio -framework GameController -framework IOKit -o $@
+$(BUILD_DIR)/game_loader: src/game_loader.c src/guest_context.S src/guest_dyld.c src/macho_file.c src/hitch_recorder.c src/game_profile.c src/macho_loader.c src/compat_runtime.c src/audio_bridge.c src/audio_converter_bridge.c src/sound_manager_bridge.c src/audio_queue_bridge.c src/time_manager_bridge.c src/openal_bridge.c src/hid_bridge.c src/dispatch_bridge.m src/dlfcn_bridge.c src/gl_core_bridge.c src/curl_bridge.c src/steam_bridge.c src/steam_storage_fix.c src/resource_bridge.c src/stl_bridge.c src/libcpp_bridge.c src/libcpp_future_bridge.c src/cxx_exception_bridge.c src/libcpp_stream_bridge.cpp src/tlv_bridge.c src/blocks_bridge.c src/socket_bridge.c src/zlib_bridge.c src/regex_bridge.c src/iconv_bridge.c src/rtti_bridge.c src/carbon_bridge.c src/carbon_text.m src/carbon_ui.m src/cfnetwork_bridge.c src/crypto_bridge.c src/quicktime_bridge.m src/controller_bridge.m src/objc_bridge.m src/objc_legacy_bridge.m src/arb_program_guard.c src/arb_sampler_usage.c src/gl_backend.c $(BUILD_DIR)/gl_dispatch.S src/mode32_switch.S src/import_gateway.S src/address_space_reserve.S $(wildcard src/*.h) $(BUILD_DIR)/gl_dispatch_names.h | $(BUILD_DIR)
+	$(CLANG) $(CFLAGS) -I$(BUILD_DIR) $(LDFLAGS) $(filter %.c %.m %.cpp %.S,$^) -lc++ -lffi -lcurl -lz -liconv -framework CoreText -framework Security -framework ForceFeedback -framework OpenAL -framework CFNetwork -framework SystemConfiguration -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework Cocoa -framework Carbon -framework AudioToolbox -framework AudioUnit -framework CoreAudio -framework GameController -framework IOKit -o $@
 	codesign --force --sign - $@
 
 $(BUILD_DIR)/game_loader: src/focus_policy.m
+
+# OpenGL is reached through exported trampolines (src/gl_backend.h).
+$(BUILD_DIR)/gl_dispatch.S: tools/gen_gl_dispatch.py lp32gl/data/apple-gl-exports.txt lp32gl/data/apple-cgl-exports.txt | $(BUILD_DIR)
+	python3 tools/gen_gl_dispatch.py lp32gl/data/apple-gl-exports.txt lp32gl/data/apple-cgl-exports.txt --asm $@ --header $(BUILD_DIR)/gl_dispatch_names.h
+$(BUILD_DIR)/gl_dispatch_names.h: $(BUILD_DIR)/gl_dispatch.S
 
 $(BUILD_DIR)/test_game_profile: tests/test_game_profile.c src/game_profile.c src/game_profile.h src/macho_loader.h | $(BUILD_DIR)
 	$(CLANG) $(CFLAGS) -Isrc tests/test_game_profile.c src/game_profile.c -o $@
@@ -246,7 +255,7 @@ mode-switch-stress: $(BUILD_DIR)/mode_switch_stress
 run: $(BUILD_DIR)/mode32_probe
 	arch -x86_64 ./$(BUILD_DIR)/mode32_probe
 
-ifneq ($(filter $(GAME),cod cod4 cod4mp mw2 mw2mp),)
+ifneq ($(filter $(GAME),cod cod4 cod4mp mw2 mw2mp mw3 mw3mp),)
 run-game: promote-loader
 	arch -x86_64 "./$(BUNDLE)/Contents/MacOS/$(LOADER_NAME)"
 else
@@ -272,11 +281,11 @@ saga-update:
 	ditto -x -k "$(SAGA_UPDATE_ZIP)" $(BUILD_DIR)/saga-update
 
 ifneq ($(filter $(GAME),cod cod4 cod4mp),)
-bundle: $(BUILD_DIR)/game_loader tools/bundle_cod4.py tools/prepare_guest_runtime.py
-	python3 tools/bundle_cod4.py --source-app "$(SOURCE_APP)" --mode "$(COD4_MODE)" --loader "$(BUILD_DIR)/game_loader" --bundle "$(BUNDLE)" --runtime "$(GUEST_RUNTIME_DIR)" --continue-when-inactive "$(CONTINUE_WHEN_INACTIVE)"
-else ifneq ($(filter $(GAME),mw2 mw2mp),)
-bundle: $(BUILD_DIR)/game_loader tools/bundle_mw2.py tools/bundle_cod4.py
-	python3 tools/bundle_mw2.py --source-app "$(SOURCE_APP)" --mode "$(MW2_MODE)" --loader "$(BUILD_DIR)/game_loader" --bundle "$(BUNDLE)" --continue-when-inactive "$(CONTINUE_WHEN_INACTIVE)"
+bundle: $(BUILD_DIR)/game_loader glmetal-lib tools/bundle_cod4.py tools/prepare_guest_runtime.py tools/package_glmetal.py
+	python3 tools/bundle_cod4.py --source-app "$(SOURCE_APP)" --mode "$(COD4_MODE)" --loader "$(BUILD_DIR)/game_loader" --bundle "$(BUNDLE)" --runtime "$(GUEST_RUNTIME_DIR)" --continue-when-inactive "$(CONTINUE_WHEN_INACTIVE)" --glmetal "$(GLMETAL_BUILD)"
+else ifneq ($(filter $(GAME),mw2 mw2mp mw3 mw3mp),)
+bundle: $(BUILD_DIR)/game_loader glmetal-lib tools/bundle_mw2.py tools/bundle_cod4.py tools/package_glmetal.py
+	python3 tools/bundle_mw2.py --game "$(MW2_GAME)" --source-app "$(SOURCE_APP)" --mode "$(MW2_MODE)" --loader "$(BUILD_DIR)/game_loader" --bundle "$(BUNDLE)" --continue-when-inactive "$(CONTINUE_WHEN_INACTIVE)" --glmetal "$(GLMETAL_BUILD)"
 else ifeq ($(GAME):$(SAGA_EDITION),saga:steam)
 bundle: $(BUILD_DIR)/game_loader $(INFO_PLIST) tools/bundle_saga_steam.py
 	python3 tools/bundle_saga_steam.py "$(SOURCE_APP)" "$(SAGA_DATA_SOURCE)" "$(BUILD_DIR)/game_loader" "$(BUNDLE)" "$(INFO_PLIST)"
@@ -307,6 +316,7 @@ promote-loader: $(BUILD_DIR)/game_loader
 	test -d $(BUNDLE)/Contents/MacOS
 	cp $(BUILD_DIR)/game_loader $(BUNDLE)/Contents/MacOS/$(LOADER_NAME).new
 	mv $(BUNDLE)/Contents/MacOS/$(LOADER_NAME).new $(BUNDLE)/Contents/MacOS/$(LOADER_NAME)
+	if test -f $(LP32GL_OUT)/libLP32GL.dylib; then mkdir -p $(BUNDLE)/Contents/Frameworks && rm -rf $(BUNDLE)/Contents/Frameworks/LP32GL && ditto $(LP32GL_OUT) $(BUNDLE)/Contents/Frameworks/LP32GL; fi
 	if test -f "$(ICON)"; then cp "$(ICON)" $(BUNDLE)/Contents/Resources/$(ICON_NAME); fi
 	python3 tools/configure_bundle.py "$(BUNDLE)" --continue-when-inactive "$(CONTINUE_WHEN_INACTIVE)"
 	codesign --force --deep --sign - $(BUNDLE)
@@ -395,6 +405,27 @@ $(BUILD_DIR)/test_libcpp_bridge: tests/test_libcpp_bridge.c src/libcpp_bridge.c 
 test-libcpp-bridge: $(BUILD_DIR)/test_libcpp_bridge
 	arch -x86_64 ./$(BUILD_DIR)/test_libcpp_bridge
 
+$(BUILD_DIR)/test_audio_queue_bridge: tests/test_audio_queue_bridge.c src/audio_queue_bridge.c src/audio_queue_bridge.h | $(BUILD_DIR)
+	$(CLANG) $(CFLAGS) -Wl,-pagezero_size,0x1000 -Isrc tests/test_audio_queue_bridge.c src/audio_queue_bridge.c -framework AudioToolbox -framework CoreAudio -o $@
+
+$(BUILD_DIR)/test_audio_queue_allocate_race: tests/test_audio_queue_allocate_race.c src/audio_queue_bridge.c src/audio_queue_bridge.h | $(BUILD_DIR)
+	$(CLANG) $(CFLAGS) -Wl,-pagezero_size,0x1000 -Isrc $< -framework AudioToolbox -framework CoreAudio -o $@
+
+.PHONY: test-audio-queue-allocate-race
+test-audio-queue-allocate-race: $(BUILD_DIR)/test_audio_queue_allocate_race
+	arch -x86_64 ./$(BUILD_DIR)/test_audio_queue_allocate_race
+
+$(BUILD_DIR)/test_audio_queue_movie: tests/test_audio_queue_movie.c src/audio_queue_bridge.c src/audio_queue_bridge.h src/guest_dyld.h | $(BUILD_DIR)
+	$(CLANG) $(CFLAGS) -Wl,-pagezero_size,0x1000 -Isrc $< -framework AudioToolbox -framework CoreAudio -o $@
+
+.PHONY: test-audio-queue-movie
+test-audio-queue-movie: $(BUILD_DIR)/test_audio_queue_movie
+	arch -x86_64 ./$(BUILD_DIR)/test_audio_queue_movie
+
+.PHONY: test-audio-queue-bridge
+test-audio-queue-bridge: $(BUILD_DIR)/test_audio_queue_bridge
+	arch -x86_64 ./$(BUILD_DIR)/test_audio_queue_bridge
+
 .PHONY: test-blocks-bridge
 $(BUILD_DIR)/test_blocks_bridge: tests/test_blocks_bridge.c src/blocks_bridge.c src/blocks_bridge.h | $(BUILD_DIR)
 	$(CLANG) $(CFLAGS) -Wl,-pagezero_size,0x1000 tests/test_blocks_bridge.c src/blocks_bridge.c -o $@
@@ -481,6 +512,10 @@ test-pointer-proxy: $(BUILD_DIR)/game_loader
 .PHONY: test-runtime-files
 test-runtime-files: $(BUILD_DIR)/game_loader
 	env LP32_FILE_SELFTEST=1 LP32_NO_DIAGNOSTIC_LOG=1 LP32_MUTE_AUDIO=1 arch -x86_64 ./$(BUILD_DIR)/game_loader "$(BUNDLE)/Contents/SharedSupport/$(IMAGE_NAME)"
+
+.PHONY: test-guest-exceptions
+test-guest-exceptions: $(BUILD_DIR)/game_loader
+	env LP32_EXCEPTION_SELFTEST=1 LP32_NO_DIAGNOSTIC_LOG=1 LP32_MUTE_AUDIO=1 arch -x86_64 ./$(BUILD_DIR)/game_loader "$(BUNDLE)/Contents/SharedSupport/$(IMAGE_NAME)"
 
 .PHONY: test-gamma-focus
 test-gamma-focus: $(BUILD_DIR)/game_loader

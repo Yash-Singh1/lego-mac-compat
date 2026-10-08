@@ -1,0 +1,26 @@
+--- a/external/openglcts/modules/common/glcPackedPixelsTests.cpp
++++ b/external/openglcts/modules/common/glcPackedPixelsTests.cpp
+@@ -2291,6 +2291,12 @@
+     glu::RenderContext &renderContext = m_context.getRenderContext();
+     const Functions &gl               = renderContext.getFunctions();
+ 
++    GLint previousDrawFramebuffer = 0, previousReadFramebuffer = 0;
++    gl.getIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &previousDrawFramebuffer);
++    GLU_EXPECT_NO_ERROR(gl.getError(), "glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING)");
++    gl.getIntegerv(GL_READ_FRAMEBUFFER_BINDING, &previousReadFramebuffer);
++    GLU_EXPECT_NO_ERROR(gl.getError(), "glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING)");
++
+     GLuint fboId;
+     gl.genFramebuffers(1, &fboId);
+     gl.bindFramebuffer(GL_FRAMEBUFFER, fboId);
+@@ -2328,6 +2334,10 @@
+     }
+ 
+     gl.deleteFramebuffers(1, &fboId);
++    gl.bindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(previousDrawFramebuffer));
++    GLU_EXPECT_NO_ERROR(gl.getError(), "glBindFramebuffer(GL_DRAW_FRAMEBUFFER)");
++    gl.bindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(previousReadFramebuffer));
++    GLU_EXPECT_NO_ERROR(gl.getError(), "glBindFramebuffer(GL_READ_FRAMEBUFFER)");
+ 
+     return result;
+ }
