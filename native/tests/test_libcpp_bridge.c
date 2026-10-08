@@ -53,6 +53,14 @@ int main(void){
     a[1]=2;a[2]=UINT32_MAX;run("5eraseEmm",a);assert(length(s)==2&&!strcmp(data(s),"ab"));
     memcpy(input,"x\0y",3);a[1]=1;a[2]=(uint32_t)(uintptr_t)input;a[3]=3;run("6insertEmPKcm",a);
     assert(length(s)==5&&!memcmp(data(s),"ax\0yb\0",6));
+    {   /* MW3 multiplayer: compare(pos, n, const char *, n2) honours n2. */
+        uint64_t r;char name[256];
+        snprintf(name,sizeof(name),"__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7compareEmmPKcm");
+        uint32_t c[5]={(uint32_t)(uintptr_t)s,0,UINT32_MAX,(uint32_t)(uintptr_t)"ax\0ybZZ",5};
+        assert(libcpp_bridge32_dispatch(name,c,&r)&&(int32_t)r==0);
+        c[4]=6;assert(libcpp_bridge32_dispatch(name,c,&r)&&(int32_t)r<0);
+        c[1]=1;c[2]=1;c[3]=(uint32_t)(uintptr_t)"xyz";c[4]=1;assert(libcpp_bridge32_dispatch(name,c,&r)&&(int32_t)r==0);
+    }
     uint32_t *copy=s+8;a[0]=(uint32_t)(uintptr_t)copy;a[1]=(uint32_t)(uintptr_t)s;run("C1ERKS5_",a);
     assert(length(copy)==5&&!memcmp(data(copy),data(s),6));
     uint32_t *sub=s+12;a[0]=(uint32_t)(uintptr_t)sub;a[2]=1;a[3]=UINT32_MAX;

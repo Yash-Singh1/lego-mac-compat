@@ -155,6 +155,7 @@ void audio_queue_bridge32_crash_report(int fd, int extra_fd, const uint64_t *add
     }
 #undef REPORT
 }
+static _Thread_local struct queue *callback_queue;
 
 static struct queue *queue_for(uint32_t handle)
 {
@@ -186,7 +187,12 @@ static void output(void *raw, AudioQueueRef audio, AudioQueueBufferRef buffer)
         static unsigned calls;
         if (++calls % 200 == 1) fprintf(stderr, "compat32: AudioQueue output callback %u queue=%08x\n", calls, q->handle);
     }
-    if (q->callback) compat_runtime32_call(q->callback, arguments, 3);
+    if (q->callback) {
+        struct queue *previous = callback_queue;
+        callback_queue = q;
+        compat_runtime32_call(q->callback, arguments, 3);
+        callback_queue = previous;
+    }
 }
 
 static OSStatus new_output(const uint32_t *a)
@@ -203,8 +209,15 @@ static OSStatus new_output(const uint32_t *a)
     q->user_data = a[2];
     q->movie = movie_callback(q->callback);
     /* The guest's run loop is not a native CFRunLoopRef; use the queue's own thread. */
+    fprintf(stderr, "compat32: AudioQueue create queue=%08x rate=%.0f format=%.4s "
+                    "flags=%x channels=%u bits=%u bytes/frame=%u\n",
+            q->handle, format->mSampleRate, (const char *)&format->mFormatID,
+            format->mFormatFlags, format->mChannelsPerFrame,
+            format->mBitsPerChannel, format->mBytesPerFrame);
     OSStatus status = AudioQueueNewOutput(format, output, q, NULL, NULL, 0, &q->audio);
     note_event(kEventNew, q->handle, q->audio, 0, status);
+    fprintf(stderr, "compat32: AudioQueue create queue=%08x status=%d\n",
+            q->handle, (int)status);
     if (status) return status;
     if (getenv("LP32_MUTE_AUDIO")) AudioQueueSetParameter(q->audio, kAudioQueueParam_Volume, 0);
     *out = q->handle;
@@ -267,26 +280,38 @@ static OSStatus enqueue(struct queue *q, const uint32_t *a)
     return status;
 }
 
-static void dispose(struct queue *q, bool immediate)
+static OSStatus dispose(struct queue *q, bool immediate)
 {
     pthread_mutex_lock(&lock);
     AudioQueueRef audio = q->disposing ? NULL : q->audio;
+    bool was_playing = q->playing;
     q->disposing = true;
     set_playing(q, false);
     pthread_mutex_unlock(&lock);
-    if (!audio) return;
+    if (!audio) return kAudioQueueErr_InvalidQueueType;
     note_event(kEventDisposeBegin, q->handle, audio, immediate, noErr);
     /* Not under lock: disposal waits for a running output callback, which
        may itself be in enqueue(). */
     OSStatus disposed = AudioQueueDispose(audio, immediate);
-    forget_buffers(q->handle);
     note_event(kEventDisposeEnd, q->handle, audio, immediate, disposed);
+    if (disposed) {
+        pthread_mutex_lock(&lock);
+        q->disposing = false;
+        set_playing(q, was_playing);
+        pthread_mutex_unlock(&lock);
+        return disposed;
+    }
+    forget_buffers(q->handle);
     pthread_mutex_lock(&lock);
     q->audio = NULL;
     unsigned count = q->buffer_count;
     q->buffer_count = 0;
     pthread_mutex_unlock(&lock);
-    for (unsigned i = 0; i < count; ++i) compat_runtime32_deallocate(q->buffers[i].guest);
+    /* Self-disposal may return while guest callback code still uses its
+       buffer record. Keep those guest records alive; slots are not reused. */
+    if (callback_queue != q)
+        for (unsigned i = 0; i < count; ++i) compat_runtime32_deallocate(q->buffers[i].guest);
+    return noErr;
 }
 
 int audio_queue_bridge32_dispatch(const char *name, const uint32_t *a, uint64_t *result)
@@ -332,7 +357,7 @@ int audio_queue_bridge32_dispatch(const char *name, const uint32_t *a, uint64_t 
         playback_result(q, false, status);
         note_event(kEventPause, q->handle, q->audio, 0, status);
     }
-    else if (!strcmp(name, "_AudioQueueDispose")) { dispose(q, a[1] != 0); status = noErr; }
+    else if (!strcmp(name, "_AudioQueueDispose")) status = dispose(q, a[1] != 0);
     else if (!strcmp(name, "_AudioQueueGetProperty") || !strcmp(name, "_AudioQueueSetProperty")) {
         /* Channel layouts, stream formats and codec settings are made of
            4-byte fields and match on i386. Object-valued properties do not. */

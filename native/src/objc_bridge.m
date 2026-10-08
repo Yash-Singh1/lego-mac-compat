@@ -2137,6 +2137,10 @@ static void post_test_key_event_with_modifiers(NSWindow *window,
         return;
     }
     if(key_code<128)__atomic_store_n(&test_key_states[key_code],is_down,__ATOMIC_RELAXED);
+    /* Reproduce a release lost by SDL/AppKit without changing the hardware
+       state that the repair path samples. Used by the input regression run. */
+    const char *drop_key = getenv("LP32_TEST_DROP_KEYUP");
+    if (!is_down && drop_key && key_code == strtoul(drop_key, NULL, 0)) return;
     NSString *characters = characters_for_test_key(key_code);
     /* Cocoa marks arrow keys as function/numeric-pad events. SDL uses
        these flags to distinguish them from ordinary character input. */
@@ -2528,7 +2532,7 @@ static bool handle_test_activation(id receiver, const char *selector, uint64_t *
                 /* MW2's SDL asks during Cocoa window construction, before
                    attaching its driver data. A hidden new window cannot
                    already have keyboard focus, even in an unattended test. */
-                if ((lp32_title_is_mw_sdl(lp32_profile()->title)) &&
+                if (lp32_title_is_mw_sdl(lp32_profile()->title) &&
                     [receiver isKindOfClass:[NSWindow class]] && ![receiver isVisible]) {
                     *result = 0;
                     return true;
@@ -2665,7 +2669,7 @@ static bool guest_gamma_in_frame(void)
     static int enabled = -1;
     if (enabled < 0) {
         enum lp32_title title = lp32_profile()->title;
-        enabled = (lp32_title_is_mw_sdl(title)) &&
+        enabled = lp32_title_is_mw_sdl(title) &&
                   !getenv("LP32_DISPLAY_GAMMA");
     }
     return enabled;
@@ -5148,7 +5152,7 @@ static struct guest_buffer_mapping *begin_buffer_mapping(
             mapping->scratch_capacity = capacity;
             enum lp32_title title = lp32_profile()->title;
             mapping->persistent_storage = target == GL_ELEMENT_ARRAY_BUFFER &&
-                (lp32_title_is_mw_sdl(title));
+                lp32_title_is_mw_sdl(title);
             mapping->storage = mapping->persistent_storage ?
                 state->retained_storage : scratch;
             mapping->capacity = mapping->persistent_storage ?
@@ -7265,7 +7269,7 @@ static struct texture_bind_cache *texture_bind_cache_current(void)
     static int enabled = -1;
     if (enabled < 0) {
         enum lp32_title title = lp32_profile()->title;
-        enabled = (lp32_title_is_mw_sdl(title)) &&
+        enabled = lp32_title_is_mw_sdl(title) &&
                   !getenv("LP32_NO_BIND_FILTER");
     }
     if (!enabled) return NULL;
@@ -7848,6 +7852,7 @@ static void cod4_apply_pointer_state(void) {
  * SDL_SendMouseButton. COD4 keeps its own pointer path.
  */
 static uint32_t mw2_buttons_held;
+static uint64_t mw2_keys_held[2], mw2_key_releases_queued[2];
 
 static bool mw2_mouse_title(void)
 {
@@ -7878,6 +7883,53 @@ static NSWindow *mw2_event_window(void)
         if (candidate.isVisible) return candidate;
     }
     return nil;
+}
+
+static void mw2_note_key_event(NSEvent *event)
+{
+    if (!mw2_mouse_title() || !event) return;
+    NSEventType type = event.type;
+    if (type != NSEventTypeKeyDown && type != NSEventTypeKeyUp) return;
+    unsigned key = event.keyCode;
+    if (key >= 128) return;
+    uint64_t bit = UINT64_C(1) << (key % 64);
+    if (type == NSEventTypeKeyDown) {
+        mw2_keys_held[key / 64] |= bit;
+        mw2_key_releases_queued[key / 64] &= ~bit;
+    } else {
+        mw2_keys_held[key / 64] &= ~bit;
+        mw2_key_releases_queued[key / 64] &= ~bit;
+    }
+}
+
+static void mw2_release_unheld_keys(uint32_t event_mask)
+{
+    bool test_repair = background_test_mode() && getenv("LP32_TEST_DROP_KEYUP");
+    if (!mw2_mouse_title() || (background_test_mode() && !test_repair) ||
+        (!test_repair && ![NSApp isActive]) ||
+        (event_mask && !(event_mask & (uint32_t)NSEventMaskKeyUp))) return;
+    NSWindow *window = mw2_event_window();
+    if (!window) return;
+    for (unsigned key = 0; key < 128; ++key) {
+        uint64_t bit = UINT64_C(1) << (key % 64);
+        if (!(mw2_keys_held[key / 64] & bit) ||
+            (mw2_key_releases_queued[key / 64] & bit) ||
+            (test_repair ? objc_bridge32_test_key_down(key) :
+                CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, (CGKeyCode)key)))
+            continue;
+        NSString *characters = characters_for_test_key(key);
+        NSEvent *up = [NSEvent keyEventWithType:NSEventTypeKeyUp
+                    location:NSZeroPoint modifierFlags:0
+                    timestamp:[[NSProcessInfo processInfo] systemUptime]
+                    windowNumber:window.windowNumber context:nil
+                    characters:characters charactersIgnoringModifiers:characters
+                    isARepeat:NO keyCode:key];
+        if (!up) continue;
+        [NSApp postEvent:up atStart:YES];
+        mw2_key_releases_queued[key / 64] |= bit;
+        if (getenv("LP32_TRACE_INPUT"))
+            fprintf(stderr, "compat32: synthesized key-up key=%u\n", key);
+    }
 }
 
 static bool mw2_post_mouse_up(NSWindow *window, uint32_t button)
@@ -8115,6 +8167,18 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                 args[2],event,(unsigned long)event.type,arguments[-1]);
         }
         return invoke_simple_message(receiver, selector, args, result, method, NULL);
+    }
+    /* The runtime pool API (MW3 multiplayer) shares NSAutoreleasePool's
+       guest scopes. The token is the scope depth; pop unwinds to it. */
+    if (LP32_NAME_IS(import_name, import_length, "_objc_autoreleasePoolPush")) {
+        guest_autorelease_push();
+        *result = guest_autorelease_depth;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_objc_autoreleasePoolPop")) {
+        while (arguments[0] && guest_autorelease_depth >= arguments[0]) guest_autorelease_pop();
+        *result = 0;
+        return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_objc_sync_enter") ||
         LP32_NAME_IS(import_name, import_length, "_objc_sync_exit")) {
@@ -8559,6 +8623,34 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         CGRect bounds = CGDisplayBounds(arguments[1]);
         float rect[] = {bounds.origin.x, bounds.origin.y, bounds.size.width, bounds.size.height};
         memcpy((void *)(uintptr_t)arguments[0], rect, sizeof(rect));
+        *result = 0;
+        return 1;
+    }
+    /* MW3 only asks a display link for the refresh period. The guest handle
+       is a cell holding the display ID; each query uses a short-lived link. */
+    if (LP32_NAME_IS(import_name, import_length, "_CVDisplayLinkCreateWithCGDisplay")) {
+        uint32_t handle = compat_runtime32_allocate(sizeof(uint32_t), 0);
+        if (!handle) { *result = kCVReturnAllocationFailed; return 1; }
+        *(uint32_t *)(uintptr_t)handle = arguments[0];
+        *(uint32_t *)(uintptr_t)arguments[1] = handle;
+        *result = kCVReturnSuccess;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CVDisplayLinkRelease")) {
+        if (arguments[0]) compat_runtime32_deallocate(arguments[0]);
+        *result = 0;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CVDisplayLinkGetNominalOutputVideoRefreshPeriod")) {
+        /* Structure return: arguments[0] is the i386 CVTime (same 16-byte layout). */
+        CVTime period = kCVZeroTime;
+        CVDisplayLinkRef link = NULL;
+        if (arguments[1] &&
+            CVDisplayLinkCreateWithCGDisplay(*(uint32_t *)(uintptr_t)arguments[1], &link) == kCVReturnSuccess) {
+            period = CVDisplayLinkGetNominalOutputVideoRefreshPeriod(link);
+            CVDisplayLinkRelease(link);
+        }
+        memcpy((void *)(uintptr_t)arguments[0], &period, sizeof(period));
         *result = 0;
         return 1;
     }
@@ -11338,7 +11430,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         /* MW2's SDL shows its window from the WinMain worker once rendering
            starts. AppKit throws from off-main ordering, and the main thread
            keeps pumping Cocoa events, so it can service the message. */
-        if ((lp32_title_is_mw_sdl(lp32_profile()->title)) &&
+        if (lp32_title_is_mw_sdl(lp32_profile()->title) &&
             ![NSThread isMainThread] && [receiver isKindOfClass:[NSWindow class]]) {
             __block int handled = 0;
             dispatch_sync(dispatch_get_main_queue(), ^{
@@ -11354,7 +11446,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             texture_bind_cache_invalidate();
         /* MW2 presents with a plain -[NSOpenGLContext flushBuffer], not the
            Feral view's swapBuffers, so count and capture frames here. */
-        if ((lp32_title_is_mw_sdl(lp32_profile()->title)) &&
+        if (lp32_title_is_mw_sdl(lp32_profile()->title) &&
             !strcmp(selector_name, "flushBuffer") &&
             [receiver isKindOfClass:[NSOpenGLContext class]]) {
             if (mw2_gl_reattach_left > 0) {
@@ -11373,13 +11465,13 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                              [(NSOpenGLContext *)receiver CGLContextObj], __ATOMIC_RELAXED);
             uint64_t swaps = ++objc_bridge_swap_count;
             if (swaps == 1) {
-                fprintf(stderr, "compat32: MW2 presented its first frame\n");
+                fprintf(stderr, "compat32: %s presented its first frame\n", lp32_profile()->name);
                 /* MW2 presents here, never through OpenGLView, so install the
                    Dock/app-switcher quit handler from this first frame. */
                 dispatch_async(dispatch_get_main_queue(), ^{ install_termination_handler(); });
             }
             if (getenv("LP32_TRACE_GL_FRAMES") && swaps % 300 == 0)
-                fprintf(stderr, "compat32: MW2 swap %llu t=%.1f\n", (unsigned long long)swaps,
+                fprintf(stderr, "compat32: %s swap %llu t=%.1f\n", lp32_profile()->name, (unsigned long long)swaps,
                         CFAbsoluteTimeGetCurrent());
             const char *frame_interval = getenv("LP32_FRAME_INTERVAL");
             if (compat_runtime32_frame_profile_enabled || frame_interval) {
@@ -11397,9 +11489,9 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                     struct compat_runtime32_frame_profile profile;
                     compat_runtime32_take_frame_profile(&profile);
                     double seconds = (now_ns - interval_start_ns) / 1e9;
-                    fprintf(stderr, "compat32: MW2 frames swap=%llu fps=%.1f frame-max=%.1fms "
+                    fprintf(stderr, "compat32: %s frames swap=%llu fps=%.1f frame-max=%.1fms "
                             "imports/frame=%.0f bridge/frame=%.2fms objc/frame=%.2fms lock-wait/frame=%.2fms\n",
-                            (unsigned long long)swaps, interval_frames / seconds, frame_max_ns / 1e6,
+                            lp32_profile()->name, (unsigned long long)swaps, interval_frames / seconds, frame_max_ns / 1e6,
                             (double)profile.calls / interval_frames,
                             profile.dispatch_ns / 1e6 / interval_frames,
                             profile.objc_ns / 1e6 / interval_frames,
@@ -11724,7 +11816,10 @@ static int objc_bridge32_dispatch_body(const char *import_name,
              */
             /* Dequeued pumps only. A peek must not inject a mouse-up that
                this call will leave on the queue. */
-            if (arguments[5]) mw2_release_unheld_mouse_buttons(arguments[2]);
+            if (arguments[5]) {
+                mw2_release_unheld_mouse_buttons(arguments[2]);
+                mw2_release_unheld_keys(arguments[2]);
+            }
             static bool logged_mask;
             if (!logged_mask) {
                 logged_mask = true;
@@ -11759,6 +11854,11 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         }
         bool invoked = invoke_simple_message(receiver, selector_name,
                                              arguments, result, NULL, NULL);
+        if (invoked && selector_name &&
+            !strcmp(selector_name, "nextEventMatchingMask:untilDate:inMode:dequeue:") &&
+            arguments[5] &&
+            [receiver isKindOfClass:[NSApplication class]])
+            mw2_note_key_event(object_for_argument((uint32_t)*result));
         if (!invoked) {
             fprintf(stderr,
                     "compat32: Objective-C bridge cannot invoke %s on %s\n",
@@ -12416,7 +12516,7 @@ int objc_bridge32_run_gl_buffer_self_test(void)
        and every element buffer on other titles, still upload immediately. */
     {
         bool expect_shadow =
-            (lp32_title_is_mw_sdl(lp32_profile()->title)) &&
+            lp32_title_is_mw_sdl(lp32_profile()->title) &&
             !getenv("LP32_NO_INDEX_SHADOW");
         enum { kElementSize = 32, kPatch = 8, kPatchAt = 4 };
         unsigned char initial[kElementSize];

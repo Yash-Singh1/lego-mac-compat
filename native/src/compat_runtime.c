@@ -524,9 +524,6 @@ struct guest_thread_context {
 };
 
 static _Thread_local uint32_t current_thread_token;
-/* Set only on threads the guest created; pthread_exit needs their cleanup. */
-static _Thread_local bool current_thread_is_guest;
-static _Thread_local uint32_t current_thread_owned_argument;
 /* pthread_t is a pointer even in i386. Public pthread_cleanup_push/pop
    macros access its cleanup-stack word at offset four. */
 static uint32_t allocate_thread_token(void) {
@@ -1575,7 +1572,7 @@ static uint32_t guest_context_symbol(const char *name)
     else if (!strcmp(name, "_sigsetjmp")) entry = lp32_context_sigsetjmp;
     else if (!strcmp(name, "_longjmp") || !strcmp(name, "_siglongjmp")) entry = lp32_context_longjmp;
     else if (!strcmp(name, "__longjmp")) entry = lp32_context_fast_longjmp;
-    else if ((lp32_title_is_mw_sdl(lp32_profile()->title)) &&
+    else if (lp32_title_is_mw_sdl(lp32_profile()->title) &&
              !getenv("LP32_NO_GUEST_LIBC")) {
         if (!strcmp(name, "_strcmp")) entry = lp32_context_strcmp;
         else if (!strcmp(name, "___tolower")) entry = lp32_context_tolower;
@@ -3114,13 +3111,17 @@ static uint64_t return_guest_double(double value)
 
 uint64_t compat_runtime32_return_double(double value) { return return_guest_double(value); }
 
+/* Set by the guest's pthread_exit, which leaves guest code like a trapped
+   import does; run_guest_thread then finishes the host thread normally. */
+static _Thread_local bool guest_thread_started, guest_thread_exiting;
+static _Thread_local uint32_t guest_thread_exit_value;
+
 static void *run_guest_thread(void *opaque)
 {
     struct guest_thread_context context = *(struct guest_thread_context *)opaque;
     free(opaque);
     current_thread_token = context.token;
-    current_thread_is_guest = true;
-    current_thread_owned_argument = lp32_profile()->thread_argument_is_direct ? 0 : context.argument;
+    guest_thread_started = true;
     if (getenv("LP32_TRACE_THREADS")) {
         uint64_t thread_id = 0;
         pthread_threadid_np(NULL, &thread_id);
@@ -3134,6 +3135,7 @@ static void *run_guest_thread(void *opaque)
                 record ? (const char *)(uintptr_t)(record + 8) : "");
     }
     uint32_t result = compat_runtime32_call(context.function, &context.argument, 1);
+    if (guest_thread_exiting) result = guest_thread_exit_value;
     if (getenv("LP32_TRACE_THREADS")) {
         uint64_t thread_id = 0;
         pthread_threadid_np(NULL, &thread_id);
@@ -3811,6 +3813,27 @@ static void hot_mutex_report(void)
     memset(hot_mutexes, 0, sizeof(hot_mutexes));
 }
 
+/* MW2/MW3 hold the D3D device lock for microseconds at a time, while several
+   threads poll it. Blocking on every contended acquire turns each handoff
+   into a sleep and wakeup, which stalls the loading thread. Spin briefly
+   first. LP32_NO_MUTEX_SPIN disables it. */
+static int lock_with_brief_spin(pthread_mutex_t *mutex)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = lp32_title_is_mw_sdl(lp32_profile()->title) && !getenv("LP32_NO_MUTEX_SPIN");
+    if (enabled && pthread_mutex_trylock(mutex) != 0) {
+        uint64_t deadline = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + 16000;
+        do {
+            for (unsigned i = 0; i < 32; ++i) __builtin_ia32_pause();
+            if (pthread_mutex_trylock(mutex) == 0) return 0;
+        } while (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) < deadline);
+    } else if (enabled) {
+        return 0;
+    }
+    return pthread_mutex_lock(mutex);
+}
+
 static uint64_t fast_pthread_mutex_lock(const uint32_t *arguments,
                                         uint32_t return_address)
 {
@@ -3822,7 +3845,7 @@ static uint64_t fast_pthread_mutex_lock(const uint32_t *arguments,
         uint32_t slot = (arguments[0] >> 3) % 4096;
         uint64_t start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         bool contended = pthread_mutex_trylock(mutex) != 0;
-        int status = contended ? pthread_mutex_lock(mutex) : 0;
+        int status = contended ? lock_with_brief_spin(mutex) : 0;
         hot_mutexes[slot].mutex = arguments[0];
         ++hot_mutexes[slot].calls;
         if (contended) {
@@ -3841,7 +3864,7 @@ static uint64_t fast_pthread_mutex_lock(const uint32_t *arguments,
         if (now - last_report > 10000000000ull) { last_report = now; hot_mutex_report(); }
         return (uint32_t)status;
     }
-    int status = pthread_mutex_lock(mutex);
+    int status = lock_with_brief_spin(mutex);
     const struct lp32_render_pool *pool = lp32_profile()->render_pool;
     if (!pool) return (uint32_t)status;
     if (return_address == pool->return_address &&
@@ -5711,6 +5734,14 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
         }
         return value;
     }
+    /* Mach semaphores are 32-bit port names on both sides. */
+    if (import_is(name, "_semaphore_create"))
+        return (uint32_t)semaphore_create((task_t)arguments[0], (semaphore_t *)(uintptr_t)arguments[1],
+                                          (int)arguments[2], (int)arguments[3]);
+    if (import_is(name, "_semaphore_destroy"))
+        return (uint32_t)semaphore_destroy((task_t)arguments[0], (semaphore_t)arguments[1]);
+    if (import_is(name, "_semaphore_signal")) return (uint32_t)semaphore_signal((semaphore_t)arguments[0]);
+    if (import_is(name, "_semaphore_wait")) return (uint32_t)semaphore_wait((semaphore_t)arguments[0]);
     if (import_is(name, "_mach_timebase_info")) {
         mach_timebase_info_data_t host_info;
         kern_return_t result = mach_timebase_info(&host_info);
@@ -6045,13 +6076,11 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
         }
         return (uint32_t)status;
     }
-    /* MW2's _endthreadex reaches ExitThread -> pthread_exit when a worker
-       finishes. Do run_guest_thread's cleanup, then end the host thread. */
-    if (import_is(name, "_pthread_exit") && current_thread_is_guest) {
-        if (current_thread_owned_argument) guest_deallocate(current_thread_owned_argument);
-        current_thread_owned_argument = 0;
-        thread_finished(current_thread_token, false);
-        pthread_exit((void *)(uintptr_t)arguments[0]);
+    if (import_is(name, "_pthread_exit") && guest_thread_started) {
+        guest_thread_exiting = true;
+        guest_thread_exit_value = arguments[0];
+        lp32_leave_guest = 1;
+        return 0;
     }
     if (import_is(name, "_pthread_create") || import_is(name, "_pthread_create_suspended_np")) {
         pthread_attr_t native_attr, *attr = NULL;

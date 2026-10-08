@@ -156,7 +156,8 @@ an explicit list of generated Metal stages in a fresh temporary directory.
 The interfaces in `src/client.h` allow a host to provide a page-aligned shared
 buffer allocator before initialization. Without it, GLMetal uses Metal allocation.
 The callbacks must remain valid for the library's lifetime, including pooled
-storage retained after context destruction. Allocation
+storage retained after context destruction. Callbacks must support concurrent
+calls, including deallocation on Metal completion threads. Allocation
 failure returns no storage instead of silently bypassing the host constraint.
 
 A host may explicitly call `glmetal_prewarm_command_queues` after initialization

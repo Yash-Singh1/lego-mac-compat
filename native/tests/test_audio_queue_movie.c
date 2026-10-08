@@ -25,6 +25,7 @@ static OSStatus mock_dispose(AudioQueueRef, Boolean);
 
 static OSStatus next_status;
 static bool dispose_during_start;
+static unsigned guest_frees;
 static uintptr_t next_audio = 0x1000;
 static const char *modules[] = {
     NULL, "/game/Contents/MacOS/libBinkMacx86.dylib",
@@ -39,7 +40,7 @@ const char *guest_dyld32_describe(uint32_t address, uint32_t *offset)
 }
 uint32_t compat_runtime32_allocate(size_t size, int clear)
 { (void)size; (void)clear; abort(); }
-void compat_runtime32_deallocate(uint32_t pointer) { (void)pointer; abort(); }
+void compat_runtime32_deallocate(uint32_t pointer) { assert(pointer == 0x40000200); ++guest_frees; }
 uint32_t compat_runtime32_call(uint32_t f, const uint32_t *a, size_t n)
 { (void)f; (void)a; (void)n; abort(); }
 
@@ -64,7 +65,7 @@ static OSStatus mock_stop(AudioQueueRef audio, Boolean immediate)
 { assert(audio); (void)immediate; return next_status; }
 static OSStatus mock_pause(AudioQueueRef audio) { assert(audio); return next_status; }
 static OSStatus mock_dispose(AudioQueueRef audio, Boolean immediate)
-{ assert(audio); (void)immediate; return noErr; }
+{ assert(audio); (void)immediate; return next_status; }
 
 static uint32_t create(uint32_t callback)
 {
@@ -118,12 +119,30 @@ int main(void)
     next_status = kAudio_ParamError;
     operation("_AudioQueuePause", b, true);
     operation("_AudioQueueStop", b, true);
+    operation("_AudioQueueDispose", b, true);
     next_status = noErr;
     operation("_AudioQueueDispose", b, false);
     /* A start returning after disposal cannot resurrect the exemption. */
     uint32_t c = create(1);
     dispose_during_start = true;
     operation("_AudioQueueStart", c, false);
+    dispose_during_start = false;
+    /* Self-disposal must retain the guest buffer record still in use by
+       the callback. Disposal from another thread releases it normally. */
+    uint32_t d = create(1);
+    struct queue *q = queue_for(d);
+    q->buffer_count = 1;
+    q->buffers[0].guest = 0x40000200;
+    callback_queue = q;
+    operation("_AudioQueueDispose", d, false);
+    callback_queue = NULL;
+    assert(!guest_frees);
+    uint32_t e = create(1);
+    q = queue_for(e);
+    q->buffer_count = 1;
+    q->buffers[0].guest = 0x40000200;
+    operation("_AudioQueueDispose", e, false);
+    assert(guest_frees == 1);
     puts("AudioQueue movie pacing lifecycle PASS");
     return 0;
 }

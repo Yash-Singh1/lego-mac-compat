@@ -10,7 +10,9 @@ extern "C" {
    single startup thread. The default uses Metal's own shared allocation.
    Custom allocations must be page aligned and release the entire requested
    range. Callbacks must remain valid for the library's lifetime, including
-   storage retained in its shared buffer pools after context destruction. */
+   storage retained in its shared buffer pools after context destruction.
+   Both callbacks must support concurrent calls; deallocation may run on a
+   Metal completion thread. */
 bool glmetal_set_shared_buffer_allocator(void *(*allocate)(size_t),
                                          void (*deallocate)(void *, size_t));
 /* Explicitly prepare reusable command queues. No warmup runs by default.

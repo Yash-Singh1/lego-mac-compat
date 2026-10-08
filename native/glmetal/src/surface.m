@@ -1,7 +1,6 @@
 /* Window surfaces: a context attached to an NSView presents into a
- * CAMetalLayer hosted by a private subview covering the view (the layout
- * LP32GL uses; see lp32gl_surface.m), so AppKit never reorders it with the
- * view's own layers:
+ * CAMetalLayer hosted by a private subview covering the view, so AppKit
+ * never reorders it with the view's own layers:
  *
  *   - normally the layer matches the view in points, or in pixels when the
  *     view opted into wantsBestResolutionOpenGLSurface, like Apple's GL;

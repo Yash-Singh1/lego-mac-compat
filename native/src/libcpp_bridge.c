@@ -215,8 +215,9 @@ int libcpp_bridge32_dispatch(const char *name,const uint32_t *a,uint64_t *out){
         set_length(p,n);memset((char *)(uintptr_t)data(p,width)+(size_t)n*width,0,width);return 1;
     }
     if(IS("7compareEPKc") || IS("7compareEmmPKc") || IS("7compareEmmPKcm")){
-        uint32_t pos=IS("7compareEPKc")?0:a[1],n=length(p);if(pos>n)return 0;n-=pos;
-        if(!IS("7compareEPKc") && n>a[2])n=a[2];const char *s=IS("7compareEPKc")?P(1):P(3);
+        bool whole=IS("7compareEPKc");
+        uint32_t pos=whole?0:a[1],n=length(p);if(pos>n)return 0;n-=pos;
+        if(!whole && n>a[2])n=a[2];const char *s=whole?P(1):P(3);
         size_t right=IS("7compareEmmPKcm")?a[4]:strlen(s);int cmp=memcmp((char *)(uintptr_t)data(p,1)+pos,s,n<right?n:right);
         *out=(uint32_t)(cmp?cmp:n<right?-1:n>right?1:0);return 1;
     }

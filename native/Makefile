@@ -3,7 +3,8 @@ BUILD_DIR := build
 CONTINUE_WHEN_INACTIVE ?= 0
 
 # One loader serves every supported title; the bundle targets pick the title
-# with GAME=pirates (default), clonewars, marvel, saga, cod4, cod4mp, mw2, mw2mp, mw3 or mw3mp.
+# with GAME=pirates (default), clonewars, marvel, saga, cod4, cod4mp, mw2, mw2mp,
+# mw3 or mw3mp.
 GAME ?= pirates
 ifneq ($(filter $(GAME),cod cod4 cod4mp),)
 COD4_MODE := $(if $(filter cod4mp,$(GAME)),mp,sp)

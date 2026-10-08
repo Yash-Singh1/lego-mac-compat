@@ -135,13 +135,18 @@ static struct {
     {"_SteamGameServer", NULL, 0},
 };
 
+/* Methods returning a CSteamID: ISteamUser::GetSteamID and
+   ISteamFriends::GetFriendByIndex (MW3). */
+static int steam_id_method(const char *name,unsigned *which) {
+    if(!strcmp(name,"_lp32_steam_0_2")) {*which=STEAM_USER;return 1;}
+    if(!strcmp(name,"_lp32_steam_7_4")) {*which=STEAM_FRIENDS;return 1;}
+    return 0;
+}
+
 int steam_bridge32_call_uses_sret(const char *name,const uint32_t *args) {
     unsigned which;
-    if (!strcmp(name,"_lp32_steam_0_2")) which = STEAM_USER;
-    else if (!strcmp(name,"_lp32_steam_7_4")) which = STEAM_FRIENDS;
-    else return 0;
-    return interfaces[which].guest && args[0] != interfaces[which].guest &&
-        args[1] == interfaces[which].guest;
+    return steam_id_method(name,&which) && interfaces[which].guest &&
+        args[0] != interfaces[which].guest && args[1] == interfaces[which].guest;
 }
 
 /* Persona names are polled; reuse the guest copy while the text is unchanged. */
@@ -180,6 +185,20 @@ static int interface_call(unsigned which, unsigned slot, const uint32_t *a, uint
             }
             *result=success;return 1;
         }
+        /* SteamUser017 auth sessions (MW3 multiplayer). CSteamID arguments
+           are passed by value as two i386 words. */
+        if (slot == 13) { *result = CALL3(uint32_t, void *, PTR(1), int32_t, (int32_t)a[2], uint32_t *, PTR(3)); return 1; }
+        if (slot == 14) {
+            *result = (uint32_t)CALL3(int32_t, const void *, PTR(1), int32_t, (int32_t)a[2],
+                                      uint64_t, (uint64_t)a[3] | ((uint64_t)a[4] << 32));
+            return 1;
+        }
+        if (slot == 15) { CALL1(void, uint64_t, (uint64_t)a[1] | ((uint64_t)a[2] << 32)); *result = 0; return 1; }
+        if (slot == 16) { CALL1(void, uint32_t, a[1]); *result = 0; return 1; }
+        /* SteamUser017 RequestEncryptedAppTicket(void *, int) returns a
+           SteamAPICall_t; GetEncryptedAppTicket(void *, int, uint32 *). */
+        if (slot == 20) { *result = CALL2(uint64_t, const void *, PTR(1), int32_t, (int32_t)a[2]); return 1; }
+        if (slot == 21) { *result = CALL3(bool, void *, PTR(1), int32_t, (int32_t)a[2], uint32_t *, PTR(3)); return 1; }
         /* Clang returns the trivial eight-byte CSteamID in EDX:EAX; older
            GCC clients pass a hidden result pointer before this. Identify
            the layout from the interface token, not from the game title. */
@@ -297,8 +316,8 @@ static int interface_call(unsigned which, unsigned slot, const uint32_t *a, uint
         case 2: *result = (uint32_t)CALL0(int32_t); return 1;
         case 3: *result = (uint32_t)CALL1(int32_t, int32_t, (int32_t)a[1]); return 1;
         case 4: {
-            /* GetFriendByIndex returns CSteamID either in EDX:EAX or through
-               a hidden result pointer, depending on the guest's C++ ABI. */
+            /* GetFriendByIndex(int, int): CSteamID in EDX:EAX, or through a
+               hidden result pointer, as for ISteamUser::GetSteamID. */
             bool hidden = a[0] != interfaces[which].guest;
             if (hidden && a[1] != interfaces[which].guest) return 0;
             const uint32_t *call = a + hidden;

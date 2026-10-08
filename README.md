@@ -13,6 +13,12 @@ and multiplayer bundles. The Steam Mac 1.7.2 build is the only release tested
 in gameplay. Other 32-bit Intel Mac releases can be converted for testing.
 See that guide for build instructions and validation status.
 
+The Steam Mac releases of Modern Warfare 2 and Modern Warfare 3 are also
+experimental: `make -C native GAME=mw2 bundle` or `GAME=mw3 bundle` (and
+`mw2mp` / `mw3mp` for multiplayer) find the Steam install and build a separate
+compatibility app in `native/build/`. MW3 campaign reaches gameplay in short
+probes; MW3 multiplayer logs in to Activision's servers, but their Mac lobby currently refuses the session, so online play is untested.
+
 Support for the original 32-bit Mac releases:
 
 | Game | Mac release | Status |

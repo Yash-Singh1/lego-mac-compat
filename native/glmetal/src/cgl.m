@@ -1,6 +1,5 @@
 /* CGL: pixel formats, renderer info, contexts and parameters, answering the
- * way Apple's CGL does on Apple silicon (data/apple-cgl-renderer-reference.txt
- * in lp32gl). */
+ * way Apple's CGL does on Apple silicon. */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
@@ -122,8 +121,8 @@ GLM_EXPORT CGLError CGLChoosePixelFormat(const CGLPixelFormatAttribute *attribs,
     }
     /* Only the hardware renderer exists; other renderer IDs, stereo, aux
        buffers and deep accumulation buffers find no format, as on Apple.
-       Renderer IDs compare under kCGLRendererIDMatchingMask like Apple's
-       (Feral's ports pass 0x27f00, without the vendor byte). */
+       Renderer IDs compare under kCGLRendererIDMatchingMask like Apple's,
+       so the vendor byte does not affect format matching. */
     if (renderer && (renderer & kCGLRendererIDMatchingMask) != (RENDERER_ID & kCGLRendererIDMatchingMask))
         return kCGLNoError;
     if (stereo || accum > 64 || aux > 0) return kCGLNoError;

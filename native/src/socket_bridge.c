@@ -4,6 +4,8 @@
 #include <errno.h>
 #include <netdb.h>
 #include <poll.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <pthread.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -76,7 +78,40 @@ static int guest_getaddrinfo(const char *node,const char *service,const struct g
     freeaddrinfo(host);*result=head;return 0;
 }
 
+static int socket_bridge32_dispatch_body(const char *name,const uint32_t *a,uint64_t *out);
+
+/* LP32_TRACE_SOCKETS[=lines]: lookups, connects and packets with results. */
+static void trace_socket_call(const char *name,const uint32_t *a,uint64_t result,int error) {
+    static long limit=-1;static long lines;
+    if(limit<0){const char *v=getenv("LP32_TRACE_SOCKETS");limit=v?(atol(v)>0?atol(v):300):0;}
+    /* Nonblocking polls that found nothing are not logged. */
+    if(lines>=limit || ((int32_t)result==-1 && error==EAGAIN) || !strcmp(name,"_select"))return;
+    ++lines;
+    char detail[128]="";
+    if(!strcmp(name,"_gethostbyname") || !strcmp(name,"_getaddrinfo") || !strcmp(name,"_inet_addr"))
+        snprintf(detail,sizeof(detail)," host=%.80s",a[0]?(const char *)(uintptr_t)a[0]:"(null)");
+    else if((!strcmp(name,"_connect") || !strcmp(name,"_sendto") || !strcmp(name,"_bind")) && a[!strcmp(name,"_sendto")?4:1]) {
+        const struct sockaddr_in *address=(const void *)(uintptr_t)a[!strcmp(name,"_sendto")?4:1];
+        if(address->sin_family==AF_INET)
+            snprintf(detail,sizeof(detail)," to=%s:%u",inet_ntoa(address->sin_addr),ntohs(address->sin_port));
+    }
+    if((!strcmp(name,"_send") || !strcmp(name,"_recv")) && (int32_t)result>0 && a[1]) {
+        const unsigned char *bytes=(const void *)(uintptr_t)a[1];
+        size_t used=strlen(detail);
+        for(int32_t i=0;i<(int32_t)result && i<24 && used+3<sizeof(detail);++i,used+=2)
+            snprintf(detail+used,sizeof(detail)-used,i?"%02x":" data=%02x",bytes[i]),used+=(i?0:6);
+    }
+    fprintf(stderr,"compat32: socket %s(%08x,%08x,%08x) -> %lld errno=%d%s\n",name,a[0],a[1],a[2],
+            (long long)(int32_t)result,error,detail);
+}
+
 int socket_bridge32_dispatch(const char *name,const uint32_t *a,uint64_t *out) {
+    int handled=socket_bridge32_dispatch_body(name,a,out);
+    if(handled)trace_socket_call(name,a,*out,errno);
+    return handled;
+}
+
+static int socket_bridge32_dispatch_body(const char *name,const uint32_t *a,uint64_t *out) {
 #define IS(s) (!strcmp(name,s))
 #define P(i) ((void *)(uintptr_t)a[i])
     int result;
