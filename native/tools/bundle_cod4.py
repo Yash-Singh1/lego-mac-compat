@@ -8,6 +8,7 @@ import struct
 import subprocess
 import tempfile
 from pathlib import Path
+import package_glmetal
 
 EXECUTABLES = {"sp": "Call of Duty 4", "mp": "Call of Duty 4 Multiplayer"}
 
@@ -108,11 +109,12 @@ def ditto(source, target):
     run("ditto", "--noextattr", "--noqtn", source, target)
 
 
-def build(source, mode, loader, bundle, inactive, runtime):
+def build(source, mode, loader, bundle, inactive, runtime, glmetal=package_glmetal.DEFAULT_BUILD):
     selected, image, info = validate_source(source, mode)
     validate_destination(source, bundle)
     if not loader.is_file():
         raise ValueError(f"Missing loader: {loader}")
+    package_glmetal.validate(glmetal)
     from prepare_guest_runtime import LIBRARIES, sha256
     for name, (_, digest) in LIBRARIES.items():
         if not (runtime / name).is_file() or sha256(runtime / name) != digest:
@@ -166,6 +168,8 @@ def build(source, mode, loader, bundle, inactive, runtime):
             # over HTTP. Linking our host against a modern SDK otherwise adds
             # ATS restrictions and fails these downloads with error -1022.
             info["NSAppTransportSecurity"] = {"NSAllowsArbitraryLoads": True}
+        package_glmetal.install(glmetal, contents / "Frameworks/GLMetal", contents / "Resources/GLMetal-build-info.json")
+        package_glmetal.configure(info)
         (contents / "Info.plist").write_bytes(plistlib.dumps(info))
         run("codesign", "--force", "--sign", "-", staged)
         run("codesign", "--verify", "--strict", staged)
@@ -189,10 +193,11 @@ def main():
     parser.add_argument("--bundle", type=Path, default=Path("build/COD4-Compat.app"))
     parser.add_argument("--runtime", type=Path, default=Path("build/guest-runtime"))
     parser.add_argument("--continue-when-inactive", type=int, choices=(0, 1), default=0)
+    parser.add_argument("--glmetal", type=Path, default=package_glmetal.DEFAULT_BUILD, help="Directory containing the built GLMetal driver and compiler")
     args = parser.parse_args()
     try:
         source = Path(args.source_app).resolve() if args.source_app else steam_source()
-        build(source, args.mode, args.loader.resolve(), args.bundle.absolute(), args.continue_when_inactive, args.runtime.resolve())
+        build(source, args.mode, args.loader.resolve(), args.bundle.absolute(), args.continue_when_inactive, args.runtime.resolve(), args.glmetal.resolve())
     except ValueError as error:
         parser.error(str(error))
 

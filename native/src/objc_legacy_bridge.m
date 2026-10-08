@@ -3,6 +3,8 @@
 #include "focus_policy.h"
 #include "compat_runtime.h"
 #include "game_profile.h"
+#include "gl_backend.h"
+#define GL_SILENCE_DEPRECATION 1
 #import <AppKit/AppKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -234,6 +236,10 @@ void *objc_legacy32_class(const char *name){
     struct class_entry *c=NULL;for(unsigned i=0;i<class_count;++i)if(!strcmp(str(classes[i].guest->name),name)){c=&classes[i];break;}
     if(!c)return NULL;
     Class parent=objc_legacy32_class(str(c->guest->super));if(!parent)return NULL;
+    if (lp32_gl_backend_is_replacement() && parent == [NSOpenGLContext class]) {
+        Class replacement = objc_getClass(lp32_gl_backend_context_class());
+        if (replacement) parent = replacement;
+    }
     Class native=objc_allocateClassPair(parent,name,0);if(!native)return objc_getClass(name);
     c->native=native;add_methods(native,c,false);add_methods(object_getClass(native),c,true);
     objc_registerClassPair(native);return native;

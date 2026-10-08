@@ -2,6 +2,8 @@
 #include <arpa/inet.h>
 #include <assert.h>
 #include <errno.h>
+#include <netdb.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -10,9 +12,96 @@
 #include <sys/socket.h>
 #include <unistd.h>
 static uint32_t next=0x10002000;
-uint32_t compat_runtime32_allocate(size_t size,int zero){uint32_t p=next;next+=(size+15)&~15u;assert(next<0x10010000);if(zero)memset((void *)(uintptr_t)p,0,size);return p;}
-void compat_runtime32_deallocate(uint32_t p){(void)p;}
+static struct allocation { uint32_t address; size_t size; int live; } allocations[256];
+static size_t allocation_count, live_allocations;
+static int fail_after = -1;
+uint32_t compat_runtime32_allocate(size_t size,int zero){
+    if(fail_after==0)return 0;
+    if(fail_after>0)--fail_after;
+    uint32_t p=next;next+=(size+15)&~15u;assert(next<0x10010000);
+    assert(allocation_count<sizeof(allocations)/sizeof(allocations[0]));
+    allocations[allocation_count++]=(struct allocation){p,size,1};++live_allocations;
+    if(zero)memset((void *)(uintptr_t)p,0,size);
+    return p;
+}
+void compat_runtime32_deallocate(uint32_t p){
+    for(size_t i=0;i<allocation_count;++i)if(allocations[i].address==p){
+        assert(allocations[i].live);allocations[i].live=0;--live_allocations;return;
+    }
+    assert(!"free of an unallocated guest pointer");
+}
+static size_t allocation_size(uint32_t p){
+    for(size_t i=0;i<allocation_count;++i)if(allocations[i].address==p){assert(allocations[i].live);return allocations[i].size;}
+    assert(!"result pointer is not a live guest allocation");return 0;
+}
 static int32_t call(const char *name,uint32_t *a){uint64_t out;assert(socket_bridge32_dispatch(name,a,&out));return (int32_t)out;}
+/* Darwin i386 has four integers followed by four 32-bit fields. */
+struct guest_addrinfo { int32_t flags,family,socktype,protocol; uint32_t addrlen,canonname,addr,next; };
+_Static_assert(sizeof(struct guest_addrinfo)==32,"guest addrinfo size");
+_Static_assert(offsetof(struct guest_addrinfo,canonname)==20,"guest canonical-name pointer offset");
+_Static_assert(offsetof(struct guest_addrinfo,addr)==24,"guest address pointer offset");
+_Static_assert(offsetof(struct guest_addrinfo,next)==28,"guest next pointer offset");
+
+static void test_numeric_addrinfo(const char *node,int family,int socktype,int canonical){
+    strcpy((void *)0x10000700,node);strcpy((void *)0x10000780,"28960");
+    struct guest_addrinfo *hints=(void *)0x10000600;
+    *hints=(struct guest_addrinfo){.flags=AI_NUMERICHOST|AI_NUMERICSERV|(canonical?AI_CANONNAME:0),
+        .family=family,.socktype=socktype,.addrlen=0xdeadbeef,.canonname=0xdeadbeef,.addr=0xdeadbeef,.next=0xdeadbeef};
+    struct addrinfo native_hints={.ai_flags=hints->flags,.ai_family=family,.ai_socktype=socktype},*native=NULL;
+    assert(!getaddrinfo(node,"28960",&native_hints,&native));
+    uint32_t *result=(void *)0x10000100;result[0]=0xfeedface;result[1]=0xabcdef01;
+    uint32_t args[]={0x10000700,0x10000780,0x10000600,0x10000100};
+    size_t before=live_allocations;
+    assert(!call("_getaddrinfo",args));assert(result[0] && result[1]==0xabcdef01);
+    uint32_t list=result[0],cursor=list;size_t count=0;
+    for(struct addrinfo *host=native;host;host=host->ai_next){
+        assert(cursor);size_t size=allocation_size(cursor);
+        struct guest_addrinfo *guest=(void *)(uintptr_t)cursor;
+        assert(guest->flags==host->ai_flags && guest->family==host->ai_family);
+        assert(guest->socktype==host->ai_socktype && guest->protocol==host->ai_protocol);
+        assert(guest->addrlen==host->ai_addrlen && guest->addr==cursor+sizeof(*guest));
+        assert(size>=sizeof(*guest)+guest->addrlen);
+        assert(!memcmp((void *)(uintptr_t)guest->addr,host->ai_addr,host->ai_addrlen));
+        if(family==AF_INET){
+            struct sockaddr_in *address=(void *)(uintptr_t)guest->addr;
+            assert(address->sin_len==sizeof(*address) && address->sin_family==AF_INET && ntohs(address->sin_port)==28960);
+        }else{
+            struct sockaddr_in6 *address=(void *)(uintptr_t)guest->addr;
+            assert(address->sin6_len==sizeof(*address) && address->sin6_family==AF_INET6 && ntohs(address->sin6_port)==28960);
+        }
+        if(host->ai_canonname){
+            assert(guest->canonname==guest->addr+guest->addrlen);
+            assert(size>=sizeof(*guest)+guest->addrlen+strlen(host->ai_canonname)+1);
+            assert(!strcmp((void *)(uintptr_t)guest->canonname,host->ai_canonname));
+        }else assert(!guest->canonname);
+        cursor=guest->next;++count;assert(count<100);
+    }
+    assert(!cursor && live_allocations==before+count);
+    uint32_t free_args[]={list};assert(!call("_freeaddrinfo",free_args));assert(live_allocations==before);
+    free_args[0]=0;assert(!call("_freeaddrinfo",free_args));assert(live_allocations==before);
+    freeaddrinfo(native);
+    if(socktype==0){
+        assert(count>1);
+        /* Fail after the first node to check partial-list cleanup. */
+        for(int fail=0;fail<2;++fail){
+            fail_after=fail;result[0]=0xfeedface;
+            assert(call("_getaddrinfo",args)==EAI_MEMORY);
+            assert(live_allocations==before && result[1]==0xabcdef01);
+        }
+        fail_after=-1;
+    }
+}
+static void test_addrinfo_failures(void){
+    struct guest_addrinfo *hints=(void *)0x10000600;
+    *hints=(struct guest_addrinfo){.flags=AI_NUMERICHOST|AI_NUMERICSERV,.family=AF_INET,.socktype=SOCK_DGRAM};
+    uint32_t *result=(void *)0x10000100;result[0]=0xfeedface;result[1]=0xabcdef01;
+    uint32_t args[]={0x10000700,0x10000780,0x10000600,0x10000100};
+    strcpy((void *)0x10000700,"numeric-only.invalid");strcpy((void *)0x10000780,"28960");
+    size_t before=live_allocations;
+    assert(call("_getaddrinfo",args)==EAI_NONAME);assert(live_allocations==before && result[1]==0xabcdef01);
+    strcpy((void *)0x10000700,"127.0.0.1");strcpy((void *)0x10000780,"not-a-numeric-service");
+    assert(call("_getaddrinfo",args)!=0);assert(live_allocations==before && result[1]==0xabcdef01);
+}
 int main(void){
     alarm(5);
     assert(mmap((void *)0x10000000,0x10000,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON|MAP_FIXED,-1,0)==(void *)0x10000000);
@@ -56,5 +145,9 @@ int main(void){
     timeout[0]=0;timeout[1]=250000;uint32_t set_args[]={receiver,SOL_SOCKET,SO_RCVTIMEO,0x10000500,8};assert(!call("_setsockopt",set_args));length[0]=8;uint32_t get_args[]={receiver,SOL_SOCKET,SO_RCVTIMEO,0x10000500,0x10000100};assert(!call("_getsockopt",get_args));assert(length[0]==8 && timeout[0]==0 && timeout[1]==250000 && timeout[2]==0x76543210 && length[1]==0xabcdef01);
     *(int *)0x10000600=1;uint32_t ioctl_args[]={receiver,FIONBIO,0x10000600};assert(!call("_ioctl",ioctl_args));assert(call("_recvfrom",recv_args)==-1 && errno==EAGAIN);
     strcpy((void *)0x10000700,"127.0.0.1");uint32_t resolve[]={0x10000700};uint32_t host=(uint32_t)call("_gethostbyname",resolve);assert(host);uint32_t *fields=(void *)(uintptr_t)host;assert(fields[2]==AF_INET && fields[3]==4);uint32_t *addresses=(void *)(uintptr_t)fields[4];assert(addresses[0] && !addresses[1]);assert(*(uint32_t *)(uintptr_t)addresses[0]==htonl(INADDR_LOOPBACK));
-    close(sender);close(receiver);alarm(0);puts("Socket bridge PASS (UDP loopback, COD4 setup-fragment burst, select, timeouts, nonblocking errno, resolver pointers, canaries)");
+    test_numeric_addrinfo("127.0.0.1",AF_INET,SOCK_DGRAM,1);
+    test_numeric_addrinfo("127.0.0.1",AF_INET,0,0);
+    test_numeric_addrinfo("::1",AF_INET6,SOCK_STREAM,1);
+    test_addrinfo_failures();
+    close(sender);close(receiver);alarm(0);puts("Socket bridge PASS (UDP loopback, COD4 setup-fragment burst, select, timeouts, nonblocking errno, resolver pointers, numeric IPv4/IPv6 addrinfo, allocation cleanup, canaries)");
 }

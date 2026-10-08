@@ -30,6 +30,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "gl_backend.h"
+
 static uintptr_t guest_breakpoint_address;
 static unsigned char guest_breakpoint_original_byte;
 static volatile sig_atomic_t guest_breakpoint_stepping;
@@ -38,6 +40,11 @@ static unsigned guest_breakpoint_limit;
 static double guest_breakpoint_after;
 static uint64_t guest_breakpoint_armed_ns;
 static unsigned guest_breakpoint_skip;
+/* LP32_TRACE_GUEST_MARKS: one-shot timing markers (first call only). */
+enum { kGuestMarkCapacity = 16 };
+static uintptr_t guest_mark_address[kGuestMarkCapacity];
+static unsigned char guest_mark_original_byte[kGuestMarkCapacity];
+static unsigned guest_mark_count;
 static int guest_diagnostic_fd = -1;
 
 /* Finder launches do not retain stderr.  Mirror crash and breakpoint output
@@ -290,7 +297,7 @@ static int write_guest_code(uintptr_t address, const void *bytes, size_t length,
 static int install_code_patches(void)
 {
     const struct lp32_code_patch *patches = lp32_profile()->code_patches;
-    if (!patches) return 0;
+    if (!patches || getenv("LP32_NO_CODE_PATCHES")) return 0; /* A/B measurements */
     for (const struct lp32_code_patch *p = patches; p->address; ++p) {
         if (p->length > sizeof(p->expected) ||
             memcmp((const void *)(uintptr_t)p->address, p->expected, p->length)) {
@@ -558,6 +565,18 @@ static void guest_crash_diagnostic(int signal_number, siginfo_t *info,
     ucontext_t *context = opaque_context;
     uint64_t rip = context->uc_mcontext->__ss.__rip;
     uint64_t rsp = context->uc_mcontext->__ss.__rsp;
+    for (unsigned index = 0; signal_number == SIGTRAP && index < guest_mark_count; ++index) {
+        if (rip != guest_mark_address[index] + 1) continue;
+        *(volatile unsigned char *)guest_mark_address[index] = guest_mark_original_byte[index];
+        flush_guest_instruction(guest_mark_address[index]);
+        context->uc_mcontext->__ss.__rip = guest_mark_address[index];
+        char line[96];
+        int length = snprintf(line, sizeof(line), "compat32: guest mark 0x%08lx t=%.3f\n",
+                              (unsigned long)guest_mark_address[index],
+                              clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9);
+        if (length > 0) write(STDERR_FILENO, line, (size_t)length);
+        return;
+    }
     if (signal_number == SIGTRAP && guest_breakpoint_address) {
         if (guest_breakpoint_stepping) {
             *(volatile unsigned char *)guest_breakpoint_address = 0xcc;
@@ -773,6 +792,39 @@ static void install_guest_crash_diagnostics(void)
     sigaction(SIGTRAP, &action, NULL);
 }
 
+/* LP32_TRACE_GUEST_MARKS=addr[,addr...] logs the first call of each guest
+   function with a timestamp, then runs it unmodified (no re-arming). */
+static int configure_guest_marks(const struct macho_image32 *image)
+{
+    const char *text = getenv("LP32_TRACE_GUEST_MARKS");
+    if (!text || !text[0]) return 0;
+    char buffer[512];
+    strlcpy(buffer, text, sizeof(buffer));
+    char *cursor = buffer;
+    size_t page_size = (size_t)getpagesize();
+    for (char *item = strsep(&cursor, ","); item; item = strsep(&cursor, ",")) {
+        char *end = NULL;
+        unsigned long long address = strtoull(item, &end, 0);
+        if (!end || *end || address < image->min_address || address >= image->max_address ||
+            guest_mark_count == kGuestMarkCapacity) {
+            fprintf(stderr, "game_loader: invalid LP32_TRACE_GUEST_MARKS entry: %s\n", item);
+            return -1;
+        }
+        uintptr_t page = (uintptr_t)address & ~(page_size - 1);
+        if (mprotect((void *)page, page_size, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+            perror("game_loader: mprotect guest mark page");
+            return -1;
+        }
+        guest_mark_address[guest_mark_count] = (uintptr_t)address;
+        guest_mark_original_byte[guest_mark_count] = *(const unsigned char *)(uintptr_t)address;
+        *(volatile unsigned char *)(uintptr_t)address = 0xcc;
+        flush_guest_instruction((uintptr_t)address);
+        ++guest_mark_count;
+    }
+    fprintf(stderr, "compat32: armed %u guest marks\n", guest_mark_count);
+    return 0;
+}
+
 static int configure_guest_breakpoint(const struct macho_image32 *image)
 {
     const char *address_text = getenv("LP32_TRACE_GUEST_ADDRESS");
@@ -896,7 +948,7 @@ static void runtime_diagnostic_line(const char *line)
 static const char *default_image_path(const char *argv0, char *buffer,
                                       size_t size)
 {
-    static const char *const candidates[] = {"LEGOPirates", "LEGOCloneWars", "LEGOMarvel", "LEGOCompleteSaga", "COD4", "COD4MP", "MW2", "MW2MP"};
+    static const char *const candidates[] = {"LEGOPirates", "LEGOCloneWars", "LEGOMarvel", "LEGOCompleteSaga", "COD4", "COD4MP", "MW2", "MW2MP", "MW3", "MW3MP"};
     const char *slash = strrchr(argv0, '/');
     size_t directory_length = slash ? (size_t)(slash - argv0) : 0;
     for (size_t index = 0; index < sizeof(candidates) / sizeof(candidates[0]); ++index) {
@@ -959,6 +1011,7 @@ int main(int argc, char **argv)
         macho_image32_unload(&image);
         return EXIT_FAILURE;
     }
+    lp32_gl_backend_select(lp32_profile()->prefers_lp32gl ? LP32_GL_BACKEND_MESA : LP32_GL_BACKEND_APPLE);
     open_guest_diagnostic_log(argc > 0 ? argv[0] : NULL);
     char host[768];
     lp32_host_description(host, sizeof(host));
@@ -979,7 +1032,7 @@ int main(int argc, char **argv)
         }
     }
 
-    if (configure_guest_breakpoint(&image) != 0) {
+    if (configure_guest_marks(&image) != 0 || configure_guest_breakpoint(&image) != 0) {
         macho_image32_unload(&image);
         return EXIT_FAILURE;
     }
@@ -1046,19 +1099,23 @@ int main(int argc, char **argv)
         }
         if (bink_imports) fprintf(stderr, "compat32: bound %u Bink imports to the original i386 library\n", bound);
     }
-    if (lp32_profile()->title == LP32_TITLE_MW2 || lp32_profile()->title == LP32_TITLE_MW2_MP) {
+    if (lp32_title_is_mw_sdl(lp32_profile()->title)) {
         if (guest_dyld32_initialize(image_path)) return EXIT_FAILURE;
-        const char *libraries[] = {"libBinkMacx86.dylib", "libMilesX86.dylib"};
+        /* MW3 multiplayer links Bink 2; its exports keep the _Bink prefix. */
+        const char *libraries[] = {
+            lp32_profile()->title == LP32_TITLE_MW3_MP ? "libBink2Macx86.dylib" : "libBinkMacx86.dylib",
+            "libMilesX86.dylib"};
         /* Imports are matched by prefix; _RADSS_CAInstallDriver is Miles'
-           CoreAudio sound-system driver (Bink exports its own copy). */
-        const char *prefixes[][2] = {{"_Bink", NULL}, {"_AIL_", "_RADSS_"}};
+           CoreAudio sound-system driver (Bink exports its own copy); _RIB_ is
+           its provider registry (MW3 multiplayer). */
+        const char *prefixes[][3] = {{"_Bink", NULL, NULL}, {"_AIL_", "_RADSS_", "_RIB_"}};
         for (unsigned library = 0; library < 2; ++library) {
             char path[PATH_MAX];
             int length = snprintf(path, sizeof(path), "%s/%s", guest_dyld32_game_root(), libraries[library]);
             if (length < 0 || (size_t)length >= sizeof(path)) return EXIT_FAILURE;
             uint32_t handle = guest_dyld32_open(path, RTLD_NOW);
             if (!handle) {
-                fprintf(stderr, "game_loader: cannot load MW2 %s: %s\n", libraries[library],
+                fprintf(stderr, "game_loader: cannot load %s %s: %s\n", lp32_profile()->name, libraries[library],
                         (char *)(uintptr_t)guest_dyld32_error());
                 return EXIT_FAILURE;
             }
@@ -1066,14 +1123,14 @@ int main(int argc, char **argv)
             for (unsigned i = 0; i < image.import_count; ++i) {
                 const struct macho_import32 *import = &image.imports[i];
                 bool matched = false;
-                for (unsigned p = 0; p < 2 && prefixes[library][p]; ++p)
+                for (unsigned p = 0; p < 3 && prefixes[library][p]; ++p)
                     matched |= !strncmp(import->name, prefixes[library][p], strlen(prefixes[library][p]));
                 if (!matched) continue;
                 uint32_t address = guest_dyld32_symbol(handle, import->name + 1);
                 if (!address || macho_image32_bind_import(import, address)) return EXIT_FAILURE;
                 ++bound;
             }
-            fprintf(stderr, "compat32: bound %u MW2 imports to %s\n", bound, libraries[library]);
+            fprintf(stderr, "compat32: bound %u %s imports to %s\n", bound, lp32_profile()->name, libraries[library]);
         }
     }
     if (lp32_profile()->title == LP32_TITLE_MW2_MP) {
@@ -1298,9 +1355,22 @@ int main(int argc, char **argv)
         if (!extra_argument_text && (lp32_profile()->title == LP32_TITLE_COD4 ||
                                      lp32_profile()->title == LP32_TITLE_COD4_MP))
             extra_argument_text = "-g";
-        uint32_t extra_argument = extra_argument_text && extra_argument_text[0] ?
-            compat_runtime32_copy_cstring(extra_argument_text) : 0;
-        uint32_t guest_argc = extra_argument ? 2 : 1;
+        /* Space-separated, so tests can pass e.g. "-g +map killhouse". */
+        enum { kMaxExtraArguments = 16 };
+        uint32_t extra_arguments[kMaxExtraArguments];
+        uint32_t extra_count = 0;
+        for (const char *cursor = extra_argument_text; cursor && *cursor && extra_count < kMaxExtraArguments;) {
+            while (*cursor == ' ') ++cursor;
+            size_t length = strcspn(cursor, " ");
+            if (!length) break;
+            char argument[256];
+            snprintf(argument, sizeof argument, "%.*s", (int)length, cursor);
+            extra_arguments[extra_count] = compat_runtime32_copy_cstring(argument);
+            if (!extra_arguments[extra_count]) break;
+            ++extra_count;
+            cursor += length;
+        }
+        uint32_t guest_argc = 1 + extra_count;
         uint32_t argv_address = compat_runtime32_allocate(
             (guest_argc + 1) * sizeof(uint32_t), 1);
         uint32_t empty_vector = compat_runtime32_allocate(sizeof(uint32_t), 1);
@@ -1311,7 +1381,7 @@ int main(int argc, char **argv)
         }
         uint32_t *guest_argv = (void *)(uintptr_t)argv_address;
         guest_argv[0] = executable_path;
-        if (extra_argument) guest_argv[1] = extra_argument;
+        for (uint32_t i = 0; i < extra_count; ++i) guest_argv[1 + i] = extra_arguments[i];
 
         const uint32_t main_arguments[] = {
             guest_argc, argv_address, empty_vector, empty_vector,

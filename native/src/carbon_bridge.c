@@ -1,4 +1,5 @@
 #include "carbon_bridge.h"
+#include "gl_backend.h"
 #include "agl_pixel_format.h"
 #include "focus_policy.h"
 #include "carbon_text.h"
@@ -630,15 +631,10 @@ static void timer_callback(void *timer, void *raw) {
   compat_runtime32_call(h->callback, a, 2);
 }
 static int agl_dispatch(const char *name, const uint32_t *a, uint64_t *out) {
-  static void *agl;
   if (strncmp(name, "_agl", 4))
     return 0;
-  if (!agl)
-    agl = dlopen("/System/Library/Frameworks/AGL.framework/AGL",
-                 RTLD_NOW | RTLD_LOCAL);
-  if (!agl)
-    return 0;
-  void *function = dlsym(agl, name + 1);
+  /* Apple's AGL or LP32GL's, whichever implements OpenGL (gl_backend.h). */
+  void *function = lp32_gl_backend_agl_symbol(name + 1);
 #define IS(s) (!strcmp(name, s))
 #define P(i) ((void *)(uintptr_t)a[i])
 #define F(type, ...) ((type (*)(__VA_ARGS__))function)
@@ -652,20 +648,22 @@ static int agl_dispatch(const char *name, const uint32_t *a, uint64_t *out) {
           if (((uint32_t *)P(0))[i] == displays[j].handle)
             ids[count++] = displays[j].id;
     void *(*query)(const CGDirectDisplayID *, int) =
-        dlsym(agl, "aglQueryRendererInfoForCGDirectDisplayIDs");
+        lp32_gl_backend_agl_symbol("aglQueryRendererInfoForCGDirectDisplayIDs");
     *out = query ? wrap(query(count ? ids : NULL, (int)count)) : 0;
     return 1;
   }
   if (IS("_aglSetDrawable")) {
-    if (lp32_profile()->title == LP32_TITLE_COD4 || lp32_profile()->title == LP32_TITLE_COD4_MP) {
+    if (lp32_gl_backend_is_replacement() ||
+        lp32_profile()->title == LP32_TITLE_COD4 ||
+        lp32_profile()->title == LP32_TITLE_COD4_MP) {
       void *cgl = NULL;
-      uint8_t (*get)(void *, void **) = dlsym(agl, "aglGetCGLContext");
+      uint8_t (*get)(void *, void **) = lp32_gl_backend_agl_symbol("aglGetCGLContext");
       *out = get && get(unwrap(a[0]), &cgl) && carbon_ui_bind_gl(unwrap(a[0]), cgl, unwrap(a[1]));
       struct carbon_ref *context = reference(a[0]);
       if (*out && context) context->agl_drawable = a[1];
       return 1;
     }
-    uint8_t (*set)(void *, void *) = dlsym(agl, "aglSetWindowRef");
+    uint8_t (*set)(void *, void *) = lp32_gl_backend_agl_symbol("aglSetWindowRef");
     *out = set ? set(unwrap(a[0]), unwrap(a[1])) : 0;
     if (*out && a[1]) {
       carbon_ui_use_native(unwrap(a[1]));
@@ -676,7 +674,7 @@ static int agl_dispatch(const char *name, const uint32_t *a, uint64_t *out) {
   if (IS("_aglGetDrawable")) {
     struct carbon_ref *context = reference(a[0]);
     if (context && context->agl_drawable) { *out = context->agl_drawable; return 1; }
-    void *(*get)(void *) = dlsym(agl, "aglGetWindowRef");
+    void *(*get)(void *) = lp32_gl_backend_agl_symbol("aglGetWindowRef");
     *out = get ? wrap(get(unwrap(a[0]))) : 0;
     return 1;
   }

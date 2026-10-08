@@ -2,9 +2,11 @@
  * drivers). Guest queues are small handles; guest buffers are i386
  * AudioQueueBuffer records in guest memory, each shadowed by a native buffer.
  * Output callbacks run on the native queue thread and call straight into the
- * guest, which refills and re-enqueues the guest buffer. */
+ * guest. Miles refills there; Bink only acknowledges completion and feeds
+ * more audio when the game next calls BinkWait/BinkService. */
 #include "audio_queue_bridge.h"
 #include "compat_runtime.h"
+#include "guest_dyld.h"
 #include <AudioToolbox/AudioToolbox.h>
 #include <CoreAudio/CoreAudio.h>
 #include <mach/kern_return.h>
@@ -32,6 +34,7 @@ struct queue {
        arriving from the queue thread then neither reach the guest nor copy
        into native buffers the disposal may already have freed. */
     bool disposing;
+    bool movie, playing;
     unsigned buffer_count;
     struct { uint32_t guest; AudioQueueBufferRef host; } buffers[kMaxBuffers];
 };
@@ -40,6 +43,43 @@ struct queue {
 static struct queue queues[kMaxQueues];
 static unsigned queue_count;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned playing_movies;
+
+int audio_queue_bridge32_movie_playing(void)
+{
+    return __atomic_load_n(&playing_movies, __ATOMIC_RELAXED) != 0;
+}
+
+static bool movie_callback(uint32_t callback)
+{
+    uint32_t offset;
+    const char *path = guest_dyld32_describe(callback, &offset);
+    if (!path) return false;
+    const char *name = strrchr(path, '/');
+    name = name ? name + 1 : path;
+    return !strcmp(name, "libBinkMacx86.dylib") ||
+           !strcmp(name, "libBink2Macx86.dylib") ||
+           !strcmp(name, "libBinkMachOx86.dylib");
+}
+
+/* Called under lock. Count queues, not start calls: repeated starts and
+   overlapping movies must not leave background pacing disabled forever. */
+static void set_playing(struct queue *q, bool playing)
+{
+    playing = playing && q->audio && !q->disposing;
+    if (!q->movie || q->playing == playing) return;
+    q->playing = playing;
+    if (playing) __atomic_fetch_add(&playing_movies, 1, __ATOMIC_RELAXED);
+    else __atomic_fetch_sub(&playing_movies, 1, __ATOMIC_RELAXED);
+}
+
+static void playback_result(struct queue *q, bool playing, OSStatus status)
+{
+    if (status) return;
+    pthread_mutex_lock(&lock);
+    set_playing(q, playing);
+    pthread_mutex_unlock(&lock);
+}
 
 /* Diagnostics for allocator corruption: every native buffer handed out, and
    a ring of recent queue operations, both read by the crash handler. */
@@ -115,6 +155,7 @@ void audio_queue_bridge32_crash_report(int fd, int extra_fd, const uint64_t *add
     }
 #undef REPORT
 }
+static _Thread_local struct queue *callback_queue;
 
 static struct queue *queue_for(uint32_t handle)
 {
@@ -146,7 +187,12 @@ static void output(void *raw, AudioQueueRef audio, AudioQueueBufferRef buffer)
         static unsigned calls;
         if (++calls % 200 == 1) fprintf(stderr, "compat32: AudioQueue output callback %u queue=%08x\n", calls, q->handle);
     }
-    if (q->callback) compat_runtime32_call(q->callback, arguments, 3);
+    if (q->callback) {
+        struct queue *previous = callback_queue;
+        callback_queue = q;
+        compat_runtime32_call(q->callback, arguments, 3);
+        callback_queue = previous;
+    }
 }
 
 static OSStatus new_output(const uint32_t *a)
@@ -161,9 +207,17 @@ static OSStatus new_output(const uint32_t *a)
     pthread_mutex_unlock(&lock);
     q->callback = a[1];
     q->user_data = a[2];
+    q->movie = movie_callback(q->callback);
     /* The guest's run loop is not a native CFRunLoopRef; use the queue's own thread. */
+    fprintf(stderr, "compat32: AudioQueue create queue=%08x rate=%.0f format=%.4s "
+                    "flags=%x channels=%u bits=%u bytes/frame=%u\n",
+            q->handle, format->mSampleRate, (const char *)&format->mFormatID,
+            format->mFormatFlags, format->mChannelsPerFrame,
+            format->mBitsPerChannel, format->mBytesPerFrame);
     OSStatus status = AudioQueueNewOutput(format, output, q, NULL, NULL, 0, &q->audio);
     note_event(kEventNew, q->handle, q->audio, 0, status);
+    fprintf(stderr, "compat32: AudioQueue create queue=%08x status=%d\n",
+            q->handle, (int)status);
     if (status) return status;
     if (getenv("LP32_MUTE_AUDIO")) AudioQueueSetParameter(q->audio, kAudioQueueParam_Volume, 0);
     *out = q->handle;
@@ -226,25 +280,38 @@ static OSStatus enqueue(struct queue *q, const uint32_t *a)
     return status;
 }
 
-static void dispose(struct queue *q, bool immediate)
+static OSStatus dispose(struct queue *q, bool immediate)
 {
     pthread_mutex_lock(&lock);
     AudioQueueRef audio = q->disposing ? NULL : q->audio;
+    bool was_playing = q->playing;
     q->disposing = true;
+    set_playing(q, false);
     pthread_mutex_unlock(&lock);
-    if (!audio) return;
+    if (!audio) return kAudioQueueErr_InvalidQueueType;
     note_event(kEventDisposeBegin, q->handle, audio, immediate, noErr);
     /* Not under lock: disposal waits for a running output callback, which
        may itself be in enqueue(). */
     OSStatus disposed = AudioQueueDispose(audio, immediate);
-    forget_buffers(q->handle);
     note_event(kEventDisposeEnd, q->handle, audio, immediate, disposed);
+    if (disposed) {
+        pthread_mutex_lock(&lock);
+        q->disposing = false;
+        set_playing(q, was_playing);
+        pthread_mutex_unlock(&lock);
+        return disposed;
+    }
+    forget_buffers(q->handle);
     pthread_mutex_lock(&lock);
     q->audio = NULL;
     unsigned count = q->buffer_count;
     q->buffer_count = 0;
     pthread_mutex_unlock(&lock);
-    for (unsigned i = 0; i < count; ++i) compat_runtime32_deallocate(q->buffers[i].guest);
+    /* Self-disposal may return while guest callback code still uses its
+       buffer record. Keep those guest records alive; slots are not reused. */
+    if (callback_queue != q)
+        for (unsigned i = 0; i < count; ++i) compat_runtime32_deallocate(q->buffers[i].guest);
+    return noErr;
 }
 
 int audio_queue_bridge32_dispatch(const char *name, const uint32_t *a, uint64_t *result)
@@ -279,15 +346,18 @@ int audio_queue_bridge32_dispatch(const char *name, const uint32_t *a, uint64_t 
     else if (!strcmp(name, "_AudioQueueEnqueueBuffer")) status = enqueue(q, a);
     else if (!strcmp(name, "_AudioQueueStart")) {
         status = AudioQueueStart(q->audio, (const void *)(uintptr_t)a[1]);
+        playback_result(q, true, status);
         note_event(kEventStart, q->handle, q->audio, 0, status);
     } else if (!strcmp(name, "_AudioQueueStop")) {
         status = AudioQueueStop(q->audio, a[1] != 0);
+        playback_result(q, false, status);
         note_event(kEventStop, q->handle, q->audio, a[1], status);
     } else if (!strcmp(name, "_AudioQueuePause")) {
         status = AudioQueuePause(q->audio);
+        playback_result(q, false, status);
         note_event(kEventPause, q->handle, q->audio, 0, status);
     }
-    else if (!strcmp(name, "_AudioQueueDispose")) { dispose(q, a[1] != 0); status = noErr; }
+    else if (!strcmp(name, "_AudioQueueDispose")) status = dispose(q, a[1] != 0);
     else if (!strcmp(name, "_AudioQueueGetProperty") || !strcmp(name, "_AudioQueueSetProperty")) {
         /* Channel layouts, stream formats and codec settings are made of
            4-byte fields and match on i386. Object-valued properties do not. */

@@ -13,10 +13,12 @@
 #include "hitch_recorder.h"
 #include "arb_program_guard.h"
 #include "audio_bridge.h"
+#include "audio_queue_bridge.h"
 #include "arb_sampler_usage.h"
 #include "compat_runtime.h"
 #include "controller_bridge.h"
 #include "game_profile.h"
+#include "gl_backend.h"
 #include "mouse_buttons.h"
 #include "name_match.h"
 
@@ -106,6 +108,7 @@ struct guest_autorelease_scope {
     struct guest_autorelease_scope *parent;
 };
 static _Thread_local struct guest_autorelease_scope *guest_autorelease_scope;
+static _Thread_local uint32_t guest_autorelease_depth;
 struct event_pool {
     struct proxy_entry entries[kEventProxyCapacity];
     uint32_t count, cursor;
@@ -658,6 +661,7 @@ static void guest_autorelease_push(void)
     struct guest_autorelease_scope *scope=calloc(1,sizeof(*scope));
     if(!scope)abort();
     scope->parent=guest_autorelease_scope;guest_autorelease_scope=scope;
+    ++guest_autorelease_depth;
 }
 static void guest_autorelease_add(uint32_t token)
 {
@@ -672,6 +676,7 @@ static void guest_autorelease_pop(void)
     struct guest_autorelease_scope *scope=guest_autorelease_scope;
     if(!scope)return;
     guest_autorelease_scope=scope->parent;
+    --guest_autorelease_depth;
     while(scope->objects){
         struct guest_autorelease_entry *entry=scope->objects;
         scope->objects=entry->next;
@@ -1017,6 +1022,15 @@ static void *event_proxy_test_worker(void *unused) {
 int objc_bridge32_run_proxy_self_test(void)
 {
     @autoreleasepool {
+        /* Modern Warfare 3 MP mixes runtime pools with NSAutoreleasePool. */
+        uint32_t initial_depth = guest_autorelease_depth;
+        uint64_t pool_token = 0, pool_result = 0;
+        if (!objc_bridge32_dispatch("_objc_autoreleasePoolPush", NULL, &pool_token) ||
+            pool_token != initial_depth + 1) return -1;
+        guest_autorelease_push();
+        uint32_t pool_argument = (uint32_t)pool_token;
+        if (!objc_bridge32_dispatch("_objc_autoreleasePoolPop", &pool_argument, &pool_result) ||
+            guest_autorelease_depth != initial_depth) return -1;
         NSString *persistent = [[[NSString alloc]
             initWithUTF8String:"persistent-proxy"] autorelease];
         uint32_t persistent_handle = proxy_for_object(persistent);
@@ -1513,7 +1527,7 @@ static volatile int mw2_gl_reattach_logged;
 static bool mw2_profile_active(void)
 {
     enum lp32_title title = lp32_profile()->title;
-    return title == LP32_TITLE_MW2 || title == LP32_TITLE_MW2_MP;
+    return lp32_title_is_mw_sdl(title);
 }
 
 static void mw2_request_gl_reattach(void)
@@ -2070,11 +2084,29 @@ static NSString *characters_for_test_key(unsigned short key_code)
         case 2: return @"d";
         case 13: return @"w";
         case 12: return @"q";
-        case 123: character = NSLeftArrowFunctionKey; break;
-        case 124: character = NSRightArrowFunctionKey; break;
-        case 125: character = NSDownArrowFunctionKey; break;
-        case 126: character = NSUpArrowFunctionKey; break;
+        case 123: character = NSLeftArrowFunctionKey; return [NSString stringWithCharacters:&character length:1];
+        case 124: character = NSRightArrowFunctionKey; return [NSString stringWithCharacters:&character length:1];
+        case 125: character = NSDownArrowFunctionKey; return [NSString stringWithCharacters:&character length:1];
+        case 126: character = NSUpArrowFunctionKey; return [NSString stringWithCharacters:&character length:1];
         case 0: return @"a";
+        default: break;
+    }
+    /* The rest of the ANSI letters and digits by virtual key code, so
+       scripted game binds (F, G, K...) arrive with their characters. */
+    static const char ansi[] = {
+        [3] = 'f', [4] = 'h', [5] = 'g', [6] = 'z', [7] = 'x', [8] = 'c', [9] = 'v', [11] = 'b', [14] = 'e',
+        [15] = 'r', [16] = 'y', [17] = 't', [18] = '1', [19] = '2', [20] = '3', [21] = '4', [22] = '6', [23] = '5',
+        [25] = '9', [26] = '7', [28] = '8', [29] = '0', [31] = 'o', [34] = 'i', [35] = 'p', [37] = 'l', [38] = 'j',
+        [40] = 'k', [45] = 'n', [46] = 'm', [48] = '\t'};
+    if (key_code < sizeof ansi && ansi[key_code]) {
+        character = (unichar)ansi[key_code];
+        return [NSString stringWithCharacters:&character length:1];
+    }
+    switch (key_code) {
+        case 115: character = NSHomeFunctionKey; break;
+        case 119: character = NSEndFunctionKey; break;
+        case 116: character = NSPageUpFunctionKey; break;
+        case 121: character = NSPageDownFunctionKey; break;
         default: return @"";
     }
     return [NSString stringWithCharacters:&character length:1];
@@ -2105,9 +2137,17 @@ static void post_test_key_event_with_modifiers(NSWindow *window,
         return;
     }
     if(key_code<128)__atomic_store_n(&test_key_states[key_code],is_down,__ATOMIC_RELAXED);
+    /* Reproduce a release lost by SDL/AppKit without changing the hardware
+       state that the repair path samples. Used by the input regression run. */
+    const char *drop_key = getenv("LP32_TEST_DROP_KEYUP");
+    if (!is_down && drop_key && key_code == strtoul(drop_key, NULL, 0)) return;
     NSString *characters = characters_for_test_key(key_code);
+    /* Cocoa marks arrow keys as function/numeric-pad events. SDL uses
+       these flags to distinguish them from ordinary character input. */
+    if (key_code >= 123 && key_code <= 126)
+        modifiers |= NSEventModifierFlagFunction | NSEventModifierFlagNumericPad;
     NSTimeInterval timestamp = [[NSProcessInfo processInfo] systemUptime];
-    bool sdl = lp32_profile()->title == LP32_TITLE_MW2 || lp32_profile()->title == LP32_TITLE_MW2_MP;
+    bool sdl = lp32_title_is_mw_sdl(lp32_profile()->title);
     /* A real keyboard reports Command going down before the key and up after
        it. Send the same flags-changed events so scripted shortcuts see it. */
     if (sdl && (modifiers & NSEventModifierFlagCommand) && is_down)
@@ -2359,7 +2399,9 @@ static uint64_t frame_pacer_choose_interval(double display_fps, uint64_t work_ns
 {
     uint64_t full_ns = (uint64_t)(1e9 / display_fps);
     pacer_work_history[pacer_work_index++ % kPacerHistory] = work_ns;
-    if (display_fps < 100.0) return full_ns;
+    /* SDL titles only enter this pacer for an explicit LP32_MAX_FPS.
+       Treat it as a ceiling, without the Feral view's half-rate policy. */
+    if (display_fps < 100.0 || lp32_title_is_mw_sdl(lp32_profile()->title)) return full_ns;
 
     uint64_t worst = 0;
     for (unsigned index = 0; index < kPacerHistory; ++index) {
@@ -2490,8 +2532,7 @@ static bool handle_test_activation(id receiver, const char *selector, uint64_t *
                 /* MW2's SDL asks during Cocoa window construction, before
                    attaching its driver data. A hidden new window cannot
                    already have keyboard focus, even in an unattended test. */
-                if ((lp32_profile()->title == LP32_TITLE_MW2 ||
-                     lp32_profile()->title == LP32_TITLE_MW2_MP) &&
+                if (lp32_title_is_mw_sdl(lp32_profile()->title) &&
                     [receiver isKindOfClass:[NSWindow class]] && ![receiver isVisible]) {
                     *result = 0;
                     return true;
@@ -2628,7 +2669,7 @@ static bool guest_gamma_in_frame(void)
     static int enabled = -1;
     if (enabled < 0) {
         enum lp32_title title = lp32_profile()->title;
-        enabled = (title == LP32_TITLE_MW2 || title == LP32_TITLE_MW2_MP) &&
+        enabled = lp32_title_is_mw_sdl(title) &&
                   !getenv("LP32_DISPLAY_GAMMA");
     }
     return enabled;
@@ -3143,8 +3184,9 @@ static bool frame_gamma_redirect_blit(const uint32_t *a)
  * MW2 keeps running when another app is in front, and at full speed it takes
  * several cores and much of the GPU from whatever the user switched to (for
  * example another game). While inactive, presents are paced to
- * LP32_INACTIVE_FPS (default 15; 0 disables). Game time and audio continue
- * normally; only the frame rate drops. Scripted tests are never paced.
+ * LP32_INACTIVE_FPS (default 15; 0 disables). Bink movie playback is exempt:
+ * its game-loop service feeds the audio queue, so pacing can cause underruns.
+ * Bink keeps its own movie timing. Scripted tests are not paced by default.
  */
 /* Assume active until the main thread says otherwise: a wrong "inactive"
    caps a game the user is playing at 15 FPS and adds visible input lag. */
@@ -3185,7 +3227,7 @@ static bool input_journal_enabled(void)
     static bool enabled;
     dispatch_once(&once, ^{
         enabled = getenv("LP32_INPUT_JOURNAL") != NULL &&
-            (lp32_profile()->title == LP32_TITLE_MW2 || lp32_profile()->title == LP32_TITLE_MW2_MP);
+            (lp32_title_is_mw_sdl(lp32_profile()->title));
     });
     return enabled;
 }
@@ -3370,7 +3412,8 @@ static void inactive_pacing_before_present(void)
     inactive_pacing_track_focus();
     static uint64_t last_present_ns;
     uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-    if (!__atomic_load_n(&presenting_app_active, __ATOMIC_RELAXED) && last_present_ns &&
+    if (!__atomic_load_n(&presenting_app_active, __ATOMIC_RELAXED) &&
+        !audio_queue_bridge32_movie_playing() && last_present_ns &&
         now - last_present_ns < (uint64_t)interval_ns) {
         uint64_t wait = (uint64_t)interval_ns - (now - last_present_ns);
         struct timespec pause = {(time_t)(wait / 1000000000), (long)(wait % 1000000000)};
@@ -5006,8 +5049,11 @@ static bool append_ring_enabled(void)
     static int enabled = -1;
     if (enabled < 0) {
         enum lp32_title title = lp32_profile()->title;
-        enabled = (title == LP32_TITLE_MW2 || title == LP32_TITLE_MW2_MP) &&
-                  !getenv("LP32_NO_APPEND_RING");
+        /* Works around Apple's synchronous BufferSubData. On LP32GL a
+           BufferSubData is queued asynchronously, while the map this uses
+           stalls Mesa's GL thread. */
+        enabled = (lp32_title_is_mw_sdl(title)) &&
+                  !lp32_gl_backend_is_replacement() && !getenv("LP32_NO_APPEND_RING");
     }
     return enabled;
 }
@@ -5106,7 +5152,7 @@ static struct guest_buffer_mapping *begin_buffer_mapping(
             mapping->scratch_capacity = capacity;
             enum lp32_title title = lp32_profile()->title;
             mapping->persistent_storage = target == GL_ELEMENT_ARRAY_BUFFER &&
-                (title == LP32_TITLE_MW2 || title == LP32_TITLE_MW2_MP);
+                lp32_title_is_mw_sdl(title);
             mapping->storage = mapping->persistent_storage ?
                 state->retained_storage : scratch;
             mapping->capacity = mapping->persistent_storage ?
@@ -5176,6 +5222,7 @@ struct index_shadow {
     size_t size;
     GLenum usage;
     bool dirty;
+    bool native_required; /* Also used through a non-element binding. */
 };
 enum { kIndexShadowCapacity = 64, kIndexShadowMaxSize = 16 << 20 };
 static struct index_shadow index_shadows[kIndexShadowCapacity];
@@ -5186,7 +5233,9 @@ static bool index_shadow_enabled(void)
     static int enabled = -1;
     if (enabled < 0) {
         enum lp32_title title = lp32_profile()->title;
-        enabled = (title == LP32_TITLE_MW2 || title == LP32_TITLE_MW2_MP) &&
+        /* Also needed on LP32GL: without it MW2 MP's element buffer maps
+           exhaust the guest's address space (Hunk_UserCreate fails). */
+        enabled = (lp32_title_is_mw_sdl(title)) &&
                   !getenv("LP32_NO_INDEX_SHADOW");
     }
     return enabled;
@@ -5209,13 +5258,14 @@ static CGLShareGroupObj current_share_group(void)
 }
 
 /* glBufferData on GL_ELEMENT_ARRAY_BUFFER: (re)create or drop the copy. */
-static void index_shadow_buffer_data(GLsizeiptr size, const void *data, GLenum usage)
+static void index_shadow_buffer_data(GLenum target, GLsizeiptr size, const void *data, GLenum usage)
 {
     if (!index_shadow_enabled()) return;
-    GLuint buffer = bound_buffer_for_target(GL_ELEMENT_ARRAY_BUFFER);
+    GLuint buffer = bound_buffer_for_target(target);
     if (!buffer) return;
     CGLShareGroupObj share_group = current_share_group();
     bool dynamic = usage == GL_DYNAMIC_DRAW || usage == GL_STREAM_DRAW;
+    bool array_alias = bound_buffer_for_target(GL_ARRAY_BUFFER) == buffer;
     pthread_mutex_lock(&index_shadow_lock);
     struct index_shadow *shadow = index_shadow_find(share_group, buffer);
     if (!dynamic || size <= 0 || size > kIndexShadowMaxSize) {
@@ -5223,6 +5273,11 @@ static void index_shadow_buffer_data(GLsizeiptr size, const void *data, GLenum u
         pthread_mutex_unlock(&index_shadow_lock);
         return;
     }
+    if (!shadow && target != GL_ELEMENT_ARRAY_BUFFER) {
+        pthread_mutex_unlock(&index_shadow_lock);
+        return;
+    }
+    bool native_required = array_alias || target != GL_ELEMENT_ARRAY_BUFFER || (shadow && shadow->native_required);
     if (!shadow) {
         for (unsigned i = 0; i < kIndexShadowCapacity && !shadow; ++i)
             if (!index_shadows[i].buffer) shadow = &index_shadows[i];
@@ -5236,7 +5291,7 @@ static void index_shadow_buffer_data(GLsizeiptr size, const void *data, GLenum u
                must publish the copy. A BufferData that carried bytes already
                matches the GPU. */
             *shadow = (struct index_shadow){
-                share_group, buffer, copy, (size_t)size, usage, data == NULL,
+                share_group, buffer, copy, (size_t)size, usage, data == NULL, native_required,
             };
         } else {
             free(shadow->data);
@@ -5267,16 +5322,52 @@ static bool index_shadow_copy(GLuint buffer, GLintptr offset, GLsizeiptr size,
             memcpy(bytes, slot, (size_t)size);
         }
     }
+    if (into_shadow && shadow && shadow->native_required) ok = false;
     pthread_mutex_unlock(&index_shadow_lock);
     return ok;
 }
 
-/* glBufferSubData on GL_ELEMENT_ARRAY_BUFFER: true when the copy absorbed it. */
-static bool index_shadow_sub_data(GLintptr offset, GLsizeiptr size, const void *data)
+static bool index_shadow_native_required(GLuint buffer)
+{
+    if (!index_shadow_enabled() || !buffer) return false;
+    pthread_mutex_lock(&index_shadow_lock);
+    struct index_shadow *shadow = index_shadow_find(current_share_group(), buffer);
+    bool required = shadow && shadow->native_required;
+    pthread_mutex_unlock(&index_shadow_lock);
+    return required;
+}
+
+/* Publish deferred element writes before this object is used through another
+   target. Keep its index mirror, but future patches also reach native storage. */
+static void index_shadow_alias(GLenum target, GLuint buffer)
+{
+    if (target == GL_ELEMENT_ARRAY_BUFFER || !index_shadow_enabled() || !buffer) return;
+    pthread_mutex_lock(&index_shadow_lock);
+    struct index_shadow *shadow = index_shadow_find(current_share_group(), buffer);
+    if (shadow) {
+        if (shadow->dirty) {
+            glBufferSubData(target, 0, (GLsizeiptr)shadow->size, shadow->data);
+            shadow->dirty = false;
+        }
+        if (!shadow->native_required && getenv("LP32_TRACE_INDEX_ALIAS"))
+            fprintf(stderr, "compat32: index buffer alias buffer=%u target=%04x size=%zu\n", buffer, target, shadow->size);
+        shadow->native_required = true;
+    }
+    pthread_mutex_unlock(&index_shadow_lock);
+}
+
+/* True only when a dedicated element buffer absorbed the native upload. */
+static bool index_shadow_sub_data(GLenum target, GLintptr offset, GLsizeiptr size, const void *data)
 {
     if (!index_shadow_enabled() || offset < 0 || size < 0) return false;
-    return index_shadow_copy(bound_buffer_for_target(GL_ELEMENT_ARRAY_BUFFER),
-                             offset, size, (void *)data, true);
+    GLuint buffer = bound_buffer_for_target(target);
+    index_shadow_alias(target, buffer);
+    if (!index_shadow_copy(buffer, offset, size, (void *)data, true)) return false;
+    pthread_mutex_lock(&index_shadow_lock);
+    struct index_shadow *shadow = index_shadow_find(current_share_group(), buffer);
+    bool absorbed = target == GL_ELEMENT_ARRAY_BUFFER && shadow && !shadow->native_required;
+    pthread_mutex_unlock(&index_shadow_lock);
+    return absorbed;
 }
 
 /* Before mapping, or when a buffer is deleted: upload (if requested) and drop. */
@@ -5464,6 +5555,7 @@ void objc_bridge32_note_agl_frame(void) {
     static bool initialized;
     ++objc_bridge_swap_count;
     if (!initialized) { initialize_gl_trace_output(); install_gl_trace_signal(); initialized = true; }
+    trace_gl_frame_boundary();
     arm_pending_gl_trace();
 }
 
@@ -6616,14 +6708,17 @@ static GLenum canonical_mipmap_target(GLenum target)
     return 0;
 }
 
+static bool mipmap_repair_disabled(void)
+{
+    static int disabled = -1;
+    if (disabled < 0) disabled = getenv("LP32_DISABLE_MIPMAP_REPAIR") != NULL;
+    return disabled;
+}
+
 static void repair_bound_texture_mipmap_range(GLenum upload_target)
 {
     GLenum target = canonical_mipmap_target(upload_target);
-    static int repair_disabled = -1;
-    if (repair_disabled < 0) {
-        repair_disabled = getenv("LP32_DISABLE_MIPMAP_REPAIR") != NULL;
-    }
-    if (!target || repair_disabled) return;
+    if (!target || mipmap_repair_disabled()) return;
 
     /* Read before the scan: a level added by another context mid-scan then
        leaves the entry stale rather than wrongly current. */
@@ -6764,7 +6859,7 @@ static void repair_mipmap_range_for_parameter(GLenum upload_target,
                                               GLenum parameter, GLint value)
 {
     GLenum target = canonical_mipmap_target(upload_target);
-    if (!target) return;
+    if (!target || mipmap_repair_disabled()) return;
     GLint texture = 0;
     glGetIntegerv(target == GL_TEXTURE_2D ? GL_TEXTURE_BINDING_2D :
                   GL_TEXTURE_BINDING_CUBE_MAP, &texture);
@@ -6895,6 +6990,8 @@ static void trace_draw_call(const char *kind, GLenum mode, GLint first,
     GLfloat alpha_reference = 0.0f;
     GLint depth_function = 0;
     GLint cull_mode = 0;
+    GLint front_face = 0;
+    GLint current_program = 0;
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &framebuffer);
     glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &array_buffer);
     glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &element_buffer);
@@ -6905,6 +7002,8 @@ static void trace_draw_call(const char *kind, GLenum mode, GLint first,
     glGetFloatv(GL_ALPHA_TEST_REF, &alpha_reference);
     glGetIntegerv(GL_DEPTH_FUNC, &depth_function);
     glGetIntegerv(GL_CULL_FACE_MODE, &cull_mode);
+    glGetIntegerv(GL_FRONT_FACE, &front_face);
+    glGetIntegerv(GL_CURRENT_PROGRAM, &current_program);
     if (framebuffer) {
         framebuffer_status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
     }
@@ -6937,19 +7036,19 @@ static void trace_draw_call(const char *kind, GLenum mode, GLint first,
         (GLuint)first + (GLuint)(count - 1) : minimum;
     gl_trace_printf(
         "compat32: %s swap=%llu mode=%04x first=%d count=%d fbo=%d "
-        "fboStatus=%04x vbo=%d ibo=%d vp=%u fp=%u vpEnabled=%d "
+        "fboStatus=%04x vbo=%d ibo=%d program=%d vp=%u fp=%u vpEnabled=%d "
         "fpEnabled=%d blend=%d blendFunc={%04x,%04x} blendEq=%04x "
         "alphaTest=%d alphaFunc=%04x alphaRef=%.7g depthTest=%d "
-        "depthFunc=%04x cull=%d cullMode=%04x\n",
+        "depthFunc=%04x cull=%d cullMode=%04x frontFace=%04x\n",
         kind, (unsigned long long)objc_bridge_swap_count, mode, first, count,
-        framebuffer, framebuffer_status, array_buffer, element_buffer,
+        framebuffer, framebuffer_status, array_buffer, element_buffer, current_program,
         (GLuint)actual_vp, (GLuint)actual_fp,
         glIsEnabled(GL_VERTEX_PROGRAM_ARB),
         glIsEnabled(GL_FRAGMENT_PROGRAM_ARB), glIsEnabled(GL_BLEND),
         blend_source, blend_destination, blend_equation,
         glIsEnabled(GL_ALPHA_TEST), alpha_function, alpha_reference,
         glIsEnabled(GL_DEPTH_TEST), depth_function,
-        glIsEnabled(GL_CULL_FACE), cull_mode);
+        glIsEnabled(GL_CULL_FACE), cull_mode, front_face);
     gl_trace_printf(
         "compat32: framebuffer-state swap=%llu fbo=%d "
         "drawBuffers={%04x,%04x,%04x,%04x} "
@@ -7170,7 +7269,7 @@ static struct texture_bind_cache *texture_bind_cache_current(void)
     static int enabled = -1;
     if (enabled < 0) {
         enum lp32_title title = lp32_profile()->title;
-        enabled = (title == LP32_TITLE_MW2 || title == LP32_TITLE_MW2_MP) &&
+        enabled = lp32_title_is_mw_sdl(title) &&
                   !getenv("LP32_NO_BIND_FILTER");
     }
     if (!enabled) return NULL;
@@ -7247,12 +7346,15 @@ FAST_GL(glVertexAttribPointer)
     (void)return_address;
     if (trace_gl_render_call()) {
         GLint array_buffer = 0;
+        GLint vertex_array = 0;
         glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &array_buffer);
+        glGetIntegerv(0x85B5 /* GL_VERTEX_ARRAY_BINDING */, &vertex_array);
         gl_trace_printf(
-            "compat32: glVertexAttribPointer swap=%llu index=%u "
+            "compat32: glVertexAttribPointer swap=%llu tid=%p vao=%d index=%u "
             "size=%d type=%04x normalized=%u stride=%d pointer=%08x "
             "buffer=%d\n",
-            (unsigned long long)objc_bridge_swap_count, arguments[0],
+            (unsigned long long)objc_bridge_swap_count, (void *)pthread_self(),
+            vertex_array, arguments[0],
             (GLint)arguments[1], arguments[2], arguments[3],
             (GLsizei)arguments[4], arguments[5], array_buffer);
 
@@ -7433,6 +7535,7 @@ FAST_GL(glBindBuffer)
             arguments[0], arguments[1]);
     }
     glBindBuffer(arguments[0], arguments[1]);
+    index_shadow_alias(arguments[0], bound_buffer_for_target(arguments[0]));
     return 0;
 }
 
@@ -7749,11 +7852,12 @@ static void cod4_apply_pointer_state(void) {
  * SDL_SendMouseButton. COD4 keeps its own pointer path.
  */
 static uint32_t mw2_buttons_held;
+static uint64_t mw2_keys_held[2], mw2_key_releases_queued[2];
 
 static bool mw2_mouse_title(void)
 {
     enum lp32_title title = lp32_profile()->title;
-    return title == LP32_TITLE_MW2 || title == LP32_TITLE_MW2_MP;
+    return lp32_title_is_mw_sdl(title);
 }
 
 static uint32_t host_mouse_button_mask(void)
@@ -7779,6 +7883,53 @@ static NSWindow *mw2_event_window(void)
         if (candidate.isVisible) return candidate;
     }
     return nil;
+}
+
+static void mw2_note_key_event(NSEvent *event)
+{
+    if (!mw2_mouse_title() || !event) return;
+    NSEventType type = event.type;
+    if (type != NSEventTypeKeyDown && type != NSEventTypeKeyUp) return;
+    unsigned key = event.keyCode;
+    if (key >= 128) return;
+    uint64_t bit = UINT64_C(1) << (key % 64);
+    if (type == NSEventTypeKeyDown) {
+        mw2_keys_held[key / 64] |= bit;
+        mw2_key_releases_queued[key / 64] &= ~bit;
+    } else {
+        mw2_keys_held[key / 64] &= ~bit;
+        mw2_key_releases_queued[key / 64] &= ~bit;
+    }
+}
+
+static void mw2_release_unheld_keys(uint32_t event_mask)
+{
+    bool test_repair = background_test_mode() && getenv("LP32_TEST_DROP_KEYUP");
+    if (!mw2_mouse_title() || (background_test_mode() && !test_repair) ||
+        (!test_repair && ![NSApp isActive]) ||
+        (event_mask && !(event_mask & (uint32_t)NSEventMaskKeyUp))) return;
+    NSWindow *window = mw2_event_window();
+    if (!window) return;
+    for (unsigned key = 0; key < 128; ++key) {
+        uint64_t bit = UINT64_C(1) << (key % 64);
+        if (!(mw2_keys_held[key / 64] & bit) ||
+            (mw2_key_releases_queued[key / 64] & bit) ||
+            (test_repair ? objc_bridge32_test_key_down(key) :
+                CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, (CGKeyCode)key)))
+            continue;
+        NSString *characters = characters_for_test_key(key);
+        NSEvent *up = [NSEvent keyEventWithType:NSEventTypeKeyUp
+                    location:NSZeroPoint modifierFlags:0
+                    timestamp:[[NSProcessInfo processInfo] systemUptime]
+                    windowNumber:window.windowNumber context:nil
+                    characters:characters charactersIgnoringModifiers:characters
+                    isARepeat:NO keyCode:key];
+        if (!up) continue;
+        [NSApp postEvent:up atStart:YES];
+        mw2_key_releases_queued[key / 64] |= bit;
+        if (getenv("LP32_TRACE_INPUT"))
+            fprintf(stderr, "compat32: synthesized key-up key=%u\n", key);
+    }
 }
 
 static bool mw2_post_mouse_up(NSWindow *window, uint32_t button)
@@ -7914,10 +8065,11 @@ int objc_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
     /* Clang's @autoreleasepool form of the guest pools handled for
        +[NSAutoreleasePool alloc]/-drain in the message path below. */
     if (!strcmp(import_name,"_objc_autoreleasePoolPush")) {
-        guest_autorelease_push();*result=1;return 1;
+        guest_autorelease_push();*result=guest_autorelease_depth;return 1;
     }
     if (!strcmp(import_name,"_objc_autoreleasePoolPop")) {
-        guest_autorelease_pop();*result=0;return 1;
+        while(arguments[0] && guest_autorelease_depth>=arguments[0])guest_autorelease_pop();
+        *result=0;return 1;
     }
     /*
      * The guest creates and drains its own NSAutoreleasePool objects, but
@@ -7993,6 +8145,9 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         id receiver = object_for_argument(super[0]);
         Class parent = (Class)object_for_argument(super[1]);
         const char *selector = (const void *)(uintptr_t)arguments[1];
+        if (lp32_gl_backend_is_replacement() && parent == [NSOpenGLContext class] &&
+            [receiver isKindOfClass:objc_getClass(lp32_gl_backend_context_class())])
+            parent = objc_getClass(lp32_gl_backend_context_class());
         Method method = parent ? class_getInstanceMethod(parent, sel_registerName(selector)) : NULL;
         if (!receiver || !method) return 0;
         NSMethodSignature *signature = [NSMethodSignature signatureWithObjCTypes:method_getTypeEncoding(method)];
@@ -8013,11 +8168,51 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         }
         return invoke_simple_message(receiver, selector, args, result, method, NULL);
     }
+    /* The runtime pool API (MW3 multiplayer) shares NSAutoreleasePool's
+       guest scopes. The token is the scope depth; pop unwinds to it. */
+    if (LP32_NAME_IS(import_name, import_length, "_objc_autoreleasePoolPush")) {
+        guest_autorelease_push();
+        *result = guest_autorelease_depth;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_objc_autoreleasePoolPop")) {
+        while (arguments[0] && guest_autorelease_depth >= arguments[0]) guest_autorelease_pop();
+        *result = 0;
+        return 1;
+    }
     if (LP32_NAME_IS(import_name, import_length, "_objc_sync_enter") ||
         LP32_NAME_IS(import_name, import_length, "_objc_sync_exit")) {
         id object = object_for_argument(arguments[0]);
         *result = (uint32_t)(LP32_NAME_IS(import_name, import_length, "_objc_sync_enter") ?
                             objc_sync_enter(object) : objc_sync_exit(object));
+        return 1;
+    }
+    /* MW3 only asks a display link for the refresh period. The guest handle
+       is a cell holding the display ID; each query uses a short-lived link. */
+    if (LP32_NAME_IS(import_name, import_length, "_CVDisplayLinkCreateWithCGDisplay")) {
+        uint32_t handle = compat_runtime32_allocate(sizeof(uint32_t), 0);
+        if (!handle) { *result = kCVReturnAllocationFailed; return 1; }
+        *(uint32_t *)(uintptr_t)handle = arguments[0];
+        *(uint32_t *)(uintptr_t)arguments[1] = handle;
+        *result = kCVReturnSuccess;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CVDisplayLinkRelease")) {
+        if (arguments[0]) compat_runtime32_deallocate(arguments[0]);
+        *result = 0;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CVDisplayLinkGetNominalOutputVideoRefreshPeriod")) {
+        /* Structure return: arguments[0] is the i386 CVTime (same 16-byte layout). */
+        CVTime period = kCVZeroTime;
+        CVDisplayLinkRef link = NULL;
+        if (arguments[1] &&
+            CVDisplayLinkCreateWithCGDisplay(*(uint32_t *)(uintptr_t)arguments[1], &link) == kCVReturnSuccess) {
+            period = CVDisplayLinkGetNominalOutputVideoRefreshPeriod(link);
+            CVDisplayLinkRelease(link);
+        }
+        memcpy((void *)(uintptr_t)arguments[0], &period, sizeof(period));
+        *result = 0;
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFDictionaryApplyFunction")) {
@@ -8428,6 +8623,34 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         CGRect bounds = CGDisplayBounds(arguments[1]);
         float rect[] = {bounds.origin.x, bounds.origin.y, bounds.size.width, bounds.size.height};
         memcpy((void *)(uintptr_t)arguments[0], rect, sizeof(rect));
+        *result = 0;
+        return 1;
+    }
+    /* MW3 only asks a display link for the refresh period. The guest handle
+       is a cell holding the display ID; each query uses a short-lived link. */
+    if (LP32_NAME_IS(import_name, import_length, "_CVDisplayLinkCreateWithCGDisplay")) {
+        uint32_t handle = compat_runtime32_allocate(sizeof(uint32_t), 0);
+        if (!handle) { *result = kCVReturnAllocationFailed; return 1; }
+        *(uint32_t *)(uintptr_t)handle = arguments[0];
+        *(uint32_t *)(uintptr_t)arguments[1] = handle;
+        *result = kCVReturnSuccess;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CVDisplayLinkRelease")) {
+        if (arguments[0]) compat_runtime32_deallocate(arguments[0]);
+        *result = 0;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CVDisplayLinkGetNominalOutputVideoRefreshPeriod")) {
+        /* Structure return: arguments[0] is the i386 CVTime (same 16-byte layout). */
+        CVTime period = kCVZeroTime;
+        CVDisplayLinkRef link = NULL;
+        if (arguments[1] &&
+            CVDisplayLinkCreateWithCGDisplay(*(uint32_t *)(uintptr_t)arguments[1], &link) == kCVReturnSuccess) {
+            period = CVDisplayLinkGetNominalOutputVideoRefreshPeriod(link);
+            CVDisplayLinkRelease(link);
+        }
+        memcpy((void *)(uintptr_t)arguments[0], &period, sizeof(period));
         *result = 0;
         return 1;
     }
@@ -8909,8 +9132,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         if (arguments[0] == GL_ARRAY_BUFFER)
             append_ring_buffer_data((GLsizeiptr)(int32_t)arguments[1],
                                     (const void *)(uintptr_t)arguments[2], arguments[3]);
-        if (arguments[0] == GL_ELEMENT_ARRAY_BUFFER)
-            index_shadow_buffer_data((GLsizeiptr)(int32_t)arguments[1],
+        index_shadow_buffer_data(arguments[0], (GLsizeiptr)(int32_t)arguments[1],
                                      (const void *)(uintptr_t)arguments[2], arguments[3]);
         *result = 0; return 1;
     }
@@ -8923,12 +9145,12 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                 (unsigned long long)objc_bridge_swap_count, arguments[0],
                 (int32_t)arguments[1], (int32_t)arguments[2], arguments[3]);
         }
-        if (arguments[0] == GL_ELEMENT_ARRAY_BUFFER &&
-            index_shadow_sub_data((GLintptr)(int32_t)arguments[1], (GLsizeiptr)(int32_t)arguments[2],
+        if (index_shadow_sub_data(arguments[0], (GLintptr)(int32_t)arguments[1], (GLsizeiptr)(int32_t)arguments[2],
                                   (const void *)(uintptr_t)arguments[3])) {
             *result = 0; return 1;
         }
         if (arguments[0] == GL_ARRAY_BUFFER &&
+            !index_shadow_native_required(bound_buffer_for_target(GL_ARRAY_BUFFER)) &&
             append_ring_sub_data((GLintptr)(int32_t)arguments[1],
                                  (GLsizeiptr)(int32_t)arguments[2],
                                  (const void *)(uintptr_t)arguments[3])) {
@@ -9408,8 +9630,9 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         ++gl_frame_diagnostics.framebuffer_binds;
         if (trace_gl_render_call()) {
             fprintf(stderr,
-                    "compat32: glBindFramebuffer swap=%llu target=%04x fbo=%u\n",
+                    "compat32: glBindFramebuffer swap=%llu tid=%p target=%04x fbo=%u\n",
                     (unsigned long long)objc_bridge_swap_count,
+                    (void *)pthread_self(),
                     arguments[0], arguments[1]);
         }
         glBindFramebuffer(arguments[0], arguments[1]);
@@ -9490,6 +9713,13 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     if (LP32_NAME_IS(import_name, import_length, "glFramebufferRenderbuffer") ||
         LP32_NAME_IS(import_name, import_length, "glFramebufferRenderbufferEXT")) {
         ++gl_frame_diagnostics.framebuffer_attachments;
+        if (trace_gl_render_call()) {
+            GLint framebuffer = 0;
+            glGetIntegerv(GL_FRAMEBUFFER_BINDING, &framebuffer);
+            fprintf(stderr, "compat32: glFramebufferRenderbuffer swap=%llu tid=%p fbo=%d attachment=%04x renderbuffer=%u\n",
+                    (unsigned long long)objc_bridge_swap_count, (void *)pthread_self(),
+                    framebuffer, arguments[1], arguments[3]);
+        }
         glFramebufferRenderbuffer(arguments[0], arguments[1], arguments[2],
                                   arguments[3]);
         *result = 0; return 1;
@@ -11200,8 +11430,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         /* MW2's SDL shows its window from the WinMain worker once rendering
            starts. AppKit throws from off-main ordering, and the main thread
            keeps pumping Cocoa events, so it can service the message. */
-        if ((lp32_profile()->title == LP32_TITLE_MW2 ||
-             lp32_profile()->title == LP32_TITLE_MW2_MP) &&
+        if (lp32_title_is_mw_sdl(lp32_profile()->title) &&
             ![NSThread isMainThread] && [receiver isKindOfClass:[NSWindow class]]) {
             __block int handled = 0;
             dispatch_sync(dispatch_get_main_queue(), ^{
@@ -11217,14 +11446,17 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             texture_bind_cache_invalidate();
         /* MW2 presents with a plain -[NSOpenGLContext flushBuffer], not the
            Feral view's swapBuffers, so count and capture frames here. */
-        if ((lp32_profile()->title == LP32_TITLE_MW2 ||
-             lp32_profile()->title == LP32_TITLE_MW2_MP) &&
+        if (lp32_title_is_mw_sdl(lp32_profile()->title) &&
             !strcmp(selector_name, "flushBuffer") &&
             [receiver isKindOfClass:[NSOpenGLContext class]]) {
             if (mw2_gl_reattach_left > 0) {
                 mw2_repair_gl_drawable((NSOpenGLContext *)receiver);
                 --mw2_gl_reattach_left;
             }
+            /* SDL presents outside OpenGLView, so honor an explicit test
+               or user frame cap here too. Leave its normal pacing intact. */
+            if (getenv("LP32_MAX_FPS"))
+                frame_pacer_wait(nil);
             frame_gamma_present((NSOpenGLContext *)receiver);
             log_frame_hitch();
             inactive_pacing_before_present();
@@ -11233,13 +11465,13 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                              [(NSOpenGLContext *)receiver CGLContextObj], __ATOMIC_RELAXED);
             uint64_t swaps = ++objc_bridge_swap_count;
             if (swaps == 1) {
-                fprintf(stderr, "compat32: MW2 presented its first frame\n");
+                fprintf(stderr, "compat32: %s presented its first frame\n", lp32_profile()->name);
                 /* MW2 presents here, never through OpenGLView, so install the
                    Dock/app-switcher quit handler from this first frame. */
                 dispatch_async(dispatch_get_main_queue(), ^{ install_termination_handler(); });
             }
             if (getenv("LP32_TRACE_GL_FRAMES") && swaps % 300 == 0)
-                fprintf(stderr, "compat32: MW2 swap %llu t=%.1f\n", (unsigned long long)swaps,
+                fprintf(stderr, "compat32: %s swap %llu t=%.1f\n", lp32_profile()->name, (unsigned long long)swaps,
                         CFAbsoluteTimeGetCurrent());
             const char *frame_interval = getenv("LP32_FRAME_INTERVAL");
             if (compat_runtime32_frame_profile_enabled || frame_interval) {
@@ -11257,9 +11489,9 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                     struct compat_runtime32_frame_profile profile;
                     compat_runtime32_take_frame_profile(&profile);
                     double seconds = (now_ns - interval_start_ns) / 1e9;
-                    fprintf(stderr, "compat32: MW2 frames swap=%llu fps=%.1f frame-max=%.1fms "
+                    fprintf(stderr, "compat32: %s frames swap=%llu fps=%.1f frame-max=%.1fms "
                             "imports/frame=%.0f bridge/frame=%.2fms objc/frame=%.2fms lock-wait/frame=%.2fms\n",
-                            (unsigned long long)swaps, interval_frames / seconds, frame_max_ns / 1e6,
+                            lp32_profile()->name, (unsigned long long)swaps, interval_frames / seconds, frame_max_ns / 1e6,
                             (double)profile.calls / interval_frames,
                             profile.dispatch_ns / 1e6 / interval_frames,
                             profile.objc_ns / 1e6 / interval_frames,
@@ -11270,6 +11502,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                     interval_start_ns = now_ns; interval_frames = 0; frame_max_ns = 0;
                 }
             }
+            trace_gl_frame_boundary();
             carbon_ui_capture_gl_frame(receiver, swaps);
         }
         /* performSelector: is typed to return an object, but MW2's SDL uses it
@@ -11424,7 +11657,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             _Exit(EXIT_SUCCESS);
         }
         if (strcmp(selector_name, "sendEvent:") == 0 &&
-            (lp32_profile()->title == LP32_TITLE_MW2 || lp32_profile()->title == LP32_TITLE_MW2_MP) &&
+            (lp32_title_is_mw_sdl(lp32_profile()->title)) &&
             [receiver isKindOfClass:[NSApplication class]])
         {
             NSEvent *dispatched = object_for_argument(arguments[2]);
@@ -11583,7 +11816,10 @@ static int objc_bridge32_dispatch_body(const char *import_name,
              */
             /* Dequeued pumps only. A peek must not inject a mouse-up that
                this call will leave on the queue. */
-            if (arguments[5]) mw2_release_unheld_mouse_buttons(arguments[2]);
+            if (arguments[5]) {
+                mw2_release_unheld_mouse_buttons(arguments[2]);
+                mw2_release_unheld_keys(arguments[2]);
+            }
             static bool logged_mask;
             if (!logged_mask) {
                 logged_mask = true;
@@ -11618,6 +11854,11 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         }
         bool invoked = invoke_simple_message(receiver, selector_name,
                                              arguments, result, NULL, NULL);
+        if (invoked && selector_name &&
+            !strcmp(selector_name, "nextEventMatchingMask:untilDate:inMode:dequeue:") &&
+            arguments[5] &&
+            [receiver isKindOfClass:[NSApplication class]])
+            mw2_note_key_event(object_for_argument((uint32_t)*result));
         if (!invoked) {
             fprintf(stderr,
                     "compat32: Objective-C bridge cannot invoke %s on %s\n",
@@ -12275,8 +12516,7 @@ int objc_bridge32_run_gl_buffer_self_test(void)
        and every element buffer on other titles, still upload immediately. */
     {
         bool expect_shadow =
-            (lp32_profile()->title == LP32_TITLE_MW2 ||
-             lp32_profile()->title == LP32_TITLE_MW2_MP) &&
+            lp32_title_is_mw_sdl(lp32_profile()->title) &&
             !getenv("LP32_NO_INDEX_SHADOW");
         enum { kElementSize = 32, kPatch = 8, kPatchAt = 4 };
         unsigned char initial[kElementSize];
@@ -12390,7 +12630,7 @@ int objc_bridge32_run_gl_buffer_self_test(void)
         /* MW2's mark draw list keeps this CPU index pointer after unmap.
            A later vertex map must not recycle and overwrite its storage. */
         enum lp32_title title = lp32_profile()->title;
-        if (title == LP32_TITLE_MW2 || title == LP32_TITLE_MW2_MP) {
+        if (lp32_title_is_mw_sdl(title)) {
             glBindBuffer(GL_ARRAY_BUFFER, buffers[1]);
             objc_bridge32_dispatch("glMapBuffer", map_arguments, &dispatch_result);
             uint32_t vertex_mapping = (uint32_t)dispatch_result;
@@ -12411,6 +12651,54 @@ int objc_bridge32_run_gl_buffer_self_test(void)
             objc_bridge32_dispatch("glUnmapBuffer", unmap_element, &dispatch_result);
         }
 
+        /* A target alias must publish earlier deferred bytes, mirror later
+           ARRAY writes, and keep native storage current for vertex users. */
+        objc_bridge32_dispatch("glBufferData", dynamic_data, &dispatch_result);
+        objc_bridge32_dispatch("glBufferSubData", sub_data, &dispatch_result);
+        const uint32_t bind_alias[] = {GL_ARRAY_BUFFER, element};
+        objc_bridge32_dispatch("glBindBuffer", bind_alias, &dispatch_result);
+        memset(gpu, 0, sizeof(gpu));
+        glGetBufferSubData(GL_ARRAY_BUFFER, 0, kElementSize, gpu);
+        if (memcmp(gpu + kPatchAt, patch, kPatch)) {
+            fputs("gl-buffer-selftest: alias bind lost deferred index bytes\n", stderr);
+            status = -1; goto cleanup;
+        }
+        memset((void *)(uintptr_t)guest_patch, 0x5e, kPatch);
+        const uint32_t alias_sub[] = {GL_ARRAY_BUFFER, kPatchAt, kPatch, guest_patch};
+        objc_bridge32_dispatch("glBufferSubData", alias_sub, &dispatch_result);
+        glGetBufferSubData(GL_ARRAY_BUFFER, 0, kElementSize, gpu);
+        if (memcmp(gpu + kPatchAt, (void *)(uintptr_t)guest_patch, kPatch)) {
+            fputs("gl-buffer-selftest: alias subdata failed native publication\n", stderr);
+            status = -1; goto cleanup;
+        }
+        objc_bridge32_dispatch("glBindBuffer", bind_element, &dispatch_result);
+        indices = NULL; shadowed = 0;
+        acquired = objc_bridge32_index_shadow_acquire(kPatchAt, kPatch / 2, GL_UNSIGNED_SHORT, &indices, &shadowed);
+        unsigned char alias_slice[kPatch];
+        glGetBufferSubData(GL_ELEMENT_ARRAY_BUFFER, acquired ? 0 : kPatchAt, kPatch, alias_slice);
+        if (shadowed) objc_bridge32_index_shadow_release(shadowed);
+        if (memcmp(alias_slice, (void *)(uintptr_t)guest_patch, kPatch)) {
+            fputs("gl-buffer-selftest: alias write left stale draw indices\n", stderr);
+            status = -1; goto cleanup;
+        }
+        memset((void *)(uintptr_t)guest_patch, 0x71, kPatch);
+        objc_bridge32_dispatch("glBufferSubData", sub_data, &dispatch_result);
+        glGetBufferSubData(GL_ARRAY_BUFFER, kPatchAt, kPatch, alias_slice);
+        if (memcmp(alias_slice, (void *)(uintptr_t)guest_patch, kPatch)) {
+            fputs("gl-buffer-selftest: aliased element update failed native publication\n", stderr);
+            status = -1; goto cleanup;
+        }
+        /* Reallocation via ARRAY must replace the old-sized CPU index copy. */
+        const uint32_t alias_data[] = {GL_ARRAY_BUFFER, kPatch, guest_patch, GL_DYNAMIC_DRAW};
+        objc_bridge32_dispatch("glBufferData", alias_data, &dispatch_result);
+        acquired = objc_bridge32_index_shadow_acquire(0, kPatch / 2, GL_UNSIGNED_SHORT, &indices, &shadowed);
+        glGetBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, kPatch, alias_slice);
+        if (shadowed) objc_bridge32_index_shadow_release(shadowed);
+        if (memcmp(alias_slice, (void *)(uintptr_t)guest_patch, kPatch)) {
+            fputs("gl-buffer-selftest: alias reallocation left stale draw indices\n", stderr);
+            status = -1; goto cleanup;
+        }
+        memcpy((void *)(uintptr_t)guest_patch, patch, kPatch);
         const uint32_t static_data[] = {
             GL_ELEMENT_ARRAY_BUFFER, kElementSize, guest_initial, GL_STATIC_DRAW,
         };

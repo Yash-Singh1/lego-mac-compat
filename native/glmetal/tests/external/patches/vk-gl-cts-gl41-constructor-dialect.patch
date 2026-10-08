@@ -1,0 +1,27 @@
+--- a/external/openglcts/modules/common/glcGLSLVectorConstructorTests.cpp
++++ b/external/openglcts/modules/common/glcGLSLVectorConstructorTests.cpp
+@@ -24,6 +24,7 @@
+ #include "glcGLSLVectorConstructorTests.hpp"
+ 
+ #include "gluDefs.hpp"
++#include "gluContextInfo.hpp"
+ #include "gluTextureUtil.hpp"
+ #include "gluDrawUtil.hpp"
+ #include "gluShaderProgram.hpp"
+@@ -417,7 +418,15 @@
+ GLSLVectorConstructorTestCase::GLSLVectorConstructorTestCase(deqp::Context &context, glu::GLSLVersion glslVersion,
+                                                              const TestParams &params)
+     : TestCase(context, params.name.c_str(), params.description.c_str())
+-    , m_glslVersion(glslVersion)
++    // Keep the inherited GL3.0 constructor templates usable on desktop core
++    // contexts whose native compiler does not accept GLSL1.30. GLSL1.40 has
++    // the same constructor rules. Leave ES, compatibility and older contexts
++    // and all positive/negative test expectations unchanged.
++    , m_glslVersion(glslVersion == glu::GLSL_VERSION_130 &&
++                            glu::isContextTypeGLCore(context.getRenderContext().getType()) &&
++                            glu::contextSupports(context.getRenderContext().getType(), glu::ApiType::core(3, 2))
++                        ? glu::GLSL_VERSION_140
++                        : glslVersion)
+     , m_params(params)
+     , m_fboId(0)
+     , m_rboId(0)

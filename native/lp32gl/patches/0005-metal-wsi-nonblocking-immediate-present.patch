@@ -1,0 +1,237 @@
+diff --git a/src/vulkan/wsi/wsi_common_metal.c b/src/vulkan/wsi/wsi_common_metal.c
+index 54542c6..3499e65 100644
+--- a/src/vulkan/wsi/wsi_common_metal.c
++++ b/src/vulkan/wsi/wsi_common_metal.c
+@@ -366,6 +366,11 @@ struct wsi_metal_swapchain {
+    /* VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR */
+    bool opaque_composition;
+ 
++   /* Immediate mode never waits for a drawable: acquire takes the one the
++    * prefetch thread has ready, and a frame without one is not presented. */
++   bool immediate;
++   struct wsi_metal_drawable_prefetch *prefetch;
++
+    struct wsi_metal_image images[0];
+ };
+ VK_DEFINE_NONDISP_HANDLE_CASTS(wsi_metal_swapchain, base.base, VkSwapchainKHR,
+@@ -479,6 +484,14 @@ wsi_cmd_blit_image_to_image(const struct wsi_swapchain *chain,
+       };
+       wsi->BeginCommandBuffer(image->blit.cmd_buffers[i], &begin_info);
+ 
++      /* A dropped immediate-mode frame has no drawable to copy into. */
++      if (!metal_image->drawable) {
++         result = wsi->EndCommandBuffer(image->blit.cmd_buffers[i]);
++         if (result != VK_SUCCESS)
++            return result;
++         continue;
++      }
++
+       VkImageMemoryBarrier img_mem_barriers[] = {
+          {
+             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+@@ -597,6 +610,23 @@ wsi_metal_swapchain_acquire_next_image(struct wsi_swapchain *wsi_chain,
+    struct timespec start_time, end_time;
+    struct timespec rel_timeout;
+ 
++   if (chain->immediate && !wsi_chain->wsi->sw) {
++      if (!chain->prefetch)
++         chain->prefetch = wsi_metal_drawable_prefetch_create(chain->surface->pLayer);
++      if (chain->prefetch) {
++         uint32_t i = (chain->current_image_index++) % chain->base.image_count;
++         struct wsi_metal_image *image = &chain->images[i];
++         *image_index = i;
++         image->drawable = wsi_metal_drawable_prefetch_take(
++            chain->prefetch, chain->extent.width, chain->extent.height);
++         if (image->drawable)
++            chain->base.wsi->metal.bind_drawable_to_vkimage(image->base.blit.image,
++                                                            image->drawable);
++         wsi_cmd_blit_image_to_image(wsi_chain, &wsi_chain->image_info, &image->base);
++         return VK_SUCCESS;
++      }
++   }
++
+    timespec_from_nsec(&rel_timeout, info->timeout);
+ 
+    clock_gettime(CLOCK_MONOTONIC, &start_time);
+@@ -668,6 +698,7 @@ wsi_metal_swapchain_set_present_mode(struct wsi_swapchain *wsi_chain,
+    struct wsi_metal_swapchain *chain = (struct wsi_metal_swapchain *)wsi_chain;
+    const bool immediate_mode = mode == VK_PRESENT_MODE_IMMEDIATE_KHR;
+    wsi_metal_layer_set_immediate(chain->surface->pLayer, immediate_mode);
++   chain->immediate = immediate_mode;
+ }
+ 
+ static void
+@@ -698,6 +729,15 @@ wsi_metal_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
+ 
+    struct wsi_metal_image *image = &chain->images[image_index];
+ 
++   if (!image->drawable && !wsi_chain->wsi->sw) {
++      /* Dropped immediate-mode frame: nothing reaches the screen. */
++      if (present_id && wsi_chain->present_wait_enabled) {
++         wsi_metal_retain_present_info(chain->present_info);
++         wsi_metal_present_complete(chain->present_info, present_id);
++      }
++      return VK_SUCCESS;
++   }
++
+    if (present_id && wsi_chain->present_wait_enabled) {
+       wsi_metal_retain_present_info(chain->present_info);
+       wsi_metal_layer_add_presented_handler(
+@@ -845,6 +885,8 @@ wsi_metal_swapchain_destroy(struct wsi_swapchain *wsi_chain,
+    struct wsi_metal_swapchain *chain =
+       (struct wsi_metal_swapchain *)wsi_chain;
+ 
++   wsi_metal_drawable_prefetch_destroy(chain->prefetch);
++
+    for (uint32_t i = 0; i < chain->base.image_count; i++) {
+       struct wsi_metal_image *image = &chain->images[i];
+       if (image->drawable) {
+@@ -950,6 +992,7 @@ wsi_metal_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
+    chain->surface = metal_surface;
+    chain->current_image_index = 0;
+    chain->opaque_composition = opaque_composition;
++   chain->immediate = immediate_mode;
+ 
+    chain->present_info = wsi_metal_create_present_info();
+    if (chain->present_info == NULL) {
+diff --git a/src/vulkan/wsi/wsi_common_metal_layer.h b/src/vulkan/wsi/wsi_common_metal_layer.h
+index f98fd1a..0c24b11 100644
+--- a/src/vulkan/wsi/wsi_common_metal_layer.h
++++ b/src/vulkan/wsi/wsi_common_metal_layer.h
+@@ -39,6 +39,23 @@ wsi_metal_layer_acquire_drawable(const CAMetalLayer *metal_layer);
+ void
+ wsi_metal_release_drawable(CAMetalDrawable *drawable_ptr);
+ 
++/* Keeps one drawable acquired ahead of time on a helper thread so an
++ * immediate-mode swapchain can present without waiting for the compositor.
++ */
++struct wsi_metal_drawable_prefetch;
++
++struct wsi_metal_drawable_prefetch *
++wsi_metal_drawable_prefetch_create(const CAMetalLayer *metal_layer);
++
++/* Returns the prefetched drawable if one is ready and matches the size, or
++ * NULL without blocking. */
++CAMetalDrawable *
++wsi_metal_drawable_prefetch_take(struct wsi_metal_drawable_prefetch *prefetch,
++                                 uint32_t width, uint32_t height);
++
++void
++wsi_metal_drawable_prefetch_destroy(struct wsi_metal_drawable_prefetch *prefetch);
++
+ void
+ wsi_metal_layer_add_presented_handler(CAMetalDrawable *drawable_ptr,
+                                       void (*presented_handler)(void *, uint64_t),
+diff --git a/src/vulkan/wsi/wsi_common_metal_layer.m b/src/vulkan/wsi/wsi_common_metal_layer.m
+index 6308d70..1bbd32a 100644
+--- a/src/vulkan/wsi/wsi_common_metal_layer.m
++++ b/src/vulkan/wsi/wsi_common_metal_layer.m
+@@ -11,6 +11,9 @@
+ #import <QuartzCore/CAMetalLayer.h>
+ #import <Metal/Metal.h>
+ 
++#include <pthread.h>
++#include <stdlib.h>
++
+ void
+ wsi_metal_layer_size(const CAMetalLayer *metal_layer,
+    uint32_t *width, uint32_t *height)
+@@ -282,6 +285,98 @@ wsi_metal_release_drawable(CAMetalDrawable *drawable_ptr)
+    [(id<CAMetalDrawable>)drawable_ptr release];
+ }
+ 
++struct wsi_metal_drawable_prefetch {
++   CAMetalLayer *layer;
++   pthread_t thread;
++   pthread_mutex_t mutex;
++   pthread_cond_t cond;
++   id<CAMetalDrawable> drawable;
++   bool stop;
++};
++
++static void *
++wsi_metal_drawable_prefetch_main(void *data)
++{
++   struct wsi_metal_drawable_prefetch *prefetch = data;
++   pthread_setname_np("wsi-metal-drawable");
++   pthread_mutex_lock(&prefetch->mutex);
++   while (!prefetch->stop) {
++      if (prefetch->drawable) {
++         pthread_cond_wait(&prefetch->cond, &prefetch->mutex);
++         continue;
++      }
++      pthread_mutex_unlock(&prefetch->mutex);
++      id<CAMetalDrawable> drawable = nil;
++      @autoreleasepool {
++         /* Blocks until the compositor returns a drawable (or 1 s). */
++         drawable = [[prefetch->layer nextDrawable] retain];
++      }
++      pthread_mutex_lock(&prefetch->mutex);
++      if (prefetch->stop) {
++         [drawable release];
++         break;
++      }
++      prefetch->drawable = drawable;
++   }
++   pthread_mutex_unlock(&prefetch->mutex);
++   return NULL;
++}
++
++struct wsi_metal_drawable_prefetch *
++wsi_metal_drawable_prefetch_create(const CAMetalLayer *metal_layer)
++{
++   struct wsi_metal_drawable_prefetch *prefetch = calloc(1, sizeof(*prefetch));
++   if (!prefetch)
++      return NULL;
++   prefetch->layer = [(CAMetalLayer *)metal_layer retain];
++   pthread_mutex_init(&prefetch->mutex, NULL);
++   pthread_cond_init(&prefetch->cond, NULL);
++   if (pthread_create(&prefetch->thread, NULL, wsi_metal_drawable_prefetch_main,
++                      prefetch) != 0) {
++      pthread_cond_destroy(&prefetch->cond);
++      pthread_mutex_destroy(&prefetch->mutex);
++      [prefetch->layer release];
++      free(prefetch);
++      return NULL;
++   }
++   return prefetch;
++}
++
++CAMetalDrawable *
++wsi_metal_drawable_prefetch_take(struct wsi_metal_drawable_prefetch *prefetch,
++                                 uint32_t width, uint32_t height)
++{
++   pthread_mutex_lock(&prefetch->mutex);
++   id<CAMetalDrawable> drawable = prefetch->drawable;
++   prefetch->drawable = nil;
++   pthread_cond_signal(&prefetch->cond);
++   pthread_mutex_unlock(&prefetch->mutex);
++   /* A drawable fetched before a resize has the old size; drop it. */
++   if (drawable && (drawable.texture.width != width ||
++                    drawable.texture.height != height)) {
++      [drawable release];
++      drawable = nil;
++   }
++   return (CAMetalDrawable *)drawable;
++}
++
++void
++wsi_metal_drawable_prefetch_destroy(struct wsi_metal_drawable_prefetch *prefetch)
++{
++   if (!prefetch)
++      return;
++   pthread_mutex_lock(&prefetch->mutex);
++   prefetch->stop = true;
++   pthread_cond_signal(&prefetch->cond);
++   pthread_mutex_unlock(&prefetch->mutex);
++   pthread_join(prefetch->thread, NULL);
++   [prefetch->drawable release];
++   [prefetch->layer release];
++   pthread_cond_destroy(&prefetch->cond);
++   pthread_mutex_destroy(&prefetch->mutex);
++   free(prefetch);
++}
++
+ void
+ wsi_metal_layer_add_presented_handler(CAMetalDrawable *drawable_ptr,
+                                       void (*presented_handler)(void *, uint64_t),

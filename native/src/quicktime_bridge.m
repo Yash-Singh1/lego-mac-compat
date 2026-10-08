@@ -344,7 +344,21 @@ int quicktime_bridge32_dispatch(const char *name, const uint32_t *a,
       *out = (uint32_t)status;
       return 1;
     }
-    LP32GraphicsImporter *importer = [graphics_importers objectForKey:@(a[0])];
+    /* Dispatch also sees unrelated imports with zero arguments. */
+    bool importer_call = IS("_CloseComponent") ||
+        IS("_GraphicsImportGetNaturalBounds") ||
+        IS("_GraphicsImportSetBoundsRect") ||
+        IS("_GraphicsImportSetGWorld") ||
+        IS("_GraphicsImportGetImageCount") ||
+        IS("_GraphicsImportSetImageIndex") ||
+        IS("_GraphicsImportGetQuality") ||
+        IS("_GraphicsImportGetMatrix") ||
+        IS("_GraphicsImportGetDefaultMatrix") ||
+        IS("_GraphicsImportSetMatrix") ||
+        IS("_GraphicsImportGetImageDescription") ||
+        IS("_GraphicsImportDraw");
+    LP32GraphicsImporter *importer = importer_call ?
+        [graphics_importers objectForKey:@(a[0])] : nil;
     if (importer) {
       if (IS("_CloseComponent")) {
         [graphics_importers removeObjectForKey:@(a[0])];
@@ -718,6 +732,26 @@ int quicktime_bridge32_dispatch(const char *name, const uint32_t *a,
       *out = a[1];
       return 1;
     }
+    /* Movie lookup likewise must not inspect an unrelated call frame. */
+    if (!(IS("_GetMovieBox") ||
+        IS("_SetMovieBox") ||
+        IS("_SetMovieGWorld") ||
+        IS("_SetMovieDrawingCompleteProc") ||
+        IS("_GetMovieIndTrackType") ||
+        IS("_GetMoviePreferredRate") ||
+        IS("_GetMovieDuration") ||
+        IS("_PrerollMovie") ||
+        IS("_SetMovieRate") ||
+        IS("_StartMovie") ||
+        IS("_StopMovie") ||
+        IS("_GoToBeginningOfMovie") ||
+        IS("_SetMovieTimeValue") ||
+        IS("_IsMovieDone") ||
+        IS("_GetMovieTimeScale") ||
+        IS("_GetMovieTimeBase") ||
+        IS("_GetMovieTime") ||
+        IS("_GetTimeBaseStartTime") ||
+        IS("_GetTimeBaseStopTime"))) return 0;
     LP32Movie *m = movie(a[0]);
     if (!m)
       return 0;

@@ -17,6 +17,8 @@ static OSStatus test_dispose(AudioQueueRef, Boolean);
 #undef AudioQueueDispose
 
 static atomic_bool disposal_requested, native_disposed;
+const char *guest_dyld32_describe(uint32_t address, uint32_t *offset)
+{ (void)address; (void)offset; return NULL; }
 static bool disposed_during_allocate;
 static unsigned allocations, guest_frees;
 static pthread_t disposer;

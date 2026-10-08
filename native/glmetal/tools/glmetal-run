@@ -1,0 +1,33 @@
+#!/bin/sh
+# Runs an OpenGL application on GLMetal instead of Apple's OpenGL.
+#
+#   glmetal-run Some.app [args...]      (or the executable itself)
+#
+# Uses DYLD_INSERT_LIBRARIES with libGLMetalInject.dylib from this
+# directory, ../build, or $GLMETAL_BUILD. macOS ignores it for binaries
+# signed with the hardened runtime (unless they carry the
+# allow-dyld-environment-variables entitlement) and for platform binaries.
+set -e
+if [ $# -lt 1 ]; then
+    echo "usage: glmetal-run APP|EXECUTABLE [arguments...]" >&2
+    exit 64
+fi
+here=$(cd "$(dirname "$0")" && pwd)
+build=${GLMETAL_BUILD:-}
+for candidate in "$build" "$here" "$here/../build"; do
+    if [ -n "$candidate" ] && [ -f "$candidate/libGLMetalInject.dylib" ]; then build=$candidate; break; fi
+done
+if [ ! -f "$build/libGLMetalInject.dylib" ]; then
+    echo "glmetal-run: libGLMetalInject.dylib not found (make -C native/glmetal inject)" >&2
+    exit 69
+fi
+target=$1
+shift
+if [ -d "$target" ]; then
+    name=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$target/Contents/Info.plist")
+    target="$target/Contents/MacOS/$name"
+fi
+if codesign -dv "$target" 2>&1 | grep -q 'flags=.*runtime'; then
+    echo "glmetal-run: $target uses the hardened runtime; macOS may ignore the injection" >&2
+fi
+DYLD_INSERT_LIBRARIES="$build/libGLMetalInject.dylib${DYLD_INSERT_LIBRARIES:+:$DYLD_INSERT_LIBRARIES}" exec "$target" "$@"

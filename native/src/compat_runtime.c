@@ -524,9 +524,6 @@ struct guest_thread_context {
 };
 
 static _Thread_local uint32_t current_thread_token;
-/* Set only on threads the guest created; pthread_exit needs their cleanup. */
-static _Thread_local bool current_thread_is_guest;
-static _Thread_local uint32_t current_thread_owned_argument;
 /* pthread_t is a pointer even in i386. Public pthread_cleanup_push/pop
    macros access its cleanup-stack word at offset four. */
 static uint32_t allocate_thread_token(void) {
@@ -728,6 +725,16 @@ static struct guest_directory_entry *guest_directory_for_handle(uint32_t handle)
     if (index >= kGuestDirectoryCapacity) return NULL;
     struct guest_directory_entry *entry = &guest_directories[index];
     return entry->directory && entry->handle == handle ? entry : NULL;
+}
+
+/* Constant doubles exported as data. MW3 reads these through its imports;
+   AppKit reports the 10.9 release the game was linked against. */
+static bool guest_double_import(const char *name, double *value)
+{
+    if (!strcmp(name, "_kCFAbsoluteTimeIntervalSince1970")) *value = kCFAbsoluteTimeIntervalSince1970;
+    else if (!strcmp(name, "_NSAppKitVersionNumber")) *value = 1265.0;
+    else return false;
+    return true;
 }
 
 static uint32_t guest_standard_file_import(const char *name)
@@ -1524,8 +1531,9 @@ static int build_transition_bridge(void)
         }
         if (strcmp(current_image->imports[index].name, "_vm_page_size") == 0)
             data_cell[data_cells] = (uint32_t)vm_page_size;
-        if (strcmp(current_image->imports[index].name, "_kCFAbsoluteTimeIntervalSince1970") == 0)
-            memcpy(&data_cell[data_cells], &kCFAbsoluteTimeIntervalSince1970, sizeof(double));
+        double constant;
+        if (guest_double_import(current_image->imports[index].name, &constant))
+            memcpy(&data_cell[data_cells], &constant, sizeof(constant));
         uint32_t objc_pointer =
             objc_bridge32_pointer_import(current_image->imports[index].name);
         if (objc_pointer) data_cell[data_cells] = objc_pointer;
@@ -1557,14 +1565,14 @@ static int build_transition_bridge(void)
 static uint32_t guest_context_symbol(const char *name)
 {
     if (lp32_profile()->title != LP32_TITLE_COD4 && lp32_profile()->title != LP32_TITLE_COD4_MP &&
-        lp32_profile()->title != LP32_TITLE_MW2 && lp32_profile()->title != LP32_TITLE_MW2_MP) return 0;
+        !lp32_title_is_mw_sdl(lp32_profile()->title)) return 0;
     const uint8_t *entry = NULL;
     if (!strcmp(name, "_setjmp")) entry = lp32_context_setjmp;
     else if (!strcmp(name, "__setjmp")) entry = lp32_context_fast_setjmp;
     else if (!strcmp(name, "_sigsetjmp")) entry = lp32_context_sigsetjmp;
     else if (!strcmp(name, "_longjmp") || !strcmp(name, "_siglongjmp")) entry = lp32_context_longjmp;
     else if (!strcmp(name, "__longjmp")) entry = lp32_context_fast_longjmp;
-    else if ((lp32_profile()->title == LP32_TITLE_MW2 || lp32_profile()->title == LP32_TITLE_MW2_MP) &&
+    else if (lp32_title_is_mw_sdl(lp32_profile()->title) &&
              !getenv("LP32_NO_GUEST_LIBC")) {
         if (!strcmp(name, "_strcmp")) entry = lp32_context_strcmp;
         else if (!strcmp(name, "___tolower")) entry = lp32_context_tolower;
@@ -1612,7 +1620,9 @@ uint32_t compat_runtime32_resolve_symbol(const char *name, int data_hint)
     }
     uint32_t value = guest_standard_file_import(name);
     if (!value) value = objc_bridge32_pointer_import(name);
-    bool data = value || !strcmp(name, "_errno") ||
+    double constant;
+    bool is_double = guest_double_import(name, &constant);
+    bool data = value || is_double || !strcmp(name, "_errno") ||
         !strcmp(name, "_mach_task_self_") || !strcmp(name, "_vm_page_size") || !strcmp(name, "_environ") ||
         !strcmp(name, "___stack_chk_guard") || !strcmp(name, "___mb_cur_max") || !strcmp(name, "___CFConstantStringClassReference") ||
         !strcmp(name, "_kCFAllocatorDefault") || !strcmp(name, "_kIOMasterPortDefault") ||
@@ -1634,6 +1644,7 @@ uint32_t compat_runtime32_resolve_symbol(const char *name, int data_hint)
     if (!strcmp(name, "___stack_chk_guard")) value = UINT32_C(0x6b71329a);
     if (!strcmp(name, "___mb_cur_max")) value = (uint32_t)MB_CUR_MAX;
     *(uint32_t *)(uintptr_t)address = value;
+    if (is_double) memcpy((void *)(uintptr_t)address, &constant, sizeof(constant));
     if (!strcmp(name, "_errno")) guest_errno_address = address;
     return address;
 }
@@ -3100,13 +3111,17 @@ static uint64_t return_guest_double(double value)
 
 uint64_t compat_runtime32_return_double(double value) { return return_guest_double(value); }
 
+/* Set by the guest's pthread_exit, which leaves guest code like a trapped
+   import does; run_guest_thread then finishes the host thread normally. */
+static _Thread_local bool guest_thread_started, guest_thread_exiting;
+static _Thread_local uint32_t guest_thread_exit_value;
+
 static void *run_guest_thread(void *opaque)
 {
     struct guest_thread_context context = *(struct guest_thread_context *)opaque;
     free(opaque);
     current_thread_token = context.token;
-    current_thread_is_guest = true;
-    current_thread_owned_argument = lp32_profile()->thread_argument_is_direct ? 0 : context.argument;
+    guest_thread_started = true;
     if (getenv("LP32_TRACE_THREADS")) {
         uint64_t thread_id = 0;
         pthread_threadid_np(NULL, &thread_id);
@@ -3120,6 +3135,7 @@ static void *run_guest_thread(void *opaque)
                 record ? (const char *)(uintptr_t)(record + 8) : "");
     }
     uint32_t result = compat_runtime32_call(context.function, &context.argument, 1);
+    if (guest_thread_exiting) result = guest_thread_exit_value;
     if (getenv("LP32_TRACE_THREADS")) {
         uint64_t thread_id = 0;
         pthread_threadid_np(NULL, &thread_id);
@@ -3321,6 +3337,7 @@ static unsigned import_return_kind(const char *name)
         strcmp(name, "_CTFontGetBoundingRectsForGlyphs") == 0 ||
         strcmp(name, "_CTLineGetImageBounds") == 0 ||
         strcmp(name, "_CGDisplayBounds") == 0 ||
+        strcmp(name, "_CVDisplayLinkGetNominalOutputVideoRefreshPeriod") == 0 ||
         strcmp(name, "_objc_msgSend_stret") == 0) return kReturnStruct;
     /* Steam's user-ID call selects its ABI from the arguments and interface
        state. Cache only that it needs a dynamic check, never its result. */
@@ -3388,6 +3405,7 @@ int compat_runtime32_run_import_return_self_test(void)
         {"_CTFontGetBoundingRectsForGlyphs", kReturnStruct},
         {"_CTLineGetImageBounds", kReturnStruct},
         {"_CGDisplayBounds", kReturnStruct},
+        {"_CVDisplayLinkGetNominalOutputVideoRefreshPeriod", kReturnStruct},
         {"_objc_msgSend_stret", kReturnStruct},
         {"_glDrawRangeElements", kReturnOrdinary},
         {"_OSAtomicAdd32Barrier", kReturnOrdinary},
@@ -3795,6 +3813,27 @@ static void hot_mutex_report(void)
     memset(hot_mutexes, 0, sizeof(hot_mutexes));
 }
 
+/* MW2/MW3 hold the D3D device lock for microseconds at a time, while several
+   threads poll it. Blocking on every contended acquire turns each handoff
+   into a sleep and wakeup, which stalls the loading thread. Spin briefly
+   first. LP32_NO_MUTEX_SPIN disables it. */
+static int lock_with_brief_spin(pthread_mutex_t *mutex)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = lp32_title_is_mw_sdl(lp32_profile()->title) && !getenv("LP32_NO_MUTEX_SPIN");
+    if (enabled && pthread_mutex_trylock(mutex) != 0) {
+        uint64_t deadline = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + 16000;
+        do {
+            for (unsigned i = 0; i < 32; ++i) __builtin_ia32_pause();
+            if (pthread_mutex_trylock(mutex) == 0) return 0;
+        } while (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) < deadline);
+    } else if (enabled) {
+        return 0;
+    }
+    return pthread_mutex_lock(mutex);
+}
+
 static uint64_t fast_pthread_mutex_lock(const uint32_t *arguments,
                                         uint32_t return_address)
 {
@@ -3806,7 +3845,7 @@ static uint64_t fast_pthread_mutex_lock(const uint32_t *arguments,
         uint32_t slot = (arguments[0] >> 3) % 4096;
         uint64_t start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         bool contended = pthread_mutex_trylock(mutex) != 0;
-        int status = contended ? pthread_mutex_lock(mutex) : 0;
+        int status = contended ? lock_with_brief_spin(mutex) : 0;
         hot_mutexes[slot].mutex = arguments[0];
         ++hot_mutexes[slot].calls;
         if (contended) {
@@ -3825,7 +3864,7 @@ static uint64_t fast_pthread_mutex_lock(const uint32_t *arguments,
         if (now - last_report > 10000000000ull) { last_report = now; hot_mutex_report(); }
         return (uint32_t)status;
     }
-    int status = pthread_mutex_lock(mutex);
+    int status = lock_with_brief_spin(mutex);
     const struct lp32_render_pool *pool = lp32_profile()->render_pool;
     if (!pool) return (uint32_t)status;
     if (return_address == pool->return_address &&
@@ -4991,7 +5030,7 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
     if (import_is(name, "_strncasecmp")) return (uint32_t)strncasecmp((void *)(uintptr_t)arguments[0],(void *)(uintptr_t)arguments[1],arguments[2]);
     if (import_is(name, "_strcoll")) return (uint32_t)strcoll((void *)(uintptr_t)arguments[0],(void *)(uintptr_t)arguments[1]);
     if (import_is(name, "_strncat")) {strncat((void *)(uintptr_t)arguments[0],(void *)(uintptr_t)arguments[1],arguments[2]);return arguments[0];}
-    if (import_is(name, "_strlcpy")) return (uint32_t)strlcpy((void *)(uintptr_t)arguments[0],(void *)(uintptr_t)arguments[1],arguments[2]);
+    if (import_is(name, "_strlcpy") || import_is(name, "___strlcpy_chk")) return (uint32_t)strlcpy((void *)(uintptr_t)arguments[0],(void *)(uintptr_t)arguments[1],arguments[2]);
     if (import_is(name, "_strlcat")) return (uint32_t)strlcat((void *)(uintptr_t)arguments[0],(void *)(uintptr_t)arguments[1],arguments[2]);
     if (import_is(name, "_strnlen")) return (uint32_t)strnlen((void *)(uintptr_t)arguments[0],arguments[1]);
     if (import_is(name, "_strtol") || import_is(name, "_strtoll") ||
@@ -5470,7 +5509,7 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
     if (import_is(name, "_rmdir")) {
         return (uint32_t)rmdir((const char *)(uintptr_t)arguments[0]);
     }
-    if (import_is(name, "_atoi")) {
+    if (import_is(name, "_atoi") || import_is(name, "_atol")) {
         return (uint32_t)atoi((const char *)(uintptr_t)arguments[0]);
     }
     if (import_is(name, "___maskrune")) {
@@ -5695,6 +5734,14 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
         }
         return value;
     }
+    /* Mach semaphores are 32-bit port names on both sides. */
+    if (import_is(name, "_semaphore_create"))
+        return (uint32_t)semaphore_create((task_t)arguments[0], (semaphore_t *)(uintptr_t)arguments[1],
+                                          (int)arguments[2], (int)arguments[3]);
+    if (import_is(name, "_semaphore_destroy"))
+        return (uint32_t)semaphore_destroy((task_t)arguments[0], (semaphore_t)arguments[1]);
+    if (import_is(name, "_semaphore_signal")) return (uint32_t)semaphore_signal((semaphore_t)arguments[0]);
+    if (import_is(name, "_semaphore_wait")) return (uint32_t)semaphore_wait((semaphore_t)arguments[0]);
     if (import_is(name, "_mach_timebase_info")) {
         mach_timebase_info_data_t host_info;
         kern_return_t result = mach_timebase_info(&host_info);
@@ -5909,6 +5956,14 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
         if (status && status!=ETIMEDOUT) abort();
         return 0;
     }
+    /* Mach semaphores are 32-bit port names on both sides. */
+    if (import_is(name, "_semaphore_create"))
+        return (uint32_t)semaphore_create((task_t)arguments[0], (semaphore_t *)(uintptr_t)arguments[1],
+                                          (int)arguments[2], (int)arguments[3]);
+    if (import_is(name, "_semaphore_destroy"))
+        return (uint32_t)semaphore_destroy((task_t)arguments[0], (semaphore_t)arguments[1]);
+    if (import_is(name, "_semaphore_signal")) return (uint32_t)semaphore_signal((semaphore_t)arguments[0]);
+    if (import_is(name, "_semaphore_wait")) return (uint32_t)semaphore_wait((semaphore_t)arguments[0]);
     if (import_is(name, "_mmap")) {
         off_t offset=(off_t)((uint64_t)arguments[5]|(uint64_t)arguments[6]<<32);
         return guest_arena_mmap(arguments[0],arguments[1],(int)arguments[2],(int)arguments[3],
@@ -6021,13 +6076,11 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
         }
         return (uint32_t)status;
     }
-    /* MW2's _endthreadex reaches ExitThread -> pthread_exit when a worker
-       finishes. Do run_guest_thread's cleanup, then end the host thread. */
-    if (import_is(name, "_pthread_exit") && current_thread_is_guest) {
-        if (current_thread_owned_argument) guest_deallocate(current_thread_owned_argument);
-        current_thread_owned_argument = 0;
-        thread_finished(current_thread_token, false);
-        pthread_exit((void *)(uintptr_t)arguments[0]);
+    if (import_is(name, "_pthread_exit") && guest_thread_started) {
+        guest_thread_exiting = true;
+        guest_thread_exit_value = arguments[0];
+        lp32_leave_guest = 1;
+        return 0;
     }
     if (import_is(name, "_pthread_create") || import_is(name, "_pthread_create_suspended_np")) {
         pthread_attr_t native_attr, *attr = NULL;
@@ -6321,6 +6374,20 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
             case UINT32_C(0x73797331): value = 10; break; /* sys1: major */
             case UINT32_C(0x73797332): value = 7; break;  /* sys2: minor */
             case UINT32_C(0x73797333): value = 5; break;  /* sys3: bugfix */
+            case UINT32_C(0x72616d6d): /* ramm: physical RAM in MiB */
+            case UINT32_C(0x72616d20): /* ram : physical RAM in bytes */
+            case UINT32_C(0x6c72616d): { /* lram: logical RAM in bytes */
+                if (lp32_profile()->title != LP32_TITLE_MW3) return (uint32_t)-5551;
+                uint64_t memory_bytes = 0;
+                size_t memory_size = sizeof(memory_bytes);
+                if (sysctlbyname("hw.memsize", &memory_bytes, &memory_size, NULL, 0) != 0 ||
+                    memory_size != sizeof(memory_bytes) || !memory_bytes)
+                    return (uint32_t)-5551;
+                uint64_t scaled = arguments[0] == UINT32_C(0x72616d6d) ?
+                    memory_bytes >> 20 : memory_bytes;
+                value = (int32_t)(scaled > INT_MAX ? INT_MAX : scaled);
+                break;
+            }
             default: return (uint32_t)-5551;              /* gestaltUndefSelectorErr */
         }
         if (response) *response = value;

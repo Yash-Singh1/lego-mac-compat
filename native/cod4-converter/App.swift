@@ -55,11 +55,11 @@ final class DropView: NSView {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var window: NSWindow!
     private let drop = DropView()
-    private let status = label("Drop Call of Duty 4 here", size: 20, weight: .semibold)
-    private let detail = label("Drop a 32-bit Mac COD4 app or its game folder.\nSteam is optional; other releases are experimental.", size: 13)
+    private let status = label("Drop \(GameTitle.current.title) here", size: 20, weight: .semibold)
+    private let detail = label("Drop a 32-bit Mac \(GameTitle.current.short) app or its game folder.\nSteam is optional; other releases are experimental.", size: 13)
     private let footnote = label("Creates a new copy. Your original game and saves stay untouched.", size: 11)
     private let progress = NSProgressIndicator()
-    private let choose = NSButton(title: "Choose Call of Duty 4…", target: nil, action: #selector(chooseSource))
+    private let choose = NSButton(title: "Choose \(GameTitle.current.title)…", target: nil, action: #selector(chooseSource))
     private let secondary = NSButton(title: "Cancel", target: nil, action: #selector(secondaryAction))
     private let mode = NSPopUpButton(frame: .zero, pullsDown: false)
     private let findSteam = NSButton(title: "Find in Steam", target: nil, action: #selector(findInSteam))
@@ -79,10 +79,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return
         }
         let appMenu = NSMenu()
-        appMenu.addItem(withTitle: "About COD4 Converter", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        appMenu.addItem(withTitle: "About \(GameTitle.current.short) Converter", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
         appMenu.addItem(.separator())
-        appMenu.addItem(withTitle: "Hide COD4 Converter", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
-        appMenu.addItem(withTitle: "Quit COD4 Converter", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appMenu.addItem(withTitle: "Hide \(GameTitle.current.short) Converter", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        appMenu.addItem(withTitle: "Quit \(GameTitle.current.short) Converter", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         let root = NSMenu()
         let menuItem = NSMenuItem()
         menuItem.submenu = appMenu
@@ -91,12 +91,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 580, height: 440),
                           styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
-        window.title = "COD4 Converter"
+        window.title = "\(GameTitle.current.short) Converter"
         window.isReleasedWhenClosed = false
         window.delegate = self
         window.center()
         let content = window.contentView!
-        let title = label("Call of Duty 4, on modern macOS.", size: 23, weight: .bold)
+        let title = label("\(GameTitle.current.title), on modern macOS.", size: 23, weight: .bold)
         let subtitle = label("Drop in your game. Get a version for modern macOS.", size: 13)
         subtitle.textColor = .secondaryLabelColor
         detail.textColor = .secondaryLabelColor
@@ -161,19 +161,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let configuration = NSWorkspace.OpenConfiguration()
             configuration.createsNewApplicationInstance = true
             NSWorkspace.shared.openApplication(at: result, configuration: configuration) { _, error in
-                if let error { DispatchQueue.main.async { self.showError(error, title: "Couldn’t open Call of Duty 4") } }
+                if let error { DispatchQueue.main.async { self.showError(error, title: "Couldn’t open \(GameTitle.current.title)") } }
             }
             return
         }
         choosing = true
         let panel = NSOpenPanel()
-        panel.message = "Choose a 32-bit Mac Call of Duty 4 app or its game folder."
+        panel.message = "Choose a 32-bit Mac \(GameTitle.current.title) app or its game folder."
         panel.prompt = "Choose Game"
         panel.allowedContentTypes = [.applicationBundle, .folder]
         panel.treatsFilePackagesAsDirectories = false
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
-        if let app = COD4Source.steamInstallation() {
+        if let app = GameTitle.current.steamInstallation(mode: GameMode.allCases[mode.indexOfSelectedItem]) {
             panel.directoryURL = app.deletingLastPathComponent()
         }
         panel.beginSheetModal(for: window) { response in
@@ -184,8 +184,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc private func findInSteam() {
         guard converter == nil, !choosing else { return }
-        guard let source = COD4Source.steamInstallation() else {
-            showError(ConversionError.message("The Steam Mac installation was not found. Choose the game manually, or let Steam finish installing Call of Duty 4."), title: "Call of Duty 4 wasn’t found")
+        guard let source = GameTitle.current.steamInstallation(mode: GameMode.allCases[mode.indexOfSelectedItem]) else {
+            showError(ConversionError.message("The Steam Mac installation was not found. Choose the game manually, or let Steam finish installing \(GameTitle.current.title)."), title: "\(GameTitle.current.title) wasn’t found")
             return
         }
         selectDestination(for: source)
@@ -195,18 +195,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         result = nil
         another.isHidden = true
         secondary.isHidden = true
-        choose.title = "Choose Call of Duty 4…"
-        status.stringValue = "Drop Call of Duty 4 here"
+        choose.title = "Choose \(GameTitle.current.title)…"
+        status.stringValue = "Drop \(GameTitle.current.title) here"
         detail.stringValue = "Choose Campaign or Multiplayer, then drop the Mac app or its game folder."
     }
 
     private func selectDestination(for source: URL) {
         guard converter == nil, !choosing else { NSSound.beep(); return }
-        do { _ = try COD4Source.discover(source, mode: GameMode.allCases[mode.indexOfSelectedItem]) }
+        do { _ = try GameTitle.current.discover(source, mode: GameMode.allCases[mode.indexOfSelectedItem]) }
         catch { showError(error); return }
         choosing = true
         let panel = NSOpenPanel()
-        panel.message = "Choose where to save your converted Call of Duty 4 app."
+        panel.message = "Choose where to save your converted \(GameTitle.current.title) app."
         panel.prompt = "Create App Here"
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
@@ -221,7 +221,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func start(_ source: URL, _ destination: URL) {
         result = nil
-        choose.title = "Choose Call of Duty 4…"
+        choose.title = "Choose \(GameTitle.current.title)…"
         choose.isEnabled = false
         mode.isEnabled = false
         findSteam.isEnabled = false
@@ -261,17 +261,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         case .success(let url):
             result = url
             another.isHidden = false
-            status.stringValue = "Your Call of Duty 4 app is ready."
+            status.stringValue = "Your \(GameTitle.current.title) app is ready."
             detail.stringValue = "Open Steam before launching.\n" + url.path
             choose.title = "Open Game"
             secondary.title = "Show in Finder"
             secondary.isHidden = false
         case .failure(ConversionError.cancelled):
-            status.stringValue = "Drop Call of Duty 4 here"
+            status.stringValue = "Drop \(GameTitle.current.title) here"
             detail.stringValue = "Conversion cancelled. You can try again whenever you're ready."
         case .failure(let error):
             status.stringValue = "Let’s try that again."
-            detail.stringValue = "Drop Call of Duty 4 here, or choose it below."
+            detail.stringValue = "Drop \(GameTitle.current.title) here, or choose it below."
             if !quitting { showError(error) }
         }
         if quitting { NSApp.reply(toApplicationShouldTerminate: true) }
@@ -288,7 +288,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
-    private func showError(_ error: Error, title: String = "Couldn’t finish converting Call of Duty 4") {
+    private func showError(_ error: Error, title: String = "Couldn’t finish converting \(GameTitle.current.title)") {
         let alert = NSAlert()
         alert.messageText = title
         alert.informativeText = error.localizedDescription

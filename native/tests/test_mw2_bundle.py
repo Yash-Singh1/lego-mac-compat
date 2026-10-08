@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MW2 mode selection, pending Steam downloads and MW1/source preservation."""
+"""MW2/MW3 mode selection, pending Steam downloads and MW1/source preservation."""
 import plistlib
 from pathlib import Path
 import sys
@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
 import bundle_mw2 as mw2
+import package_glmetal as metal
 
 
 def image(cpu=7):
@@ -27,15 +28,15 @@ class MW2BundleTests(unittest.TestCase):
         (self.data / 'main').mkdir(parents=True)
         (self.data / 'main/iw_00.iwd').write_bytes(b'original assets')
 
-    def fixture(self, mode='sp', state=4):
-        name, _, appid = mw2.MODES[mode]
+    def fixture(self, mode='sp', state=4, game='mw2'):
+        name, _, appid = mw2.GAMES[game][2][mode]
         app = self.install / (name + '.app')
         macos = app / 'Contents/MacOS'
         macos.mkdir(parents=True)
         (app / 'Contents/Resources').mkdir()
         (macos / name).write_bytes(b'launcher must not be used')
         (macos / (name + 'sub')).write_bytes(image())
-        for lib in mw2.LIBRARIES:
+        for lib in mw2.libraries(game, mode):
             (macos / lib).write_bytes(image())
         (macos / 'libsteam_api.dylib').write_bytes(image(0x01000007))
         (app / 'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleExecutable': name}))
@@ -54,6 +55,32 @@ class MW2BundleTests(unittest.TestCase):
             self.assertEqual(mw2.validate_source(self.install, mode)[0], app)
             with self.assertRaisesRegex(ValueError, 'Choose the original'):
                 mw2.validate_source(app, 'mp' if mode == 'sp' else 'sp')
+
+    def test_mw3_modes_are_separate_from_mw2(self):
+        mw2_app = self.fixture('sp')
+        for mode in mw2.MODES:
+            app = self.fixture(mode, game='mw3')
+            self.assertEqual(mw2.steam_source(mode, self.steam, game='mw3'), app)
+            source, executable, data, _ = mw2.validate_source(app, mode, 'mw3')
+            self.assertEqual(executable.name, mw2.GAMES['mw3'][2][mode][0] + 'sub')
+            self.assertEqual(data, self.data)
+            with self.assertRaisesRegex(ValueError, 'Choose the original MW2'):
+                mw2.validate_source(app, mode, 'mw2')
+        with self.assertRaisesRegex(ValueError, 'Choose the original MW3'):
+            mw2.validate_source(mw2_app, 'sp', 'mw3')
+        self.assertEqual(mw2.steam_source('sp', self.steam), mw2_app)
+        (self.steam / 'steamapps/appmanifest_42690.acf').write_text(
+            f'"StateFlags" "68" "installdir" "{self.install.name}"')
+        with self.assertRaisesRegex(ValueError, 'MW3 is still downloading'):
+            mw2.steam_source('mp', self.steam, game='mw3')
+        # MW3 multiplayer links Bink 2; the Bink 1 library is not required.
+        (self.steam / 'steamapps/appmanifest_42690.acf').write_text(
+            f'"StateFlags" "4" "installdir" "{self.install.name}"')
+        mp = self.install / 'COD_MW3_MP.app/Contents/MacOS'
+        self.assertFalse((mp / 'libBinkMacx86.dylib').exists())
+        (mp / 'libBink2Macx86.dylib').unlink()
+        with self.assertRaisesRegex(ValueError, 'libBink2Macx86'):
+            mw2.validate_source(mp.parent.parent, 'mp', 'mw3')
 
     def test_external_library(self):
         app = self.fixture()
@@ -123,7 +150,7 @@ class MW2BundleTests(unittest.TestCase):
         loader.write_bytes(b'loader')
         output = self.root / 'MW2-Compat.app'
         before = {p.relative_to(self.install): p.read_bytes() for p in self.install.rglob('*') if p.is_file()}
-        with patch.object(mw2, 'ditto', side_effect=RuntimeError('copy failed')):
+        with patch.object(metal, 'validate'), patch.object(mw2, 'ditto', side_effect=RuntimeError('copy failed')):
             with self.assertRaisesRegex(RuntimeError, 'copy failed'):
                 mw2.build(app, 'sp', loader, output)
         self.assertFalse(output.exists())

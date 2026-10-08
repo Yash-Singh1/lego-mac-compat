@@ -25,7 +25,17 @@ enum lp32_title {
     LP32_TITLE_COD4_MP,
     LP32_TITLE_MW2,
     LP32_TITLE_MW2_MP,
+    LP32_TITLE_MW3,
+    LP32_TITLE_MW3_MP,
 };
+
+/* Aspyr's SDL-based ports of MW2 and MW3 share one engine family and
+   runtime (Miles/Bink guest libraries, core-profile GL, SDL event pump). */
+static inline int lp32_title_is_mw_sdl(enum lp32_title title)
+{
+    return title == LP32_TITLE_MW2 || title == LP32_TITLE_MW2_MP ||
+           title == LP32_TITLE_MW3 || title == LP32_TITLE_MW3_MP;
+}
 
 /* Splash-dismiss repeat latch (see game_loader.c). */
 struct lp32_startup_latch_patch {
@@ -220,6 +230,7 @@ struct lp32_game_profile {
     /* NuSound streamer render callback (diagnostics only: lets the audio
        bridge read the stream's refill-request ring). 0 = unknown. */
     uint32_t stream_input_callback;
+    uint8_t prefers_lp32gl;         /* default to LP32GL over Apple's OpenGL (gl_backend.h) */
 };
 
 /* Chooses the profile for a loaded image (LP32_GAME overrides detection).

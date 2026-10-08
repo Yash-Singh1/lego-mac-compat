@@ -4,6 +4,8 @@
 #include <errno.h>
 #include <netdb.h>
 #include <poll.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <pthread.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -45,7 +47,71 @@ static uint32_t guest_gethostbyname(const char *name) {
     resolver_storage=storage;return storage;
 }
 
+/* Darwin's i386 addrinfo keeps the host field order with 32-bit pointers. */
+struct guest_addrinfo { int32_t flags, family, socktype, protocol; uint32_t addrlen, canonname, addr, next; };
+_Static_assert(sizeof(struct guest_addrinfo)==32,"i386 addrinfo");
+
+static void guest_freeaddrinfo(uint32_t list) {
+    while(list) { uint32_t next=((struct guest_addrinfo *)(uintptr_t)list)->next;compat_runtime32_deallocate(list);list=next; }
+}
+
+/* Each result node, its address and its canonical name share one guest block. */
+static int guest_getaddrinfo(const char *node,const char *service,const struct guest_addrinfo *guest_hints,uint32_t *result) {
+    if (!result) return EAI_FAIL;
+    *result=0;
+    struct addrinfo hints={0},*host=NULL;
+    if(guest_hints) { hints.ai_flags=guest_hints->flags;hints.ai_family=guest_hints->family;hints.ai_socktype=guest_hints->socktype;hints.ai_protocol=guest_hints->protocol; }
+    int status=getaddrinfo(node,service,guest_hints?&hints:NULL,&host);
+    if(status)return status;
+    uint32_t head=0,*link=&head;
+    for(struct addrinfo *entry=host;entry;entry=entry->ai_next) {
+        size_t name=entry->ai_canonname?strlen(entry->ai_canonname)+1:0;
+        uint32_t block=compat_runtime32_allocate(sizeof(struct guest_addrinfo)+entry->ai_addrlen+name,1);
+        if(!block) { guest_freeaddrinfo(head);freeaddrinfo(host);return EAI_MEMORY; }
+        struct guest_addrinfo *copy=(void *)(uintptr_t)block;
+        *copy=(struct guest_addrinfo){entry->ai_flags,entry->ai_family,entry->ai_socktype,entry->ai_protocol,entry->ai_addrlen,0,0,0};
+        uint32_t cursor=block+sizeof(*copy);
+        if(entry->ai_addr) { memcpy((void *)(uintptr_t)cursor,entry->ai_addr,entry->ai_addrlen);copy->addr=cursor;cursor+=entry->ai_addrlen; }
+        if(name) { memcpy((void *)(uintptr_t)cursor,entry->ai_canonname,name);copy->canonname=cursor; }
+        *link=block;link=&copy->next;
+    }
+    freeaddrinfo(host);*result=head;return 0;
+}
+
+static int socket_bridge32_dispatch_body(const char *name,const uint32_t *a,uint64_t *out);
+
+/* LP32_TRACE_SOCKETS[=lines]: lookups, connects and packets with results. */
+static void trace_socket_call(const char *name,const uint32_t *a,uint64_t result,int error) {
+    static long limit=-1;static long lines;
+    if(limit<0){const char *v=getenv("LP32_TRACE_SOCKETS");limit=v?(atol(v)>0?atol(v):300):0;}
+    /* Nonblocking polls that found nothing are not logged. */
+    if(lines>=limit || ((int32_t)result==-1 && error==EAGAIN) || !strcmp(name,"_select"))return;
+    ++lines;
+    char detail[128]="";
+    if(!strcmp(name,"_gethostbyname") || !strcmp(name,"_getaddrinfo") || !strcmp(name,"_inet_addr"))
+        snprintf(detail,sizeof(detail)," host=%.80s",a[0]?(const char *)(uintptr_t)a[0]:"(null)");
+    else if((!strcmp(name,"_connect") || !strcmp(name,"_sendto") || !strcmp(name,"_bind")) && a[!strcmp(name,"_sendto")?4:1]) {
+        const struct sockaddr_in *address=(const void *)(uintptr_t)a[!strcmp(name,"_sendto")?4:1];
+        if(address->sin_family==AF_INET)
+            snprintf(detail,sizeof(detail)," to=%s:%u",inet_ntoa(address->sin_addr),ntohs(address->sin_port));
+    }
+    if((!strcmp(name,"_send") || !strcmp(name,"_recv")) && (int32_t)result>0 && a[1]) {
+        const unsigned char *bytes=(const void *)(uintptr_t)a[1];
+        size_t used=strlen(detail);
+        for(int32_t i=0;i<(int32_t)result && i<24 && used+3<sizeof(detail);++i,used+=2)
+            snprintf(detail+used,sizeof(detail)-used,i?"%02x":" data=%02x",bytes[i]),used+=(i?0:6);
+    }
+    fprintf(stderr,"compat32: socket %s(%08x,%08x,%08x) -> %lld errno=%d%s\n",name,a[0],a[1],a[2],
+            (long long)(int32_t)result,error,detail);
+}
+
 int socket_bridge32_dispatch(const char *name,const uint32_t *a,uint64_t *out) {
+    int handled=socket_bridge32_dispatch_body(name,a,out);
+    if(handled)trace_socket_call(name,a,*out,errno);
+    return handled;
+}
+
+static int socket_bridge32_dispatch_body(const char *name,const uint32_t *a,uint64_t *out) {
 #define IS(s) (!strcmp(name,s))
 #define P(i) ((void *)(uintptr_t)a[i])
     int result;
@@ -57,6 +123,8 @@ int socket_bridge32_dispatch(const char *name,const uint32_t *a,uint64_t *out) {
     else if(IS("_sendto")) result=(int)sendto((int)a[0],P(1),a[2],(int)a[3],P(4),(socklen_t)a[5]);
     else if(IS("_recvfrom")) result=(int)recvfrom((int)a[0],P(1),a[2],(int)a[3],P(4),P(5));
     else if(IS("_getsockname")) result=getsockname((int)a[0],P(1),P(2));
+    else if(IS("_getaddrinfo")) { *out=(uint32_t)guest_getaddrinfo(P(0),P(1),P(2),P(3));return 1; }
+    else if(IS("_freeaddrinfo")) { guest_freeaddrinfo(a[0]);*out=0;return 1; }
     else if(IS("_gethostname")) result=gethostname(P(0),a[1]);
     else if(IS("_inet_addr")) { *out=inet_addr(P(0));return 1; }
     else if(IS("_inet_ntoa")) {

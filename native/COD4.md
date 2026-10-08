@@ -51,6 +51,44 @@ capture, so its cause has not been established.
 
 ## Converter app
 
+The converters now package GLMetal and its native shader compiler. Build all
+three standalone apps with `make -C native cod-converters`, or use
+`cod4-converter`, `mw2-converter`, or `mw3-converter` for one title. The output
+apps are `native/build/COD4-Converter.app`, `MW2-Converter.app`, and
+`MW3-Converter.app`. Each supports campaign and multiplayer.
+
+Each build asks `native/glmetal` to rebuild its `lib` target, then copies and
+signs the resulting driver and compiler. `GLMETAL_SOURCE` can select another
+GLMetal checkout. The converters keep that build inside the app and copy it
+into every converted game. They do not fetch updates at conversion time.
+Rebuild the converter after changing GLMetal; previously converted games
+keep their existing driver until updated or converted again.
+
+Generated apps use GLMetal both from Finder and when their executable is run
+directly. `LP32_GL_BACKEND=apple` remains an explicit command-line override.
+Driver build hashes are recorded in `Contents/Resources/GLMetal-build-info.json`.
+The converter verifies its packaged files before copying game data.
+
+The command-line bundle targets use the same driver packaging for
+`GAME=cod4`, `cod4mp`, `mw2`, `mw2mp`, `mw3`, and `mw3mp`. Direct use of
+`tools/bundle_cod4.py` or `tools/bundle_mw2.py` accepts `--glmetal` for a directory
+containing an already built driver and compiler. The MW script accepts
+`--game mw2` or `--game mw3`.
+
+Packaging verification without launching games:
+
+```sh
+make -C native test-cod4-converter test-game-profile
+python3 native/tests/test_glmetal_packaging.py
+python3 native/tests/test_mw2_bundle.py
+python3 native/tests/test_cod_converters_packaging.py --runtime /path/to/verified/compat-runtime
+```
+
+The last test converts small fixtures through all six campaign/multiplayer
+paths using relocated converter apps, checks signatures and driver hashes,
+and checks that the sources are unchanged. It uses an existing COD4 runtime
+and does not download one or run graphics workloads.
+
 Build the standalone converter with `make -C native cod4-converter` from the
 repository root. Open `native/build/COD4-Converter.app` and select **Campaign**
 or **Multiplayer**. Click **Find in Steam**, choose the game manually, or drag

@@ -1,0 +1,85 @@
+--- a/external/openglcts/modules/common/glcPackedDepthStencilTests.cpp
++++ b/external/openglcts/modules/common/glcPackedDepthStencilTests.cpp
+@@ -1362,6 +1362,13 @@
+     const glu::RenderContext &renderContext = m_context.getRenderContext();
+     const glw::Functions &gl                = renderContext.getFunctions();
+     bool isContextES                        = glu::isContextTypeES(renderContext.getType());
++    auto expectError = [&](GLenum expected, int line) {
++        GLenum actual = gl.getError();
++        if (actual != expected)
++            m_testCtx.getLog() << tcu::TestLog::Message << "Error check line " << line
++                              << ": got " << actual << ", expected " << expected << tcu::TestLog::EndMessage;
++        return actual == expected;
++    };
+ 
+     if (isContextES)
+     {
+@@ -1374,7 +1381,7 @@
+             !((GL_NO_ERROR == error) && m_context.getContextInfo().isExtensionSupported("GL_NV_read_depth_stencil")))
+         {
+             gl.readPixels(0, 0, TEX_SIZE, TEX_SIZE, GL_DEPTH_STENCIL, m_typeFormat.type, &data[0]);
+-            if (gl.getError() != GL_INVALID_OPERATION)
++            if (!expectError(GL_INVALID_OPERATION, __LINE__))
+                 result = false;
+         }
+ 
+@@ -1390,7 +1397,7 @@
+         for (unsigned int i = 0; i < m_nonDepthStencilTypesCount; i++)
+         {
+             gl.readPixels(0, 0, TEX_SIZE, TEX_SIZE, GL_DEPTH_STENCIL, m_nonDepthStencilTypes[i], &data[0]);
+-            if (gl.getError() != GL_INVALID_ENUM)
++            if (!expectError(GL_INVALID_ENUM, __LINE__))
+                 result = false;
+         }
+ 
+@@ -1398,7 +1405,7 @@
+         {
+             gl.readPixels(0, 0, TEX_SIZE, TEX_SIZE, m_nonDepthStencilFormats[i], m_typeFormat.type, &data[0]);
+ 
+-            if (gl.getError() != GL_INVALID_OPERATION)
++            if (!expectError(GL_INVALID_OPERATION, __LINE__))
+                 result = false;
+         }
+ 
+@@ -1418,7 +1425,7 @@
+             gl.framebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texColor, 0);
+ 
+             gl.readPixels(0, 0, TEX_SIZE, TEX_SIZE, GL_DEPTH_STENCIL, m_typeFormat.type, &data[0]);
+-            if (gl.getError() != GL_INVALID_OPERATION)
++            if (!expectError(GL_INVALID_OPERATION, __LINE__))
+                 result = false;
+ 
+             gl.bindFramebuffer(GL_FRAMEBUFFER, m_defaultFBO);
+@@ -1439,12 +1446,12 @@
+             {
+                 gl.getTexImage(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT, &data[0]);
+ 
+-                if (gl.getError() != GL_INVALID_OPERATION)
++                if (!expectError(GL_INVALID_OPERATION, __LINE__))
+                     result = false;
+             }
+ 
+             gl.getTexImage(GL_TEXTURE_2D, 0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, &data[0]);
+-            if (gl.getError() != GL_INVALID_OPERATION)
++            if (!expectError(GL_INVALID_OPERATION, __LINE__))
+                 result = false;
+ 
+             gl.deleteTextures(1, &texColor);
+@@ -1505,7 +1512,7 @@
+                 // for this specific case.
+                 gl.getError();
+             }
+-            else if (gl.getError() != expectedError)
++            else if (!expectError(expectedError, __LINE__))
+                 result = false;
+ 
+             gl.bindTexture(GL_TEXTURE_2D, 0);
+@@ -1549,7 +1556,7 @@
+         if ((GL_INVALID_OPERATION != error) && (GL_INVALID_ENUM != error))
+         {
+             gl.copyTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_STENCIL, 0, 0, TEX_SIZE, TEX_SIZE, 0);
+-            if (gl.getError() != GL_INVALID_OPERATION)
++            if (!expectError(GL_INVALID_OPERATION, __LINE__))
+                 result = false;
+         }
+ 

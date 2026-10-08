@@ -1,0 +1,1352 @@
+# glGetIntegerv in a new context (RGBA8, depth 24, double-buffered, no drawable):
+# profile pname count values...  /  profile-cap pname settable-by-glEnable
+# profile-rb internalformat reported-internalformat red green blue alpha depth stencil (glRenderbufferStorage)
+# profile-tex internalformat: glGetTexLevelParameteriv internal-format, red green blue alpha luminance
+#   intensity depth stencil shared-exponent sizes, red green blue alpha luminance intensity depth types,
+#   compressed; then attached to a framebuffer (colour, depth or stencil by its sizes) the attachment's
+#   encoding, component type, red green blue alpha depth stencil sizes; x = GL error; then
+#   glCheckFramebufferStatus with it alone as colour 0, depth and stencil (draw/read buffers NONE)
+legacy 0b00 4 2147483647 2147483647 2147483647 2147483647
+legacy 0b01 1 1
+legacy 0b02 3 0 0 2147483647
+legacy 0b03 4 0 0 0 1
+legacy 0b04 4 2147483647 2147483647 2147483647 2147483647
+legacy 0b05 1 1
+legacy 0b06 4 0 0 0 1
+legacy 0b07 4 0 0 0 1
+legacy 0b08 1 1
+legacy 0b09 1 0
+legacy 0b10 1 0
+legacy 0b11 1 1
+legacy 0b12 2 1 64
+legacy 0b13 1 0
+legacy 0b20 1 0
+legacy 0b21 1 1
+legacy 0b22 2 1 16
+legacy 0b23 1 0
+legacy 0b24 1 0
+legacy 0b25 1 65535
+legacy 0b26 1 1
+legacy 0b30 1 0
+legacy 0b31 1 64
+legacy 0b32 1 0
+legacy 0b33 1 0
+legacy 0b40 2 6914 6914
+legacy 0b41 1 0
+legacy 0b42 1 0
+legacy 0b43 1 1
+legacy 0b44 1 0
+legacy 0b45 1 1029
+legacy 0b46 1 2305
+legacy 0b50 1 0
+legacy 0b51 1 0
+legacy 0b52 1 0
+legacy 0b53 4 429496735 429496735 429496735 2147483647
+legacy 0b54 1 7425
+legacy 0b55 1 1032
+legacy 0b56 1 5634
+legacy 0b57 1 0
+legacy 0b60 1 0
+legacy 0b61 1 0
+legacy 0b62 1 1
+legacy 0b63 1 0
+legacy 0b64 1 1
+legacy 0b65 1 2048
+legacy 0b66 4 0 0 0 0
+legacy 0b70 2 0 2147483647
+legacy 0b71 1 0
+legacy 0b72 1 1
+legacy 0b73 1 2147483647
+legacy 0b74 1 513
+legacy 0b80 4 0 0 0 0
+legacy 0b90 1 0
+legacy 0b91 1 0
+legacy 0b92 1 519
+legacy 0b93 1 -1
+legacy 0b94 1 7680
+legacy 0b95 1 7680
+legacy 0b96 1 7680
+legacy 0b97 1 0
+legacy 0b98 1 -1
+legacy 0ba0 1 5888
+legacy 0ba1 1 0
+legacy 0ba2 4 0 0 0 0
+legacy 0ba3 1 1
+legacy 0ba4 1 1
+legacy 0ba5 1 1
+legacy 0ba6 16 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1
+legacy 0ba7 16 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1
+legacy 0ba8 16 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1
+legacy 0bb0 1 0
+legacy 0bb1 1 0
+legacy 0bc0 1 0
+legacy 0bc1 1 519
+legacy 0bc2 1 0
+legacy 0bd0 1 1
+legacy 0be0 1 0
+legacy 0be1 1 1
+legacy 0be2 1 0
+legacy 0bf0 1 5379
+legacy 0bf1 1 0
+legacy 0bf2 1 0
+legacy 0c00 1 0
+legacy 0c01 1 0
+legacy 0c02 1 0
+legacy 0c10 4 0 0 0 0
+legacy 0c11 1 0
+legacy 0c20 1 0
+legacy 0c21 1 -1
+legacy 0c22 4 0 0 0 0
+legacy 0c23 4 1 1 1 1
+legacy 0c30 1 0
+legacy 0c31 1 1
+legacy 0c32 1 1
+legacy 0c33 1 0
+legacy 0c40 1 7168
+legacy 0c50 1 4352
+legacy 0c51 1 4352
+legacy 0c52 1 4352
+legacy 0c53 1 4352
+legacy 0c54 1 4352
+legacy 0c60 1 0
+legacy 0c61 1 0
+legacy 0c62 1 0
+legacy 0c63 1 0
+legacy 0cb0 1 1
+legacy 0cb1 1 1
+legacy 0cb2 1 1
+legacy 0cb3 1 1
+legacy 0cb4 1 1
+legacy 0cb5 1 1
+legacy 0cb6 1 1
+legacy 0cb7 1 1
+legacy 0cb8 1 1
+legacy 0cb9 1 1
+legacy 0cf0 1 0
+legacy 0cf1 1 0
+legacy 0cf2 1 0
+legacy 0cf3 1 0
+legacy 0cf4 1 0
+legacy 0cf5 1 4
+legacy 0d00 1 0
+legacy 0d01 1 0
+legacy 0d02 1 0
+legacy 0d03 1 0
+legacy 0d04 1 0
+legacy 0d05 1 4
+legacy 0d10 1 0
+legacy 0d11 1 0
+legacy 0d12 1 0
+legacy 0d13 1 0
+legacy 0d14 1 1
+legacy 0d15 1 0
+legacy 0d16 1 1
+legacy 0d17 1 1
+legacy 0d18 1 1
+legacy 0d19 1 0
+legacy 0d1a 1 1
+legacy 0d1b 1 0
+legacy 0d1c 1 1
+legacy 0d1d 1 0
+legacy 0d1e 1 1
+legacy 0d1f 1 0
+legacy 0d30 1 10
+legacy 0d31 1 8
+legacy 0d32 1 6
+legacy 0d33 1 16384
+legacy 0d34 1 256
+legacy 0d35 1 16
+legacy 0d36 1 32
+legacy 0d37 1 128
+legacy 0d38 1 10
+legacy 0d39 1 10
+legacy 0d3a 2 16384 16384
+legacy 0d3b 1 16
+legacy 0d50 1 4
+legacy 0d51 1 0
+legacy 0d52 1 8
+legacy 0d53 1 8
+legacy 0d54 1 8
+legacy 0d55 1 8
+legacy 0d56 1 32
+legacy 0d57 1 0
+legacy 0d58 1 0
+legacy 0d59 1 0
+legacy 0d5a 1 0
+legacy 0d5b 1 0
+legacy 0d70 1 0
+legacy 0d80 1 0
+legacy 0d90 1 0
+legacy 0d91 1 0
+legacy 0d92 1 0
+legacy 0d93 1 0
+legacy 0d94 1 0
+legacy 0d95 1 0
+legacy 0d96 1 0
+legacy 0d97 1 0
+legacy 0d98 1 0
+legacy 0db0 1 0
+legacy 0db1 1 0
+legacy 0db2 1 0
+legacy 0db3 1 0
+legacy 0db4 1 0
+legacy 0db5 1 0
+legacy 0db6 1 0
+legacy 0db7 1 0
+legacy 0db8 1 0
+legacy 0dd0 2 0 1
+legacy 0dd1 1 1
+legacy 0dd2 4 0 1 0 1
+legacy 0dd3 2 1 1
+legacy 0de0 1 0
+legacy 0de1 1 0
+legacy 0df1 1 0
+legacy 0df2 1 1536
+legacy 0df4 1 0
+legacy 1700 16 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1
+legacy 2a00 1 0
+legacy 2a01 1 0
+legacy 2a02 1 0
+legacy 3000 1 0
+legacy 3001 1 0
+legacy 3002 1 0
+legacy 3003 1 0
+legacy 3004 1 0
+legacy 3005 1 0
+legacy 4000 1 0
+legacy 4001 1 0
+legacy 4002 1 0
+legacy 4003 1 0
+legacy 4004 1 0
+legacy 4005 1 0
+legacy 4006 1 0
+legacy 4007 1 0
+legacy 8005 4 0 0 0 0
+legacy 8009 1 32774
+legacy 8010 1 0
+legacy 8011 1 0
+legacy 8012 1 0
+legacy 801c 1 1
+legacy 801d 1 1
+legacy 801e 1 1
+legacy 801f 1 1
+legacy 8020 1 0
+legacy 8021 1 0
+legacy 8022 1 0
+legacy 8023 1 0
+legacy 8024 1 0
+legacy 802e 1 0
+legacy 8037 1 0
+legacy 8038 1 0
+legacy 803a 1 0
+legacy 8068 1 0
+legacy 8069 1 0
+legacy 806a 1 0
+legacy 806b 1 0
+legacy 806c 1 0
+legacy 806d 1 0
+legacy 806e 1 0
+legacy 806f 1 0
+legacy 8073 1 2048
+legacy 8074 1 0
+legacy 8075 1 0
+legacy 8076 1 0
+legacy 8077 1 0
+legacy 8078 1 0
+legacy 8079 1 0
+legacy 807a 1 4
+legacy 807b 1 5126
+legacy 807c 1 0
+legacy 807e 1 5126
+legacy 807f 1 0
+legacy 8081 1 4
+legacy 8082 1 5126
+legacy 8083 1 0
+legacy 8085 1 5126
+legacy 8086 1 0
+legacy 8088 1 4
+legacy 8089 1 5126
+legacy 808a 1 0
+legacy 808c 1 0
+legacy 809d 1 1
+legacy 809e 1 0
+legacy 809f 1 0
+legacy 80a0 1 0
+legacy 80a8 1 0
+legacy 80a9 1 0
+legacy 80aa 1 1
+legacy 80ab 1 0
+legacy 80b1 16 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1
+legacy 80b2 1 1
+legacy 80b3 1 10
+legacy 80b4 1 1
+legacy 80b5 1 1
+legacy 80b6 1 1
+legacy 80b7 1 1
+legacy 80b8 1 0
+legacy 80b9 1 0
+legacy 80ba 1 0
+legacy 80bb 1 0
+legacy 80c8 1 0
+legacy 80c9 1 1
+legacy 80ca 1 0
+legacy 80cb 1 1
+legacy 80d0 1 0
+legacy 80d1 1 0
+legacy 80d2 1 0
+legacy 80e8 1 1048575
+legacy 80e9 1 150000
+legacy 80f0 1 4352
+legacy 8126 1 0
+legacy 8127 1 64
+legacy 8128 1 1
+legacy 8129 3 1 0 0
+legacy 8192 1 4352
+legacy 81a8 1 0
+legacy 81a9 1 0
+legacy 81f8 1 33273
+legacy 8406 3 0 0 1
+legacy 8450 1 33874
+legacy 8453 1 0
+legacy 8454 1 5126
+legacy 8455 1 0
+legacy 8457 1 0
+legacy 8458 1 0
+legacy 8459 4 0 0 0 2147483647
+legacy 845a 1 3
+legacy 845b 1 5126
+legacy 845c 1 0
+legacy 845e 1 0
+legacy 845f 4 0 0 0 2147483647
+legacy 846d 2 1 64
+legacy 846e 2 1 16
+legacy 84e0 1 33984
+legacy 84e1 1 33984
+legacy 84e2 1 8
+legacy 84e3 16 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1
+legacy 84e4 16 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1
+legacy 84e5 16 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1
+legacy 84e6 16 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1
+legacy 84e8 1 16384
+legacy 84ef 1 4352
+legacy 84f5 1 0
+legacy 84f6 1 0
+legacy 84f8 1 16384
+legacy 84fd 1 16
+legacy 84ff 1 16
+legacy 8504 1 128
+legacy 8505 1 128
+legacy 850a 16 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1
+legacy 8513 1 0
+legacy 8514 1 0
+legacy 851c 1 16384
+legacy 851d 1 0
+legacy 851e 1 0
+legacy 851f 1 34228
+legacy 8520 1 0
+legacy 8534 1 4352
+legacy 855a 1 34140
+legacy 85b0 1 0
+legacy 85b1 1 4352
+legacy 85b2 1 0
+legacy 85b5 1 0
+legacy 8620 1 0
+legacy 862e 1 2
+legacy 862f 1 8
+legacy 8640 1 1
+legacy 8641 16 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1
+legacy 8642 1 0
+legacy 8643 1 0
+legacy 864b 1 -1
+legacy 864f 1 0
+legacy 86a2 1 3
+legacy 86a3 3 33776 33778 33779
+legacy 86a4 1 4
+legacy 86a5 1 1
+legacy 86a6 1 0
+legacy 86a7 1 0
+legacy 86a8 4 2147483647 0 0 0
+legacy 86a9 1 5126
+legacy 86aa 1 0
+legacy 86ab 1 1
+legacy 86ad 1 0
+legacy 8722 16 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1
+legacy 8723 16 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1
+legacy 8800 1 519
+legacy 8801 1 7680
+legacy 8802 1 7680
+legacy 8803 1 7680
+legacy 8804 1 0
+legacy 8820 1 0
+legacy 8824 1 8
+legacy 8825 1 0
+legacy 8826 1 0
+legacy 8827 1 0
+legacy 8828 1 0
+legacy 8829 1 0
+legacy 882a 1 0
+legacy 882b 1 0
+legacy 882c 1 0
+legacy 882d 1 0
+legacy 882e 1 0
+legacy 882f 1 0
+legacy 8830 1 0
+legacy 8831 1 0
+legacy 8832 1 0
+legacy 8833 1 0
+legacy 8834 1 0
+legacy 883d 1 32774
+legacy 884f 1 0
+legacy 8861 1 0
+legacy 8863 1 0
+legacy 8869 1 16
+legacy 8871 1 8
+legacy 8872 1 16
+legacy 8890 1 0
+legacy 8891 2 0 1
+legacy 8894 1 0
+legacy 8895 1 0
+legacy 8896 1 0
+legacy 8897 1 0
+legacy 8898 1 0
+legacy 8899 1 0
+legacy 889a 1 0
+legacy 889b 1 0
+legacy 889c 1 0
+legacy 889d 1 0
+legacy 889e 1 0
+legacy 88b7 16 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1
+legacy 88ed 1 0
+legacy 88ef 1 0
+legacy 88ff 1 2048
+legacy 8904 1 -8
+legacy 8905 1 7
+legacy 8910 1 0
+legacy 8911 1 1028
+legacy 891a 1 1
+legacy 891b 1 35101
+legacy 891c 1 35101
+legacy 898a 1 5126
+legacy 898b 1 0
+legacy 8a0c 1 0
+legacy 8a0d 1 5125
+legacy 8a0f 1 0
+legacy 8a10 2 1 1
+legacy 8a14 1 0
+legacy 8a15 1 0
+legacy 8a16 1 0
+legacy 8a17 1 0
+legacy 8a18 1 0
+legacy 8a26 1 0
+legacy 8a27 1 1
+legacy 8b49 1 4096
+legacy 8b4a 1 4096
+legacy 8b4b 1 124
+legacy 8b4c 1 16
+legacy 8b4d 1 16
+legacy 8b8b 1 4352
+legacy 8b8d 1 0
+legacy 8b9c 1 0
+legacy 8b9f 1 0
+legacy 8c1c 1 0
+legacy 8c1d 1 0
+legacy 8c29 1 16
+legacy 8c3c 4 0 0 0 0
+legacy 8c80 1 4
+legacy 8c89 1 0
+legacy 8c8a 1 64
+legacy 8c8b 1 4
+legacy 8c8f 1 0
+legacy 8ca0 1 36002
+legacy 8ca3 1 0
+legacy 8ca4 1 -1
+legacy 8ca5 1 -1
+legacy 8ca6 1 0
+legacy 8ca7 1 0
+legacy 8caa 1 0
+legacy 8cdf 1 8
+legacy 8d57 1 8
+legacy 8d9e 1 0
+legacy 8db9 1 0
+legacy 8dba 1 1
+legacy 8ddd 1 128
+legacy 8dde 1 64
+legacy 8ddf 1 4096
+legacy 8de0 1 1024
+legacy 8de1 1 1024
+legacy 8de2 1 16
+legacy 8de3 1 16
+legacy 8de4 1 16
+legacy 8ded 1 65536
+legacy 8def 1 0
+legacy 8e4c 1 0
+legacy 8e4f 1 36430
+legacy 9111 1 -1
+legacy-cap 0b10 1
+legacy-cap 0b20 1
+legacy-cap 0b24 1
+legacy-cap 0b41 1
+legacy-cap 0b42 1
+legacy-cap 0b44 1
+legacy-cap 0b50 1
+legacy-cap 0b57 1
+legacy-cap 0b60 1
+legacy-cap 0b71 1
+legacy-cap 0b90 1
+legacy-cap 0ba1 1
+legacy-cap 0bc0 1
+legacy-cap 0bd0 1
+legacy-cap 0be2 1
+legacy-cap 0bf1 1
+legacy-cap 0bf2 1
+legacy-cap 0c11 1
+legacy-cap 0c60 1
+legacy-cap 0c61 1
+legacy-cap 0c62 1
+legacy-cap 0c63 1
+legacy-cap 0d80 1
+legacy-cap 0d90 1
+legacy-cap 0d91 1
+legacy-cap 0d92 1
+legacy-cap 0d93 1
+legacy-cap 0d94 1
+legacy-cap 0d95 1
+legacy-cap 0d96 1
+legacy-cap 0d97 1
+legacy-cap 0d98 1
+legacy-cap 0db0 1
+legacy-cap 0db1 1
+legacy-cap 0db2 1
+legacy-cap 0db3 1
+legacy-cap 0db4 1
+legacy-cap 0db5 1
+legacy-cap 0db6 1
+legacy-cap 0db7 1
+legacy-cap 0db8 1
+legacy-cap 0de0 1
+legacy-cap 0de1 1
+legacy-cap 2a01 1
+legacy-cap 2a02 1
+legacy-cap 3000 1
+legacy-cap 3001 1
+legacy-cap 3002 1
+legacy-cap 3003 1
+legacy-cap 3004 1
+legacy-cap 3005 1
+legacy-cap 4000 1
+legacy-cap 4001 1
+legacy-cap 4002 1
+legacy-cap 4003 1
+legacy-cap 4004 1
+legacy-cap 4005 1
+legacy-cap 4006 1
+legacy-cap 4007 1
+legacy-cap 8010 1
+legacy-cap 8011 1
+legacy-cap 8012 1
+legacy-cap 8024 1
+legacy-cap 802e 1
+legacy-cap 8037 1
+legacy-cap 803a 1
+legacy-cap 806f 1
+legacy-cap 8074 0
+legacy-cap 8075 0
+legacy-cap 8076 0
+legacy-cap 8077 0
+legacy-cap 8078 0
+legacy-cap 8079 0
+legacy-cap 809d 1
+legacy-cap 809e 1
+legacy-cap 809f 1
+legacy-cap 80a0 1
+legacy-cap 80d0 1
+legacy-cap 80d1 1
+legacy-cap 80d2 1
+legacy-cap 8457 0
+legacy-cap 8458 1
+legacy-cap 845e 0
+legacy-cap 84f5 1
+legacy-cap 8513 1
+legacy-cap 851d 0
+legacy-cap 8620 1
+legacy-cap 8642 1
+legacy-cap 8643 1
+legacy-cap 864f 1
+legacy-cap 86a6 1
+legacy-cap 86a7 1
+legacy-cap 86ad 0
+legacy-cap 8804 1
+legacy-cap 884f 1
+legacy-cap 8861 1
+legacy-cap 8890 1
+legacy-cap 8910 1
+legacy-cap 8a0c 0
+legacy-cap 8a26 1
+legacy-cap 8b9c 0
+legacy-cap 8c89 1
+legacy-cap 8db9 1
+legacy-rb 1901 8d48 0 0 0 0 0 8
+legacy-rb 1902 81a7 0 0 0 0 32 0
+legacy-rb 1903 8229 8 0 0 0 0 0
+legacy-rb 1906 803c 0 0 0 8 0 0
+legacy-rb 1907 8051 8 8 8 0 0 0
+legacy-rb 1908 8058 8 8 8 8 0 0
+legacy-rb 1909 8040 0 0 0 0 0 0
+legacy-rb 190a 8045 0 0 0 8 0 0
+legacy-rb 2a10 2a10 5 6 5 0 0 0
+legacy-rb 803b 803b 0 0 0 8 0 0
+legacy-rb 803c 803c 0 0 0 8 0 0
+legacy-rb 803d 803d 0 0 0 16 0 0
+legacy-rb 803e 803e 0 0 0 16 0 0
+legacy-rb 803f 803f 0 0 0 0 0 0
+legacy-rb 8040 8040 0 0 0 0 0 0
+legacy-rb 8041 8041 0 0 0 0 0 0
+legacy-rb 8042 8042 0 0 0 0 0 0
+legacy-rb 8043 8043 0 0 0 8 0 0
+legacy-rb 8044 8044 0 0 0 8 0 0
+legacy-rb 8045 8045 0 0 0 8 0 0
+legacy-rb 8046 8046 0 0 0 16 0 0
+legacy-rb 8047 8047 0 0 0 16 0 0
+legacy-rb 8048 8048 0 0 0 16 0 0
+legacy-rb 8049 804b 0 0 0 0 0 0
+legacy-rb 804a 804a 0 0 0 0 0 0
+legacy-rb 804b 804b 0 0 0 0 0 0
+legacy-rb 804c 804c 0 0 0 0 0 0
+legacy-rb 804d 804d 0 0 0 0 0 0
+legacy-rb 804f 804f 5 6 5 0 0 0
+legacy-rb 8050 8050 5 6 5 0 0 0
+legacy-rb 8051 8051 8 8 8 0 0 0
+legacy-rb 8052 8052 10 10 10 0 0 0
+legacy-rb 8053 8053 12 12 12 0 0 0
+legacy-rb 8054 8054 16 16 16 0 0 0
+legacy-rb 8055 8055 8 8 8 8 0 0
+legacy-rb 8056 8056 4 4 4 4 0 0
+legacy-rb 8057 8057 5 5 5 1 0 0
+legacy-rb 8058 8058 8 8 8 8 0 0
+legacy-rb 8059 8059 10 10 10 2 0 0
+legacy-rb 805a 805a 12 12 12 12 0 0
+legacy-rb 805b 805b 16 16 16 16 0 0
+legacy-rb 81a5 81a5 0 0 0 0 16 0
+legacy-rb 81a6 81a7 0 0 0 0 32 0
+legacy-rb 81a7 81a7 0 0 0 0 32 0
+legacy-rb 8227 822b 8 8 0 0 0 0
+legacy-rb 8229 8229 8 0 0 0 0 0
+legacy-rb 822a 822a 16 0 0 0 0 0
+legacy-rb 822b 822b 8 8 0 0 0 0
+legacy-rb 822c 822c 16 16 0 0 0 0
+legacy-rb 822d 822d 16 0 0 0 0 0
+legacy-rb 822e 822e 32 0 0 0 0 0
+legacy-rb 822f 822f 16 16 0 0 0 0
+legacy-rb 8230 8230 32 32 0 0 0 0
+legacy-rb 8231 8231 8 0 0 0 0 0
+legacy-rb 8232 8232 8 0 0 0 0 0
+legacy-rb 8233 8233 16 0 0 0 0 0
+legacy-rb 8234 8234 16 0 0 0 0 0
+legacy-rb 8235 8235 32 0 0 0 0 0
+legacy-rb 8236 8236 32 0 0 0 0 0
+legacy-rb 8237 8237 8 8 0 0 0 0
+legacy-rb 8238 8238 8 8 0 0 0 0
+legacy-rb 8239 8239 16 16 0 0 0 0
+legacy-rb 823a 823a 16 16 0 0 0 0
+legacy-rb 823b 823b 32 32 0 0 0 0
+legacy-rb 823c 823c 32 32 0 0 0 0
+legacy-rb 84f9 88f0 0 0 0 0 24 8
+legacy-rb 8814 8814 32 32 32 32 0 0
+legacy-rb 8815 8815 32 32 32 0 0 0
+legacy-rb 8816 8816 0 0 0 32 0 0
+legacy-rb 8817 8817 0 0 0 0 0 0
+legacy-rb 8818 8818 0 0 0 0 0 0
+legacy-rb 8819 8819 0 0 0 32 0 0
+legacy-rb 881a 881a 16 16 16 16 0 0
+legacy-rb 881b 881b 16 16 16 0 0 0
+legacy-rb 881c 881c 0 0 0 16 0 0
+legacy-rb 881d 881d 0 0 0 0 0 0
+legacy-rb 881e 881e 0 0 0 0 0 0
+legacy-rb 881f 881f 0 0 0 16 0 0
+legacy-rb 88f0 88f0 0 0 0 0 24 8
+legacy-rb 8c3a 8c3a 11 11 10 0 0 0
+legacy-rb 8c3d 8c3d 9 9 9 0 0 0
+legacy-rb 8c41 8c41 8 8 8 0 0 0
+legacy-rb 8c43 8c43 8 8 8 8 0 0
+legacy-rb 8c45 8c45 0 0 0 8 0 0
+legacy-rb 8c47 8c47 0 0 0 0 0 0
+legacy-rb 8cac 8cac 0 0 0 0 32 0
+legacy-rb 8cad 8cad 0 0 0 0 32 8
+legacy-rb 8d46 8d46 0 0 0 0 0 8
+legacy-rb 8d47 8d47 0 0 0 0 0 8
+legacy-rb 8d48 8d48 0 0 0 0 0 8
+legacy-rb 8d49 8d49 0 0 0 0 0 8
+legacy-rb 8d70 8d70 32 32 32 32 0 0
+legacy-rb 8d71 8d71 32 32 32 0 0 0
+legacy-rb 8d72 8d72 0 0 0 32 0 0
+legacy-rb 8d73 8d73 0 0 0 0 0 0
+legacy-rb 8d74 8d74 0 0 0 0 0 0
+legacy-rb 8d75 8d75 0 0 0 32 0 0
+legacy-rb 8d76 8d76 16 16 16 16 0 0
+legacy-rb 8d77 8d77 16 16 16 0 0 0
+legacy-rb 8d78 8d78 0 0 0 16 0 0
+legacy-rb 8d79 8d79 0 0 0 0 0 0
+legacy-rb 8d7a 8d7a 0 0 0 0 0 0
+legacy-rb 8d7b 8d7b 0 0 0 16 0 0
+legacy-rb 8d7c 8d7c 8 8 8 8 0 0
+legacy-rb 8d7d 8d7d 8 8 8 0 0 0
+legacy-rb 8d7e 8d7e 0 0 0 8 0 0
+legacy-rb 8d7f 8d7f 0 0 0 0 0 0
+legacy-rb 8d80 8d80 0 0 0 0 0 0
+legacy-rb 8d81 8d81 0 0 0 8 0 0
+legacy-rb 8d82 8d82 32 32 32 32 0 0
+legacy-rb 8d83 8d83 32 32 32 0 0 0
+legacy-rb 8d84 8d84 0 0 0 32 0 0
+legacy-rb 8d85 8d85 0 0 0 0 0 0
+legacy-rb 8d86 8d86 0 0 0 0 0 0
+legacy-rb 8d87 8d87 0 0 0 32 0 0
+legacy-rb 8d88 8d88 16 16 16 16 0 0
+legacy-rb 8d89 8d89 16 16 16 0 0 0
+legacy-rb 8d8a 8d8a 0 0 0 16 0 0
+legacy-rb 8d8b 8d8b 0 0 0 0 0 0
+legacy-rb 8d8c 8d8c 0 0 0 0 0 0
+legacy-rb 8d8d 8d8d 0 0 0 16 0 0
+legacy-rb 8d8e 8d8e 8 8 8 8 0 0
+legacy-rb 8d8f 8d8f 8 8 8 0 0 0
+legacy-rb 8d90 8d90 0 0 0 8 0 0
+legacy-rb 8d91 8d91 0 0 0 0 0 0
+legacy-rb 8d92 8d92 0 0 0 0 0 0
+legacy-rb 8d93 8d93 0 0 0 8 0 0
+legacy-tex 0001 8040 0 0 0 0 8 0 0 0 0 0000 0000 0000 0000 8c17 0000 0000 0 2601 8c17 0 0 0 0 0 0 8cdd 8cd6 8cd6
+legacy-tex 0002 8045 0 0 0 8 8 0 0 0 0 0000 0000 0000 8c17 8c17 0000 0000 0 2601 8c17 0 0 0 8 0 0 8cdd 8cd6 8cd6
+legacy-tex 0003 8051 8 8 8 0 0 0 0 0 0 8c17 8c17 8c17 0000 0000 0000 0000 0 2601 8c17 8 8 8 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 0004 8058 8 8 8 8 0 0 0 0 0 8c17 8c17 8c17 8c17 0000 0000 0000 0 2601 8c17 8 8 8 8 0 0 8cd5 8cd6 8cd6
+legacy-tex 1902 8cac 0 0 0 0 0 0 32 0 0 0000 0000 0000 0000 0000 0000 1406 0 2601 1406 0 0 0 0 32 0 8cd6 8cd5 8cd6
+legacy-tex 1903 8229 8 0 0 0 0 0 0 0 0 8c17 0000 0000 0000 0000 0000 0000 0 2601 8c17 8 0 0 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 1906 803c 0 0 0 8 0 0 0 0 0 0000 0000 0000 8c17 0000 0000 0000 0 2601 8c17 0 0 0 8 0 0 8cdd 8cd6 8cd6
+legacy-tex 1907 8051 8 8 8 0 0 0 0 0 0 8c17 8c17 8c17 0000 0000 0000 0000 0 2601 8c17 8 8 8 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 1908 8058 8 8 8 8 0 0 0 0 0 8c17 8c17 8c17 8c17 0000 0000 0000 0 2601 8c17 8 8 8 8 0 0 8cd5 8cd6 8cd6
+legacy-tex 1909 8040 0 0 0 0 8 0 0 0 0 0000 0000 0000 0000 8c17 0000 0000 0 2601 8c17 0 0 0 0 0 0 8cdd 8cd6 8cd6
+legacy-tex 190a 8045 0 0 0 8 8 0 0 0 0 0000 0000 0000 8c17 8c17 0000 0000 0 2601 8c17 0 0 0 8 0 0 8cdd 8cd6 8cd6
+legacy-tex 2a10 2a10 5 6 5 0 0 0 0 0 0 8c17 8c17 8c17 0000 0000 0000 0000 0 2601 8c17 5 6 5 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 803b 803b 0 0 0 8 0 0 0 0 0 0000 0000 0000 8c17 0000 0000 0000 0 2601 8c17 0 0 0 8 0 0 8cdd 8cd6 8cd6
+legacy-tex 803c 803c 0 0 0 8 0 0 0 0 0 0000 0000 0000 8c17 0000 0000 0000 0 2601 8c17 0 0 0 8 0 0 8cdd 8cd6 8cd6
+legacy-tex 803d 803d 0 0 0 16 0 0 0 0 0 0000 0000 0000 8c17 0000 0000 0000 0 2601 8c17 0 0 0 16 0 0 8cdd 8cd6 8cd6
+legacy-tex 803e 803e 0 0 0 16 0 0 0 0 0 0000 0000 0000 8c17 0000 0000 0000 0 2601 8c17 0 0 0 16 0 0 8cdd 8cd6 8cd6
+legacy-tex 803f 803f 0 0 0 0 8 0 0 0 0 0000 0000 0000 0000 8c17 0000 0000 0 2601 8c17 0 0 0 0 0 0 8cdd 8cd6 8cd6
+legacy-tex 8040 8040 0 0 0 0 8 0 0 0 0 0000 0000 0000 0000 8c17 0000 0000 0 2601 8c17 0 0 0 0 0 0 8cdd 8cd6 8cd6
+legacy-tex 8041 8041 0 0 0 0 16 0 0 0 0 0000 0000 0000 0000 8c17 0000 0000 0 2601 8c17 0 0 0 0 0 0 8cdd 8cd6 8cd6
+legacy-tex 8042 8042 0 0 0 0 16 0 0 0 0 0000 0000 0000 0000 8c17 0000 0000 0 2601 8c17 0 0 0 0 0 0 8cdd 8cd6 8cd6
+legacy-tex 8043 8043 0 0 0 8 8 0 0 0 0 0000 0000 0000 8c17 8c17 0000 0000 0 2601 8c17 0 0 0 8 0 0 8cdd 8cd6 8cd6
+legacy-tex 8044 8044 0 0 0 8 8 0 0 0 0 0000 0000 0000 8c17 8c17 0000 0000 0 2601 8c17 0 0 0 8 0 0 8cdd 8cd6 8cd6
+legacy-tex 8045 8045 0 0 0 8 8 0 0 0 0 0000 0000 0000 8c17 8c17 0000 0000 0 2601 8c17 0 0 0 8 0 0 8cdd 8cd6 8cd6
+legacy-tex 8046 8046 0 0 0 16 16 0 0 0 0 0000 0000 0000 8c17 8c17 0000 0000 0 2601 8c17 0 0 0 16 0 0 8cdd 8cd6 8cd6
+legacy-tex 8047 8047 0 0 0 16 16 0 0 0 0 0000 0000 0000 8c17 8c17 0000 0000 0 2601 8c17 0 0 0 16 0 0 8cdd 8cd6 8cd6
+legacy-tex 8048 8048 0 0 0 16 16 0 0 0 0 0000 0000 0000 8c17 8c17 0000 0000 0 2601 8c17 0 0 0 16 0 0 8cdd 8cd6 8cd6
+legacy-tex 8049 804b 0 0 0 0 0 8 0 0 0 0000 0000 0000 0000 0000 8c17 0000 0 2601 8c17 0 0 0 0 0 0 8cdd 8cd6 8cd6
+legacy-tex 804a 804a 0 0 0 0 0 8 0 0 0 0000 0000 0000 0000 0000 8c17 0000 0 2601 8c17 0 0 0 0 0 0 8cdd 8cd6 8cd6
+legacy-tex 804b 804b 0 0 0 0 0 8 0 0 0 0000 0000 0000 0000 0000 8c17 0000 0 2601 8c17 0 0 0 0 0 0 8cdd 8cd6 8cd6
+legacy-tex 804c 804c 0 0 0 0 0 16 0 0 0 0000 0000 0000 0000 0000 8c17 0000 0 2601 8c17 0 0 0 0 0 0 8cdd 8cd6 8cd6
+legacy-tex 804d 804d 0 0 0 0 0 16 0 0 0 0000 0000 0000 0000 0000 8c17 0000 0 2601 8c17 0 0 0 0 0 0 8cdd 8cd6 8cd6
+legacy-tex 804f 804f 5 6 5 0 0 0 0 0 0 8c17 8c17 8c17 0000 0000 0000 0000 0 2601 8c17 5 6 5 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 8050 8050 5 6 5 0 0 0 0 0 0 8c17 8c17 8c17 0000 0000 0000 0000 0 2601 8c17 5 6 5 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 8051 8051 8 8 8 0 0 0 0 0 0 8c17 8c17 8c17 0000 0000 0000 0000 0 2601 8c17 8 8 8 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 8052 8052 10 10 10 0 0 0 0 0 0 8c17 8c17 8c17 0000 0000 0000 0000 0 2601 8c17 10 10 10 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 8053 8053 12 12 12 0 0 0 0 0 0 8c17 8c17 8c17 0000 0000 0000 0000 0 2601 8c17 12 12 12 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 8054 8054 16 16 16 0 0 0 0 0 0 8c17 8c17 8c17 0000 0000 0000 0000 0 2601 8c17 16 16 16 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 8055 8055 8 8 8 8 0 0 0 0 0 8c17 8c17 8c17 8c17 0000 0000 0000 0 2601 8c17 8 8 8 8 0 0 8cd5 8cd6 8cd6
+legacy-tex 8056 8056 4 4 4 4 0 0 0 0 0 8c17 8c17 8c17 8c17 0000 0000 0000 0 2601 8c17 4 4 4 4 0 0 8cd5 8cd6 8cd6
+legacy-tex 8057 8057 5 5 5 1 0 0 0 0 0 8c17 8c17 8c17 8c17 0000 0000 0000 0 2601 8c17 5 5 5 1 0 0 8cd5 8cd6 8cd6
+legacy-tex 8058 8058 8 8 8 8 0 0 0 0 0 8c17 8c17 8c17 8c17 0000 0000 0000 0 2601 8c17 8 8 8 8 0 0 8cd5 8cd6 8cd6
+legacy-tex 8059 8059 10 10 10 2 0 0 0 0 0 8c17 8c17 8c17 8c17 0000 0000 0000 0 2601 8c17 10 10 10 2 0 0 8cd5 8cd6 8cd6
+legacy-tex 805a 805a 12 12 12 12 0 0 0 0 0 8c17 8c17 8c17 8c17 0000 0000 0000 0 2601 8c17 12 12 12 12 0 0 8cd5 8cd6 8cd6
+legacy-tex 805b 805b 16 16 16 16 0 0 0 0 0 8c17 8c17 8c17 8c17 0000 0000 0000 0 2601 8c17 16 16 16 16 0 0 8cd5 8cd6 8cd6
+legacy-tex 81a5 81a5 0 0 0 0 0 0 16 0 0 0000 0000 0000 0000 0000 0000 8c17 0 2601 8c17 0 0 0 0 16 0 8cd6 8cd5 8cd6
+legacy-tex 81a6 81a7 0 0 0 0 0 0 32 0 0 0000 0000 0000 0000 0000 0000 8c17 0 2601 8c17 0 0 0 0 32 0 8cd6 8cd5 8cd6
+legacy-tex 81a7 81a7 0 0 0 0 0 0 32 0 0 0000 0000 0000 0000 0000 0000 8c17 0 2601 8c17 0 0 0 0 32 0 8cd6 8cd5 8cd6
+legacy-tex 8225 8dbb 8 0 0 0 0 0 0 0 0 8c17 0000 0000 0000 0000 0000 0000 1 2601 8c17 8 0 0 0 0 0 8cd6 8cd6 8cd6
+legacy-tex 8226 8dbd 8 8 0 0 0 0 0 0 0 8c17 8c17 0000 0000 0000 0000 0000 1 2601 8c17 8 8 0 0 0 0 8cd6 8cd6 8cd6
+legacy-tex 8227 822b 8 8 0 0 0 0 0 0 0 8c17 8c17 0000 0000 0000 0000 0000 0 2601 8c17 8 8 0 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 8229 8229 8 0 0 0 0 0 0 0 0 8c17 0000 0000 0000 0000 0000 0000 0 2601 8c17 8 0 0 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 822a 822a 16 0 0 0 0 0 0 0 0 8c17 0000 0000 0000 0000 0000 0000 0 2601 8c17 16 0 0 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 822b 822b 8 8 0 0 0 0 0 0 0 8c17 8c17 0000 0000 0000 0000 0000 0 2601 8c17 8 8 0 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 822c 822c 16 16 0 0 0 0 0 0 0 8c17 8c17 0000 0000 0000 0000 0000 0 2601 8c17 16 16 0 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 822d 822d 16 0 0 0 0 0 0 0 0 1406 0000 0000 0000 0000 0000 0000 0 2601 1406 16 0 0 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 822e 822e 32 0 0 0 0 0 0 0 0 1406 0000 0000 0000 0000 0000 0000 0 2601 1406 32 0 0 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 822f 822f 16 16 0 0 0 0 0 0 0 1406 1406 0000 0000 0000 0000 0000 0 2601 1406 16 16 0 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 8230 8230 32 32 0 0 0 0 0 0 0 1406 1406 0000 0000 0000 0000 0000 0 2601 1406 32 32 0 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 8231 8231 8 0 0 0 0 0 0 0 0 1404 0000 0000 0000 0000 0000 0000 0 2601 1404 8 0 0 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 8232 8232 8 0 0 0 0 0 0 0 0 1405 0000 0000 0000 0000 0000 0000 0 2601 1405 8 0 0 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 8233 8233 16 0 0 0 0 0 0 0 0 1404 0000 0000 0000 0000 0000 0000 0 2601 1404 16 0 0 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 8234 8234 16 0 0 0 0 0 0 0 0 1405 0000 0000 0000 0000 0000 0000 0 2601 1405 16 0 0 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 8235 8235 32 0 0 0 0 0 0 0 0 1404 0000 0000 0000 0000 0000 0000 0 2601 1404 32 0 0 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 8236 8236 32 0 0 0 0 0 0 0 0 1405 0000 0000 0000 0000 0000 0000 0 2601 1405 32 0 0 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 8237 8237 8 8 0 0 0 0 0 0 0 1404 1404 0000 0000 0000 0000 0000 0 2601 1404 8 8 0 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 8238 8238 8 8 0 0 0 0 0 0 0 1405 1405 0000 0000 0000 0000 0000 0 2601 1405 8 8 0 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 8239 8239 16 16 0 0 0 0 0 0 0 1404 1404 0000 0000 0000 0000 0000 0 2601 1404 16 16 0 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 823a 823a 16 16 0 0 0 0 0 0 0 1405 1405 0000 0000 0000 0000 0000 0 2601 1405 16 16 0 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 823b 823b 32 32 0 0 0 0 0 0 0 1404 1404 0000 0000 0000 0000 0000 0 2601 1404 32 32 0 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 823c 823c 32 32 0 0 0 0 0 0 0 1405 1405 0000 0000 0000 0000 0000 0 2601 1405 32 32 0 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 83f0 83f0 5 6 5 0 0 0 0 0 0 8c17 8c17 8c17 0000 0000 0000 0000 1 2601 8c17 8 8 8 0 0 0 8cd6 8cd6 8cd6
+legacy-tex 83f1 83f1 5 6 5 1 0 0 0 0 0 8c17 8c17 8c17 8c17 0000 0000 0000 1 2601 8c17 8 8 8 8 0 0 8cd6 8cd6 8cd6
+legacy-tex 83f2 83f2 5 6 5 4 0 0 0 0 0 8c17 8c17 8c17 8c17 0000 0000 0000 1 2601 8c17 8 8 8 8 0 0 8cd6 8cd6 8cd6
+legacy-tex 83f3 83f3 5 6 5 8 0 0 0 0 0 8c17 8c17 8c17 8c17 0000 0000 0000 1 2601 8c17 8 8 8 8 0 0 8cd6 8cd6 8cd6
+legacy-tex 84e9 803c 0 0 0 8 0 0 0 0 0 0000 0000 0000 8c17 0000 0000 0000 0 2601 8c17 0 0 0 8 0 0 8cdd 8cd6 8cd6
+legacy-tex 84ea 8040 0 0 0 0 8 0 0 0 0 0000 0000 0000 0000 8c17 0000 0000 0 2601 8c17 0 0 0 0 0 0 8cdd 8cd6 8cd6
+legacy-tex 84eb 8837 0 0 0 8 8 0 0 0 0 0000 0000 0000 8c17 8c17 0000 0000 1 2601 8c17 0 0 0 8 0 0 8cd6 8cd6 8cd6
+legacy-tex 84ec 804b 0 0 0 0 0 8 0 0 0 0000 0000 0000 0000 0000 8c17 0000 0 2601 8c17 0 0 0 0 0 0 8cdd 8cd6 8cd6
+legacy-tex 84ed 83f0 5 6 5 0 0 0 0 0 0 8c17 8c17 8c17 0000 0000 0000 0000 1 2601 8c17 8 8 8 0 0 0 8cd6 8cd6 8cd6
+legacy-tex 84ee 83f2 5 6 5 4 0 0 0 0 0 8c17 8c17 8c17 8c17 0000 0000 0000 1 2601 8c17 8 8 8 8 0 0 8cd6 8cd6 8cd6
+legacy-tex 84f9 88f0 0 0 0 0 0 0 24 8 0 0000 0000 0000 0000 0000 0000 8c17 0 2601 8c17 0 0 0 0 24 8 8cd6 8cd5 8cd5
+legacy-tex 8814 8814 32 32 32 32 0 0 0 0 0 1406 1406 1406 1406 0000 0000 0000 0 2601 1406 32 32 32 32 0 0 8cd5 8cd6 8cd6
+legacy-tex 8815 8815 32 32 32 0 0 0 0 0 0 1406 1406 1406 0000 0000 0000 0000 0 2601 1406 32 32 32 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 8816 8816 0 0 0 32 0 0 0 0 0 0000 0000 0000 1406 0000 0000 0000 0 2601 1406 0 0 0 32 0 0 8cdd 8cd6 8cd6
+legacy-tex 8817 8817 0 0 0 0 0 32 0 0 0 0000 0000 0000 0000 0000 1406 0000 0 2601 1406 0 0 0 0 0 0 8cdd 8cd6 8cd6
+legacy-tex 8818 8818 0 0 0 0 32 0 0 0 0 0000 0000 0000 0000 1406 0000 0000 0 2601 1406 0 0 0 0 0 0 8cdd 8cd6 8cd6
+legacy-tex 8819 8819 0 0 0 32 32 0 0 0 0 0000 0000 0000 1406 1406 0000 0000 0 2601 1406 0 0 0 32 0 0 8cdd 8cd6 8cd6
+legacy-tex 881a 881a 16 16 16 16 0 0 0 0 0 1406 1406 1406 1406 0000 0000 0000 0 2601 1406 16 16 16 16 0 0 8cd5 8cd6 8cd6
+legacy-tex 881b 881b 16 16 16 0 0 0 0 0 0 1406 1406 1406 0000 0000 0000 0000 0 2601 1406 16 16 16 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 881c 881c 0 0 0 16 0 0 0 0 0 0000 0000 0000 1406 0000 0000 0000 0 2601 1406 0 0 0 16 0 0 8cdd 8cd6 8cd6
+legacy-tex 881d 881d 0 0 0 0 0 16 0 0 0 0000 0000 0000 0000 0000 1406 0000 0 2601 1406 0 0 0 0 0 0 8cdd 8cd6 8cd6
+legacy-tex 881e 881e 0 0 0 0 16 0 0 0 0 0000 0000 0000 0000 1406 0000 0000 0 2601 1406 0 0 0 0 0 0 8cdd 8cd6 8cd6
+legacy-tex 881f 881f 0 0 0 16 16 0 0 0 0 0000 0000 0000 1406 1406 0000 0000 0 2601 1406 0 0 0 16 0 0 8cdd 8cd6 8cd6
+legacy-tex 8837 8837 0 0 0 8 8 0 0 0 0 0000 0000 0000 8c17 8c17 0000 0000 1 2601 8c17 0 0 0 8 0 0 8cd6 8cd6 8cd6
+legacy-tex 88f0 88f0 0 0 0 0 0 0 24 8 0 0000 0000 0000 0000 0000 0000 8c17 0 2601 8c17 0 0 0 0 24 8 8cd6 8cd5 8cd5
+legacy-tex 8a51 8a51 8 8 8 0 0 0 0 0 0 8c17 8c17 8c17 0000 0000 0000 0000 0 2601 8c17 8 8 8 0 0 0 8cdd 8cd6 8cd6
+legacy-tex 8c3a 8c3a 11 11 10 0 0 0 0 0 0 1406 1406 1406 0000 0000 0000 0000 0 2601 1406 11 11 10 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 8c3d 8c3d 9 9 9 0 0 0 0 0 5 1406 1406 1406 0000 0000 0000 0000 0 2601 1406 9 9 9 0 0 0 8cdd 8cd6 8cd6
+legacy-tex 8c40 8c41 8 8 8 0 0 0 0 0 0 8c17 8c17 8c17 0000 0000 0000 0000 0 8c40 8c17 8 8 8 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 8c41 8c41 8 8 8 0 0 0 0 0 0 8c17 8c17 8c17 0000 0000 0000 0000 0 8c40 8c17 8 8 8 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 8c42 8c43 8 8 8 8 0 0 0 0 0 8c17 8c17 8c17 8c17 0000 0000 0000 0 8c40 8c17 8 8 8 8 0 0 8cd5 8cd6 8cd6
+legacy-tex 8c43 8c43 8 8 8 8 0 0 0 0 0 8c17 8c17 8c17 8c17 0000 0000 0000 0 8c40 8c17 8 8 8 8 0 0 8cd5 8cd6 8cd6
+legacy-tex 8c44 8c45 0 0 0 8 8 0 0 0 0 0000 0000 0000 8c17 8c17 0000 0000 0 8c40 8c17 0 0 0 8 0 0 8cdd 8cd6 8cd6
+legacy-tex 8c45 8c45 0 0 0 8 8 0 0 0 0 0000 0000 0000 8c17 8c17 0000 0000 0 8c40 8c17 0 0 0 8 0 0 8cdd 8cd6 8cd6
+legacy-tex 8c46 8c47 0 0 0 0 8 0 0 0 0 0000 0000 0000 0000 8c17 0000 0000 0 8c40 8c17 0 0 0 0 0 0 8cdd 8cd6 8cd6
+legacy-tex 8c47 8c47 0 0 0 0 8 0 0 0 0 0000 0000 0000 0000 8c17 0000 0000 0 8c40 8c17 0 0 0 0 0 0 8cdd 8cd6 8cd6
+legacy-tex 8c48 8c4c 5 6 5 0 0 0 0 0 0 8c17 8c17 8c17 0000 0000 0000 0000 1 8c40 8c17 8 8 8 0 0 0 8cd6 8cd6 8cd6
+legacy-tex 8c49 8c4e 5 6 5 4 0 0 0 0 0 8c17 8c17 8c17 8c17 0000 0000 0000 1 8c40 8c17 8 8 8 8 0 0 8cd6 8cd6 8cd6
+legacy-tex 8c4a 8c47 0 0 0 0 8 0 0 0 0 0000 0000 0000 0000 8c17 0000 0000 0 8c40 8c17 0 0 0 0 0 0 8cdd 8cd6 8cd6
+legacy-tex 8c4b 8c45 0 0 0 8 8 0 0 0 0 0000 0000 0000 8c17 8c17 0000 0000 0 8c40 8c17 0 0 0 8 0 0 8cdd 8cd6 8cd6
+legacy-tex 8c4c 8c4c 5 6 5 0 0 0 0 0 0 8c17 8c17 8c17 0000 0000 0000 0000 1 8c40 8c17 8 8 8 0 0 0 8cd6 8cd6 8cd6
+legacy-tex 8c4d 8c4d 5 6 5 1 0 0 0 0 0 8c17 8c17 8c17 8c17 0000 0000 0000 1 8c40 8c17 8 8 8 8 0 0 8cd6 8cd6 8cd6
+legacy-tex 8c4e 8c4e 5 6 5 4 0 0 0 0 0 8c17 8c17 8c17 8c17 0000 0000 0000 1 8c40 8c17 8 8 8 8 0 0 8cd6 8cd6 8cd6
+legacy-tex 8c4f 8c4f 5 6 5 8 0 0 0 0 0 8c17 8c17 8c17 8c17 0000 0000 0000 1 8c40 8c17 8 8 8 8 0 0 8cd6 8cd6 8cd6
+legacy-tex 8cac 8cac 0 0 0 0 0 0 32 0 0 0000 0000 0000 0000 0000 0000 1406 0 2601 1406 0 0 0 0 32 0 8cd6 8cd5 8cd6
+legacy-tex 8cad 8cad 0 0 0 0 0 0 32 8 0 0000 0000 0000 0000 0000 0000 1406 0 2601 1406 0 0 0 0 32 8 8cd6 8cd5 8cd5
+legacy-tex 8d70 8d70 32 32 32 32 0 0 0 0 0 1405 1405 1405 1405 0000 0000 0000 0 2601 1405 32 32 32 32 0 0 8cd5 8cd6 8cd6
+legacy-tex 8d71 8d71 32 32 32 0 0 0 0 0 0 1405 1405 1405 0000 0000 0000 0000 0 2601 1405 32 32 32 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 8d72 8d72 0 0 0 32 0 0 0 0 0 0000 0000 0000 1405 0000 0000 0000 0 2601 1405 0 0 0 32 0 0 8cdd 8cd6 8cd6
+legacy-tex 8d73 8d73 0 0 0 0 0 32 0 0 0 0000 0000 0000 0000 0000 1405 0000 0 2601 1405 0 0 0 0 0 0 8cdd 8cd6 8cd6
+legacy-tex 8d74 8d74 0 0 0 0 32 0 0 0 0 0000 0000 0000 0000 1405 0000 0000 0 2601 1405 0 0 0 0 0 0 8cdd 8cd6 8cd6
+legacy-tex 8d75 8d75 0 0 0 32 32 0 0 0 0 0000 0000 0000 1405 1405 0000 0000 0 2601 1405 0 0 0 32 0 0 8cdd 8cd6 8cd6
+legacy-tex 8d76 8d76 16 16 16 16 0 0 0 0 0 1405 1405 1405 1405 0000 0000 0000 0 2601 1405 16 16 16 16 0 0 8cd5 8cd6 8cd6
+legacy-tex 8d77 8d77 16 16 16 0 0 0 0 0 0 1405 1405 1405 0000 0000 0000 0000 0 2601 1405 16 16 16 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 8d78 8d78 0 0 0 16 0 0 0 0 0 0000 0000 0000 1405 0000 0000 0000 0 2601 1405 0 0 0 16 0 0 8cdd 8cd6 8cd6
+legacy-tex 8d79 8d79 0 0 0 0 0 16 0 0 0 0000 0000 0000 0000 0000 1405 0000 0 2601 1405 0 0 0 0 0 0 8cdd 8cd6 8cd6
+legacy-tex 8d7a 8d7a 0 0 0 0 16 0 0 0 0 0000 0000 0000 0000 1405 0000 0000 0 2601 1405 0 0 0 0 0 0 8cdd 8cd6 8cd6
+legacy-tex 8d7b 8d7b 0 0 0 16 16 0 0 0 0 0000 0000 0000 1405 1405 0000 0000 0 2601 1405 0 0 0 16 0 0 8cdd 8cd6 8cd6
+legacy-tex 8d7c 8d7c 8 8 8 8 0 0 0 0 0 1405 1405 1405 1405 0000 0000 0000 0 2601 1405 8 8 8 8 0 0 8cd5 8cd6 8cd6
+legacy-tex 8d7d 8d7d 8 8 8 0 0 0 0 0 0 1405 1405 1405 0000 0000 0000 0000 0 2601 1405 8 8 8 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 8d7e 8d7e 0 0 0 8 0 0 0 0 0 0000 0000 0000 1405 0000 0000 0000 0 2601 1405 0 0 0 8 0 0 8cdd 8cd6 8cd6
+legacy-tex 8d7f 8d7f 0 0 0 0 0 8 0 0 0 0000 0000 0000 0000 0000 1405 0000 0 2601 1405 0 0 0 0 0 0 8cdd 8cd6 8cd6
+legacy-tex 8d80 8d80 0 0 0 0 8 0 0 0 0 0000 0000 0000 0000 1405 0000 0000 0 2601 1405 0 0 0 0 0 0 8cdd 8cd6 8cd6
+legacy-tex 8d81 8d81 0 0 0 8 8 0 0 0 0 0000 0000 0000 1405 1405 0000 0000 0 2601 1405 0 0 0 8 0 0 8cdd 8cd6 8cd6
+legacy-tex 8d82 8d82 32 32 32 32 0 0 0 0 0 1404 1404 1404 1404 0000 0000 0000 0 2601 1404 32 32 32 32 0 0 8cd5 8cd6 8cd6
+legacy-tex 8d83 8d83 32 32 32 0 0 0 0 0 0 1404 1404 1404 0000 0000 0000 0000 0 2601 1404 32 32 32 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 8d84 8d84 0 0 0 32 0 0 0 0 0 0000 0000 0000 1404 0000 0000 0000 0 2601 1404 0 0 0 32 0 0 8cdd 8cd6 8cd6
+legacy-tex 8d85 8d85 0 0 0 0 0 32 0 0 0 0000 0000 0000 0000 0000 1404 0000 0 2601 1404 0 0 0 0 0 0 8cdd 8cd6 8cd6
+legacy-tex 8d86 8d86 0 0 0 0 32 0 0 0 0 0000 0000 0000 0000 1404 0000 0000 0 2601 1404 0 0 0 0 0 0 8cdd 8cd6 8cd6
+legacy-tex 8d87 8d87 0 0 0 32 32 0 0 0 0 0000 0000 0000 1404 1404 0000 0000 0 2601 1404 0 0 0 32 0 0 8cdd 8cd6 8cd6
+legacy-tex 8d88 8d88 16 16 16 16 0 0 0 0 0 1404 1404 1404 1404 0000 0000 0000 0 2601 1404 16 16 16 16 0 0 8cd5 8cd6 8cd6
+legacy-tex 8d89 8d89 16 16 16 0 0 0 0 0 0 1404 1404 1404 0000 0000 0000 0000 0 2601 1404 16 16 16 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 8d8a 8d8a 0 0 0 16 0 0 0 0 0 0000 0000 0000 1404 0000 0000 0000 0 2601 1404 0 0 0 16 0 0 8cdd 8cd6 8cd6
+legacy-tex 8d8b 8d8b 0 0 0 0 0 16 0 0 0 0000 0000 0000 0000 0000 1404 0000 0 2601 1404 0 0 0 0 0 0 8cdd 8cd6 8cd6
+legacy-tex 8d8c 8d8c 0 0 0 0 16 0 0 0 0 0000 0000 0000 0000 1404 0000 0000 0 2601 1404 0 0 0 0 0 0 8cdd 8cd6 8cd6
+legacy-tex 8d8d 8d8d 0 0 0 16 16 0 0 0 0 0000 0000 0000 1404 1404 0000 0000 0 2601 1404 0 0 0 16 0 0 8cdd 8cd6 8cd6
+legacy-tex 8d8e 8d8e 8 8 8 8 0 0 0 0 0 1404 1404 1404 1404 0000 0000 0000 0 2601 1404 8 8 8 8 0 0 8cd5 8cd6 8cd6
+legacy-tex 8d8f 8d8f 8 8 8 0 0 0 0 0 0 1404 1404 1404 0000 0000 0000 0000 0 2601 1404 8 8 8 0 0 0 8cd5 8cd6 8cd6
+legacy-tex 8d90 8d90 0 0 0 8 0 0 0 0 0 0000 0000 0000 1404 0000 0000 0000 0 2601 1404 0 0 0 8 0 0 8cdd 8cd6 8cd6
+legacy-tex 8d91 8d91 0 0 0 0 0 8 0 0 0 0000 0000 0000 0000 0000 1404 0000 0 2601 1404 0 0 0 0 0 0 8cdd 8cd6 8cd6
+legacy-tex 8d92 8d92 0 0 0 0 8 0 0 0 0 0000 0000 0000 0000 1404 0000 0000 0 2601 1404 0 0 0 0 0 0 8cdd 8cd6 8cd6
+legacy-tex 8d93 8d93 0 0 0 8 8 0 0 0 0 0000 0000 0000 1404 1404 0000 0000 0 2601 1404 0 0 0 8 0 0 8cdd 8cd6 8cd6
+legacy-tex 8dbb 8dbb 8 0 0 0 0 0 0 0 0 8c17 0000 0000 0000 0000 0000 0000 1 2601 8c17 8 0 0 0 0 0 8cd6 8cd6 8cd6
+legacy-tex 8dbc 8dbc 8 0 0 0 0 0 0 0 0 8f9c 0000 0000 0000 0000 0000 0000 1 2601 8f9c 8 0 0 0 0 0 8cd6 8cd6 8cd6
+legacy-tex 8dbd 8dbd 8 8 0 0 0 0 0 0 0 8c17 8c17 0000 0000 0000 0000 0000 1 2601 8c17 8 8 0 0 0 0 8cd6 8cd6 8cd6
+legacy-tex 8dbe 8dbe 8 8 0 0 0 0 0 0 0 8f9c 8f9c 0000 0000 0000 0000 0000 1 2601 8f9c 8 8 0 0 0 0 8cd6 8cd6 8cd6
+core 0b11 1 1
+core 0b12 2 1 64
+core 0b13 1 0
+core 0b20 1 0
+core 0b21 1 1
+core 0b22 2 1 1
+core 0b23 1 0
+core 0b40 2 6914 6914
+core 0b41 1 0
+core 0b44 1 0
+core 0b45 1 1029
+core 0b46 1 2305
+core 0b70 2 0 2147483647
+core 0b71 1 0
+core 0b72 1 1
+core 0b73 1 2147483647
+core 0b74 1 513
+core 0b90 1 0
+core 0b91 1 0
+core 0b92 1 519
+core 0b93 1 -1
+core 0b94 1 7680
+core 0b95 1 7680
+core 0b96 1 7680
+core 0b97 1 0
+core 0b98 1 -1
+core 0ba2 4 0 0 0 0
+core 0bd0 1 1
+core 0be0 1 0
+core 0be1 1 1
+core 0be2 1 0
+core 0bf0 1 5379
+core 0bf2 1 0
+core 0c01 1 0
+core 0c02 1 0
+core 0c10 4 0 0 0 0
+core 0c11 1 0
+core 0c22 4 0 0 0 0
+core 0c23 4 1 1 1 1
+core 0c32 1 1
+core 0c33 1 0
+core 0c52 1 4352
+core 0c53 1 4352
+core 0cf0 1 0
+core 0cf1 1 0
+core 0cf2 1 0
+core 0cf3 1 0
+core 0cf4 1 0
+core 0cf5 1 4
+core 0d00 1 0
+core 0d01 1 0
+core 0d02 1 0
+core 0d03 1 0
+core 0d04 1 0
+core 0d05 1 4
+core 0d32 1 8
+core 0d33 1 16384
+core 0d3a 2 16384 16384
+core 0d50 1 4
+core 2a00 1 0
+core 2a01 1 0
+core 2a02 1 0
+core 3000 1 0
+core 3001 1 0
+core 3002 1 0
+core 3003 1 0
+core 3004 1 0
+core 3005 1 0
+core 3006 1 0
+core 3007 1 0
+core 8005 4 0 0 0 0
+core 8009 1 32774
+core 8037 1 0
+core 8038 1 0
+core 8068 1 0
+core 8069 1 0
+core 806a 1 0
+core 806b 1 0
+core 806c 1 0
+core 806d 1 0
+core 806e 1 0
+core 8073 1 2048
+core 809d 1 1
+core 809e 1 0
+core 809f 1 0
+core 80a0 1 0
+core 80a8 1 0
+core 80a9 1 0
+core 80aa 1 1
+core 80ab 1 0
+core 80c8 1 0
+core 80c9 1 1
+core 80ca 1 0
+core 80cb 1 1
+core 80e8 1 1048575
+core 80e9 1 150000
+core 8128 1 1
+core 821b 1 4
+core 821c 1 1
+core 821d 1 43
+core 821e 1 1
+core 825a 1 0
+core 825b 1 16
+core 825c 1 0
+core 825d 2 -32768 32767
+core 825e 1 33376
+core 825f 1 33376
+core 846e 2 1 1
+core 84e0 1 33984
+core 84e8 1 16384
+core 84ef 1 4352
+core 84f6 1 0
+core 84f8 1 16384
+core 84fd 1 16
+core 84ff 1 16
+core 8514 1 0
+core 851c 1 16384
+core 85b2 1 0
+core 85b5 1 0
+core 8642 1 0
+core 864f 1 0
+core 86a2 1 3
+core 86a3 3 33776 33778 33779
+core 87fe 1 0
+core 87ff 0
+core 8800 1 519
+core 8801 1 7680
+core 8802 1 7680
+core 8803 1 7680
+core 8824 1 8
+core 8825 1 0
+core 8826 1 0
+core 8827 1 0
+core 8828 1 0
+core 8829 1 0
+core 882a 1 0
+core 882b 1 0
+core 882c 1 0
+core 882d 1 0
+core 882e 1 0
+core 882f 1 0
+core 8830 1 0
+core 8831 1 0
+core 8832 1 0
+core 8833 1 0
+core 8834 1 0
+core 883d 1 32774
+core 884f 1 0
+core 8869 1 16
+core 886c 1 128
+core 886d 1 128
+core 8872 1 16
+core 8890 1 0
+core 8891 2 0 1
+core 8894 1 0
+core 8895 1 0
+core 88ed 1 0
+core 88ef 1 0
+core 88fc 1 1
+core 88ff 1 2048
+core 8904 1 -8
+core 8905 1 7
+core 8919 1 0
+core 891c 1 35101
+core 8a15 1 0
+core 8a16 1 0
+core 8a17 1 0
+core 8a18 1 0
+core 8a28 1 0
+core 8a2b 1 16
+core 8a2c 1 16
+core 8a2d 1 16
+core 8a2e 1 80
+core 8a2f 1 80
+core 8a30 1 65536
+core 8a31 1 266240
+core 8a32 1 266240
+core 8a33 1 266240
+core 8a34 1 256
+core 8b49 1 4096
+core 8b4a 1 4096
+core 8b4c 1 16
+core 8b4d 1 80
+core 8b8b 1 4352
+core 8b8d 1 0
+core 8b9a 1 5121
+core 8b9b 1 6408
+core 8c1c 1 0
+core 8c1d 1 0
+core 8c29 1 16
+core 8c2a 1 0
+core 8c2b 1 268435456
+core 8c2c 1 0
+core 8c36 1 0
+core 8c37 1 0
+core 8c80 1 4
+core 8c89 1 0
+core 8c8a 1 64
+core 8c8b 1 4
+core 8c8f 1 0
+core 8ca0 1 36002
+core 8ca3 1 0
+core 8ca4 1 -1
+core 8ca5 1 -1
+core 8ca6 1 0
+core 8ca7 1 0
+core 8caa 1 0
+core 8cdf 1 8
+core 8d57 1 8
+core 8db9 1 0
+core 8ddf 1 4096
+core 8de0 1 1024
+core 8de1 1 1024
+core 8de7 1 4096
+core 8de8 1 4096
+core 8df8 0
+core 8df9 1 0
+core 8dfa 1 1
+core 8dfb 1 1024
+core 8dfc 1 31
+core 8dfd 1 1024
+core 8e1e 1 266240
+core 8e1f 1 266240
+core 8e23 1 0
+core 8e24 1 0
+core 8e25 1 0
+core 8e28 1 0
+core 8e4f 1 36430
+core 8e51 1 0
+core 8e59 1 1
+core 8e5a 1 32
+core 8e5b 1 -1
+core 8e5c 1 1
+core 8e5d 1 4
+core 8e5e 1 -8
+core 8e5f 1 7
+core 8e70 1 4
+core 8e71 1 4
+core 8e72 1 3
+core 8e73 2 1 1
+core 8e74 4 1 1 1 1
+core 8e7d 1 32
+core 8e7e 1 64
+core 8e7f 1 4096
+core 8e80 1 4096
+core 8e81 1 16
+core 8e82 1 16
+core 8e83 1 128
+core 8e84 1 120
+core 8e85 1 4216
+core 8e86 1 128
+core 8e89 1 16
+core 8e8a 1 16
+core 8f36 1 0
+core 8f37 1 0
+core 8f43 1 0
+core 8f9d 1 0
+core 8f9e 1 0
+core 8f9f 1 4
+core 900a 1 0
+core 9104 1 0
+core 9105 1 0
+core 910e 1 8
+core 910f 1 8
+core 9110 1 1
+core 9111 1 -1
+core 9122 1 64
+core 9123 1 64
+core 9124 1 128
+core 9125 1 128
+core 9126 1 1
+core-cap 0b20 1
+core-cap 0b41 1
+core-cap 0b44 1
+core-cap 0b71 1
+core-cap 0b90 1
+core-cap 0bd0 1
+core-cap 0be2 1
+core-cap 0bf2 1
+core-cap 0c11 1
+core-cap 2a01 1
+core-cap 2a02 1
+core-cap 3000 1
+core-cap 3001 1
+core-cap 3002 1
+core-cap 3003 1
+core-cap 3004 1
+core-cap 3005 1
+core-cap 3006 1
+core-cap 3007 1
+core-cap 8037 1
+core-cap 809d 1
+core-cap 809e 1
+core-cap 809f 1
+core-cap 80a0 1
+core-cap 8642 1
+core-cap 864f 1
+core-cap 884f 1
+core-cap 8890 1
+core-cap 8c36 1
+core-cap 8c89 1
+core-cap 8db9 1
+core-cap 8e51 1
+core-cap 8f9d 1
+core-rb 1901 8d48 0 0 0 0 0 8
+core-rb 1902 81a7 0 0 0 0 32 0
+core-rb 1903 8229 8 0 0 0 0 0
+core-rb 1907 8051 8 8 8 0 0 0
+core-rb 1908 8058 8 8 8 8 0 0
+core-rb 2a10 2a10 5 6 5 0 0 0
+core-rb 804f 804f 5 6 5 0 0 0
+core-rb 8050 8050 5 6 5 0 0 0
+core-rb 8051 8051 8 8 8 0 0 0
+core-rb 8052 8052 10 10 10 0 0 0
+core-rb 8053 8053 12 12 12 0 0 0
+core-rb 8054 8054 16 16 16 0 0 0
+core-rb 8055 8055 8 8 8 8 0 0
+core-rb 8056 8056 4 4 4 4 0 0
+core-rb 8057 8057 5 5 5 1 0 0
+core-rb 8058 8058 8 8 8 8 0 0
+core-rb 8059 8059 10 10 10 2 0 0
+core-rb 805a 805a 12 12 12 12 0 0
+core-rb 805b 805b 16 16 16 16 0 0
+core-rb 81a5 81a5 0 0 0 0 16 0
+core-rb 81a6 81a7 0 0 0 0 32 0
+core-rb 81a7 81a7 0 0 0 0 32 0
+core-rb 8227 822b 8 8 0 0 0 0
+core-rb 8229 8229 8 0 0 0 0 0
+core-rb 822a 822a 16 0 0 0 0 0
+core-rb 822b 822b 8 8 0 0 0 0
+core-rb 822c 822c 16 16 0 0 0 0
+core-rb 822d 822d 16 0 0 0 0 0
+core-rb 822e 822e 32 0 0 0 0 0
+core-rb 822f 822f 16 16 0 0 0 0
+core-rb 8230 8230 32 32 0 0 0 0
+core-rb 8231 8231 8 0 0 0 0 0
+core-rb 8232 8232 8 0 0 0 0 0
+core-rb 8233 8233 16 0 0 0 0 0
+core-rb 8234 8234 16 0 0 0 0 0
+core-rb 8235 8235 32 0 0 0 0 0
+core-rb 8236 8236 32 0 0 0 0 0
+core-rb 8237 8237 8 8 0 0 0 0
+core-rb 8238 8238 8 8 0 0 0 0
+core-rb 8239 8239 16 16 0 0 0 0
+core-rb 823a 823a 16 16 0 0 0 0
+core-rb 823b 823b 32 32 0 0 0 0
+core-rb 823c 823c 32 32 0 0 0 0
+core-rb 84f9 88f0 0 0 0 0 24 8
+core-rb 8814 8814 32 32 32 32 0 0
+core-rb 8815 8815 32 32 32 0 0 0
+core-rb 881a 881a 16 16 16 16 0 0
+core-rb 881b 881b 16 16 16 0 0 0
+core-rb 88f0 88f0 0 0 0 0 24 8
+core-rb 8c3a 8c3a 11 11 10 0 0 0
+core-rb 8c3d 8c3d 9 9 9 0 0 0
+core-rb 8c41 8c41 8 8 8 0 0 0
+core-rb 8c43 8c43 8 8 8 8 0 0
+core-rb 8cac 8cac 0 0 0 0 32 0
+core-rb 8cad 8cad 0 0 0 0 32 8
+core-rb 8d46 8d46 0 0 0 0 0 8
+core-rb 8d47 8d47 0 0 0 0 0 8
+core-rb 8d48 8d48 0 0 0 0 0 8
+core-rb 8d49 8d49 0 0 0 0 0 8
+core-rb 8d62 8d62 5 6 5 0 0 0
+core-rb 8d70 8d70 32 32 32 32 0 0
+core-rb 8d71 8d71 32 32 32 0 0 0
+core-rb 8d76 8d76 16 16 16 16 0 0
+core-rb 8d77 8d77 16 16 16 0 0 0
+core-rb 8d7c 8d7c 8 8 8 8 0 0
+core-rb 8d7d 8d7d 8 8 8 0 0 0
+core-rb 8d82 8d82 32 32 32 32 0 0
+core-rb 8d83 8d83 32 32 32 0 0 0
+core-rb 8d88 8d88 16 16 16 16 0 0
+core-rb 8d89 8d89 16 16 16 0 0 0
+core-rb 8d8e 8d8e 8 8 8 8 0 0
+core-rb 8d8f 8d8f 8 8 8 0 0 0
+core-rb 8f94 8f94 8 0 0 0 0 0
+core-rb 8f95 8f95 8 8 0 0 0 0
+core-rb 8f96 8f96 8 8 8 0 0 0
+core-rb 8f97 8f97 8 8 8 8 0 0
+core-rb 8f98 8f98 16 0 0 0 0 0
+core-rb 8f99 8f99 16 16 0 0 0 0
+core-rb 8f9a 8f9a 16 16 16 0 0 0
+core-rb 8f9b 8f9b 16 16 16 16 0 0
+core-rb 906f 906f 10 10 10 2 0 0
+core-tex 1902 8cac 0 0 0 0 x x 32 0 0 0000 0000 0000 0000 x x 1406 0 2601 1406 0 0 0 0 32 0 8cd6 8cd5 8cd6
+core-tex 1903 8229 8 0 0 0 x x 0 0 0 8c17 0000 0000 0000 x x 0000 0 2601 8c17 8 0 0 0 0 0 8cd5 8cd6 8cd6
+core-tex 1907 8051 8 8 8 0 x x 0 0 0 8c17 8c17 8c17 0000 x x 0000 0 2601 8c17 8 8 8 0 0 0 8cd5 8cd6 8cd6
+core-tex 1908 8058 8 8 8 8 x x 0 0 0 8c17 8c17 8c17 8c17 x x 0000 0 2601 8c17 8 8 8 8 0 0 8cd5 8cd6 8cd6
+core-tex 2a10 2a10 5 6 5 0 x x 0 0 0 8c17 8c17 8c17 0000 x x 0000 0 2601 8c17 5 6 5 0 0 0 8cd5 8cd6 8cd6
+core-tex 804f 804f 5 6 5 0 x x 0 0 0 8c17 8c17 8c17 0000 x x 0000 0 2601 8c17 5 6 5 0 0 0 8cd5 8cd6 8cd6
+core-tex 8050 8050 5 6 5 0 x x 0 0 0 8c17 8c17 8c17 0000 x x 0000 0 2601 8c17 5 6 5 0 0 0 8cd5 8cd6 8cd6
+core-tex 8051 8051 8 8 8 0 x x 0 0 0 8c17 8c17 8c17 0000 x x 0000 0 2601 8c17 8 8 8 0 0 0 8cd5 8cd6 8cd6
+core-tex 8052 8052 10 10 10 0 x x 0 0 0 8c17 8c17 8c17 0000 x x 0000 0 2601 8c17 10 10 10 0 0 0 8cd5 8cd6 8cd6
+core-tex 8053 8053 12 12 12 0 x x 0 0 0 8c17 8c17 8c17 0000 x x 0000 0 2601 8c17 12 12 12 0 0 0 8cd5 8cd6 8cd6
+core-tex 8054 8054 16 16 16 0 x x 0 0 0 8c17 8c17 8c17 0000 x x 0000 0 2601 8c17 16 16 16 0 0 0 8cd5 8cd6 8cd6
+core-tex 8055 8055 8 8 8 8 x x 0 0 0 8c17 8c17 8c17 8c17 x x 0000 0 2601 8c17 8 8 8 8 0 0 8cd5 8cd6 8cd6
+core-tex 8056 8056 4 4 4 4 x x 0 0 0 8c17 8c17 8c17 8c17 x x 0000 0 2601 8c17 4 4 4 4 0 0 8cd5 8cd6 8cd6
+core-tex 8057 8057 5 5 5 1 x x 0 0 0 8c17 8c17 8c17 8c17 x x 0000 0 2601 8c17 5 5 5 1 0 0 8cd5 8cd6 8cd6
+core-tex 8058 8058 8 8 8 8 x x 0 0 0 8c17 8c17 8c17 8c17 x x 0000 0 2601 8c17 8 8 8 8 0 0 8cd5 8cd6 8cd6
+core-tex 8059 8059 10 10 10 2 x x 0 0 0 8c17 8c17 8c17 8c17 x x 0000 0 2601 8c17 10 10 10 2 0 0 8cd5 8cd6 8cd6
+core-tex 805a 805a 12 12 12 12 x x 0 0 0 8c17 8c17 8c17 8c17 x x 0000 0 2601 8c17 12 12 12 12 0 0 8cd5 8cd6 8cd6
+core-tex 805b 805b 16 16 16 16 x x 0 0 0 8c17 8c17 8c17 8c17 x x 0000 0 2601 8c17 16 16 16 16 0 0 8cd5 8cd6 8cd6
+core-tex 81a5 81a5 0 0 0 0 x x 16 0 0 0000 0000 0000 0000 x x 8c17 0 2601 8c17 0 0 0 0 16 0 8cd6 8cd5 8cd6
+core-tex 81a6 81a7 0 0 0 0 x x 32 0 0 0000 0000 0000 0000 x x 8c17 0 2601 8c17 0 0 0 0 32 0 8cd6 8cd5 8cd6
+core-tex 81a7 81a7 0 0 0 0 x x 32 0 0 0000 0000 0000 0000 x x 8c17 0 2601 8c17 0 0 0 0 32 0 8cd6 8cd5 8cd6
+core-tex 8225 8dbb 8 0 0 0 x x 0 0 0 8c17 0000 0000 0000 x x 0000 1 2601 8c17 8 0 0 0 0 0 8cd6 8cd6 8cd6
+core-tex 8226 8dbd 8 8 0 0 x x 0 0 0 8c17 8c17 0000 0000 x x 0000 1 2601 8c17 8 8 0 0 0 0 8cd6 8cd6 8cd6
+core-tex 8227 822b 8 8 0 0 x x 0 0 0 8c17 8c17 0000 0000 x x 0000 0 2601 8c17 8 8 0 0 0 0 8cd5 8cd6 8cd6
+core-tex 8229 8229 8 0 0 0 x x 0 0 0 8c17 0000 0000 0000 x x 0000 0 2601 8c17 8 0 0 0 0 0 8cd5 8cd6 8cd6
+core-tex 822a 822a 16 0 0 0 x x 0 0 0 8c17 0000 0000 0000 x x 0000 0 2601 8c17 16 0 0 0 0 0 8cd5 8cd6 8cd6
+core-tex 822b 822b 8 8 0 0 x x 0 0 0 8c17 8c17 0000 0000 x x 0000 0 2601 8c17 8 8 0 0 0 0 8cd5 8cd6 8cd6
+core-tex 822c 822c 16 16 0 0 x x 0 0 0 8c17 8c17 0000 0000 x x 0000 0 2601 8c17 16 16 0 0 0 0 8cd5 8cd6 8cd6
+core-tex 822d 822d 16 0 0 0 x x 0 0 0 1406 0000 0000 0000 x x 0000 0 2601 1406 16 0 0 0 0 0 8cd5 8cd6 8cd6
+core-tex 822e 822e 32 0 0 0 x x 0 0 0 1406 0000 0000 0000 x x 0000 0 2601 1406 32 0 0 0 0 0 8cd5 8cd6 8cd6
+core-tex 822f 822f 16 16 0 0 x x 0 0 0 1406 1406 0000 0000 x x 0000 0 2601 1406 16 16 0 0 0 0 8cd5 8cd6 8cd6
+core-tex 8230 8230 32 32 0 0 x x 0 0 0 1406 1406 0000 0000 x x 0000 0 2601 1406 32 32 0 0 0 0 8cd5 8cd6 8cd6
+core-tex 8231 8231 8 0 0 0 x x 0 0 0 1404 0000 0000 0000 x x 0000 0 2601 1404 8 0 0 0 0 0 8cd5 8cd6 8cd6
+core-tex 8232 8232 8 0 0 0 x x 0 0 0 1405 0000 0000 0000 x x 0000 0 2601 1405 8 0 0 0 0 0 8cd5 8cd6 8cd6
+core-tex 8233 8233 16 0 0 0 x x 0 0 0 1404 0000 0000 0000 x x 0000 0 2601 1404 16 0 0 0 0 0 8cd5 8cd6 8cd6
+core-tex 8234 8234 16 0 0 0 x x 0 0 0 1405 0000 0000 0000 x x 0000 0 2601 1405 16 0 0 0 0 0 8cd5 8cd6 8cd6
+core-tex 8235 8235 32 0 0 0 x x 0 0 0 1404 0000 0000 0000 x x 0000 0 2601 1404 32 0 0 0 0 0 8cd5 8cd6 8cd6
+core-tex 8236 8236 32 0 0 0 x x 0 0 0 1405 0000 0000 0000 x x 0000 0 2601 1405 32 0 0 0 0 0 8cd5 8cd6 8cd6
+core-tex 8237 8237 8 8 0 0 x x 0 0 0 1404 1404 0000 0000 x x 0000 0 2601 1404 8 8 0 0 0 0 8cd5 8cd6 8cd6
+core-tex 8238 8238 8 8 0 0 x x 0 0 0 1405 1405 0000 0000 x x 0000 0 2601 1405 8 8 0 0 0 0 8cd5 8cd6 8cd6
+core-tex 8239 8239 16 16 0 0 x x 0 0 0 1404 1404 0000 0000 x x 0000 0 2601 1404 16 16 0 0 0 0 8cd5 8cd6 8cd6
+core-tex 823a 823a 16 16 0 0 x x 0 0 0 1405 1405 0000 0000 x x 0000 0 2601 1405 16 16 0 0 0 0 8cd5 8cd6 8cd6
+core-tex 823b 823b 32 32 0 0 x x 0 0 0 1404 1404 0000 0000 x x 0000 0 2601 1404 32 32 0 0 0 0 8cd5 8cd6 8cd6
+core-tex 823c 823c 32 32 0 0 x x 0 0 0 1405 1405 0000 0000 x x 0000 0 2601 1405 32 32 0 0 0 0 8cd5 8cd6 8cd6
+core-tex 83f0 83f0 5 6 5 0 x x 0 0 0 8c17 8c17 8c17 0000 x x 0000 1 2601 8c17 8 8 8 0 0 0 8cd6 8cd6 8cd6
+core-tex 83f1 83f1 5 6 5 1 x x 0 0 0 8c17 8c17 8c17 8c17 x x 0000 1 2601 8c17 8 8 8 8 0 0 8cd6 8cd6 8cd6
+core-tex 83f2 83f2 5 6 5 4 x x 0 0 0 8c17 8c17 8c17 8c17 x x 0000 1 2601 8c17 8 8 8 8 0 0 8cd6 8cd6 8cd6
+core-tex 83f3 83f3 5 6 5 8 x x 0 0 0 8c17 8c17 8c17 8c17 x x 0000 1 2601 8c17 8 8 8 8 0 0 8cd6 8cd6 8cd6
+core-tex 84ed 83f0 5 6 5 0 x x 0 0 0 8c17 8c17 8c17 0000 x x 0000 1 2601 8c17 8 8 8 0 0 0 8cd6 8cd6 8cd6
+core-tex 84ee 83f2 5 6 5 4 x x 0 0 0 8c17 8c17 8c17 8c17 x x 0000 1 2601 8c17 8 8 8 8 0 0 8cd6 8cd6 8cd6
+core-tex 84f9 88f0 0 0 0 0 x x 24 8 0 0000 0000 0000 0000 x x 8c17 0 2601 8c17 0 0 0 0 24 8 8cd6 8cd5 8cd5
+core-tex 8814 8814 32 32 32 32 x x 0 0 0 1406 1406 1406 1406 x x 0000 0 2601 1406 32 32 32 32 0 0 8cd5 8cd6 8cd6
+core-tex 8815 8815 32 32 32 0 x x 0 0 0 1406 1406 1406 0000 x x 0000 0 2601 1406 32 32 32 0 0 0 8cd5 8cd6 8cd6
+core-tex 881a 881a 16 16 16 16 x x 0 0 0 1406 1406 1406 1406 x x 0000 0 2601 1406 16 16 16 16 0 0 8cd5 8cd6 8cd6
+core-tex 881b 881b 16 16 16 0 x x 0 0 0 1406 1406 1406 0000 x x 0000 0 2601 1406 16 16 16 0 0 0 8cd5 8cd6 8cd6
+core-tex 88f0 88f0 0 0 0 0 x x 24 8 0 0000 0000 0000 0000 x x 8c17 0 2601 8c17 0 0 0 0 24 8 8cd6 8cd5 8cd5
+core-tex 8a51 8a51 8 8 8 0 x x 0 0 0 8c17 8c17 8c17 0000 x x 0000 0 2601 8c17 8 8 8 0 0 0 8cdd 8cd6 8cd6
+core-tex 8c3a 8c3a 11 11 10 0 x x 0 0 0 1406 1406 1406 0000 x x 0000 0 2601 1406 11 11 10 0 0 0 8cd5 8cd6 8cd6
+core-tex 8c3d 8c3d 9 9 9 0 x x 0 0 5 1406 1406 1406 0000 x x 0000 0 2601 1406 9 9 9 0 0 0 8cdd 8cd6 8cd6
+core-tex 8c40 8c41 8 8 8 0 x x 0 0 0 8c17 8c17 8c17 0000 x x 0000 0 8c40 8c17 8 8 8 0 0 0 8cd5 8cd6 8cd6
+core-tex 8c41 8c41 8 8 8 0 x x 0 0 0 8c17 8c17 8c17 0000 x x 0000 0 8c40 8c17 8 8 8 0 0 0 8cd5 8cd6 8cd6
+core-tex 8c42 8c43 8 8 8 8 x x 0 0 0 8c17 8c17 8c17 8c17 x x 0000 0 8c40 8c17 8 8 8 8 0 0 8cd5 8cd6 8cd6
+core-tex 8c43 8c43 8 8 8 8 x x 0 0 0 8c17 8c17 8c17 8c17 x x 0000 0 8c40 8c17 8 8 8 8 0 0 8cd5 8cd6 8cd6
+core-tex 8c48 8c4c 5 6 5 0 x x 0 0 0 8c17 8c17 8c17 0000 x x 0000 1 8c40 8c17 8 8 8 0 0 0 8cd6 8cd6 8cd6
+core-tex 8c49 8c4e 5 6 5 4 x x 0 0 0 8c17 8c17 8c17 8c17 x x 0000 1 8c40 8c17 8 8 8 8 0 0 8cd6 8cd6 8cd6
+core-tex 8c4c 8c4c 5 6 5 0 x x 0 0 0 8c17 8c17 8c17 0000 x x 0000 1 8c40 8c17 8 8 8 0 0 0 8cd6 8cd6 8cd6
+core-tex 8c4d 8c4d 5 6 5 1 x x 0 0 0 8c17 8c17 8c17 8c17 x x 0000 1 8c40 8c17 8 8 8 8 0 0 8cd6 8cd6 8cd6
+core-tex 8c4e 8c4e 5 6 5 4 x x 0 0 0 8c17 8c17 8c17 8c17 x x 0000 1 8c40 8c17 8 8 8 8 0 0 8cd6 8cd6 8cd6
+core-tex 8c4f 8c4f 5 6 5 8 x x 0 0 0 8c17 8c17 8c17 8c17 x x 0000 1 8c40 8c17 8 8 8 8 0 0 8cd6 8cd6 8cd6
+core-tex 8cac 8cac 0 0 0 0 x x 32 0 0 0000 0000 0000 0000 x x 1406 0 2601 1406 0 0 0 0 32 0 8cd6 8cd5 8cd6
+core-tex 8cad 8cad 0 0 0 0 x x 32 8 0 0000 0000 0000 0000 x x 1406 0 2601 1406 0 0 0 0 32 8 8cd6 8cd5 8cd5
+core-tex 8d62 8d62 5 6 5 0 x x 0 0 0 8c17 8c17 8c17 0000 x x 0000 0 2601 8c17 5 6 5 0 0 0 8cd5 8cd6 8cd6
+core-tex 8d70 8d70 32 32 32 32 x x 0 0 0 1405 1405 1405 1405 x x 0000 0 2601 1405 32 32 32 32 0 0 8cd5 8cd6 8cd6
+core-tex 8d71 8d71 32 32 32 0 x x 0 0 0 1405 1405 1405 0000 x x 0000 0 2601 1405 32 32 32 0 0 0 8cd5 8cd6 8cd6
+core-tex 8d76 8d76 16 16 16 16 x x 0 0 0 1405 1405 1405 1405 x x 0000 0 2601 1405 16 16 16 16 0 0 8cd5 8cd6 8cd6
+core-tex 8d77 8d77 16 16 16 0 x x 0 0 0 1405 1405 1405 0000 x x 0000 0 2601 1405 16 16 16 0 0 0 8cd5 8cd6 8cd6
+core-tex 8d7c 8d7c 8 8 8 8 x x 0 0 0 1405 1405 1405 1405 x x 0000 0 2601 1405 8 8 8 8 0 0 8cd5 8cd6 8cd6
+core-tex 8d7d 8d7d 8 8 8 0 x x 0 0 0 1405 1405 1405 0000 x x 0000 0 2601 1405 8 8 8 0 0 0 8cd5 8cd6 8cd6
+core-tex 8d82 8d82 32 32 32 32 x x 0 0 0 1404 1404 1404 1404 x x 0000 0 2601 1404 32 32 32 32 0 0 8cd5 8cd6 8cd6
+core-tex 8d83 8d83 32 32 32 0 x x 0 0 0 1404 1404 1404 0000 x x 0000 0 2601 1404 32 32 32 0 0 0 8cd5 8cd6 8cd6
+core-tex 8d88 8d88 16 16 16 16 x x 0 0 0 1404 1404 1404 1404 x x 0000 0 2601 1404 16 16 16 16 0 0 8cd5 8cd6 8cd6
+core-tex 8d89 8d89 16 16 16 0 x x 0 0 0 1404 1404 1404 0000 x x 0000 0 2601 1404 16 16 16 0 0 0 8cd5 8cd6 8cd6
+core-tex 8d8e 8d8e 8 8 8 8 x x 0 0 0 1404 1404 1404 1404 x x 0000 0 2601 1404 8 8 8 8 0 0 8cd5 8cd6 8cd6
+core-tex 8d8f 8d8f 8 8 8 0 x x 0 0 0 1404 1404 1404 0000 x x 0000 0 2601 1404 8 8 8 0 0 0 8cd5 8cd6 8cd6
+core-tex 8dbb 8dbb 8 0 0 0 x x 0 0 0 8c17 0000 0000 0000 x x 0000 1 2601 8c17 8 0 0 0 0 0 8cd6 8cd6 8cd6
+core-tex 8dbc 8dbc 8 0 0 0 x x 0 0 0 8f9c 0000 0000 0000 x x 0000 1 2601 8f9c 8 0 0 0 0 0 8cd6 8cd6 8cd6
+core-tex 8dbd 8dbd 8 8 0 0 x x 0 0 0 8c17 8c17 0000 0000 x x 0000 1 2601 8c17 8 8 0 0 0 0 8cd6 8cd6 8cd6
+core-tex 8dbe 8dbe 8 8 0 0 x x 0 0 0 8f9c 8f9c 0000 0000 x x 0000 1 2601 8f9c 8 8 0 0 0 0 8cd6 8cd6 8cd6
+core-tex 8f94 8f94 8 0 0 0 x x 0 0 0 8f9c 0000 0000 0000 x x 0000 0 2601 8f9c 8 0 0 0 0 0 8cd5 8cd6 8cd6
+core-tex 8f95 8f95 8 8 0 0 x x 0 0 0 8f9c 8f9c 0000 0000 x x 0000 0 2601 8f9c 8 8 0 0 0 0 8cd5 8cd6 8cd6
+core-tex 8f96 8f96 8 8 8 0 x x 0 0 0 8f9c 8f9c 8f9c 0000 x x 0000 0 2601 8f9c 8 8 8 0 0 0 8cd5 8cd6 8cd6
+core-tex 8f97 8f97 8 8 8 8 x x 0 0 0 8f9c 8f9c 8f9c 8f9c x x 0000 0 2601 8f9c 8 8 8 8 0 0 8cd5 8cd6 8cd6
+core-tex 8f98 8f98 16 0 0 0 x x 0 0 0 8f9c 0000 0000 0000 x x 0000 0 2601 8f9c 16 0 0 0 0 0 8cd5 8cd6 8cd6
+core-tex 8f99 8f99 16 16 0 0 x x 0 0 0 8f9c 8f9c 0000 0000 x x 0000 0 2601 8f9c 16 16 0 0 0 0 8cd5 8cd6 8cd6
+core-tex 8f9a 8f9a 16 16 16 0 x x 0 0 0 8f9c 8f9c 8f9c 0000 x x 0000 0 2601 8f9c 16 16 16 0 0 0 8cd5 8cd6 8cd6
+core-tex 8f9b 8f9b 16 16 16 16 x x 0 0 0 8f9c 8f9c 8f9c 8f9c x x 0000 0 2601 8f9c 16 16 16 16 0 0 8cd5 8cd6 8cd6
+core-tex 906f 906f 10 10 10 2 x x 0 0 0 1405 1405 1405 1405 x x 0000 0 2601 1405 10 10 10 2 0 0 8cd5 8cd6 8cd6

@@ -17,6 +17,8 @@
 #include <unistd.h>
 
 static uint32_t cursor = 0x40000000;
+const char *guest_dyld32_describe(uint32_t address, uint32_t *offset)
+{ (void)address; (void)offset; return NULL; }
 static pthread_mutex_t heap = PTHREAD_MUTEX_INITIALIZER;
 uint32_t compat_runtime32_allocate(size_t n, int clear)
 {
