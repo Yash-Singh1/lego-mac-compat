@@ -1,5 +1,5 @@
-// Texture-object LOD bias is not part of a Metal sampler descriptor. Add it
-// to SPIR-V sampling operations, after reflection has assigned sampler slots.
+// Texture-object LOD bias and fixed-depth comparison clamping need runtime
+// texture state. Add them after reflection has assigned sampler slots.
 // The private uniform block uses the fixed-function slot, which is unused by
 // programmable stages. Reflection of the application's program is unchanged.
 static std::vector<uint32_t> texture_bias_spirv(const std::vector<uint32_t> &words,
@@ -13,16 +13,17 @@ static std::vector<uint32_t> texture_bias_spirv(const std::vector<uint32_t> &wor
         auto slot = slots.find(reflect.get_name(resource.id));
         const auto &type = reflect.get_type(resource.type_id);
         if (slot == slots.end() || slot->second >= 64 || type.image.ms || type.image.dim == DimBuffer ||
-            type.image.dim == DimRect || type.image.dim == DimSubpassData) continue;
+            type.image.dim == DimSubpassData) continue;
         images[resource.id] = {static_cast<uint32_t>(slot->second), 0};
     }
     if (images.empty()) return words;
-    uint32_t next = words[3], float_type = 0, uint_type = 0, glsl = 0;
+    uint32_t next = words[3], float_type = 0, uint_type = 0, bool_type = 0, glsl = 0;
     std::map<uint32_t, uint32_t> value_types;
     std::set<uint32_t> types;
     for (size_t at = 5; at < words.size();) {
         uint32_t n = words[at] >> 16, op = words[at] & 0xffff;
         if (!n) return words;
+        if (op == OpTypeBool) bool_type = words[at + 1];
         if (op == OpTypeFloat && words[at + 2] == 32) float_type = words[at + 1];
         if (op == OpTypeInt && words[at + 2] == 32 && words[at + 3] == 0) uint_type = words[at + 1];
         if (op == OpExtInstImport && std::string(reinterpret_cast<const char *>(&words[at + 2])) == "GLSL.std.450")
@@ -45,6 +46,7 @@ static std::vector<uint32_t> texture_bias_spirv(const std::vector<uint32_t> &wor
         out[start + 1] = id;
         memcpy(out.data() + start + 2, text, strlen(text));
     };
+    if (!bool_type) { bool_type = next++; emit(declarations, OpTypeBool, {bool_type}); }
     if (!float_type) { float_type = next++; emit(declarations, OpTypeFloat, {float_type, 32}); }
     if (!uint_type) { uint_type = next++; emit(declarations, OpTypeInt, {uint_type, 32, 0}); }
     if (!glsl) { glsl = next++; name(imports, OpExtInstImport, glsl, "GLSL.std.450"); }
@@ -58,12 +60,14 @@ static std::vector<uint32_t> texture_bias_spirv(const std::vector<uint32_t> &wor
         return id;
     };
     uint32_t zero = constant(0), count = constant(GLM_LOD_ROW_COUNT), array = next++, block = next++, ptr_block = next++, ptr_float = next++;
-    uint32_t state = next++, min_bias = next++, max_bias = next++;
+    uint32_t state = next++, min_bias = next++, max_bias = next++, float_zero = next++, float_one = next++;
     emit(declarations, OpTypeArray, {array, float_type, count});
     emit(declarations, OpTypeStruct, {block, array});
     emit(declarations, OpTypePointer, {ptr_block, StorageClassUniform, block});
     emit(declarations, OpTypePointer, {ptr_float, StorageClassUniform, float_type});
     emit(declarations, OpVariable, {ptr_block, state, StorageClassUniform});
+    emit(declarations, OpConstant, {float_type, float_zero, 0});
+    emit(declarations, OpConstant, {float_type, float_one, 0x3f800000u});
     emit(declarations, OpConstant, {float_type, min_bias, 0xc1800000u}); // -16
     emit(declarations, OpConstant, {float_type, max_bias, 0x41800000u}); // +16
     emit(annotations, OpDecorate, {array, DecorationArrayStride, 16});
@@ -89,7 +93,7 @@ static std::vector<uint32_t> texture_bias_spirv(const std::vector<uint32_t> &wor
         } else if (op == OpFunctionParameter) {
             const auto &type = reflect.get_type(words[at + 1]);
             if (type.basetype == spirv_cross::SPIRType::SampledImage && !type.image.ms &&
-                type.image.dim != DimBuffer && type.image.dim != DimRect && type.image.dim != DimSubpassData) {
+                type.image.dim != DimBuffer && type.image.dim != DimSubpassData) {
                 uint32_t parameter = next++;
                 functions[function_id].samplers.push_back({argument, parameter});
                 images[words[at + 2]] = {0, 0, parameter};
@@ -173,15 +177,45 @@ static std::vector<uint32_t> texture_bias_spirv(const std::vector<uint32_t> &wor
                         op == OpImageSampleProjImplicitLod || op == OpImageSampleProjDrefImplicitLod;
         bool explicit_lod = op == OpImageSampleExplicitLod || op == OpImageSampleDrefExplicitLod ||
                             op == OpImageSampleProjExplicitLod || op == OpImageSampleProjDrefExplicitLod;
-        bool query = op == OpImageQueryLod;
-        if ((!implicit && !explicit_lod && !query) || !images.count(words[at + 3])) { at += n; continue; }
+        bool query = op == OpImageQueryLod, gather = op == OpImageDrefGather;
+        if ((!implicit && !explicit_lod && !query && !gather) || !images.count(words[at + 3])) { at += n; continue; }
         bool dref = op == OpImageSampleDrefImplicitLod || op == OpImageSampleProjDrefImplicitLod ||
-                    op == OpImageSampleDrefExplicitLod || op == OpImageSampleProjDrefExplicitLod;
+                    op == OpImageSampleDrefExplicitLod || op == OpImageSampleProjDrefExplicitLod || gather;
         size_t mask_at = dref ? 6 : 5;
         uint32_t mask = n > mask_at ? words[at + mask_at] : 0;
         Image image = images[words[at + 3]];
         std::vector<uint32_t> prefix;
         uint32_t slot = descriptor(image, prefix);
+        std::vector<uint32_t> sample(words.begin() + at, words.begin() + at + n);
+        if (dref) {
+            uint32_t index = next++, pointer = next++, fixed = next++, enabled = next++;
+            emit(prefix, OpIAdd, {uint_type, index, slot, constant(GLM_DEPTH_METADATA_BASE)});
+            emit(prefix, OpAccessChain, {ptr_float, pointer, state, zero, index});
+            emit(prefix, OpLoad, {float_type, fixed, pointer});
+            emit(prefix, OpFOrdNotEqual, {bool_type, enabled, fixed, float_zero});
+            uint32_t lower = float_zero, upper = float_one;
+            bool projected = op == OpImageSampleProjDrefImplicitLod || op == OpImageSampleProjDrefExplicitLod;
+            if (projected) {
+                uint32_t coordinate = sample[4], q = next++;
+                emit(prefix, OpCompositeExtract, {float_type, q, coordinate,
+                     reflect.get_type(value_types.at(coordinate)).vecsize - 1});
+                // Clamp after projection without dividing and multiplying the
+                // reference twice. This also preserves in-range rounding.
+                lower = next++; upper = next++;
+                emit(prefix, OpExtInst, {float_type, lower, glsl, GLSLstd450FMin, float_zero, q});
+                emit(prefix, OpExtInst, {float_type, upper, glsl, GLSLstd450FMax, float_zero, q});
+            }
+            uint32_t clamped = next++;
+            emit(prefix, OpExtInst, {float_type, clamped, glsl, GLSLstd450FClamp, sample[5], lower, upper});
+            uint32_t selected = next++;
+            emit(prefix, OpSelect, {float_type, selected, enabled, clamped, sample[5]});
+            sample[5] = selected;
+        }
+        // Rectangle images have no LOD or bias. Gather also has no bias operand.
+        if (gather || reflect.get_type(value_types.at(sample[3])).image.dim == DimRect) {
+            prefix.insert(prefix.end(), sample.begin(), sample.end());
+            replacements[at] = std::move(prefix); sampled = true; at += n; continue;
+        }
         uint32_t pointer = next++, bias = next++;
         emit(prefix, OpAccessChain, {ptr_float, pointer, state, zero, slot});
         emit(prefix, OpLoad, {float_type, bias, pointer});
@@ -201,7 +235,6 @@ static std::vector<uint32_t> texture_bias_spirv(const std::vector<uint32_t> &wor
             operand = next++;
             emit(prefix, OpFAdd, {float_type, operand, words[at + mask_at + 1], clamped});
         }
-        std::vector<uint32_t> sample(words.begin() + at, words.begin() + at + n);
         if (mask & ImageOperandsGradMask) {
             uint32_t scale = next++;
             emit(prefix, OpExtInst, {float_type, scale, glsl, GLSLstd450Exp2, clamped});

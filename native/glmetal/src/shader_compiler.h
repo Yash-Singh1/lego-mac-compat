@@ -43,7 +43,8 @@ enum { GLM_SLOT_XFB = 17 /* 17..20 buffers, 21 GLMXfbInfo; transform feedback dr
        GLM_SLOT_GLOBALS = 0, GLM_SLOT_FIRST_UBO = 1, GLM_SLOT_UBO_COUNT = 12, GLM_SLOT_ARB = 13, GLM_SLOT_LEGACY = 14,
        GLM_SLOT_POINT = 15, GLM_SLOT_FF = 16, GLM_SLOT_BORDER = 22 /* GLMBorder */, GLM_SLOT_STREAM = 30 };
 /* Programmable stages do not use the fixed-function uniform block. */
-enum { GLM_SLOT_LOD_BIAS = GLM_SLOT_FF, GLM_LOD_ROW_COUNT = 128, GLM_LOD_METADATA_BASE = 64 };
+/* Bias/cube flags, sampling LOD metadata, then fixed-depth reference flags. */
+enum { GLM_SLOT_LOD_BIAS = GLM_SLOT_FF, GLM_LOD_ROW_COUNT = 192, GLM_LOD_METADATA_BASE = 64, GLM_DEPTH_METADATA_BASE = 128 };
 /* Fragment-only; vertex/compute slot 25 retains its geometry meaning. */
 enum { GLM_SLOT_FF_CUBE_LOD = 25 };
 
