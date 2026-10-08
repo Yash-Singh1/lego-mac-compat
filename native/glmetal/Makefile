@@ -38,6 +38,15 @@ LIB_CFLAGS := $(CFLAGS) -fvisibility=hidden -Isrc -I$(GEN) -Wno-unused-function 
 .PHONY: all lib inject glcompare check check-reference clean
 all: lib inject glcompare
 lib: $(OUT)/libGLMetal.dylib $(OUT)/glmetal-compiler
+
+$(OUT)/client_configuration: tests/probes/client_configuration.c src/client.h
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) $< -o $@
+
+.PHONY: test-client-configuration
+test-client-configuration: lib $(OUT)/client_configuration
+	arch -x86_64 $(OUT)/client_configuration $(OUT)/libGLMetal.dylib
+	arch -arm64 $(OUT)/client_configuration $(OUT)/libGLMetal.dylib
 inject: $(OUT)/libGLMetalInject.dylib
 
 # The injector: interposes Apple's OpenGL.framework onto GLMetal in an
