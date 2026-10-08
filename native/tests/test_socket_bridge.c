@@ -2,6 +2,7 @@
 #include <arpa/inet.h>
 #include <assert.h>
 #include <errno.h>
+#include <netdb.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -56,5 +57,12 @@ int main(void){
     timeout[0]=0;timeout[1]=250000;uint32_t set_args[]={receiver,SOL_SOCKET,SO_RCVTIMEO,0x10000500,8};assert(!call("_setsockopt",set_args));length[0]=8;uint32_t get_args[]={receiver,SOL_SOCKET,SO_RCVTIMEO,0x10000500,0x10000100};assert(!call("_getsockopt",get_args));assert(length[0]==8 && timeout[0]==0 && timeout[1]==250000 && timeout[2]==0x76543210 && length[1]==0xabcdef01);
     *(int *)0x10000600=1;uint32_t ioctl_args[]={receiver,FIONBIO,0x10000600};assert(!call("_ioctl",ioctl_args));assert(call("_recvfrom",recv_args)==-1 && errno==EAGAIN);
     strcpy((void *)0x10000700,"127.0.0.1");uint32_t resolve[]={0x10000700};uint32_t host=(uint32_t)call("_gethostbyname",resolve);assert(host);uint32_t *fields=(void *)(uintptr_t)host;assert(fields[2]==AF_INET && fields[3]==4);uint32_t *addresses=(void *)(uintptr_t)fields[4];assert(addresses[0] && !addresses[1]);assert(*(uint32_t *)(uintptr_t)addresses[0]==htonl(INADDR_LOOPBACK));
-    close(sender);close(receiver);alarm(0);puts("Socket bridge PASS (UDP loopback, COD4 setup-fragment burst, select, timeouts, nonblocking errno, resolver pointers, canaries)");
+    /* MW3's getaddrinfo: numeric lookup, i386 node layout, hints honoured. */
+    strcpy((void *)0x10000780,"4242");int32_t *hints=(void *)0x100007a0;memset(hints,0,32);hints[0]=AI_NUMERICHOST|AI_NUMERICSERV;hints[1]=AF_INET;hints[2]=SOCK_DGRAM;
+    uint32_t *list=(void *)0x10000800;*list=0;uint32_t info_args[]={0x10000700,0x10000780,0x100007a0,0x10000800};assert(call("_getaddrinfo",info_args)==0 && *list);
+    uint32_t *node=(void *)(uintptr_t)*list;assert((int32_t)node[1]==AF_INET && (int32_t)node[2]==SOCK_DGRAM && node[4]==sizeof(struct sockaddr_in) && node[6]);
+    const struct sockaddr_in *resolved=(void *)(uintptr_t)node[6];assert(resolved->sin_family==AF_INET && resolved->sin_port==htons(4242) && resolved->sin_addr.s_addr==htonl(INADDR_LOOPBACK));
+    uint32_t free_args[]={*list};call("_freeaddrinfo",free_args);
+    strcpy((void *)0x10000700,"not an address");assert(call("_getaddrinfo",info_args)==EAI_NONAME);
+    close(sender);close(receiver);alarm(0);puts("Socket bridge PASS (UDP loopback, COD4 setup-fragment burst, select, timeouts, nonblocking errno, resolver pointers, getaddrinfo, canaries)");
 }

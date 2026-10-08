@@ -32,6 +32,7 @@ struct queue {
 static struct queue queues[kMaxQueues];
 static unsigned queue_count;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+static _Thread_local struct queue *callback_queue;
 
 static struct queue *queue_for(uint32_t handle)
 {
@@ -56,7 +57,12 @@ static void output(void *raw, AudioQueueRef audio, AudioQueueBufferRef buffer)
         static unsigned calls;
         if (++calls % 200 == 1) fprintf(stderr, "compat32: AudioQueue output callback %u queue=%08x\n", calls, q->handle);
     }
-    if (q->callback) compat_runtime32_call(q->callback, arguments, 3);
+    if (q->callback) {
+        struct queue *previous = callback_queue;
+        callback_queue = q;
+        compat_runtime32_call(q->callback, arguments, 3);
+        callback_queue = previous;
+    }
 }
 
 static OSStatus new_output(const uint32_t *a)
@@ -72,7 +78,14 @@ static OSStatus new_output(const uint32_t *a)
     q->callback = a[1];
     q->user_data = a[2];
     /* The guest's run loop is not a native CFRunLoopRef; use the queue's own thread. */
+    fprintf(stderr, "compat32: AudioQueue create queue=%08x rate=%.0f format=%.4s "
+                    "flags=%x channels=%u bits=%u bytes/frame=%u\n",
+            q->handle, format->mSampleRate, (const char *)&format->mFormatID,
+            format->mFormatFlags, format->mChannelsPerFrame,
+            format->mBitsPerChannel, format->mBytesPerFrame);
     OSStatus status = AudioQueueNewOutput(format, output, q, NULL, NULL, 0, &q->audio);
+    fprintf(stderr, "compat32: AudioQueue create queue=%08x status=%d\n",
+            q->handle, (int)status);
     if (status) return status;
     if (getenv("LP32_MUTE_AUDIO")) AudioQueueSetParameter(q->audio, kAudioQueueParam_Volume, 0);
     *out = q->handle;
@@ -110,12 +123,21 @@ static OSStatus enqueue(struct queue *q, const uint32_t *a)
     return AudioQueueEnqueueBuffer(q->audio, host, a[2], (const void *)(uintptr_t)a[3]);
 }
 
-static void dispose(struct queue *q, bool immediate)
+static OSStatus dispose(struct queue *q, bool immediate)
 {
-    AudioQueueDispose(q->audio, immediate);
+    OSStatus status = AudioQueueDispose(q->audio, immediate);
+    fprintf(stderr, "compat32: AudioQueue dispose queue=%08x immediate=%d status=%d\n",
+            q->handle, immediate, (int)status);
+    if (status) return status;
     q->audio = NULL;
-    for (unsigned i = 0; i < q->buffer_count; ++i) compat_runtime32_deallocate(q->buffers[i].guest);
+    /* Audio Queue may invoke more callbacks after Dispose returns when the
+       caller is itself inside a completion callback. Keep their guest buffer
+       records alive in that case; queue slots are not reused. */
+    if (callback_queue != q)
+        for (unsigned i = 0; i < q->buffer_count; ++i)
+            compat_runtime32_deallocate(q->buffers[i].guest);
     q->buffer_count = 0;
+    return noErr;
 }
 
 int audio_queue_bridge32_dispatch(const char *name, const uint32_t *a, uint64_t *result)
@@ -151,7 +173,7 @@ int audio_queue_bridge32_dispatch(const char *name, const uint32_t *a, uint64_t 
     else if (!strcmp(name, "_AudioQueueStart")) status = AudioQueueStart(q->audio, (const void *)(uintptr_t)a[1]);
     else if (!strcmp(name, "_AudioQueueStop")) status = AudioQueueStop(q->audio, a[1] != 0);
     else if (!strcmp(name, "_AudioQueuePause")) status = AudioQueuePause(q->audio);
-    else if (!strcmp(name, "_AudioQueueDispose")) { dispose(q, a[1] != 0); status = noErr; }
+    else if (!strcmp(name, "_AudioQueueDispose")) status = dispose(q, a[1] != 0);
     else if (!strcmp(name, "_AudioQueueGetProperty") || !strcmp(name, "_AudioQueueSetProperty")) {
         /* Channel layouts, stream formats and codec settings are made of
            4-byte fields and match on i386. Object-valued properties do not. */

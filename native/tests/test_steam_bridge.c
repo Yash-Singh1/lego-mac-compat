@@ -21,6 +21,7 @@ uint32_t compat_runtime32_call(uint32_t fn,const uint32_t *a,size_t n){
     return 0;
 }
 static uint64_t user_id(void *self){assert(self==interfaces[STEAM_USER].host);return UINT64_C(0x1122334455667788);}
+static uint64_t friend_by_index(void *self,int32_t index,int32_t flags){assert(self==interfaces[STEAM_FRIENDS].host&&index==3&&flags==4);return UINT64_C(0x0110000100000042);}
 static unsigned forget_calls;
 static bool forget(void *self,const char *name){assert(self==interfaces[STEAM_STORAGE].host&&!strcmp(name,"slot"));++forget_calls;return true;}
 static bool quota(void *self,int32_t *total,int32_t *available){assert(self==interfaces[STEAM_STORAGE].host);*total=200;*available=100;return true;}
@@ -61,6 +62,15 @@ int main(void){
     a[0]=0x10000010;a[1]=0x10000000;memory[6]=0xabcdef01;
     assert(steam_bridge32_call_uses_sret("_lp32_steam_0_2",a));
     assert(interface_call(STEAM_USER,2,a,&out)&&out==0x10000010);assert(*(uint64_t *)(memory+4)==UINT64_C(0x1122334455667788)&&memory[6]==0xabcdef01);
+    /* MW3's GetFriendByIndex returns a CSteamID with the same two layouts. */
+    void *friends_table[64]={0},**friends=friends_table;friends_table[4]=friend_by_index;
+    interfaces[STEAM_FRIENDS].host=&friends;interfaces[STEAM_FRIENDS].guest=0x10000100;
+    uint32_t f[]={0x10000100,3,4,0};
+    assert(!steam_bridge32_call_uses_sret("_lp32_steam_7_4",f));
+    assert(interface_call(STEAM_FRIENDS,4,f,&out)&&out==UINT64_C(0x0110000100000042));
+    uint32_t g[]={0x10000010,0x10000100,3,4};
+    assert(steam_bridge32_call_uses_sret("_lp32_steam_7_4",g));
+    assert(interface_call(STEAM_FRIENDS,4,g,&out)&&out==0x10000010&&*(uint64_t *)(memory+4)==UINT64_C(0x0110000100000042));
     void *storage_table[64]={0},**storage=storage_table;interfaces[STEAM_STORAGE].host=&storage;steam_library=(void *)1;
     strcpy((char *)memory+64,"slot");a[1]=0x10000040;
     for(unsigned version=0;version<2;++version){modern=version;memset(storage_table,0,sizeof(storage_table));unsigned f=modern?5:2,q=modern?20:17;

@@ -478,6 +478,148 @@ static const struct lp32_game_profile mw2_mp_profile = {
     .steam_app_id = 10190,
 };
 
+/* The same Aspyr runtime changes as mw2_code_patches, at the Steam MW3
+   single-player executable's addresses (same functions, same byte checks). */
+static const struct lp32_code_patch mw3_code_patches[] = {
+    {
+        .address = 0x000894f6,
+        .expected = {0xe8, 0x2d, 0x29, 0x3a, 0x00},
+        .replacement = {0xe8, 0x27, 0x29, 0x3a, 0x00},
+        .length = 5,
+        .reason = "ASLCriticalSection waits for contended locks without spinning",
+    },
+    {
+        .address = 0x000b6194,
+        .expected = {0xe8, 0x8f, 0x5c, 0x37, 0x00},
+        .replacement = {0xe8, 0x89, 0x5c, 0x37, 0x00},
+        .length = 5,
+        .reason = "EnterCriticalSection waits for contended locks without spinning",
+    },
+    {
+        .address = 0x000b5df1,
+        .expected = {0x83, 0xfb, 0x02, 0x0f, 0x82},
+        .replacement = {0x83, 0xfb, 0x01, 0x0f, 0x82},
+        .length = 5,
+        .reason = "WaitForSingleObject 1 ms timeout waits instead of polling",
+    },
+    {
+        .address = 0x002db91f,
+        .expected = {0xe8, 0x02, 0xb0, 0x08, 0x00},
+        .replacement = {0x0f, 0x1f, 0x44, 0x00, 0x00},
+        .length = 5,
+        .reason = "pixel shader creation does not sleep between shaders",
+    },
+    {
+        .address = 0x002dba53,
+        .expected = {0xe8, 0xce, 0xae, 0x08, 0x00},
+        .replacement = {0x0f, 0x1f, 0x44, 0x00, 0x00},
+        .length = 5,
+        .reason = "vertex shader creation does not sleep between shaders",
+    },
+    /* RB_EndFrame sleeps 1 ms before every Present on the render thread, the
+       frame's bottleneck. The swap fence still bounds frames in flight. */
+    {
+        .address = 0x002ffb0c,
+        .expected = {0xe8, 0x15, 0x6e, 0x06, 0x00},
+        .replacement = {0x0f, 0x1f, 0x44, 0x00, 0x00},
+        .length = 5,
+        .reason = "render thread does not sleep before each present",
+    },
+    /* Sys_HasInfoChanged compares a fresh CPU frequency estimate with the
+       archived one. Under translation that estimate varies with load and
+       thermal state, so MW3 repeatedly offers to reset graphics settings.
+       Keep its RAM and GPU checks, which still identify a real hardware
+       change, but ignore the two unstable CPU comparison branches. */
+    {
+        .address = 0x003f41fb,
+        .expected = {0x77, 0x4a},
+        .replacement = {0x90, 0x90},
+        .length = 2,
+        .reason = "CPU frequency drift does not reset graphics settings",
+    },
+    {
+        .address = 0x003f4209,
+        .expected = {0x77, 0x3c},
+        .replacement = {0x90, 0x90},
+        .length = 2,
+        .reason = "CPU frequency drift does not reset graphics settings",
+    },
+    {0},
+};
+
+/* The same changes at the Steam MW3 multiplayer executable's addresses. Its
+   WaitForSingleObject compares the timeout in %ecx rather than %ebx. */
+static const struct lp32_code_patch mw3_mp_code_patches[] = {
+    {
+        .address = 0x000ad435,
+        .expected = {0xe8, 0x5c, 0x51, 0x3a, 0x00},
+        .replacement = {0xe8, 0x56, 0x51, 0x3a, 0x00},
+        .length = 5,
+        .reason = "ASLCriticalSection waits for contended locks without spinning",
+    },
+    {
+        .address = 0x000b412f,
+        .expected = {0xe8, 0x62, 0xe4, 0x39, 0x00},
+        .replacement = {0xe8, 0x5c, 0xe4, 0x39, 0x00},
+        .length = 5,
+        .reason = "EnterCriticalSection waits for contended locks without spinning",
+    },
+    {
+        .address = 0x000b39ab,
+        .expected = {0x83, 0xf9, 0x02},
+        .replacement = {0x83, 0xf9, 0x01},
+        .length = 3,
+        .reason = "WaitForSingleObject 1 ms timeout waits instead of polling",
+    },
+    {
+        .address = 0x002d3fc6,
+        .expected = {0xe8, 0xb6, 0xd6, 0x09, 0x00},
+        .replacement = {0x0f, 0x1f, 0x44, 0x00, 0x00},
+        .length = 5,
+        .reason = "pixel shader creation does not sleep between shaders",
+    },
+    {
+        .address = 0x002d40ec,
+        .expected = {0xe8, 0x90, 0xd5, 0x09, 0x00},
+        .replacement = {0x0f, 0x1f, 0x44, 0x00, 0x00},
+        .length = 5,
+        .reason = "vertex shader creation does not sleep between shaders",
+    },
+    {
+        .address = 0x002f53da,
+        .expected = {0xe8, 0xa2, 0xc2, 0x07, 0x00},
+        .replacement = {0x0f, 0x1f, 0x44, 0x00, 0x00},
+        .length = 5,
+        .reason = "render thread does not sleep before each present",
+    },
+    {0},
+};
+
+/* MW3 uses MW2's Aspyr runtime. MW2's addresses do not apply to MW3. */
+static const struct lp32_game_profile mw3_profile = {
+    .title = LP32_TITLE_MW3,
+    .name = "MW3",
+    .display_name = "Call of Duty: Modern Warfare 3",
+    .log_directory = "MW3Compat",
+    .image_file = "MW3.image",
+    .callee_pops_struct_return = 1,
+    .thread_argument_is_direct = 1,
+    .steam_app_id = 42680,
+    .code_patches = mw3_code_patches,
+};
+
+static const struct lp32_game_profile mw3_mp_profile = {
+    .title = LP32_TITLE_MW3_MP,
+    .name = "MW3MP",
+    .display_name = "Call of Duty: Modern Warfare 3 Multiplayer",
+    .log_directory = "MW3MPCompat",
+    .image_file = "MW3MP.image",
+    .callee_pops_struct_return = 1,
+    .thread_argument_is_direct = 1,
+    .steam_app_id = 42690,
+    .code_patches = mw3_mp_code_patches,
+};
+
 static const struct lp32_game_profile *const known_profiles[] = {
     &pirates_profile,
     &clone_wars_profile,
@@ -489,6 +631,8 @@ static const struct lp32_game_profile *const known_profiles[] = {
     &cod4_mp_profile,
     &mw2_profile,
     &mw2_mp_profile,
+    &mw3_profile,
+    &mw3_mp_profile,
 };
 
 static const struct lp32_game_profile *current_profile = &unknown_profile;
@@ -559,6 +703,8 @@ const struct lp32_game_profile *lp32_profile_named(const char *name)
     if (!strcasecmp(name, "cod4mp") || !strcasecmp(name, "cod4-mp")) return &cod4_mp_profile;
     if (!strcasecmp(name, "mw2") || !strcasecmp(name, "codmw2")) return &mw2_profile;
     if (!strcasecmp(name, "mw2mp") || !strcasecmp(name, "mw2-mp")) return &mw2_mp_profile;
+    if (!strcasecmp(name, "mw3") || !strcasecmp(name, "codmw3")) return &mw3_profile;
+    if (!strcasecmp(name, "mw3mp") || !strcasecmp(name, "mw3-mp")) return &mw3_mp_profile;
     for (size_t index = 0; index < sizeof(known_profiles) / sizeof(known_profiles[0]); ++index) {
         if (strcasecmp(known_profiles[index]->name, name) == 0) {
             return known_profiles[index];
@@ -664,6 +810,8 @@ int lp32_profile_select(const struct macho_image32 *image, const char *image_pat
         name = name ? name + 1 : image_path;
         if (!strcmp(name, "MW2.image")) selected = &mw2_profile;
         if (!strcmp(name, "MW2MP.image")) selected = &mw2_mp_profile;
+        if (!strcmp(name, "MW3.image")) selected = &mw3_profile;
+        if (!strcmp(name, "MW3MP.image")) selected = &mw3_mp_profile;
         if (!strcmp(name, "COD4.image") || !strcmp(name, "COD4MP.image")) {
             /* Other Mac releases may place functions at different addresses.
                Retain title-level ABI handling, but never apply the tested
