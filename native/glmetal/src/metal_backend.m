@@ -11,6 +11,7 @@
 
 #include "ffgen.h"
 #include "shader_depth.h"
+#include "pipeline_prewarm.h"
 
 static void remember_function_source(id<MTLFunction> function, NSString *source);
 
@@ -1168,7 +1169,7 @@ static id<MTLRenderPipelineState> pipeline_for(struct glm_backend_context *b, id
     }
     NSError *error = nil;
     uint64_t started = glm_now_ns();
-    state = [device newRenderPipelineStateWithDescriptor:d error:&error];
+    state = glm_pipeline_acquire(device, d, !for_clear && !no_raster && !key.tess_mode, &error);
     glm_note_stall("pipeline", started);
     if (!state) {
         glm_log("pipeline creation failed: %s", error.localizedDescription.UTF8String);
@@ -2087,6 +2088,17 @@ void glm_backend_prewarm_program(const struct glm_compile_result *r)
                         : NULL;
     const char *sources[4] = {r->msl[GLM_STAGE_VERTEX], r->msl[GLM_STAGE_FRAGMENT], r->msl_capture, variant};
     metal_functions_prewarm(sources, 4);
+    /* Once both functions are ready, prepare the common configuration for
+       their vertex inputs while the application translates later programs. */
+    if (sources[0] && sources[1]) {
+        GLMCompiledFunction *vertex = function_entry(@(sources[3] ? sources[3] : sources[0]));
+        GLMCompiledFunction *fragment = function_entry(@(sources[1]));
+        dispatch_group_notify(vertex->group, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            dispatch_group_notify(fragment->group, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                glm_pipeline_prewarm(device, vertex->function, fragment->function);
+            });
+        });
+    }
     free(variant);
 }
 

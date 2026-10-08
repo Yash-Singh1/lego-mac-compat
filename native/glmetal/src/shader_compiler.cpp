@@ -2803,7 +2803,14 @@ std::map<std::string, int> uniform_declaration_order(const glm_compile_request *
     for (glm_stage stage : stages) {
         if (!req->sources[stage]) continue;
         std::string text = strip_comments(normalize_newlines(req->sources[stage]));
-        for (std::sregex_iterator it(text.begin(), text.end(), declaration), end; it != end; ++it) {
+        // No declaration can start after the last "uniform", or end past
+        // its next semicolon. Keep the same regex and its ordering, while
+        // avoiding a search through the usually much larger function bodies.
+        size_t last_uniform = text.rfind("uniform");
+        if (last_uniform == std::string::npos) continue;
+        size_t end_uniform = text.find(';', last_uniform);
+        auto limit = end_uniform == std::string::npos ? text.end() : text.begin() + end_uniform + 1;
+        for (std::sregex_iterator it(text.begin(), limit, declaration), end; it != end; ++it) {
             // "a, b[3], c = 1.0": each declarator's identifier.
             std::string list = (*it)[2];
             int depth = 0;
@@ -3126,7 +3133,9 @@ static void compile_program(const glm_compile_request *req, glm_compile_result *
         // Block { ... } inst;" is "Block.g").
         static const std::regex block_decl(R"(uniform\s+(\w+)\s*\{([^}]*)\}\s*(\w*))");
         static const std::regex bool_member(R"((?:^|;)\s*(?:(?:lowp|mediump|highp|layout\s*\([^)]*\))\s+)*(bool|bvec[234])\s+([^;]*);)");
-        for (int stage = 0; stage < GLM_STAGE_COUNT; ++stage) {
+        // This source scan only repairs reflected block members. Programs
+        // without any such members need no declaration fallback.
+        for (int stage = 0; !block_members.empty() && stage < GLM_STAGE_COUNT; ++stage) {
             if (!req->sources[stage]) continue;
             std::string text = strip_comments(normalize_newlines(req->sources[stage]));
             for (std::sregex_iterator b(text.begin(), text.end(), block_decl), end; b != end; ++b) {
