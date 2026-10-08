@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <unistd.h>
 static void *provider;
 static void (*p_glClearColor)(GLfloat,GLfloat,GLfloat,GLfloat);
 static void (*p_glClearDepth)(GLdouble);
@@ -107,6 +108,22 @@ int main(int argc,char **argv) {
  p_glReadPixels(4,4,1,1,GL_RGBA,GL_UNSIGNED_BYTE,color);
  int draw_ok=abs(color[0]-207)<=1&&abs(color[1]-48)<=1&&abs(color[2]-112)<=1;
  GLenum error=p_glGetError();printf("first draw: %s rgba=%u,%u,%u,%u GLerror=%x\n",draw_ok?"PASS":"FAIL",color[0],color[1],color[2],color[3],error);
+ /* A subsequent linked program can prewarm the configuration learned from
+    this draw. It must still select its own fragment function exactly. */
+ GLuint fs2=shader(GL_FRAGMENT_SHADER,"#version 150 core\nout vec4 c;void main(){c=vec4(.1875,.8125,.3125,1);}");
+ GLuint prog2=p_glCreateProgram();p_glAttachShader(prog2,vs);p_glAttachShader(prog2,fs2);p_glLinkProgram(prog2);
+ p_glGetProgramiv(prog2,GL_LINK_STATUS,&linked);if(!linked)return 2;
+ usleep(100000);p_glUseProgram(prog2);p_glDrawArrays(GL_TRIANGLES,0,3);
+ p_glReadPixels(4,4,1,1,GL_RGBA,GL_UNSIGNED_BYTE,color);
+ int predicted_ok=abs(color[0]-48)<=1&&abs(color[1]-207)<=1&&abs(color[2]-80)<=1;
+ GLenum predicted_error=p_glGetError();printf("subsequent program: %s rgba=%u,%u,%u,%u GLerror=%x\n",predicted_ok?"PASS":"FAIL",color[0],color[1],color[2],color[3],predicted_error);
+ GLuint fs3=shader(GL_FRAGMENT_SHADER,"#version 150 core\nout vec4 c;void main(){c=vec4(.4375,.3125,.8125,1);}");
+ GLuint prog3=p_glCreateProgram();p_glAttachShader(prog3,vs);p_glAttachShader(prog3,fs3);p_glLinkProgram(prog3);
+ p_glGetProgramiv(prog3,GL_LINK_STATUS,&linked);if(!linked)return 2;
+ usleep(100000);p_glUseProgram(prog3);p_glDrawArrays(GL_TRIANGLES,0,3);
+ p_glReadPixels(4,4,1,1,GL_RGBA,GL_UNSIGNED_BYTE,color);
+ predicted_ok=predicted_ok&&abs(color[0]-112)<=1&&abs(color[1]-80)<=1&&abs(color[2]-207)<=1;
+ predicted_error=predicted_error|p_glGetError();printf("predicted program: %s rgba=%u,%u,%u,%u GLerror=%x\n",predicted_ok?"PASS":"FAIL",color[0],color[1],color[2],color[3],predicted_error);
  /* Depth-only targets can use a packed depth/stencil format without a color attachment. */
  GLuint shadow_texture,shadow_fbo;
  p_glGenTextures(1,&shadow_texture);p_glGenFramebuffers(1,&shadow_fbo);
@@ -120,6 +137,6 @@ int main(int argc,char **argv) {
  float shadow_depth=-1;p_glReadPixels(4,8,1,1,GL_DEPTH_COMPONENT,GL_FLOAT,&shadow_depth);
  GLenum shadow_error=p_glGetError();int shadow_ok=fabsf(shadow_depth-1)<.00001f&&!shadow_error;
  printf("first depth-only clear: %s depth=%.8f GLerror=%x\n",shadow_ok?"PASS":"FAIL",shadow_depth,shadow_error);
- [NSOpenGLContext clearCurrentContext];[w close];return clear_ok&&draw_ok&&shadow_ok&&!error?0:1;
+ [NSOpenGLContext clearCurrentContext];[w close];return clear_ok&&draw_ok&&predicted_ok&&shadow_ok&&!error&&!predicted_error?0:1;
  }
 }

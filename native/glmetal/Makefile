@@ -131,6 +131,21 @@ glcompare: $(OUT)/glcompare $(OUT)/libglcases.dylib
 .PHONY: compile-budget-probe
 compile-budget-probe: $(OUT)/glm_compile_budget
 
+.PHONY: pipeline-compile-probes test-pipeline-prewarm
+pipeline-compile-probes: $(OUT)/pipeline_compile $(OUT)/pipeline_prewarm_cpu
+
+$(OUT)/pipeline_compile: tests/probes/pipeline_compile.m src/pipeline_prewarm.m src/pipeline_prewarm.h
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -fobjc-arc $< src/pipeline_prewarm.m -framework Metal -framework Foundation -o $@
+
+$(OUT)/pipeline_prewarm_cpu: tests/probes/pipeline_prewarm_cpu.m src/pipeline_prewarm.m src/pipeline_prewarm.h
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -fobjc-arc $< -framework Metal -framework Foundation -o $@
+
+test-pipeline-prewarm: $(OUT)/pipeline_prewarm_cpu
+	arch -x86_64 $(OUT)/pipeline_prewarm_cpu
+	arch -arm64 $(OUT)/pipeline_prewarm_cpu
+
 $(OUT)/glm_compile_budget: tests/window/glm_compile_budget.m
 	@mkdir -p $(OUT)
 	$(CC) $(CFLAGS) -Wno-deprecated-declarations $< -framework Cocoa -framework OpenGL -o $@
