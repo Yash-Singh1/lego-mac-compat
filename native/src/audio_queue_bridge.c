@@ -35,6 +35,8 @@ struct queue {
        into native buffers the disposal may already have freed. */
     bool disposing;
     bool movie, playing;
+    unsigned controls;
+    bool deferred_dispose, dispose_immediate, dispose_was_playing, preserve_guest_buffers;
     unsigned buffer_count;
     struct { uint32_t guest; AudioQueueBufferRef host; } buffers[kMaxBuffers];
 };
@@ -44,6 +46,16 @@ static struct queue queues[kMaxQueues];
 static unsigned queue_count;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static unsigned playing_movies;
+static pthread_cond_t controls_done = PTHREAD_COND_INITIALIZER;
+struct control_scope { struct queue *queue; struct control_scope *previous; };
+static _Thread_local struct control_scope *control_scopes;
+
+static bool current_thread_controls(struct queue *q)
+{
+    for (struct control_scope *scope = control_scopes; scope; scope = scope->previous)
+        if (scope->queue == q) return true;
+    return false;
+}
 
 int audio_queue_bridge32_movie_playing(void)
 {
@@ -77,7 +89,10 @@ static void playback_result(struct queue *q, bool playing, OSStatus status)
 {
     if (status) return;
     pthread_mutex_lock(&lock);
-    set_playing(q, playing);
+    /* Retirement drains successful controls before native disposal. If
+       disposal fails, restore their latest logical playback result. */
+    if (q->disposing) q->dispose_was_playing = playing;
+    else set_playing(q, playing);
     pthread_mutex_unlock(&lock);
 }
 
@@ -280,24 +295,19 @@ static OSStatus enqueue(struct queue *q, const uint32_t *a)
     return status;
 }
 
-static OSStatus dispose(struct queue *q, bool immediate)
+/* No bridge lock is held across native calls or callbacks. */
+static OSStatus finish_dispose(struct queue *q)
 {
-    pthread_mutex_lock(&lock);
-    AudioQueueRef audio = q->disposing ? NULL : q->audio;
-    bool was_playing = q->playing;
-    q->disposing = true;
-    set_playing(q, false);
-    pthread_mutex_unlock(&lock);
-    if (!audio) return kAudioQueueErr_InvalidQueueType;
-    note_event(kEventDisposeBegin, q->handle, audio, immediate, noErr);
+    AudioQueueRef audio = q->audio;
+    note_event(kEventDisposeBegin, q->handle, audio, q->dispose_immediate, noErr);
     /* Not under lock: disposal waits for a running output callback, which
        may itself be in enqueue(). */
-    OSStatus disposed = AudioQueueDispose(audio, immediate);
-    note_event(kEventDisposeEnd, q->handle, audio, immediate, disposed);
+    OSStatus disposed = AudioQueueDispose(audio, q->dispose_immediate);
+    note_event(kEventDisposeEnd, q->handle, audio, q->dispose_immediate, disposed);
     if (disposed) {
         pthread_mutex_lock(&lock);
         q->disposing = false;
-        set_playing(q, was_playing);
+        set_playing(q, q->dispose_was_playing);
         pthread_mutex_unlock(&lock);
         return disposed;
     }
@@ -309,9 +319,52 @@ static OSStatus dispose(struct queue *q, bool immediate)
     pthread_mutex_unlock(&lock);
     /* Self-disposal may return while guest callback code still uses its
        buffer record. Keep those guest records alive; slots are not reused. */
-    if (callback_queue != q)
+    if (!q->preserve_guest_buffers)
         for (unsigned i = 0; i < count; ++i) compat_runtime32_deallocate(q->buffers[i].guest);
     return noErr;
+}
+
+static OSStatus dispose(struct queue *q, bool immediate)
+{
+    pthread_mutex_lock(&lock);
+    if (!q->audio || q->disposing) {
+        pthread_mutex_unlock(&lock);
+        return kAudioQueueErr_InvalidQueueType;
+    }
+    q->disposing = true;
+    q->dispose_was_playing = q->playing;
+    q->dispose_immediate = immediate;
+    q->preserve_guest_buffers = callback_queue == q;
+    set_playing(q, false);
+    /* A native control can synchronously invoke the requesting callback.
+       Waiting here would deadlock that control. Retire after it returns. */
+    if (q->controls && (current_thread_controls(q) || callback_queue == q)) {
+        q->deferred_dispose = true;
+        pthread_mutex_unlock(&lock);
+        return noErr;
+    }
+    while (q->controls) pthread_cond_wait(&controls_done, &lock);
+    pthread_mutex_unlock(&lock);
+    return finish_dispose(q);
+}
+
+static AudioQueueRef begin_control(struct queue *q)
+{
+    pthread_mutex_lock(&lock);
+    AudioQueueRef audio = q->disposing ? NULL : q->audio;
+    if (audio) ++q->controls;
+    pthread_mutex_unlock(&lock);
+    return audio;
+}
+
+static void end_control(struct queue *q)
+{
+    pthread_mutex_lock(&lock);
+    bool deferred = --q->controls == 0 && q->deferred_dispose;
+    if (deferred) q->deferred_dispose = false;
+    pthread_cond_broadcast(&controls_done);
+    pthread_mutex_unlock(&lock);
+    if (deferred) finish_dispose(q);
 }
 
 int audio_queue_bridge32_dispatch(const char *name, const uint32_t *a, uint64_t *result)
@@ -341,19 +394,26 @@ int audio_queue_bridge32_dispatch(const char *name, const uint32_t *a, uint64_t 
     if (!strcmp(name, "_AudioQueueNewInput")) { *result = (uint32_t)kAudioQueueErr_InvalidDevice; return 1; }
     struct queue *q = queue_for(a[0]);
     if (!q) { *result = (uint32_t)kAudioQueueErr_InvalidQueueType; return 1; }
+    bool control = !strcmp(name, "_AudioQueueStart") || !strcmp(name, "_AudioQueueStop") ||
+        !strcmp(name, "_AudioQueuePause") || !strcmp(name, "_AudioQueueGetProperty") ||
+        !strcmp(name, "_AudioQueueSetProperty") || !strcmp(name, "_AudioQueueSetParameter");
+    AudioQueueRef audio = control ? begin_control(q) : NULL;
+    if (control && !audio) { *result = (uint32_t)kAudioQueueErr_InvalidQueueType; return 1; }
+    struct control_scope scope = {q, control_scopes};
+    if (control) control_scopes = &scope;
     OSStatus status;
     if (!strcmp(name, "_AudioQueueAllocateBuffer")) status = allocate_buffer(q, a[1], (void *)(uintptr_t)a[2]);
     else if (!strcmp(name, "_AudioQueueEnqueueBuffer")) status = enqueue(q, a);
     else if (!strcmp(name, "_AudioQueueStart")) {
-        status = AudioQueueStart(q->audio, (const void *)(uintptr_t)a[1]);
+        status = AudioQueueStart(audio, (const void *)(uintptr_t)a[1]);
         playback_result(q, true, status);
         note_event(kEventStart, q->handle, q->audio, 0, status);
     } else if (!strcmp(name, "_AudioQueueStop")) {
-        status = AudioQueueStop(q->audio, a[1] != 0);
+        status = AudioQueueStop(audio, a[1] != 0);
         playback_result(q, false, status);
         note_event(kEventStop, q->handle, q->audio, a[1], status);
     } else if (!strcmp(name, "_AudioQueuePause")) {
-        status = AudioQueuePause(q->audio);
+        status = AudioQueuePause(audio);
         playback_result(q, false, status);
         note_event(kEventPause, q->handle, q->audio, 0, status);
     }
@@ -363,14 +423,15 @@ int audio_queue_bridge32_dispatch(const char *name, const uint32_t *a, uint64_t 
            4-byte fields and match on i386. Object-valued properties do not. */
         if (a[1] == kAudioQueueProperty_CurrentDevice) status = kAudioQueueErr_InvalidPropertyValue;
         else if (name[11] == 'G')
-            status = AudioQueueGetProperty(q->audio, a[1], (void *)(uintptr_t)a[2], (UInt32 *)(uintptr_t)a[3]);
-        else status = AudioQueueSetProperty(q->audio, a[1], (const void *)(uintptr_t)a[2], a[3]);
+            status = AudioQueueGetProperty(audio, a[1], (void *)(uintptr_t)a[2], (UInt32 *)(uintptr_t)a[3]);
+        else status = AudioQueueSetProperty(audio, a[1], (const void *)(uintptr_t)a[2], a[3]);
     } else if (!strcmp(name, "_AudioQueueSetParameter")) {
         float value;
         memcpy(&value, &a[2], sizeof(value));
         if (a[1] == kAudioQueueParam_Volume && getenv("LP32_MUTE_AUDIO")) value = 0;
-        status = AudioQueueSetParameter(q->audio, a[1], value);
+        status = AudioQueueSetParameter(audio, a[1], value);
     } else return 0;
+    if (control) { control_scopes = scope.previous; end_control(q); }
     if (getenv("LP32_TRACE_AUDIO_QUEUE"))
         fprintf(stderr, "compat32: %s queue=%08x -> %d\n", name + 1, a[0], (int)status);
     *result = (uint32_t)status;

@@ -1292,9 +1292,14 @@ int main(int argc, char **argv)
        threshold is 50 ms rather than treating each loading frame as a hitch. */
     bool cod4_hitches = lp32_profile()->title == LP32_TITLE_COD4 ||
                        lp32_profile()->title == LP32_TITLE_COD4_MP;
+    bool modern_warfare_hitches = lp32_profile()->title == LP32_TITLE_MW2 ||
+                                  lp32_profile()->title == LP32_TITLE_MW2_MP ||
+                                  lp32_profile()->title == LP32_TITLE_MW3 ||
+                                  lp32_profile()->title == LP32_TITLE_MW3_MP;
     const char *hitch_option = getenv("LP32_HITCH_LOG");
     if ((hitch_option && strcmp(hitch_option, "0")) ||
-        (!hitch_option && (lp32_profile()->title == LP32_TITLE_MARVEL || cod4_hitches))) {
+        (!hitch_option && (lp32_profile()->title == LP32_TITLE_MARVEL ||
+                           cod4_hitches || modern_warfare_hitches))) {
         char path[PATH_MAX];
         const char *home = getenv("HOME");
         int length = snprintf(path, sizeof(path), "%s/Library/Logs/%s/hitches-%ld-%llu.log",

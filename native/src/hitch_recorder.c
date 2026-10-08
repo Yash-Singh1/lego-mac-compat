@@ -105,7 +105,8 @@ unsigned hitch_classify(const char *name)
         strstr(name, "WaitSync") || !strcmp(name, "MPWaitOnSemaphore") ||
         !strcmp(name, "MPWaitOnQueue") || !strcmp(name, "MPDelayUntil") ||
         !strcmp(name, "usleep") || !strcmp(name, "nanosleep")) return HITCH_WAIT;
-    if (!strncmp(name, "AudioUnit", 9) || !strncmp(name, "AudioConverter", 14) ||
+    if (!strncmp(name, "AudioQueue", 10) || !strncmp(name, "AudioUnit", 9) ||
+        !strncmp(name, "AudioConverter", 14) ||
         !strncmp(name, "AudioFile", 9) || !strncmp(name, "ExtAudioFile", 12) ||
         !strncmp(name, "Snd", 3)) return HITCH_AUDIO;
     if (!strncmp(name, "gl", 2) || !strncmp(name, "CGL", 3)) return HITCH_GL_STATE;
@@ -180,7 +181,9 @@ int hitch_start(const char *path, double threshold_ms)
     fchmod(fileno(output), 0600);
     threshold_ns = (threshold_ms >= 1 && threshold_ms <= 10000) ?
         (uint64_t)(threshold_ms * 1e6) : 25000000;
-    is_render_thread = true;
+    /* Startup may run on the application thread while a guest Backend
+       thread presents. Ownership is established at the first presentation. */
+    is_render_thread = false;
     const char *full = getenv("LP32_HITCH_FULL_IMPORTS");
     hitch_full_imports = full && full[0] && strcmp(full, "0");
     fprintf(output, "hitch-recorder v3 pid=%ld wall=%lld monotonic=%.3f threshold_ms=%.3f history=%d after=%d limit=%d full_imports=%d\n"
@@ -263,6 +266,9 @@ void hitch_frame(uint64_t swap, uint64_t work_end, uint64_t flush_end,
                  uint64_t present_end, uint64_t target_ns, bool active)
 {
     if (!hitch_recorder_enabled) return;
+    /* One presentation producer owns current and its counters. Imports
+       before its first presentation remain worker events. */
+    is_render_thread = true;
     ++frame_generation;
     current.swap = swap; current.end = present_end; current.active = active;
     current.present = previous_end ? present_end - previous_end : 0;
