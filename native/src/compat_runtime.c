@@ -93,7 +93,9 @@ enum {
     kBridgeCodeSize = 0x00010000,
     kBridgeDataBase = 0x7f010000,
     kBridgeDataSize = 0x00010000,
-    kGuestStackBase = 0x7c000000,
+    kLegacyGuestStackBase = 0x7c000000,
+    /* Where 32-bit macOS placed secondary thread stacks. */
+    kNativeGuestStackBase = 0xb0000000,
     kGuestStackSize = 0x03000000,
     kGuestStackPerThread = 0x00100000,
     /* Pages 0x0000-0xcfff hold only i386 code and far-pointer data; the
@@ -154,6 +156,15 @@ _Static_assert(kDynamicThunksOffset + kDynamicThunkCapacity * kImportThunkSize <
 
 /* Where the 64-bit gateway sends a thread back into i386 code. */
 uint32_t lp32_landing32 = kBridgeCodeBase + kLanding32Offset;
+
+/* Stale stack words are read by MW2 code with mismatched varargs (e.g.
+   Scr_Objective_Position formats int zeros with %f). At 0x7c000000+ a stale
+   stack pointer read as a double's high word is ~1e300 and printed as a
+   300-digit number; at 32-bit macOS's 0xb0000000 it is a tiny negative value
+   and prints "-0.00", as the game shipped with. compat_runtime32_reserve_
+   guest_arena moves stacks there when the range is free. */
+static uint32_t guest_stack_base = kLegacyGuestStackBase;
+
 
 struct __attribute__((packed)) far_ptr32 {
     uint32_t offset;
@@ -4210,10 +4221,17 @@ void compat_runtime32_reserve_guest_arena(void)
         cursor = region + length;
     }
     guest_arena_ready = true;
+    uint64_t stacks = kNativeGuestStackBase, stacks_end = stacks + kGuestStackSize;
+    if (range_within(guest_arena_free, guest_arena_free_count, stacks, stacks_end) &&
+        mmap((void *)(uintptr_t)stacks, kGuestStackSize, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0) == (void *)(uintptr_t)stacks) {
+        arena_free_remove(stacks, stacks_end);
+        guest_stack_base = kNativeGuestStackBase;
+    }
     pthread_mutex_unlock(&guest_arena_lock);
     if (getenv("LP32_TRACE_GUEST_VM"))
-        fprintf(stderr, "compat32: guest arena reserved %u ranges, %llu MB above 0x%08x\n",
-                guest_arena_count, (unsigned long long)(reserved >> 20), kGuestArenaStart);
+        fprintf(stderr, "compat32: guest arena reserved %u ranges, %llu MB above 0x%08x; stacks at 0x%08x\n",
+                guest_arena_count, (unsigned long long)(reserved >> 20), kGuestArenaStart, guest_stack_base);
 }
 
 static bool trace_guest_vm(void)
@@ -4340,6 +4358,9 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
     return result;
 }
 
+static uint32_t mw2_command_overflow_target;
+void compat_runtime32_set_command_overflow_target(uint32_t com_error) { mw2_command_overflow_target = com_error; }
+
 static unsigned trace_print_argument;
 void compat_runtime32_set_trace_print_argument(unsigned argument) { trace_print_argument = argument; }
 
@@ -4373,6 +4394,39 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
         uint64_t exception_result;
         if (cxx_exception_bridge32_dispatch(name, arguments, return_address, &exception_result))
             return exception_result;
+    }
+    if (!strcmp(name, "_lp32_mw2_command_overflow")) {
+        /* Replaces SV_AddServerCommand's two Com_Error calls: print the
+           commands still waiting for the client, then continue into
+           Com_Error with the original arguments, as if called directly. */
+        struct guest_resume_context frame;
+        if (!compat_runtime32_import_frame(&frame) || !mw2_command_overflow_target) {
+            compat_runtime32_trap_import(name, arguments, return_address);
+            return 0;
+        }
+        const uint32_t *caller = (const void *)(uintptr_t)frame.ebp;
+        uint32_t client = frame.ebp >= 0x1000 ? caller[2] : 0;
+        const char *adding = frame.ebp >= 0x1000 && caller[3] >= 0x1000 ? (const char *)(uintptr_t)caller[3] : "";
+        if (client >= 0x1000) {
+            const uint32_t *fields = (const void *)(uintptr_t)client;
+            uint32_t used = fields[1], sequence = fields[2], acknowledge = fields[3];
+            fprintf(stderr, "compat32: server command buffer full at 0x%08" PRIx32 ": %u bytes used, %d commands pending "
+                    "(sequence %u, acknowledged %u); adding %zu bytes: %.300s\n", return_address, used,
+                    (int)(sequence - acknowledge), sequence, acknowledge, strlen(adding), adding);
+            const char *text = (const char *)(uintptr_t)(client + 0x10);
+            const uint32_t *offsets = (const void *)(uintptr_t)(client + 0x1010);
+            for (uint32_t index = acknowledge + 1; (int32_t)(sequence - index) >= 0 && index - acknowledge <= 128; ++index) {
+                uint32_t offset = offsets[index & 0x7f];
+                if (offset >= 0x1000) continue;
+                fprintf(stderr, "compat32:   pending %u (%zu bytes): %.200s\n", index,
+                        strnlen(text + offset, 0x1000 - offset), text + offset);
+            }
+        }
+        fflush(stderr);
+        frame.esp -= 4; /* the call's return address is still in place */
+        frame.eip = mw2_command_overflow_target;
+        compat_runtime32_resume_guest(&frame);
+        return 0;
     }
     if (!strcmp(name, "_puts")) {
         /* Aspyr prints the Steam proof-of-purchase key before storing it.
@@ -6524,7 +6578,7 @@ uint32_t compat_runtime32_call(uint32_t function, const uint32_t *arguments,
         last_call_trapped = 1;
         return 0;
     }
-    uintptr_t stack_top = kGuestStackBase + kGuestStackSize -
+    uintptr_t stack_top = guest_stack_base + kGuestStackSize -
                           guest_thread_slot * kGuestStackPerThread -
                           guest_call_depth * stack_slice_size;
     /* Entry goes through the i386 landing trampoline, whose `ret` pops the
@@ -7659,6 +7713,56 @@ int compat_runtime32_run_sync_self_test(void)
         uint32_t again = (uint32_t)compat_runtime32_dispatch_import("_mmap", map);
         if (again != first || *(volatile uint8_t *)(uintptr_t)again != 0) return -1;
         compat_runtime32_dispatch_import("_munmap", unmap);
+    }
+
+    /* The command-overflow dump reads SV_AddServerCommand's frame, then
+       tail-calls its Com_Error target with the original arguments. */
+    {
+        uint8_t *code = mmap((void *)0x76200000, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                             MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+        uint32_t client = guest_allocate(0x1210, true);
+        if (code == MAP_FAILED || !client) return -1;
+        uint32_t base = (uint32_t)(uintptr_t)code;
+        uint32_t thunk = compat_runtime32_guest_callback("_lp32_mw2_command_overflow");
+        uint8_t frame_code[] = {0x55, 0x89, 0xe5, 0x83, 0xec, 0x08, 0xc7, 0x04, 0x24, 1, 0, 0, 0,
+            0xc7, 0x44, 0x24, 0x04, 0, 0, 0, 0, 0xe8, 0, 0, 0, 0, 0x89, 0xec, 0x5d, 0xc3};
+        uint32_t format = base + 0x80;
+        int32_t relative = (int32_t)(thunk - (base + 26));
+        memcpy(frame_code + 17, &format, 4);
+        memcpy(frame_code + 22, &relative, 4);
+        memcpy(code, frame_code, sizeof(frame_code));
+        const uint8_t target[] = {0x8b, 0x44, 0x24, 0x04, 0x83, 0xc0, 0x40, 0xc3}; /* return arg0 + 0x40 */
+        memcpy(code + 0x40, target, sizeof(target));
+        uint32_t *fields = (void *)(uintptr_t)client;
+        fields[1] = 10; fields[2] = 2; fields[3] = 0;
+        memcpy((char *)(uintptr_t)client + 0x10, "cmd1\0cmd2", 10);
+        fields[(0x1010 / 4) + 2] = 5;
+        uint32_t previous_target = mw2_command_overflow_target;
+        mw2_command_overflow_target = base + 0x40;
+        uint32_t call_arguments[] = {client, base + 0x90};
+        memcpy(code + 0x90, "next", 5);
+        uint32_t result = compat_runtime32_call(base, call_arguments, 2);
+        mw2_command_overflow_target = previous_target;
+        munmap(code, 4096);
+        guest_deallocate(client);
+        if (compat_runtime32_last_call_trapped() || result != 0x41) return -1;
+    }
+
+    /* Guest stacks sit where 32-bit macOS put thread stacks, so a stale
+       stack pointer read as a double (MW2's Scr_Objective_Position formats
+       int zeros with %.2f) is tiny, not a 300-digit number. */
+    if (guest_arena_ready) {
+        uint8_t *code = mmap((void *)0x76300000, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                             MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+        if (code == MAP_FAILED) return -1;
+        const uint8_t read_esp[] = {0x89, 0xe0, 0xc3}; /* mov eax, esp; ret */
+        memcpy(code, read_esp, sizeof(read_esp));
+        uint32_t esp = compat_runtime32_call((uint32_t)(uintptr_t)code, NULL, 0);
+        munmap(code, 4096);
+        if (esp < kNativeGuestStackBase || esp >= kNativeGuestStackBase + kGuestStackSize) return -1;
+        uint32_t stale[] = {0, 0, 0, 1, esp}; /* three int zeros, then stale words */
+        char text[128];
+        if (guest_vformat(text, sizeof(text), "%.2f %.2f %.2f", stale) < 0 || strlen(text) > 20) return -1;
     }
 
     /* Windows-style swprintf(L"%hs"), CoreAudio device queries across the

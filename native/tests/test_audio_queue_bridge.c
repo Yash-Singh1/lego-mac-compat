@@ -1,7 +1,9 @@
 /* Disposes AudioQueues while their output callbacks keep refilling and
- * re-enqueueing buffers, as MW2's Miles and Bink drivers do. Before disposal
- * was ordered against enqueue, the refill could copy into native buffers the
- * disposal had freed, corrupting the audio allocator. */
+ * re-enqueueing buffers, and while another thread keeps starting, pausing,
+ * stopping and adjusting the same queue, as MW2's Miles and Bink drivers do
+ * around movies and level changes. A call that reached AudioToolbox after
+ * disposal freed the queue corrupted the audio allocator; the next
+ * AudioQueueNewOutput then trapped in caulk. */
 #include "../src/audio_queue_bridge.h"
 #include <AudioToolbox/AudioToolbox.h>
 #include <assert.h>
@@ -42,6 +44,37 @@ uint32_t compat_runtime32_call(uint32_t function, const uint32_t *a, size_t coun
     return 0;
 }
 
+static _Atomic uint32_t current_queue;
+static atomic_bool racing = true;
+static atomic_uint racer_calls;
+/* Another guest thread operating on whichever queue is current. */
+static void *racer(void *unused)
+{
+    (void)unused;
+    uint32_t *size = (void *)(uintptr_t)compat_runtime32_allocate(16, 1);
+    while (atomic_load(&racing)) {
+        uint32_t queue = atomic_load(&current_queue);
+        if (!queue) continue;
+        uint64_t result;
+        float volume = 0.5f;
+        uint32_t parameter[3] = {queue, kAudioQueueParam_Volume, 0};
+        memcpy(&parameter[2], &volume, 4);
+        audio_queue_bridge32_dispatch("_AudioQueueSetParameter", parameter, &result);
+        uint32_t pause[] = {queue};
+        audio_queue_bridge32_dispatch("_AudioQueuePause", pause, &result);
+        uint32_t start[] = {queue, 0};
+        audio_queue_bridge32_dispatch("_AudioQueueStart", start, &result);
+        size[0] = 4;
+        uint32_t get[] = {queue, kAudioQueueProperty_IsRunning, (uint32_t)(uintptr_t)(size + 1),
+                          (uint32_t)(uintptr_t)size};
+        audio_queue_bridge32_dispatch("_AudioQueueGetProperty", get, &result);
+        uint32_t stop[] = {queue, 0};
+        audio_queue_bridge32_dispatch("_AudioQueueStop", stop, &result);
+        atomic_fetch_add(&racer_calls, 1);
+    }
+    return NULL;
+}
+
 int main(void)
 {
     assert(mmap((void *)0x40000000, 0x4000000, PROT_READ | PROT_WRITE,
@@ -55,6 +88,8 @@ int main(void)
         .mChannelsPerFrame = 2, .mBitsPerChannel = 16,
     };
     uint32_t *out = (void *)(uintptr_t)compat_runtime32_allocate(8, 1);
+    pthread_t racing_thread;
+    pthread_create(&racing_thread, NULL, racer, NULL);
     for (unsigned round = 0; round < 200; ++round) {
         uint64_t result;
         uint32_t create[] = {(uint32_t)(uintptr_t)format, 1, 0, 0, 0, 0, (uint32_t)(uintptr_t)out};
@@ -70,18 +105,52 @@ int main(void)
         }
         uint32_t start[] = {queue, 0};
         audio_queue_bridge32_dispatch("_AudioQueueStart", start, &result);
+        atomic_store(&current_queue, queue);
         usleep(round % 4 ? 300 + (round % 11) * 700 : 60000);
         uint32_t dispose[] = {queue, round % 2};
         assert(audio_queue_bridge32_dispatch("_AudioQueueDispose", dispose, &result));
     }
+    atomic_store(&racing, false);
+    pthread_join(racing_thread, NULL);
     usleep(200000);
-    /* A fresh queue still works after all the disposals. */
+    /* Fresh queues still work after all the disposals (the step that trapped
+       in caulk when the allocator had been corrupted). */
     uint64_t result;
-    uint32_t create[] = {(uint32_t)(uintptr_t)format, 1, 0, 0, 0, 0, (uint32_t)(uintptr_t)out};
-    assert(audio_queue_bridge32_dispatch("_AudioQueueNewOutput", create, &result) && !result);
+    for (unsigned i = 0; i < 50; ++i) {
+        uint32_t create[] = {(uint32_t)(uintptr_t)format, 1, 0, 0, 0, 0, (uint32_t)(uintptr_t)out};
+        assert(audio_queue_bridge32_dispatch("_AudioQueueNewOutput", create, &result) && !result);
+        uint32_t dispose[] = {out[0], 1};
+        audio_queue_bridge32_dispatch("_AudioQueueDispose", dispose, &result);
+    }
+    /* The crash report finds a native buffer from its address. */
+    {
+        int pipe_fds[2];
+        assert(pipe(pipe_fds) == 0);
+        uint32_t create[] = {(uint32_t)(uintptr_t)format, 1, 0, 0, 0, 0, (uint32_t)(uintptr_t)out};
+        assert(audio_queue_bridge32_dispatch("_AudioQueueNewOutput", create, &result) && !result);
+        uint32_t alloc[] = {out[0], 4096, (uint32_t)(uintptr_t)(out + 1)};
+        assert(audio_queue_bridge32_dispatch("_AudioQueueAllocateBuffer", alloc, &result) && !result);
+        uint64_t none = 0;
+        audio_queue_bridge32_crash_report(pipe_fds[1], -1, &none, 1);
+        static char text[1 << 16];
+        ssize_t n = read(pipe_fds[0], text, sizeof(text) - 1);
+        assert(n > 0);
+        text[n] = 0;
+        const char *allocate = strstr(text, " allocate ");
+        assert(allocate && strstr(text, "audio queue operations"));
+        unsigned long long address = strtoull(strstr(allocate, "object=") + 7, NULL, 16);
+        uint64_t inside = address + 16;
+        audio_queue_bridge32_crash_report(pipe_fds[1], -1, &inside, 1);
+        n = read(pipe_fds[0], text, sizeof(text) - 1);
+        assert(n > 0);
+        text[n] = 0;
+        assert(strstr(text, "+16 bytes from buffer"));
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+    }
     /* Playing queues are still refilled; only disposing ones are not. */
     assert(atomic_load(&refills) > 100);
-    printf("AudioQueue bridge PASS (200 disposals during callback refills, %u refills)\n",
-           atomic_load(&refills));
+    printf("AudioQueue bridge PASS (200 disposals during callback refills and %u racing control "
+           "calls, %u refills)\n", atomic_load(&racer_calls), atomic_load(&refills));
     return 0;
 }

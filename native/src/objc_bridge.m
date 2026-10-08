@@ -3176,6 +3176,160 @@ static void inactive_pacing_track_focus(void)
 /* Input diagnostics for the play log: a key event reaching AppKit late,
    or a long gap between presented frames (a hitch keeps the last held
    movement going), both while the game is in front. */
+/* LP32_INPUT_JOURNAL=1: key/button transitions and one motion/frame summary
+   per second. The sampler keeps reporting if the event or render thread stalls.
+   Engine reads are limited to recognized MW2 SP static image data. */
+static bool input_journal_enabled(void)
+{
+    static dispatch_once_t once;
+    static bool enabled;
+    dispatch_once(&once, ^{
+        enabled = getenv("LP32_INPUT_JOURNAL") != NULL &&
+            (lp32_profile()->title == LP32_TITLE_MW2 || lp32_profile()->title == LP32_TITLE_MW2_MP);
+    });
+    return enabled;
+}
+
+static pthread_mutex_t input_journal_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct input_journal_totals {
+    unsigned motions, frames;
+    double dx, dy, travel_x, travel_y, max_age_ms;
+    uint64_t motion_gap_ns, frame_gap_ns;
+    uint64_t last_motion_ns, last_frame_ns;
+} input_journal_totals;
+static bool input_journal_engine;
+
+static void input_journal_frame(uint64_t now)
+{
+    if (!input_journal_enabled()) return;
+    pthread_mutex_lock(&input_journal_mutex);
+    struct input_journal_totals *s = &input_journal_totals;
+    uint64_t gap = s->last_frame_ns ? now - s->last_frame_ns : 0;
+    if (gap > s->frame_gap_ns) s->frame_gap_ns = gap;
+    s->last_frame_ns = now;
+    ++s->frames;
+    pthread_mutex_unlock(&input_journal_mutex);
+}
+
+static void *input_journal_sampler(void *unused)
+{
+    (void)unused;
+    const uint8_t *buttons = (const void *)(uintptr_t)0x0072fe98;
+    /* _clients is static image storage, never a heap pointer. Do not follow
+       the engine's client pointer unless it still names this exact storage. */
+    const int32_t *mouse = (const void *)(uintptr_t)0x019d7c68;
+    uint32_t previous = 0;
+    int previous_index = -1;
+    unsigned flips = 0;
+    uint64_t last_flip_ns = 0, flip_gap_ns = 0;
+    uint64_t last_summary_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    for (;;) {
+        uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        uint32_t mask = 0;
+        int index = -1, dx = 0, dy = 0;
+        if (input_journal_engine) {
+            for (unsigned i = 0; i < 27; ++i)
+                if (__atomic_load_n(&buttons[i * 0x14 + 0x10], __ATOMIC_RELAXED)) mask |= 1u << i;
+            if (mask != previous) {
+                fprintf(stderr, "input: t=%.1f engine buttons=0x%07x (changed 0x%07x)\n",
+                        now / 1e6, mask, mask ^ previous);
+                previous = mask;
+            }
+            if (__atomic_load_n((const uint32_t *)(uintptr_t)0x003d4b58, __ATOMIC_RELAXED) == 0x019d7c68) {
+                index = __atomic_load_n(&mouse[5], __ATOMIC_RELAXED);
+                if (index == 0 || index == 1) {
+                    dx = __atomic_load_n(&mouse[1 + index], __ATOMIC_RELAXED);
+                    dy = __atomic_load_n(&mouse[3 + index], __ATOMIC_RELAXED);
+                    if (previous_index >= 0 && index != previous_index) {
+                        uint64_t gap = last_flip_ns ? now - last_flip_ns : 0;
+                        if (gap > flip_gap_ns) flip_gap_ns = gap;
+                        last_flip_ns = now;
+                        ++flips;
+                    }
+                } else index = -1;
+            }
+            if (index < 0) last_flip_ns = 0;
+            previous_index = index;
+        }
+        if (now - last_summary_ns >= 1000000000) {
+            pthread_mutex_lock(&input_journal_mutex);
+            struct input_journal_totals s = input_journal_totals;
+            input_journal_totals = (struct input_journal_totals){
+                .last_motion_ns = s.last_motion_ns, .last_frame_ns = s.last_frame_ns
+            };
+            pthread_mutex_unlock(&input_journal_mutex);
+            /* Read the timestamp after the snapshot so concurrent producers
+               cannot give negative ages. No formatting or I/O under the lock. */
+            uint64_t report_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            fprintf(stderr, "input: t=%.1f summary span=%.1fms active=%d "
+                    "motion=%u delta=%.1f,%.1f travel=%.1f,%.1f ageMax=%.1fms "
+                    "motionGap=%.1fms motionIdle=%.1fms frames=%u frameGap=%.1fms frameIdle=%.1fms "
+                    "engine=%d buttons=0x%07x mouseIndex=%d pending=%d,%d "
+                    "sampledFlips=%u flipGap=%.1fms flipIdle=%.1fms\n",
+                    report_ns / 1e6, (now - last_summary_ns) / 1e6,
+                    __atomic_load_n(&presenting_app_active, __ATOMIC_RELAXED),
+                    s.motions, s.dx, s.dy, s.travel_x, s.travel_y, s.max_age_ms,
+                    s.motion_gap_ns / 1e6, s.last_motion_ns ? (report_ns - s.last_motion_ns) / 1e6 : -1.0,
+                    s.frames, s.frame_gap_ns / 1e6, s.last_frame_ns ? (report_ns - s.last_frame_ns) / 1e6 : -1.0,
+                    input_journal_engine, mask, index, dx, dy, flips,
+                    flip_gap_ns / 1e6, last_flip_ns ? (report_ns - last_flip_ns) / 1e6 : -1.0);
+            last_summary_ns = now;
+            flips = 0;
+            flip_gap_ns = 0;
+        }
+        /* Index flips are sampled, not an exact count: two flips between
+           samples can cancel. Pending deltas are an approximate snapshot. */
+        struct timespec pause = {0, input_journal_engine ? 2000000 : 20000000};
+        nanosleep(&pause, NULL);
+    }
+    return NULL;
+}
+
+static void input_journal_event(NSEvent *event)
+{
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        static const uint8_t buttons_ref[] = {0x8d, 0x88, 0x98, 0xfe, 0x72, 0x00};
+        static const uint8_t mouse_ref[] = {0x8b, 0x15, 0x58, 0x4b, 0x3d, 0x00, 0x8b, 0x7a, 0x14};
+        const struct macho_image32 *image = compat_runtime32_image();
+        input_journal_engine = lp32_profile()->title == LP32_TITLE_MW2 && image && image->header &&
+            macho_image32_find_symbol(image, "__ZL9playersKb") == 0x0072fe98 &&
+            macho_image32_find_symbol(image, "_clients") == 0x019d7c68 &&
+            macho_image32_find_symbol(image, "__Z13CL_MouseEventiiii") == 0x001ad9b4 &&
+            !memcmp((const void *)(uintptr_t)0x001af43b, buttons_ref, sizeof(buttons_ref)) &&
+            !memcmp((const void *)(uintptr_t)0x001ada1d, mouse_ref, sizeof(mouse_ref));
+        pthread_t thread;
+        int error = pthread_create(&thread, NULL, input_journal_sampler, NULL);
+        if (!error) {
+            pthread_detach(thread);
+            fprintf(stderr, "input: journal started (motion/frame summaries every second; engine sampling %s)\n",
+                    input_journal_engine ? "2 ms" : "unavailable for this image");
+        } else fprintf(stderr, "input: journal sampler unavailable: %s\n", strerror(error));
+    });
+    NSEventType type = event.type;
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (type == NSEventTypeMouseMoved || type == NSEventTypeLeftMouseDragged ||
+        type == NSEventTypeRightMouseDragged || type == NSEventTypeOtherMouseDragged) {
+        double dx = event.deltaX, dy = event.deltaY;
+        double age_ms = ([[NSProcessInfo processInfo] systemUptime] - event.timestamp) * 1000;
+        pthread_mutex_lock(&input_journal_mutex);
+        struct input_journal_totals *s = &input_journal_totals;
+        uint64_t gap = s->last_motion_ns ? now - s->last_motion_ns : 0;
+        if (gap > s->motion_gap_ns) s->motion_gap_ns = gap;
+        if (age_ms > s->max_age_ms) s->max_age_ms = age_ms;
+        s->last_motion_ns = now;
+        ++s->motions;
+        s->dx += dx; s->dy += dy;
+        s->travel_x += fabs(dx); s->travel_y += fabs(dy);
+        pthread_mutex_unlock(&input_journal_mutex);
+    } else if (type == NSEventTypeKeyDown || type == NSEventTypeKeyUp) {
+        fprintf(stderr, "input: t=%.1f cocoa key=%u %s%s event=%.1f\n",
+                now / 1e6, (unsigned)event.keyCode,
+                type == NSEventTypeKeyUp ? "up" : "down", event.isARepeat ? " repeat" : "",
+                event.timestamp * 1000);
+    }
+}
+
 static void log_late_key_event(NSEvent *event)
 {
     if (!event || background_test_mode() || !__atomic_load_n(&presenting_app_active, __ATOMIC_RELAXED)) return;
@@ -3194,6 +3348,7 @@ static void log_frame_hitch(void)
     static uint64_t last_ns;
     static unsigned logged;
     uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    input_journal_frame(now);
     uint64_t gap = last_ns ? now - last_ns : 0;
     last_ns = now;
     if (gap < 250000000 || logged >= 500 || background_test_mode() ||
@@ -11271,7 +11426,11 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         if (strcmp(selector_name, "sendEvent:") == 0 &&
             (lp32_profile()->title == LP32_TITLE_MW2 || lp32_profile()->title == LP32_TITLE_MW2_MP) &&
             [receiver isKindOfClass:[NSApplication class]])
-            log_late_key_event(object_for_argument(arguments[2]));
+        {
+            NSEvent *dispatched = object_for_argument(arguments[2]);
+            log_late_key_event(dispatched);
+            if (input_journal_enabled() && dispatched) input_journal_event(dispatched);
+        }
         if (strcmp(selector_name, "sendEvent:") == 0 &&
             [receiver isKindOfClass:[NSApplication class]] &&
             ![(NSApplication *)receiver mainMenu]) {

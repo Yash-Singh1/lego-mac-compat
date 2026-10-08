@@ -53,6 +53,8 @@ void compat_runtime32_resume_guest(const struct guest_resume_context *context);
 uint32_t compat_runtime32_guest_callback(const char *name);
 /* See LP32_TRACE_CONSOLE_PRINT in game_loader.c. */
 void compat_runtime32_set_trace_print_argument(unsigned argument);
+/* Com_Error, which _lp32_mw2_command_overflow continues into. */
+void compat_runtime32_set_command_overflow_target(uint32_t com_error);
 
 /* Guest callback standing in for Feral's Content.loader MainEntry (returns 1
    so the title proceeds to its own main). */

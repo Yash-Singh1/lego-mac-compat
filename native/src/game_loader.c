@@ -1,5 +1,6 @@
 #include "objc_legacy_bridge.h"
 #include "compat_runtime.h"
+#include "audio_queue_bridge.h"
 #include "cxx_exception_bridge.h"
 #include "carbon_bridge.h"
 #include "controller_bridge.h"
@@ -600,7 +601,7 @@ static void guest_crash_diagnostic(int signal_number, siginfo_t *info,
                     context->uc_mcontext->__ss.__rdi & UINT32_MAX,
                     context->uc_mcontext->__ss.__rbp & UINT32_MAX,
                     rsp & UINT32_MAX);
-            if (rsp >= UINT32_C(0x1000) && rsp < UINT32_C(0x80000000)) {
+            if (rsp >= UINT32_C(0x1000) && rsp < UINT64_C(0xfffff000)) {
                 for (unsigned index = 0; index < 12; ++index) {
                     GUEST_DIAGNOSTIC(
                             "compat32: breakpoint stack[%u]=0x%08x\n",
@@ -724,7 +725,12 @@ static void guest_crash_diagnostic(int signal_number, siginfo_t *info,
             context->uc_mcontext->__ss.__rdi,
             context->uc_mcontext->__ss.__rbp,
             context->uc_mcontext->__ss.__r14);
-    if (rsp >= UINT32_C(0x1000) && rsp < UINT32_C(0x80000000)) {
+    /* An allocator trap (caulk's maybe_create_free_node) leaves the bad
+       block in rsi/rax: say whether it is one of the bridge's audio buffers. */
+    const uint64_t suspects[] = {context->uc_mcontext->__ss.__rsi, context->uc_mcontext->__ss.__rax,
+                                 context->uc_mcontext->__ss.__rdi, context->uc_mcontext->__ss.__rbx};
+    audio_queue_bridge32_crash_report(STDERR_FILENO, guest_diagnostic_fd, suspects, 4);
+    if (rsp >= UINT32_C(0x1000) && rsp < UINT64_C(0xfffff000)) {
         const uint32_t *words = (const void *)(uintptr_t)rsp;
         for (unsigned index = 0; index < 16; ++index) {
             GUEST_DIAGNOSTIC("compat32: crash stack[%u]=0x%08x\n",
@@ -850,6 +856,36 @@ static void configure_console_print_trace(const struct macho_image32 *image)
     fprintf(stderr, "compat32: console print trace at 0x%08lx argument %u\n", address, argument);
 }
 
+/* MW2 campaign: SV_AddServerCommand ends the game with "Reliable command
+   buffer overflow" when more than 4 KB of server commands, or 128 of them,
+   wait for the client. Route its two Com_Error calls through the loader so
+   the log shows which commands filled it; the game then errors as before. */
+static void configure_command_overflow_dump(const struct macho_image32 *image)
+{
+    if (lp32_profile()->title != LP32_TITLE_MW2) return;
+    uint32_t com_error = macho_image32_find_symbol(image, "__Z9Com_Error11errorParm_tPKcz");
+    static const uint32_t sites[] = {0x002ee211, 0x002ee24e};
+    if (!com_error) return;
+    for (size_t i = 0; i < sizeof(sites) / sizeof(sites[0]); ++i) {
+        const uint8_t *code = (const uint8_t *)(uintptr_t)sites[i];
+        int32_t displacement;
+        memcpy(&displacement, code + 1, 4);
+        if (code[0] != 0xe8 || sites[i] + 5 + (uint32_t)displacement != com_error) return;
+    }
+    uint32_t thunk = compat_runtime32_guest_callback("_lp32_mw2_command_overflow");
+    size_t page_size = (size_t)getpagesize();
+    uintptr_t page = sites[0] & ~(page_size - 1);
+    if (!thunk || mprotect((void *)page, page_size * 2, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return;
+    compat_runtime32_set_command_overflow_target(com_error);
+    for (size_t i = 0; i < sizeof(sites) / sizeof(sites[0]); ++i) {
+        int32_t displacement = (int32_t)(thunk - (sites[i] + 5));
+        memcpy((uint8_t *)(uintptr_t)sites[i] + 1, &displacement, 4);
+        flush_guest_instruction(sites[i]);
+    }
+    mprotect((void *)page, page_size * 2, PROT_READ | PROT_EXEC);
+    fprintf(stderr, "compat32: server command overflow dump installed\n");
+}
+
 static void runtime_diagnostic_line(const char *line)
 {
     GUEST_DIAGNOSTIC("%s", line);
@@ -948,6 +984,7 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
     configure_console_print_trace(&image);
+    configure_command_overflow_dump(&image);
 
     printf("image: segments=%" PRIu32 " range=0x%08" PRIx32 "-0x%08" PRIx32
            " entry=0x%08" PRIx32 " initializers=%" PRIu32 " imports=%" PRIu32 "\n",
