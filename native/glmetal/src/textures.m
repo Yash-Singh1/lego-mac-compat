@@ -2124,6 +2124,17 @@ static void sampling_lod_metadata(float (*rows)[4], int slot, const struct glm_s
                   (min == GL_NEAREST_MIPMAP_NEAREST || min == GL_LINEAR_MIPMAP_NEAREST) ? 1 : 2;
 }
 
+/* OpenGL clamps comparison references for fixed-point depth formats even
+   when the Metal backing storage uses floating-point depth. */
+static float fixed_depth_reference(const struct glm_texture *texture)
+{
+    if (!texture || texture->base_level < 0 || texture->base_level >= GLM_MAX_LEVELS) return 0;
+    GLenum format = texture->levels[0][texture->base_level].internal_format;
+    struct glm_format_info info;
+    return glm_format_lookup(format, &info) && info.depth &&
+           format != GL_DEPTH_COMPONENT32F && format != GL_DEPTH32F_STENCIL8;
+}
+
 bool glm_bind_program_textures(struct glm_context *ctx, id<MTLRenderCommandEncoder> encoder,
                                const struct glm_program *program, unsigned stages, uint32_t border_mask,
                                float (*lod_bias)[4])
@@ -2172,6 +2183,7 @@ bool glm_bind_program_textures(struct glm_context *ctx, id<MTLRenderCommandEncod
             struct glm_sampler_state fallback = {GL_NEAREST, GL_NEAREST, GL_REPEAT, GL_REPEAT, GL_REPEAT, GL_NONE, GL_LEQUAL, {0}, 0, 0, 0, 1};
             if (!state) state = &fallback;
             lod_bias[metal_slot][0] = state->lod_bias;
+            lod_bias[GLM_DEPTH_METADATA_BASE + metal_slot][0] = fixed_depth_reference(t);
             sampling_lod_metadata(lod_bias, metal_slot, state, mipmapped);
             bool cube_seams = native_cube_seams(ctx, state, uniform->type == GL_SAMPLER_CUBE ||
                                                            uniform->type == GL_SAMPLER_CUBE_SHADOW ||
@@ -2196,7 +2208,10 @@ bool glm_bind_program_textures(struct glm_context *ctx, id<MTLRenderCommandEncod
                 for (int c = 0; c < 4; ++c) emulated.border_color[c] = 1;
                 id<MTLSamplerState> white = sampler_for(&emulated, bias, mipmapped, slot == GLM_TEX_RECT, cube_seams);
                 int white_slot = program->result.sampler_count + __builtin_popcount(border_mask & ((1u << metal_slot) - 1));
-                if (white_slot < 64) lod_bias[white_slot][0] = state->lod_bias;
+                if (white_slot < 64) {
+                    lod_bias[white_slot][0] = state->lod_bias;
+                    lod_bias[GLM_DEPTH_METADATA_BASE + white_slot][0] = fixed_depth_reference(t);
+                }
                 glm_encoder_texture(ctx, stages, (__bridge void *)view, (__bridge void *)black, (NSUInteger)metal_slot);
                 glm_encoder_texture(ctx, stages, (__bridge void *)view, (__bridge void *)white, (NSUInteger)white_slot);
                 continue;
@@ -2240,6 +2255,7 @@ bool glm_bind_compute_textures(struct glm_context *ctx, id<MTLComputeCommandEnco
             struct glm_sampler_state fallback = {GL_NEAREST, GL_NEAREST, GL_REPEAT, GL_REPEAT, GL_REPEAT, GL_NONE, GL_LEQUAL, {0}, 0, 0, 0, 1};
             if (!state) state = &fallback;
             lod_bias[metal_slot][0] = state->lod_bias;
+            lod_bias[GLM_DEPTH_METADATA_BASE + metal_slot][0] = fixed_depth_reference(t);
             sampling_lod_metadata(lod_bias, metal_slot, state, mipmapped);
             bool cube_seams = native_cube_seams(ctx, state, uniform->type == GL_SAMPLER_CUBE ||
                                                            uniform->type == GL_SAMPLER_CUBE_SHADOW ||
