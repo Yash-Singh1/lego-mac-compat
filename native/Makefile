@@ -614,3 +614,10 @@ $(BUILD_DIR)/test_agl_pixel_format: tests/test_agl_pixel_format.c src/agl_pixel_
 	$(CLANG) $(CFLAGS) -Isrc tests/test_agl_pixel_format.c -o $@
 test-agl-pixel-format: $(BUILD_DIR)/test_agl_pixel_format
 	arch -x86_64 ./$(BUILD_DIR)/test_agl_pixel_format
+
+$(BUILD_DIR)/test_audio_queue_control_race: tests/test_audio_queue_control_race.c src/audio_queue_bridge.c src/audio_queue_bridge.h | $(BUILD_DIR)
+	$(CLANG) $(CFLAGS) -Wl,-pagezero_size,0x1000 -Isrc $< -framework AudioToolbox -framework CoreAudio -o $@
+
+.PHONY: test-audio-queue-control-race
+test-audio-queue-control-race: $(BUILD_DIR)/test_audio_queue_control_race
+	arch -x86_64 ./$(BUILD_DIR)/test_audio_queue_control_race
