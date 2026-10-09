@@ -1,0 +1,3 @@
+[submodule "native/glmetal"]
+	path = native/glmetal
+	url = https://github.com/Yash-Singh1/GLMetal.git

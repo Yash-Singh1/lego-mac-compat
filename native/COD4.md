@@ -64,6 +64,33 @@ into every converted game. They do not fetch updates at conversion time.
 Rebuild the converter after changing GLMetal; previously converted games
 keep their existing driver until updated or converted again.
 
+`native/glmetal` is a submodule of
+[Yash-Singh1/GLMetal](https://github.com/Yash-Singh1/GLMetal), pinned by the
+parent repository. Run `git submodule update --init --recursive` after cloning
+or pulling a change to the pin. The build initializes a missing submodule,
+but leaves an existing checkout alone so it does not overwrite local work.
+CI checkouts must initialize submodules too, for example with
+`submodules: recursive` in `actions/checkout`.
+
+When migrating a checkout that previously contained the vendored source,
+move any leftover `native/glmetal/build` and `native/glmetal/third_party`
+directories outside `native/glmetal` before its first initialization, then
+move them back. This preserves compiled dependencies and lets Git clone
+into an empty directory.
+
+Make renderer changes in the GLMetal repository, test and push them there,
+then update the parent repository's pin to that tested commit:
+
+```sh
+git -C native/glmetal fetch origin
+git -C native/glmetal checkout <tested-commit>
+git add native/glmetal
+git commit -m "Update GLMetal to tested revision"
+```
+
+The converter build uses the checked-out revision; it does not automatically
+follow GLMetal's latest `main` commit.
+
 Generated apps use GLMetal both from Finder and when their executable is run
 directly. `LP32_GL_BACKEND=apple` remains an explicit command-line override.
 Driver build hashes are recorded in `Contents/Resources/GLMetal-build-info.json`.

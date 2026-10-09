@@ -1,5 +1,0 @@
-Run `tests/probes/run_shader_clip_cpu.sh` from any directory after the existing compiler dependencies and `build/gen/compiler_stamp.h` are available. This builds a standalone probe, runs CPU compiler/cache checks, and invokes the offline Metal compiler. It does not build the driver library or execute GPU work.
-
-The six fixtures cover linked noperspective and flat integer interpolation, original fragment primitive IDs, original user transform feedback, affine VertexID with raw TF indexing, legacy ClipVertex, and accepted global VertexID initializers. All six programs roundtrip through the real cache encoder and decoder, including two programs that must retain the native clipping fallback. The probe compares captured MSL, every child stage's MSL, varying layouts, clip metadata, and original TF strides.
-
-Each run creates a fresh temporary directory and an explicit manifest. The wrapper requires nineteen distinct nonempty MSL files and compiles exactly those files. Set `GLM_PROBE_KEEP=1` to retain the executable, MSL, manifest, and compiled AIR files for inspection.

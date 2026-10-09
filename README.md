@@ -44,6 +44,16 @@ Support for the original 32-bit Mac releases:
 
 ## Building
 
+GLMetal is a Git submodule pinned to a tested revision. Initialize it after
+cloning or pulling this branch:
+
+```sh
+git submodule update --init --recursive
+```
+
+The Call of Duty build targets also initialize it automatically when missing.
+Prebuilt converters already contain GLMetal and need no repository access.
+
 For a Finder-based COD4 conversion, build the standalone app once:
 
 ```sh

@@ -152,6 +152,9 @@ GLMETAL_SOURCE ?= glmetal
 GLMETAL_BUILD ?= $(GLMETAL_SOURCE)/build
 .PHONY: glmetal-lib cod-converters cod4-converter mw2-converter mw3-converter test-cod4-converter
 glmetal-lib:
+	@if test "$(GLMETAL_SOURCE)" = glmetal && ! test -f glmetal/Makefile; then \
+		git -C .. submodule update --init --recursive -- native/glmetal; \
+	fi
 	$(MAKE) -C "$(GLMETAL_SOURCE)" lib
 
 cod-converters: cod4-converter mw2-converter mw3-converter
