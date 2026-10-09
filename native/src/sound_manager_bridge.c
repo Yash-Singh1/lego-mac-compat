@@ -21,10 +21,20 @@ struct pending {
     AudioQueueBufferRef buffer;
     bool submitted, done;
 };
+struct owned_buffer {
+    AudioQueueBufferRef buffer;
+    uint64_t epoch;
+    uint32_t generation;
+    bool available;
+    struct owned_buffer *next;
+};
 struct sound_channel {
     uint32_t guest, callback, volume, rate, multiplier, generation;
     atomic_bool closed;
-    bool playing, paused, owns_guest, advancing;
+    bool playing, paused, owns_guest, advancing, started;
+    Float32 applied_rate;
+    uint64_t audio_epoch;
+    struct owned_buffer *buffers;
     unsigned queued_buffers, immediate_buffers;
     dispatch_queue_t worker;
     AudioQueueRef audio;
@@ -42,9 +52,14 @@ static uint32_t u32(const void *p) { uint32_t n; memcpy(&n,p,4);return n; }
 static uint16_t u16(const void *p) { uint16_t n; memcpy(&n,p,2);return n; }
 static void completed(void *raw, AudioQueueRef queue, AudioQueueBufferRef buffer) {
     struct sound_channel *channel = raw;
-    uint32_t generation = (uint32_t)(uintptr_t)buffer->mUserData;
+    struct owned_buffer *owned = buffer->mUserData;
+    uint32_t generation = owned->generation;
+    uint64_t epoch = owned->epoch;
     dispatch_async(channel->worker, ^{
-        if (!channel->closed && channel->audio == queue) {
+        if (!channel->closed && channel->audio == queue && channel->audio_epoch == epoch) {
+            /* Returned buffers stay owned by their queue. FreeBuffer is only
+               legal while stopped; reuse them after this completion instead. */
+            if (owned->generation == generation) owned->available = true;
             if (generation == channel->generation) {
                 bool queued = false;
                 for (struct pending *p = channel->head; p; p = p->next) {
@@ -58,7 +73,6 @@ static void completed(void *raw, AudioQueueRef queue, AudioQueueBufferRef buffer
                 else if (!queued && channel->immediate_buffers) --channel->immediate_buffers;
                 channel->playing = channel->queued_buffers || channel->immediate_buffers;
             }
-            AudioQueueFreeBuffer(queue, buffer);
             if (generation == channel->generation) advance(channel);
         }
     });
@@ -70,13 +84,33 @@ static void volume(struct sound_channel *c) {
     AudioQueueSetParameter(c->audio,kAudioQueueParam_Volume,level);
     if (left+right>0) AudioQueueSetParameter(c->audio,kAudioQueueParam_Pan,(right-left)/(left+right));
 }
+static int dispose_audio(struct sound_channel *c) {
+    if (c->audio) {
+        OSStatus status=AudioQueueDispose(c->audio, true);
+        if (status) return (int)status;
+    }
+    c->audio = NULL;
+    c->started = false;
+    ++c->audio_epoch;
+    /* Dispose reclaims every native buffer after native callbacks finish.
+       Delayed worker jobs validate their captured epoch before touching nodes. */
+    while (c->buffers) {
+        struct owned_buffer *next = c->buffers->next;
+        free(c->buffers);
+        c->buffers = next;
+    }
+    return 0;
+}
 static void playback_rate(struct sound_channel *c) {
-    if(!c->audio)return;
+    if (!c->audio) return;
     double ratio=c->rate/65536.0/c->format.mSampleRate*c->multiplier/65536.0;
-    if(ratio<=0 || c->paused)AudioQueuePause(c->audio);
-    else {
-        AudioQueueSetParameter(c->audio,kAudioQueueParam_PlayRate,(Float32)ratio);
-        if(c->playing)AudioQueueStart(c->audio,NULL);
+    if (ratio<=0 || c->paused) {
+        if (c->started && !AudioQueuePause(c->audio)) c->started=false;
+    } else {
+        if ((Float32)ratio != c->applied_rate &&
+            !AudioQueueSetParameter(c->audio,kAudioQueueParam_PlayRate,(Float32)ratio))
+            c->applied_rate=(Float32)ratio;
+        if (c->playing && !c->started && !AudioQueueStart(c->audio,NULL)) c->started=true;
     }
 }
 static int play(struct sound_channel *c, uint32_t address, AudioQueueBufferRef *queued) {
@@ -113,26 +147,38 @@ static int play(struct sound_channel *c, uint32_t address, AudioQueueBufferRef *
         /* A different sample format is a queue barrier. Keep earlier audio
            alive until it drains instead of disposing a queue still in use. */
         if (c->playing) return queued ? 1 : -50;
-        AudioQueueDispose(c->audio,true);c->audio=NULL;
+        int disposed=dispose_audio(c);
+        if (disposed) return disposed;
     }
     OSStatus status=0;
     if(!c->audio) {
         status=AudioQueueNewOutput(&format,completed,c,NULL,NULL,0,&c->audio);
         if(status)return (int)status;
+        ++c->audio_epoch;
+        c->applied_rate=1.0f;
         c->format=format;volume(c);
         UInt32 enabled=1;
         AudioQueueSetProperty(c->audio,kAudioQueueProperty_EnableTimePitch,&enabled,sizeof(enabled));
         UInt32 algorithm=kAudioQueueTimePitchAlgorithm_Varispeed;
         AudioQueueSetProperty(c->audio,kAudioQueueProperty_TimePitchAlgorithm,&algorithm,sizeof(algorithm));
     }
-    AudioQueueBufferRef buffer=NULL;
-    status=AudioQueueAllocateBuffer(c->audio,(UInt32)size,&buffer);
-    if(status)return (int)status;
+    struct owned_buffer *owned=c->buffers;
+    while (owned && (!owned->available || owned->buffer->mAudioDataBytesCapacity<size)) owned=owned->next;
+    if (!owned) {
+        owned=calloc(1,sizeof(*owned));
+        if (!owned) return -108;
+        status=AudioQueueAllocateBuffer(c->audio,(UInt32)size,&owned->buffer);
+        if (status) { free(owned); return (int)status; }
+        owned->epoch=c->audio_epoch;
+        owned->next=c->buffers;c->buffers=owned;
+        owned->buffer->mUserData=owned;
+    }
+    AudioQueueBufferRef buffer=owned->buffer;
+    owned->available=false;owned->generation=c->generation;
     memcpy(buffer->mAudioData,(void *)(uintptr_t)data,(size_t)size);buffer->mAudioDataByteSize=(UInt32)size;
-    buffer->mUserData=(void *)(uintptr_t)c->generation;
     c->rate=u32(h+8);
     status=AudioQueueEnqueueBuffer(c->audio,buffer,0,NULL);
-    if(status){AudioQueueFreeBuffer(c->audio,buffer);return (int)status;}
+    if(status){owned->available=true;return (int)status;}
     if (queued) { *queued = buffer; ++c->queued_buffers; }
     else ++c->immediate_buffers;
     c->playing=true;
@@ -143,8 +189,11 @@ static int command(struct sound_channel *c,struct command32 cmd) {
     switch(cmd.command & 0x7fff) {
     case 0: return 0;
     case 3:
-        ++c->generation;
-        if(c->audio)AudioQueueStop(c->audio,true);
+        if(c->audio) {
+            OSStatus status=AudioQueueStop(c->audio,true);
+            if(status)return (int)status;
+        }
+        ++c->generation;c->started=false;
         c->queued_buffers=c->immediate_buffers=0;c->playing=false;
         for(struct pending *p=c->head;p;p=p->next) {
             if(p->submitted){p->buffer=NULL;p->done=true;}
@@ -153,11 +202,15 @@ static int command(struct sound_channel *c,struct command32 cmd) {
     case 4:
         /* Queued buffers are already in Core Audio, so flushing must cancel
            them there too. Completion jobs carry a generation, not item pointers. */
+        if(c->audio) {
+            OSStatus status=AudioQueueReset(c->audio);
+            if(status)return (int)status;
+        }
+        /* Reset returns the buffers but leaves a running queue running. */
         ++c->generation;
-        if(c->audio)AudioQueueReset(c->audio);
         c->queued_buffers=c->immediate_buffers=0;c->playing=false;
         while(c->head){struct pending *p=c->head;c->head=p->next;free(p);}c->tail=NULL;return 0;
-    case 11:c->paused=true;if(c->audio)AudioQueuePause(c->audio);return 0;
+    case 11:c->paused=true;playback_rate(c);return 0;
     case 12:c->paused=false;playback_rate(c);return 0;
     case 13:
         if(c->callback) {
@@ -256,7 +309,8 @@ int sound_manager_bridge32_dispatch(const char *name,const uint32_t *a,uint64_t 
         if(c->closed){status=-205;return;}
         if(dispose) {
             c->closed=true;
-            if(c->audio){AudioQueueDispose(c->audio,true);c->audio=NULL;}
+            status=dispose_audio(c);
+            if(status){c->closed=false;return;}
             while(c->head){struct pending *p=c->head;c->head=p->next;free(p);}c->tail=NULL;
             if(c->owns_guest)compat_runtime32_deallocate(c->guest);
         } else if(immediate) {

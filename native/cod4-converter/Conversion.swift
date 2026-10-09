@@ -357,9 +357,9 @@ final class Converter {
         info["LSMinimumSystemVersion"] = "11.0"
         info["NSHighResolutionCapable"] = false
         info["LP32GeneratedGame"] = game.rawValue
-        info["LP32GLMetal"] = false
+        info["LP32GLMetal"] = true
         var environment = info["LSEnvironment"] as? [String: String] ?? [:]
-        environment["LP32_GL_BACKEND"] = "apple"
+        environment["LP32_GL_BACKEND"] = "metal"
         environment.removeValue(forKey: "LP32_GLMETAL_PATH")
         info["LSEnvironment"] = environment
         if game != .cod4 {

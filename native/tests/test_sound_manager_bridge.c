@@ -1,4 +1,14 @@
+#include <AudioToolbox/AudioToolbox.h>
+#include <stdatomic.h>
+static atomic_uint native_pause_calls;
+static OSStatus counted_pause(AudioQueueRef queue);
+#define AudioQueuePause counted_pause
 #include "../src/sound_manager_bridge.c"
+#undef AudioQueuePause
+static OSStatus counted_pause(AudioQueueRef queue) {
+    atomic_fetch_add(&native_pause_calls, 1);
+    return AudioQueuePause(queue);
+}
 #include <math.h>
 #include <assert.h>
 #include <stdatomic.h>
@@ -130,6 +140,26 @@ static void check_stream_queue(void) {
     for(unsigned i=0;i<1000 && atomic_load(&stream_completions)<blocks;++i)usleep(1000);
     assert(atomic_load(&stream_completions)==blocks);
     assert(!AudioQueueFreeBuffer(c->audio,rendered));
+    assert(!call("_SndChannelStatus",query));
+    unsigned owned_count=0;
+    for(struct owned_buffer *b=c->buffers;b;b=b->next) {
+        assert(b->available);++owned_count;
+    }
+    assert(owned_count==blocks);
+    /* Resetting a running offline queue must preserve its run state until
+       pauseCmd actually pauses it. Subsequent PCM must stay queued. */
+    *cmd=(struct command32){86,0,65536};assert(!call("_SndDoImmediate",args));
+    *cmd=(struct command32){81,0,0x10010000};assert(!call("_SndDoImmediate",args));
+    assert(!call("_SndChannelStatus",query));assert(c->started && c->immediate_buffers==1);
+    *cmd=(struct command32){4,0,0};assert(!call("_SndDoImmediate",args));
+    assert(!call("_SndChannelStatus",query));assert(c->started && !c->playing);
+    unsigned pauses=atomic_load(&native_pause_calls);
+    *cmd=(struct command32){11,0,0};assert(!call("_SndDoImmediate",args));
+    assert(atomic_load(&native_pause_calls)==pauses+1);
+    *cmd=(struct command32){81,0,0x10010000};assert(!call("_SndDoImmediate",args));
+    assert(!call("_SndChannelStatus",query));assert(c->paused && !c->started && c->immediate_buffers==1);
+    *cmd=(struct command32){3,0,0};assert(!call("_SndDoImmediate",args));
+    *cmd=(struct command32){4,0,0};assert(!call("_SndDoImmediate",args));
     /* Teardown must cancel PCM already submitted to Core Audio and suppress
        its queued refill callbacks, including late native completion jobs. */
     *cmd=(struct command32){11,0,0};assert(!call("_SndDoImmediate",args));
@@ -138,6 +168,9 @@ static void check_stream_queue(void) {
         *cmd=(struct command32){13,0,blocks+i};assert(!call("_SndDoCommand",args));
     }
     assert(!call("_SndChannelStatus",query));assert(c->queued_buffers==2);
+    unsigned reused_count=0;
+    for(struct owned_buffer *b=c->buffers;b;b=b->next)++reused_count;
+    assert(reused_count==owned_count); /* reuse completed buffers */
     *cmd=(struct command32){3,0,0};assert(!call("_SndDoImmediate",args));
     *cmd=(struct command32){4,0,0};assert(!call("_SndDoImmediate",args));
     *cmd=(struct command32){12,0,0};assert(!call("_SndDoImmediate",args));

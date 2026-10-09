@@ -81,9 +81,9 @@ def main():
                 assert output.name == stem + '-Compat.app', result.stdout
                 out = output / 'Contents'
                 info = plistlib.loads((out / 'Info.plist').read_bytes())
-                assert info['LP32GeneratedGame'] == game and info['LP32GLMetal'] is False
+                assert info['LP32GeneratedGame'] == game and info['LP32GLMetal'] is True
                 assert info['CFBundleExecutable'] == stem + 'Compat'
-                assert info['LSEnvironment'] == {'KEEP_ME': 'yes', 'LP32_GL_BACKEND': 'apple'}
+                assert info['LSEnvironment'] == {'KEEP_ME': 'yes', 'LP32_GL_BACKEND': 'metal'}
                 assert json.loads((out / 'Resources/GLMetal-build-info.json').read_text()) == manifest
                 for name, hashes in manifest['files'].items():
                     assert sha256(out / 'Frameworks/GLMetal' / name) == hashes['bundled_sha256']

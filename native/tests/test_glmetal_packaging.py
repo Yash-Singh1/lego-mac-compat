@@ -51,13 +51,13 @@ class GLMetalPackagingTests(unittest.TestCase):
         info = {'LSEnvironment': {'UNCHANGED': 'value', 'LP32_GL_BACKEND': 'legacy',
                                  'LP32_GLMETAL_PATH': '/developer/build/libGLMetal.dylib'}}
         metal.configure(info)
-        self.assertFalse(info['LP32GLMetal'])
-        self.assertEqual(info['LSEnvironment'], {'UNCHANGED': 'value', 'LP32_GL_BACKEND': 'apple'})
+        self.assertTrue(info['LP32GLMetal'])
+        self.assertEqual(info['LSEnvironment'], {'UNCHANGED': 'value', 'LP32_GL_BACKEND': 'metal'})
         metal.configure(info)
         self.assertEqual(info['LSEnvironment']['UNCHANGED'], 'value')
         empty = {}
         metal.configure(empty)
-        self.assertEqual(empty['LSEnvironment'], {'LP32_GL_BACKEND': 'apple'})
+        self.assertEqual(empty['LSEnvironment'], {'LP32_GL_BACKEND': 'metal'})
 
     def test_install_records_both_source_and_signed_hashes(self):
         original = snapshot(self.build)
@@ -173,8 +173,8 @@ class GameGLMetalConversionTests(unittest.TestCase):
                     self.assertEqual(snapshot(install), before)
                     info = plistlib.loads((output / 'Contents/Info.plist').read_bytes())
                     self.assertEqual(info['LP32GeneratedGame'], game)
-                    self.assertFalse(info['LP32GLMetal'])
-                    self.assertEqual(info['LSEnvironment'], {'KEEP_ME': 'yes', 'LP32_GL_BACKEND': 'apple'})
+                    self.assertTrue(info['LP32GLMetal'])
+                    self.assertEqual(info['LSEnvironment'], {'KEEP_ME': 'yes', 'LP32_GL_BACKEND': 'metal'})
                     package = output / 'Contents/Frameworks/GLMetal'
                     for name in NAMES:
                         self.assertEqual((package / name).read_bytes(), (self.glmetal / name).read_bytes())

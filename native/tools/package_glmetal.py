@@ -51,13 +51,11 @@ def install(build_dir, destination, manifest_path=None):
 
 def configure(info):
     environment = dict(info.get('LSEnvironment', {}))
-    # Keep the established renderer as the default until GLMetal's gameplay
-    # frame pacing is validated. Shader stalls also interrupt legacy audio.
-    environment['LP32_GL_BACKEND'] = 'apple'
+    environment['LP32_GL_BACKEND'] = 'metal'
     # A generated app must not inherit a developer's absolute driver path.
     environment.pop('LP32_GLMETAL_PATH', None)
     info['LSEnvironment'] = environment
-    info['LP32GLMetal'] = False
+    info['LP32GLMetal'] = True
 
 
 if __name__ == '__main__':
