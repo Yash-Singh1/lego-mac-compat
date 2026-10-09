@@ -6261,10 +6261,11 @@ static void trace_vertex_attributes(GLuint minimum, GLuint maximum)
         glGetVertexAttribPointerv(index, GL_VERTEX_ATTRIB_ARRAY_POINTER,
                                   &raw_pointer);
 
+        GLint components = size == GL_BGRA ? 4 : size;
         size_t component_size = gl_attribute_component_size((GLenum)type);
-        size_t element_size = size > 0 && component_size &&
-            (size_t)size <= SIZE_MAX / component_size ?
-            (size_t)size * component_size : 0;
+        size_t element_size = components > 0 && component_size &&
+            (size_t)components <= SIZE_MAX / component_size ?
+            (size_t)components * component_size : 0;
         size_t effective_stride = stride > 0 ? (size_t)stride : element_size;
         size_t pointer = (size_t)(uintptr_t)raw_pointer;
         GLint buffer_size = 0;
@@ -6291,7 +6292,7 @@ static void trace_vertex_attributes(GLuint minimum, GLuint maximum)
         unsigned int maximum_byte = 0;
         uint64_t content_hash = UINT64_C(1469598103934665603);
         bool scanned = false;
-        if (in_bounds && size > 0 && size <= 4) {
+        if (in_bounds && components > 0 && components <= 4) {
             size_t first_byte = pointer + (size_t)minimum * effective_stride;
             size_t scan_size = final_byte - first_byte;
             if (scan_size && scan_size <= 2 * 1024 * 1024) {
@@ -6306,7 +6307,7 @@ static void trace_vertex_attributes(GLuint minimum, GLuint maximum)
                         content_hash = trace_hash_bytes(
                             content_hash, data + relative, element_size);
                         if (type == GL_FLOAT || type == GL_HALF_FLOAT) {
-                            for (GLint component = 0; component < size;
+                            for (GLint component = 0; component < components;
                                  ++component) {
                                 double value;
                                 if (type == GL_FLOAT) {
@@ -6842,6 +6843,29 @@ static void repair_bound_texture_mipmap_range(GLenum upload_target)
     }
 }
 
+/* A bounded upload-order log, independent of expensive per-draw tracing. */
+static void trace_mip_upload(GLenum target, GLint level, GLenum internal,
+                             GLsizei width, GLsizei height)
+{
+    static int enabled = -1;
+    static unsigned recorded;
+    if (enabled < 0) enabled = getenv("LP32_TRACE_MIP_UPLOADS") != NULL;
+    if (!enabled || recorded >= 32768) return;
+    GLenum binding = target == GL_TEXTURE_2D ? GL_TEXTURE_BINDING_2D :
+        target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X &&
+        target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z ?
+            GL_TEXTURE_BINDING_CUBE_MAP : 0;
+    if (!binding) return;
+    GLint texture = 0;
+    glGetIntegerv(binding, &texture);
+    ++recorded;
+    fprintf(stderr,
+            "compat32: mip-upload swap=%llu tex=%d target=%04x "
+            "level=%d format=%04x size=%dx%d\n",
+            (unsigned long long)objc_bridge_swap_count, texture, target,
+            level, internal, width, height);
+}
+
 static void note_texture_level_change(void)
 {
     __atomic_fetch_add(&texture_level_generation, 1, __ATOMIC_RELEASE);
@@ -6926,6 +6950,13 @@ static void trace_texture_units(void)
         GLint height_3d = 0;
         GLint depth_3d = 0;
         GLint format_3d = 0;
+        GLint min_filter_3d = 0;
+        GLint mag_filter_3d = 0;
+        GLint base_level_3d = 0;
+        GLint max_level_3d = 0;
+        GLint wrap_s_3d = 0;
+        GLint wrap_t_3d = 0;
+        GLint wrap_r_3d = 0;
         if (texture_3d) {
             glGetTexLevelParameteriv(GL_TEXTURE_3D, 0, GL_TEXTURE_WIDTH,
                                      &width_3d);
@@ -6935,6 +6966,17 @@ static void trace_texture_units(void)
                                      &depth_3d);
             glGetTexLevelParameteriv(GL_TEXTURE_3D, 0,
                                      GL_TEXTURE_INTERNAL_FORMAT, &format_3d);
+            glGetTexParameteriv(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER,
+                                &min_filter_3d);
+            glGetTexParameteriv(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER,
+                                &mag_filter_3d);
+            glGetTexParameteriv(GL_TEXTURE_3D, GL_TEXTURE_BASE_LEVEL,
+                                &base_level_3d);
+            glGetTexParameteriv(GL_TEXTURE_3D, GL_TEXTURE_MAX_LEVEL,
+                                &max_level_3d);
+            glGetTexParameteriv(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, &wrap_s_3d);
+            glGetTexParameteriv(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, &wrap_t_3d);
+            glGetTexParameteriv(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, &wrap_r_3d);
         }
         GLint width_cube = 0;
         GLint height_cube = 0;
@@ -6957,16 +6999,127 @@ static void trace_texture_units(void)
             "compat32: texture-state swap=%llu unit=%d "
             "tex2d=%d size2d=%dx%d format2d=%04x min2d=%04x enabled2d=%d "
             "tex3d=%d size3d=%dx%dx%d format3d=%04x enabled3d=%d "
+            "min3d=%04x mag3d=%04x base3d=%d max3d=%d "
+            "wrapS3d=%04x wrapT3d=%04x wrapR3d=%04x "
             "cube=%d sizeCube=%dx%d formatCube=%04x enabledCube=%d "
             "minCube=%04x\n",
             (unsigned long long)objc_bridge_swap_count, unit,
             texture_2d, width_2d, height_2d, format_2d, min_filter_2d,
             glIsEnabled(GL_TEXTURE_2D), texture_3d, width_3d, height_3d,
-            depth_3d, format_3d, glIsEnabled(GL_TEXTURE_3D), texture_cube,
+            depth_3d, format_3d, glIsEnabled(GL_TEXTURE_3D),
+            min_filter_3d, mag_filter_3d, base_level_3d, max_level_3d,
+            wrap_s_3d, wrap_t_3d, wrap_r_3d, texture_cube,
             width_cube, height_cube, format_cube,
             glIsEnabled(GL_TEXTURE_CUBE_MAP), min_filter_cube);
     }
     glActiveTexture((GLenum)previous_active_texture);
+}
+
+/* Uniform getters return one array element, including every matrix component.
+   Keep these queries inside the existing render trace's draw-call budget. */
+static void trace_glsl_uniforms(GLuint program)
+{
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("LP32_TRACE_GL_UNIFORMS") != NULL;
+    if (!enabled || !program) return;
+
+    enum { maximum_uniforms = 64, maximum_shaders = 64 };
+    GLint attached = 0, active = 0, name_capacity = 0;
+    glGetProgramiv(program, GL_ATTACHED_SHADERS, &attached);
+    glGetProgramiv(program, GL_ACTIVE_UNIFORMS, &active);
+    glGetProgramiv(program, GL_ACTIVE_UNIFORM_MAX_LENGTH, &name_capacity);
+    GLuint shaders[maximum_shaders] = {0};
+    GLsizei shader_count = 0;
+    glGetAttachedShaders(program, maximum_shaders, &shader_count, shaders);
+    char shader_ids[maximum_shaders * 12 + 1] = {0};
+    size_t shader_length = 0;
+    for (GLsizei index = 0; index < shader_count; ++index) {
+        shader_length += (size_t)snprintf(shader_ids + shader_length,
+                                         sizeof(shader_ids) - shader_length,
+                                         "%s%u", index ? "," : "", shaders[index]);
+    }
+    GLint count = active > maximum_uniforms ? maximum_uniforms : active;
+    gl_trace_printf(
+        "compat32: glsl-program swap=%llu program=%u attached=%d "
+        "shaderIds={%s} activeUniforms=%d loggedUniforms=%d\n",
+        (unsigned long long)objc_bridge_swap_count, program, attached,
+        shader_ids, active, count);
+    if (count <= 0 || name_capacity <= 0) return;
+    char *name = malloc((size_t)name_capacity);
+    if (!name) return;
+
+    for (GLint index = 0; index < count; ++index) {
+        GLsizei name_length = 0;
+        GLint array_size = 0;
+        GLenum type = 0;
+        name[0] = '\0';
+        glGetActiveUniform(program, (GLuint)index, name_capacity, &name_length,
+                            &array_size, &type, name);
+        if (name_length <= 0) continue;
+        GLint location = glGetUniformLocation(program, name);
+        unsigned components = 0;
+        bool integer = false, unsigned_integer = false;
+        switch (type) {
+            case GL_FLOAT: components = 1; break;
+            case GL_FLOAT_VEC2: components = 2; break;
+            case GL_FLOAT_VEC3: components = 3; break;
+            case GL_FLOAT_VEC4: components = 4; break;
+            case GL_FLOAT_MAT2: components = 4; break;
+            case GL_FLOAT_MAT3: components = 9; break;
+            case GL_FLOAT_MAT4: components = 16; break;
+            case GL_FLOAT_MAT2x3: case GL_FLOAT_MAT3x2: components = 6; break;
+            case GL_FLOAT_MAT2x4: case GL_FLOAT_MAT4x2: components = 8; break;
+            case GL_FLOAT_MAT3x4: case GL_FLOAT_MAT4x3: components = 12; break;
+            case GL_INT: case GL_BOOL: integer = true; components = 1; break;
+            case GL_INT_VEC2: case GL_BOOL_VEC2: integer = true; components = 2; break;
+            case GL_INT_VEC3: case GL_BOOL_VEC3: integer = true; components = 3; break;
+            case GL_INT_VEC4: case GL_BOOL_VEC4: integer = true; components = 4; break;
+            case GL_UNSIGNED_INT: unsigned_integer = true; components = 1; break;
+            case GL_UNSIGNED_INT_VEC2_EXT: unsigned_integer = true; components = 2; break;
+            case GL_UNSIGNED_INT_VEC3_EXT: unsigned_integer = true; components = 3; break;
+            case GL_UNSIGNED_INT_VEC4_EXT: unsigned_integer = true; components = 4; break;
+            default:
+                /* Samplers contain signed texture-unit indices, including
+                   samplers whose sampled texels contain unsigned integers. */
+                if ((type >= GL_SAMPLER_1D && type <= GL_SAMPLER_2D_RECT_SHADOW_ARB) ||
+                    (type >= GL_SAMPLER_1D_ARRAY_EXT && type <= GL_SAMPLER_CUBE_SHADOW_EXT) ||
+                    (type >= GL_INT_SAMPLER_1D_EXT && type <= GL_UNSIGNED_INT_SAMPLER_BUFFER_EXT) ||
+                    (type >= 0x900c && type <= 0x900f) || /* cube-map arrays */
+                    (type >= 0x9108 && type <= 0x910d)) { /* multisample samplers */
+                    integer = true;
+                    components = 1;
+                }
+                break;
+        }
+        char values[512] = "unavailable";
+        if (location >= 0 && components) {
+            GLfloat floats[16] = {0};
+            GLint integers[16] = {0};
+            GLuint unsigned_integers[16] = {0};
+            if (unsigned_integer) glGetUniformuivEXT(program, location, unsigned_integers);
+            else if (integer) glGetUniformiv(program, location, integers);
+            else glGetUniformfv(program, location, floats);
+            size_t length = 0;
+            for (unsigned component = 0; component < components; ++component) {
+                const char *separator = component ? "," : "";
+                if (unsigned_integer)
+                    length += (size_t)snprintf(values + length, sizeof(values) - length,
+                                               "%s%u", separator, unsigned_integers[component]);
+                else if (integer)
+                    length += (size_t)snprintf(values + length, sizeof(values) - length,
+                                               "%s%d", separator, integers[component]);
+                else
+                    length += (size_t)snprintf(values + length, sizeof(values) - length,
+                                               "%s%.9g", separator, floats[component]);
+            }
+        }
+        gl_trace_printf(
+            "compat32: glsl-uniform swap=%llu program=%u index=%d name=%s "
+            "type=%04x arraySize=%d element=0 location=%d value={%s}\n",
+            (unsigned long long)objc_bridge_swap_count, program, index, name,
+            type, array_size, location, values);
+    }
+    free(name);
 }
 
 static void trace_draw_call(const char *kind, GLenum mode, GLint first,
@@ -7059,6 +7212,7 @@ static void trace_draw_call(const char *kind, GLenum mode, GLint first,
         attachment_types[0], attachment_types[1], attachment_types[2],
         attachment_types[3], attachment_names[0], attachment_names[1],
         attachment_names[2], attachment_names[3]);
+    trace_glsl_uniforms((GLuint)current_program);
 
     if (indexed) {
         struct gl_index_diagnostic diagnostic = trace_index_buffer(
@@ -9529,6 +9683,8 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                 (GLsizei)arguments[4], (GLint)arguments[5],
                 (GLsizei)arguments[6], arguments[7]);
         }
+        trace_mip_upload(arguments[0], (GLint)arguments[1], arguments[2],
+                         (GLsizei)arguments[3], (GLsizei)arguments[4]);
         glCompressedTexImage2D(arguments[0], (GLint)arguments[1], arguments[2],
                                (GLsizei)arguments[3], (GLsizei)arguments[4],
                                (GLint)arguments[5], (GLsizei)arguments[6],
@@ -11466,6 +11622,11 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             uint64_t swaps = ++objc_bridge_swap_count;
             if (swaps == 1) {
                 fprintf(stderr, "compat32: %s presented its first frame\n", lp32_profile()->name);
+                if (getenv("LP32_TRACE_GL_RENDER") ||
+                    getenv("LP32_TRACE_GL_RENDER_LIMIT") ||
+                    getenv("LP32_TRACE_GL_UNIFORMS")) {
+                    install_gl_trace_signal();
+                }
                 /* MW2 presents here, never through OpenGLView, so install the
                    Dock/app-switcher quit handler from this first frame. */
                 dispatch_async(dispatch_get_main_queue(), ^{ install_termination_handler(); });
