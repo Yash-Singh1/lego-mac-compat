@@ -91,8 +91,11 @@ git commit -m "Update GLMetal to tested revision"
 The converter build uses the checked-out revision; it does not automatically
 follow GLMetal's latest `main` commit.
 
-Generated apps use GLMetal both from Finder and when their executable is run
-directly. `LP32_GL_BACKEND=apple` remains an explicit command-line override.
+Generated apps use Apple's OpenGL by default, both from Finder and when their
+executable is run directly. GLMetal remains bundled for testing with the
+explicit command-line override `LP32_GL_BACKEND=metal`. Its first-use shader
+and vertex-input compilation can cause long frame stalls and audio gaps, so
+rendering comparison tests alone do not qualify it as the default renderer.
 Driver build hashes are recorded in `Contents/Resources/GLMetal-build-info.json`.
 The converter verifies its packaged files before copying game data.
 
