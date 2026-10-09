@@ -5,11 +5,84 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdbool.h>
 #define CONVERTER_BASE 0x7f0a0000u
 #define CONVERTER_COUNT 1024
 #define BUFFER_COUNT 32
-static AudioConverterRef converters[CONVERTER_COUNT];
+struct converter_slot {
+    AudioConverterRef audio;
+    uint64_t generation;
+    pthread_t owner;
+    bool busy, disposing, deferred_dispose;
+};
+static struct converter_slot converters[CONVERTER_COUNT];
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t changed = PTHREAD_COND_INITIALIZER;
+
+/* Native conversion calls invoke guest input callbacks synchronously. Never
+   hold the registry lock during those calls, or while disposing a converter. */
+static struct converter_slot *slot_for(uint32_t token) {
+    unsigned index=(token-CONVERTER_BASE)/16;
+    return token>=CONVERTER_BASE && !(token&15) && index<CONVERTER_COUNT ? &converters[index] : NULL;
+}
+static AudioConverterRef acquire(struct converter_slot *slot) {
+    if (!slot) return NULL;
+    pthread_mutex_lock(&lock);
+    uint64_t generation=slot->generation;
+    while (slot->audio && !slot->disposing && slot->busy) {
+        if (pthread_equal(slot->owner,pthread_self())) {
+            /* Reset or recursive conversion of the active converter cannot
+               safely run inside its own input callback. */
+            pthread_mutex_unlock(&lock);return NULL;
+        }
+        pthread_cond_wait(&changed,&lock);
+        if (generation!=slot->generation) break;
+    }
+    AudioConverterRef audio=NULL;
+    if (slot->audio && !slot->disposing && !slot->busy && generation==slot->generation) {
+        audio=slot->audio;slot->busy=true;slot->owner=pthread_self();
+    }
+    pthread_mutex_unlock(&lock);return audio;
+}
+static OSStatus finish_dispose(struct converter_slot *slot,AudioConverterRef audio) {
+    OSStatus status=AudioConverterDispose(audio);
+    pthread_mutex_lock(&lock);
+    if (!status) slot->audio=NULL;
+    slot->disposing=false;
+    pthread_cond_broadcast(&changed);
+    pthread_mutex_unlock(&lock);return status;
+}
+static OSStatus dispose_converter(struct converter_slot *slot) {
+    if (!slot) return kAudio_ParamError;
+    pthread_mutex_lock(&lock);
+    if (!slot->audio || slot->disposing) {
+        pthread_mutex_unlock(&lock);return kAudio_ParamError;
+    }
+    slot->disposing=true;
+    pthread_cond_broadcast(&changed);
+    if (slot->busy && pthread_equal(slot->owner,pthread_self())) {
+        /* A callback can retire its own converter. Native disposal must wait
+           until the outer Fill returns and stops using the callback context. */
+        slot->deferred_dispose=true;
+        pthread_mutex_unlock(&lock);return noErr;
+    }
+    while (slot->busy) pthread_cond_wait(&changed,&lock);
+    AudioConverterRef audio=slot->audio;
+    pthread_mutex_unlock(&lock);return finish_dispose(slot,audio);
+}
+static void release(struct converter_slot *slot) {
+    pthread_mutex_lock(&lock);
+    slot->busy=false;
+    bool deferred=slot->deferred_dispose;
+    slot->deferred_dispose=false;
+    AudioConverterRef audio=slot->audio;
+    pthread_cond_broadcast(&changed);
+    pthread_mutex_unlock(&lock);
+    if (deferred) {
+        OSStatus status=finish_dispose(slot,audio);
+        if (status) fprintf(stderr,"compat32: deferred AudioConverterDispose failed: %d\n",(int)status);
+    }
+}
 struct buffer32 { uint32_t channels, size, data; };
 struct input_context { uint32_t token, function, user, scratch; };
 static OSStatus input(AudioConverterRef converter, UInt32 *packets, AudioBufferList *data,
@@ -51,53 +124,7 @@ static OSStatus input_legacy(AudioConverterRef converter, UInt32 *packets,
     if(descriptions)*descriptions=NULL;
     return status;
 }
-int audio_converter_bridge32_dispatch(const char *name,const uint32_t *a,uint64_t *out) {
-    if(strncmp(name,"_AudioConverter",15))return 0;
-    if(!strcmp(name,"_AudioConverterNew")){
-        if(!a[0]||!a[1]||!a[2]){*out=(uint32_t)kAudio_ParamError;return 1;}
-        AudioStreamBasicDescription source,destination;
-        memcpy(&source,(void *)(uintptr_t)a[0],sizeof(source));
-        memcpy(&destination,(void *)(uintptr_t)a[1],sizeof(destination));
-        if (getenv("LP32_TRACE_CONVERTERS"))
-            fprintf(stderr, "compat32: converter new src=%g/%08x/%x/%u/%u/%u/%u/%u dst=%g/%08x/%x/%u/%u/%u/%u/%u\n",
-                source.mSampleRate, source.mFormatID, source.mFormatFlags, source.mBytesPerPacket, source.mFramesPerPacket, source.mBytesPerFrame, source.mChannelsPerFrame, source.mBitsPerChannel,
-                destination.mSampleRate, destination.mFormatID, destination.mFormatFlags, destination.mBytesPerPacket, destination.mFramesPerPacket, destination.mBytesPerFrame, destination.mChannelsPerFrame, destination.mBitsPerChannel);
-        AudioConverterRef converter=NULL;OSStatus status=AudioConverterNew(&source,&destination,&converter);
-        *(uint32_t *)(uintptr_t)a[2]=0;
-        if(!status && source.mFormatID==kAudioFormatLinearPCM &&
-           destination.mFormatID==kAudioFormatLinearPCM &&
-           source.mSampleRate!=destination.mSampleRate){
-            /* The default macOS SRC can endlessly request one input packet
-               when successive fills change size (COD4: 13,544 -> 44,100 Hz,
-               470 then 471 frames). Minimum-phase SRC completes these fills
-               while retaining filter history across audio callbacks. */
-            UInt32 complexity=kAudioConverterSampleRateConverterComplexity_MinimumPhase;
-            status=AudioConverterSetProperty(converter,kAudioConverterSampleRateConverterComplexity,
-                                             sizeof(complexity),&complexity);
-            if(status)AudioConverterDispose(converter);
-        }
-        if(!status){
-            pthread_mutex_lock(&lock);unsigned slot;
-            for(slot=0;slot<CONVERTER_COUNT && converters[slot];++slot){}
-            if(slot<CONVERTER_COUNT){converters[slot]=converter;*(uint32_t *)(uintptr_t)a[2]=CONVERTER_BASE+16*slot;}
-            pthread_mutex_unlock(&lock);
-            if(slot==CONVERTER_COUNT){AudioConverterDispose(converter);status=kAudio_MemFullError;}
-        }
-        *out=(uint32_t)status;return 1;
-    }
-    if(strcmp(name,"_AudioConverterDispose") && strcmp(name,"_AudioConverterReset") &&
-       strcmp(name,"_AudioConverterFillComplexBuffer") && strcmp(name,"_AudioConverterFillBuffer"))return 0;
-    unsigned slot=(a[0]-CONVERTER_BASE)/16;
-    pthread_mutex_lock(&lock);
-    AudioConverterRef converter=a[0]>=CONVERTER_BASE && !(a[0]&15) && slot<CONVERTER_COUNT?converters[slot]:NULL;
-    pthread_mutex_unlock(&lock);
-    if(!converter){*out=(uint32_t)kAudio_ParamError;return 1;}
-    if(!strcmp(name,"_AudioConverterReset")){*out=(uint32_t)AudioConverterReset(converter);return 1;}
-    if(!strcmp(name,"_AudioConverterDispose")){
-        OSStatus status=AudioConverterDispose(converter);
-        if(!status){pthread_mutex_lock(&lock);converters[slot]=NULL;pthread_mutex_unlock(&lock);}
-        *out=(uint32_t)status;return 1;
-    }
+static int fill_converter(AudioConverterRef converter,const char *name,const uint32_t *a,uint64_t *out) {
     if(!a[1]||!a[3]||!a[4]){*out=(uint32_t)kAudio_ParamError;return 1;}
     if(!strcmp(name,"_AudioConverterFillBuffer")) {
         AudioStreamBasicDescription source,destination;UInt32 size=sizeof(source);
@@ -137,4 +164,51 @@ int audio_converter_bridge32_dispatch(const char *name,const uint32_t *a,uint64_
         for(uint32_t i=0;i<host->mNumberBuffers;++i){buffers[i].channels=host->mBuffers[i].mNumberChannels;buffers[i].size=host->mBuffers[i].mDataByteSize;}
     }
     compat_runtime32_deallocate(context.scratch);free(host);return 1;
+}
+int audio_converter_bridge32_dispatch(const char *name,const uint32_t *a,uint64_t *out) {
+    if(strncmp(name,"_AudioConverter",15))return 0;
+    if(!strcmp(name,"_AudioConverterNew")){
+        if(!a[0]||!a[1]||!a[2]){*out=(uint32_t)kAudio_ParamError;return 1;}
+        AudioStreamBasicDescription source,destination;
+        memcpy(&source,(void *)(uintptr_t)a[0],sizeof(source));
+        memcpy(&destination,(void *)(uintptr_t)a[1],sizeof(destination));
+        if (getenv("LP32_TRACE_CONVERTERS"))
+            fprintf(stderr, "compat32: converter new src=%g/%08x/%x/%u/%u/%u/%u/%u dst=%g/%08x/%x/%u/%u/%u/%u/%u\n",
+                source.mSampleRate, source.mFormatID, source.mFormatFlags, source.mBytesPerPacket, source.mFramesPerPacket, source.mBytesPerFrame, source.mChannelsPerFrame, source.mBitsPerChannel,
+                destination.mSampleRate, destination.mFormatID, destination.mFormatFlags, destination.mBytesPerPacket, destination.mFramesPerPacket, destination.mBytesPerFrame, destination.mChannelsPerFrame, destination.mBitsPerChannel);
+        AudioConverterRef converter=NULL;OSStatus status=AudioConverterNew(&source,&destination,&converter);
+        *(uint32_t *)(uintptr_t)a[2]=0;
+        if(!status && source.mFormatID==kAudioFormatLinearPCM &&
+           destination.mFormatID==kAudioFormatLinearPCM &&
+           source.mSampleRate!=destination.mSampleRate){
+            /* The default macOS SRC can endlessly request one input packet
+               when successive fills change size (COD4: 13,544 -> 44,100 Hz,
+               470 then 471 frames). Minimum-phase SRC completes these fills
+               while retaining filter history across audio callbacks. */
+            UInt32 complexity=kAudioConverterSampleRateConverterComplexity_MinimumPhase;
+            status=AudioConverterSetProperty(converter,kAudioConverterSampleRateConverterComplexity,
+                                             sizeof(complexity),&complexity);
+            if(status)AudioConverterDispose(converter);
+        }
+        if(!status){
+            pthread_mutex_lock(&lock);unsigned slot;
+            for(slot=0;slot<CONVERTER_COUNT && converters[slot].audio;++slot){}
+            if(slot<CONVERTER_COUNT){converters[slot].audio=converter;++converters[slot].generation;*(uint32_t *)(uintptr_t)a[2]=CONVERTER_BASE+16*slot;}
+            pthread_mutex_unlock(&lock);
+            if(slot==CONVERTER_COUNT){AudioConverterDispose(converter);status=kAudio_MemFullError;}
+        }
+        *out=(uint32_t)status;return 1;
+    }
+    if(strcmp(name,"_AudioConverterDispose") && strcmp(name,"_AudioConverterReset") &&
+       strcmp(name,"_AudioConverterFillComplexBuffer") && strcmp(name,"_AudioConverterFillBuffer"))return 0;
+    struct converter_slot *slot=slot_for(a[0]);
+    if(!strcmp(name,"_AudioConverterDispose")) {
+        *out=(uint32_t)dispose_converter(slot);return 1;
+    }
+    AudioConverterRef converter=acquire(slot);
+    if(!converter){*out=(uint32_t)kAudio_ParamError;return 1;}
+    if(!strcmp(name,"_AudioConverterReset")) *out=(uint32_t)AudioConverterReset(converter);
+    else fill_converter(converter,name,a,out);
+    release(slot);
+    return 1;
 }

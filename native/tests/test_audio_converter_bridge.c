@@ -5,11 +5,40 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
-static uint32_t next=0x10002000, expected_converter;
+#include <pthread.h>
+#include <stdbool.h>
+#include <time.h>
+static _Thread_local uint32_t next=0x10002000;
+static uint32_t expected_converter;
 static unsigned resample_calls;
-uint32_t compat_runtime32_allocate(size_t size,int zero){uint32_t p=next;next+=(size+15)&~15u;assert(next<0x10010000);if(zero)memset((void *)(uintptr_t)p,0,size);return p;}
+static pthread_mutex_t barrier_lock=PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t barrier_changed=PTHREAD_COND_INITIALIZER;
+static bool callback_entered, callback_release;
+static unsigned disposals_finished;
+static int32_t call(const char *,uint32_t *);
+uint32_t compat_runtime32_allocate(size_t size,int zero){uint32_t p=next;next+=(size+15)&~15u;assert(next<0x10040000);if(zero)memset((void *)(uintptr_t)p,0,size);return p;}
 void compat_runtime32_deallocate(uint32_t p){next=p;}
 uint32_t compat_runtime32_call(uint32_t fn,const uint32_t *a,size_t count){
+    if(fn==10 || fn==11 || fn==12){
+        assert(count==5);
+        uint32_t token=a[0];
+        if(fn==10){
+            assert(call("_AudioConverterReset",&token)==kAudio_ParamError);
+            pthread_mutex_lock(&barrier_lock);
+            callback_entered=true;pthread_cond_broadcast(&barrier_changed);
+            while(!callback_release)pthread_cond_wait(&barrier_changed,&barrier_lock);
+            pthread_mutex_unlock(&barrier_lock);
+        } else if(fn==11){
+            assert(!call("_AudioConverterDispose",&token));
+            assert(call("_AudioConverterDispose",&token)==kAudio_ParamError);
+            assert(call("_AudioConverterReset",&token)==kAudio_ParamError);
+        }
+        uint32_t *packets=(void *)(uintptr_t)a[1],*list=(void *)(uintptr_t)a[2];
+        assert(*packets>=4 && list[0]==1);
+        *packets=4;list[1]=2;list[2]=16;list[3]=0x10000800;
+        if(a[3])*(uint32_t *)(uintptr_t)a[3]=0;
+        return 0;
+    }
     if(fn==9){
         assert(count==5 && a[0]==expected_converter && a[4]==123);
         uint32_t *packets=(void *)(uintptr_t)a[1],*list=(void *)(uintptr_t)a[2];
@@ -30,8 +59,78 @@ uint32_t compat_runtime32_call(uint32_t fn,const uint32_t *a,size_t count){
     return 0;
 }
 static int32_t call(const char *name,uint32_t *a){uint64_t out;assert(audio_converter_bridge32_dispatch(name,a,&out));return (int32_t)out;}
+struct job { const char *name; uint32_t args[6],scratch; int32_t status; bool begun,done; };
+static void *run_job(void *raw){
+    struct job *job=raw;next=job->scratch;
+    pthread_mutex_lock(&barrier_lock);job->begun=true;pthread_cond_broadcast(&barrier_changed);pthread_mutex_unlock(&barrier_lock);
+    job->status=call(job->name,job->args);
+    pthread_mutex_lock(&barrier_lock);job->done=true;
+    if(!strcmp(job->name,"_AudioConverterDispose"))++disposals_finished;
+    pthread_cond_broadcast(&barrier_changed);pthread_mutex_unlock(&barrier_lock);return NULL;
+}
+/* Every expected transition has a deadline, so a lifecycle deadlock fails the
+   CPU-only test instead of hanging its runner. */
+static void wait_flag(const bool *flag){
+    struct timespec deadline;assert(!clock_gettime(CLOCK_REALTIME,&deadline));deadline.tv_sec+=5;
+    pthread_mutex_lock(&barrier_lock);
+    while(!*flag)assert(!pthread_cond_timedwait(&barrier_changed,&barrier_lock,&deadline));
+    pthread_mutex_unlock(&barrier_lock);
+}
+static struct job fill_job(uint32_t token,uint32_t callback,uint32_t base,uint32_t scratch){
+    *(uint32_t *)(uintptr_t)base=4;
+    uint32_t *list=(void *)(uintptr_t)(base+0x100);
+    list[0]=1;list[1]=2;list[2]=32;list[3]=base+0x200;
+    return (struct job){.name="_AudioConverterFillComplexBuffer",.args={token,callback,123,base,base+0x100,0},.scratch=scratch};
+}
+static void check_lifetime(uint32_t *create){
+    AudioStreamBasicDescription *source=(void *)0x10000000,*destination=(void *)0x10000040;
+    *source=(AudioStreamBasicDescription){44100,kAudioFormatLinearPCM,kAudioFormatFlagIsSignedInteger|kAudioFormatFlagIsPacked,4,1,4,2,16,0};
+    *destination=(AudioStreamBasicDescription){44100,kAudioFormatLinearPCM,kAudioFormatFlagIsFloat|kAudioFormatFlagIsPacked,8,1,8,2,32,0};
+    assert(!call("_AudioConverterNew",create));uint32_t first=*(uint32_t *)0x10000100;
+    assert(!call("_AudioConverterNew",create));uint32_t second=*(uint32_t *)0x10000100;
+    struct job fill=fill_job(first,10,0x10010000,0x10020000);
+    pthread_t fill_thread;assert(!pthread_create(&fill_thread,NULL,run_job,&fill));wait_flag(&callback_entered);
+    struct job reset={.name="_AudioConverterReset",.args={first},.scratch=0x10024000};
+    pthread_t reset_thread;assert(!pthread_create(&reset_thread,NULL,run_job,&reset));wait_flag(&reset.begun);
+    /* Another converter must progress while the first one's native input
+       callback is blocked. This rejects a registry-wide native-call lock. */
+    struct job independent=fill_job(second,12,0x10011000,0x10028000);
+    pthread_t independent_thread;assert(!pthread_create(&independent_thread,NULL,run_job,&independent));wait_flag(&independent.done);
+    assert(!pthread_join(independent_thread,NULL));assert(!independent.status);
+    assert(!call("_AudioConverterReset",&second));assert(!call("_AudioConverterDispose",&second));
+    struct job dispose[2]={
+        {.name="_AudioConverterDispose",.args={first},.scratch=0x10024000},
+        {.name="_AudioConverterDispose",.args={first},.scratch=0x10028000}};
+    pthread_t dispose_thread[2];
+    for(unsigned i=0;i<2;++i)assert(!pthread_create(&dispose_thread[i],NULL,run_job,&dispose[i]));
+    struct timespec deadline;assert(!clock_gettime(CLOCK_REALTIME,&deadline));deadline.tv_sec+=5;
+    pthread_mutex_lock(&barrier_lock);
+    while(!disposals_finished)assert(!pthread_cond_timedwait(&barrier_changed,&barrier_lock,&deadline));
+    /* Exactly one caller is rejected. The actual disposer is still waiting
+       for the live Fill, and the callback has not been released. */
+    assert(disposals_finished==1);
+    assert(dispose[0].done!=dispose[1].done);
+    assert((dispose[0].done?dispose[0].status:dispose[1].status)==kAudio_ParamError);
+    pthread_mutex_unlock(&barrier_lock);
+    wait_flag(&reset.done);assert(reset.status==kAudio_ParamError);
+    pthread_mutex_lock(&barrier_lock);callback_release=true;pthread_cond_broadcast(&barrier_changed);pthread_mutex_unlock(&barrier_lock);
+    wait_flag(&fill.done);assert(!pthread_join(fill_thread,NULL));assert(!fill.status);
+    for(unsigned i=0;i<2;++i){wait_flag(&dispose[i].done);assert(!pthread_join(dispose_thread[i],NULL));}
+    assert(!pthread_join(reset_thread,NULL));
+    assert((dispose[0].status==noErr && dispose[1].status==kAudio_ParamError) ||
+           (dispose[1].status==noErr && dispose[0].status==kAudio_ParamError));
+    assert(call("_AudioConverterReset",&first)==kAudio_ParamError);
+    /* Callback self-disposal retires the handle immediately and frees the
+       native converter only after Fill and its callback have returned. */
+    assert(!call("_AudioConverterNew",create));uint32_t token=*(uint32_t *)0x10000100;
+    struct job reentrant=fill_job(token,11,0x10010000,0x10020000);
+    assert(!call(reentrant.name,reentrant.args));
+    assert(call("_AudioConverterReset",&token)==kAudio_ParamError);
+    assert(call("_AudioConverterDispose",&token)==kAudio_ParamError);
+    puts("Audio converter lifetime PASS (blocked fill, reset, duplicate disposal, independent converter, callback self-disposal)");
+}
 int main(void){
-    assert(mmap((void *)0x10000000,0x10000,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON|MAP_FIXED,-1,0)==(void *)0x10000000);
+    assert(mmap((void *)0x10000000,0x40000,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON|MAP_FIXED,-1,0)==(void *)0x10000000);
     AudioStreamBasicDescription *source=(void *)0x10000000,*destination=(void *)0x10000040;
     *source=(AudioStreamBasicDescription){44100,kAudioFormatLinearPCM,kAudioFormatFlagIsSignedInteger|kAudioFormatFlagIsPacked,4,1,4,2,16,0};
     *destination=(AudioStreamBasicDescription){44100,kAudioFormatLinearPCM,kAudioFormatFlagIsFloat|kAudioFormatFlagIsPacked,8,1,8,2,32,0};
@@ -90,6 +189,7 @@ int main(void){
         }
         assert(!call("_AudioConverterDispose",&expected_converter));
     }
+    check_lifetime(create);
     puts("Audio converter resampling PASS (16,384 variable-size fills, four rates, reset, sample values and guards)");
     puts("Audio converter PASS (PCM samples, legacy and complex callback ABI, packed output buffers, reset, disposal)");
 }
