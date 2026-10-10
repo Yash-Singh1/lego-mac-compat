@@ -52,7 +52,7 @@ uint32_t compat_runtime32_call(uint32_t function, const uint32_t *a, size_t n) {
 }
 static void *render_blocked_callback(void *opaque) {
     AudioUnitRenderActionFlags flags = 0;
-    assert(!host_audio_callback(opaque, &flags, NULL, 0, 128, NULL));
+    assert(!host_audio_callback(((struct audio_callback_context *)opaque)->registration, &flags, NULL, 0, 128, NULL));
     return NULL;
 }
 
@@ -116,7 +116,7 @@ int main(void) {
     assert(audio_bridge32_dispatch("_AudioUnitAddRenderNotify", add, &result) && !result);
     struct audio_callback_context *context = audio_callbacks[audio_callback_count - 1];
     AudioUnitRenderActionFlags flags = kAudioUnitRenderAction_PostRender;
-    assert(!host_audio_callback(context, &flags, NULL, 0, 128, NULL));
+    assert(!host_audio_callback(context->registration, &flags, NULL, 0, 128, NULL));
     drain_deferred_graph_work(graph, false);
     assert(callbacks == iteration + 1 && !context->in_use);
     }
@@ -126,7 +126,7 @@ int main(void) {
     struct audio_callback_context *context=audio_callbacks[audio_callback_count-1];
     assert(context->in_use && context->owner_unit==unit && context->guest_function==8 && context->guest_refcon==99);
     AudioUnitRenderActionFlags flags=0;AudioTimeStamp timestamp={0};
-    assert(!host_audio_callback(context,&flags,&timestamp,0,128,NULL));
+    assert(!host_audio_callback(context->registration,&flags,&timestamp,0,128,NULL));
     assert(callbacks==101 && guest[2]==0xabcdef01);
     guest[0]=guest[1]=0;
     assert(audio_bridge32_dispatch("_AudioUnitSetProperty",set,&result) && !result && !context->in_use);
@@ -138,20 +138,20 @@ int main(void) {
     assert(unprepared != MAP_FAILED);
     AudioBufferList list = {1, {{1, 16, unprepared}}};
     flags = kAudioUnitRenderAction_PreRender;
-    assert(!host_audio_callback(notify, &flags, NULL, 0, 128, &list));
+    assert(!host_audio_callback(notify->registration, &flags, NULL, 0, 128, &list));
     /* Neither skipped notifications nor muted test playback own the mix. */
     flags = kAudioUnitRenderAction_PostRender;
     notify->muted = true;
-    assert(!host_audio_callback(notify, &flags, NULL, 0, 128, &list));
+    assert(!host_audio_callback(notify->registration, &flags, NULL, 0, 128, &list));
     notify->muted = false;
     hold_last_frame_ns = monotonic_ns() - 200000000;
-    assert(!host_audio_callback(notify, &flags, NULL, 0, 128, &list));
+    assert(!host_audio_callback(notify->registration, &flags, NULL, 0, 128, &list));
     hold_last_frame_ns = 0;
     float mixed[] = {0.25f, -0.5f, 0.75f, -1};
     float original[4]; memcpy(original, mixed, sizeof(mixed));
     list.mBuffers[0].mData = mixed;
     notify->guest_function = 10;
-    assert(!host_audio_callback(notify, &flags, NULL, 0, 128, &list));
+    assert(!host_audio_callback(notify->registration, &flags, NULL, 0, 128, &list));
     assert(!memcmp(mixed, original, sizeof(mixed)));
     release_audio_callback(notify);
     assert(!munmap(unprepared, page));

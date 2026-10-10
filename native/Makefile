@@ -426,6 +426,13 @@ $(BUILD_DIR)/test_audio_queue_movie: tests/test_audio_queue_movie.c src/audio_qu
 test-audio-queue-movie: $(BUILD_DIR)/test_audio_queue_movie
 	arch -x86_64 ./$(BUILD_DIR)/test_audio_queue_movie
 
+$(BUILD_DIR)/test_audio_queue_callback_lifetime: tests/test_audio_queue_callback_lifetime.c src/audio_queue_bridge.c src/audio_queue_bridge.h | $(BUILD_DIR)
+	$(CLANG) $(CFLAGS) -Wl,-pagezero_size,0x1000 -Isrc $< -framework AudioToolbox -framework CoreAudio -o $@
+
+.PHONY: test-audio-queue-callback-lifetime
+test-audio-queue-callback-lifetime: $(BUILD_DIR)/test_audio_queue_callback_lifetime
+	arch -x86_64 ./$(BUILD_DIR)/test_audio_queue_callback_lifetime
+
 .PHONY: test-audio-queue-bridge
 test-audio-queue-bridge: $(BUILD_DIR)/test_audio_queue_bridge
 	arch -x86_64 ./$(BUILD_DIR)/test_audio_queue_bridge
@@ -581,6 +588,13 @@ $(BUILD_DIR)/test_quicktime_bridge: tests/test_quicktime_bridge.m src/quicktime_
 
 test-quicktime-bridge: $(BUILD_DIR)/test_quicktime_bridge
 	arch -x86_64 ./$(BUILD_DIR)/test_quicktime_bridge
+
+.PHONY: test-audio-callback-lifetime
+$(BUILD_DIR)/test_audio_callback_lifetime: tests/test_audio_callback_lifetime.c src/audio_bridge.c src/audio_bridge.h | $(BUILD_DIR)
+	$(CLANG) $(CFLAGS) -Wl,-no_pie,-pagezero_size,0x1000 -Isrc tests/test_audio_callback_lifetime.c -framework AudioToolbox -framework CoreAudio -o $@
+
+test-audio-callback-lifetime: $(BUILD_DIR)/test_audio_callback_lifetime
+	arch -x86_64 ./$(BUILD_DIR)/test_audio_callback_lifetime
 
 .PHONY: test-audio-render-notify
 $(BUILD_DIR)/test_audio_render_notify: tests/test_audio_render_notify.c src/audio_bridge.c src/audio_bridge.h | $(BUILD_DIR)

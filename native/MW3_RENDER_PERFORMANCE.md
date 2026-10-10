@@ -210,3 +210,122 @@ category sums stayed within frame work time. The native buffer check and signed
 normal-app manifest checks passed. This was an integration check, not a replay
 of the player's mission or a gameplay performance benchmark. The normal app
 was refreshed atomically; the player's existing process stayed running.
+
+
+## Mission-transition crash investigation, October 10
+
+The preserved crash from PID 32923 occurred after `DIAMOND_IN_THE_ROUGH`, at
+creation of the next 48 kHz movie AudioQueue. Its loader was built at 00:17:48.
+The stack ends in Core Audio's Caulk allocator while constructing an audio
+converter. Disassembly and saved registers identify a zero block-size field
+before a 0x4040-byte allocation. The allocator deliberately traps there.
+The damaged address did not match a recorded AudioQueue buffer payload.
+The write that damaged that field has not been identified.
+
+The review found and corrected separate bridge defects. Native AudioUnit
+callbacks now carry permanent registration identities even when their guest
+staging contexts are recycled. Retired callbacks return before touching old
+native buffer lists. Overlapping renders serialize through their own response
+and writeback, and delayed release/removal retains the original identity.
+Tiny native registration records remain alive for the process lifetime;
+guest sample storage still uses the existing bounded context pool. The traced
+MW3 run used AudioQueue, so these fixes are not established as its crash cause.
+
+Guest fixed mappings and unmaps now reject ranges crossing 4 GB before the
+system call. Previously, a low starting address could bypass containment and
+replace native memory before return-value validation. All 968 VM operations
+in the initial private transition trace stayed inside the guest address space.
+The boundary fix is also not an observed trigger of the original crash.
+
+AudioQueue crash reports now retain a separate creation/control/disposal
+history. Continuous refills no longer erase those lifecycle events. Queue
+creation records a begin event before entering Core Audio, including when
+that call fails to return. These signal-time records are best-effort evidence.
+
+The callback regression forces overlapping requests, a release waiter delayed
+across context recycling, delayed notification removal, and 1,000 retired/reused
+registrations with inaccessible native buffer lists. It passes normally and
+under AddressSanitizer. The overlap check fails against the old bridge. Existing
+render-notify and queue allocation/control/disposal regressions pass. The runtime
+sync self-test passes, including destructive-range rejection before any mapping.
+A muted native queue test passed 30 disposal cycles with 16 KiB buffers, 240
+refills and 18,279 concurrent control iterations.
+
+A three-minute muted replay created six queues without the original trap.
+A second, 200-second private run used an instrumented GLMetal driver, passed
+through the mission-end save and briefing, and reached playable `sp_dubai`.
+It recorded no AddressSanitizer errors or crash signals before its planned
+termination. The diagnostic setup adapted suspended thread creation through
+the sanitizer's normal pthread interceptor; the ordinary suspended API otherwise
+causes a sanitizer tracking error, reproduced in the standalone runtime test.
+That adapter is confined to ignored test artifacts. The custom Core Audio
+allocator itself is not instrumented, so this does not prove it cannot corrupt.
+The player's reopened normal session also created queue six successfully and
+logged `WHO_DARES_WINS` after the next mission.
+
+Evidence, private profile copies and diagnostic binaries are under
+`build/mw3-crash-20261010/`, excluded from Git. Original saves and settings were
+not modified. The renderer memory check and successful transitions narrow the
+investigation but do not establish a complete fix for the reported crash.
+
+
+### AudioQueue callback reclamation follow-up
+
+A focused native experiment now demonstrates an additional teardown defect.
+With an output callback paused in guest work, `AudioQueueDispose(false)` returns
+success while that callback remains active. Synchronous disposal waits in the
+same experiment. The bridge previously reclaimed all guest buffer records as
+soon as native disposal returned, allowing that active callback to read or write
+recycled guest heap storage. Bink requests synchronous disposal in both of its
+recorded call sites, so this finding alone does not identify the original Caulk
+allocator corruption.
+
+The bridge now pins the guest records when admitting a callback. Successful
+native disposal retires the queue immediately, but reclaims its guest records
+only after the last admitted callback returns. Callback self-disposal follows
+the same rule and no longer leaks those records. Buffer associations come from
+the permanent bridge registry; retired callbacks return without dereferencing
+native or guest buffers. Failed disposal leaves live records available.
+
+The CPU regression fails against the preceding bridge and passes with the fix,
+including under AddressSanitizer. It covers asynchronous disposal with one and
+two active callbacks, self-disposal, an inaccessible late-callback buffer and
+failed disposal. Existing allocation/control races, movie pacing, AudioUnit
+callback lifetime and render-notify tests pass. The muted native queue stress
+also passes 200 disposal cycles, 27,801,831 control iterations and 150 refills.
+The runtime sync self-test passes. These tests establish the reclamation fix,
+not that every mission-transition crash is resolved.
+
+Further private runtime and renderer instrumentation is under
+`build/mw3-crash-followup-20261010/`. Test profiles and diagnostic binaries are
+separate from the player's running application and original profile.
+
+
+Two further muted tests instrumented the entire native compatibility runtime
+and GLMetal driver. They ran for 180 and 160 seconds and created 39 and 31
+AudioQueues respectively, with no sanitizer errors or crash signals before
+planned termination. Their captures remained in cinematic sequences, so they
+are playback/teardown checks rather than confirmed gameplay transition tests.
+The second used a diagnostic-only preload to enable Caulk's malloc resource
+inside that test process, exposing converter scratch buffers to AddressSanitizer.
+That preload and all diagnostic input hooks are confined to ignored artifacts;
+neither is packaged in MW3-Compat or applied to the player's process.
+
+The normal MW3-Compat executable has been updated atomically. Its app signature
+passes strict verification and its unsigned code matches the tested ordinary
+loader. It contains no sanitizer dependency or private command-injection hook.
+The already running player process retains its previous executable.
+
+
+After restoring the previously verified private profile and disabling its
+`monkeytoy`/intro settings, a third fully instrumented 200-second replay reached
+playable Dust to Dust. The frame-4200 capture shows the Dubai armored mission
+opening; the earlier capture shows the diamond-mine briefing. Five AudioQueues
+were created successfully. There were no AddressSanitizer errors or crash
+signals before planned termination. The test also used the private Caulk malloc
+resource. The callback reclamation defect is verified and corrected, but the
+write responsible for the original Caulk block corruption remains unidentified.
+Original `.svg` save files matched the pre-test hashes. The player's session
+continued during these tests and later exited through a normal quit Apple
+event, with no new game crash report. Its settings/stat files changed during
+the session; those files were not restored over the player's current state.

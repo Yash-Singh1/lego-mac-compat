@@ -4290,7 +4290,11 @@ static uint32_t guest_arena_mmap(uint32_t hint, uint64_t size, int protection, i
     pthread_mutex_lock(&guest_arena_lock);
     uint64_t start = hint & ~(page - 1), end = start + length;
     bool in_arena = guest_arena_ready && range_within(guest_arena, guest_arena_count, start, end);
-    if (flags & MAP_FIXED) {
+    if ((flags & MAP_FIXED) && length > UINT64_C(0x100000000) - start) {
+        /* Validate before MAP_FIXED can replace native allocations above the
+           guest address space. Checking the return value is too late. */
+        errno = EINVAL;
+    } else if (flags & MAP_FIXED) {
         if (!guest_arena_ready || start < kGuestArenaStart || in_arena) {
             mapping = mmap((void *)(uintptr_t)hint, size, protection, flags, fd, offset);
             if (mapping != MAP_FAILED && in_arena) arena_free_remove(start, end);
@@ -4339,7 +4343,10 @@ static int guest_arena_munmap(uint32_t address, uint64_t size, uint32_t return_a
 {
     uint64_t page = (uint64_t)getpagesize();
     uint64_t start = address, end = (start + size + page - 1) & ~(page - 1);
-    if (start & (page - 1) || !size) { errno = EINVAL; return -1; }
+    if (start & (page - 1) || !size || size > UINT64_C(0x100000000) - start) {
+        errno = EINVAL;
+        return -1;
+    }
     int status = 0;
     pthread_mutex_lock(&guest_arena_lock);
     if (!guest_arena_ready || start < kGuestArenaStart) {
@@ -7755,6 +7762,18 @@ int compat_runtime32_run_sync_self_test(void)
     const uint64_t nanoseconds[] = {0, 250000000, 750000, UINT64_MAX};
     for (unsigned i = 0; i < 4; ++i)
         if (compat_runtime32_dispatch_import("_DurationToNanoseconds", &durations[i]) != nanoseconds[i]) return -1;
+
+    /* Both low- and high-address requests must reject a range crossing 4GB
+       before touching mappings. These would include this native executable. */
+    const uint32_t crossing_starts[] = {0x70000000, 0xfffff000};
+    const uint32_t crossing_sizes[] = {0xb0000000, 0x2000};
+    for (unsigned i = 0; i < 2; ++i) {
+        uint32_t map[] = {crossing_starts[i], crossing_sizes[i], PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANON | MAP_FIXED, UINT32_MAX, 0, 0};
+        if ((uint32_t)compat_runtime32_dispatch_import("_mmap", map) != UINT32_MAX) return -1;
+        uint32_t unmap[] = {crossing_starts[i], crossing_sizes[i]};
+        if ((int32_t)compat_runtime32_dispatch_import("_munmap", unmap) != -1) return -1;
+    }
 
     /* The guest arena: host allocations stay above 4 GB, guest mmap comes
        from the arena, munmap keeps the pages reserved, and a freed range is

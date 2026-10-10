@@ -35,8 +35,8 @@ struct queue {
        into native buffers the disposal may already have freed. */
     bool disposing;
     bool movie, playing;
-    unsigned controls;
-    bool deferred_dispose, dispose_immediate, dispose_was_playing, preserve_guest_buffers;
+    unsigned controls, callbacks;
+    bool deferred_dispose, dispose_immediate, dispose_was_playing;
     unsigned buffer_count;
     struct { uint32_t guest; AudioQueueBufferRef host; } buffers[kMaxBuffers];
 };
@@ -98,14 +98,16 @@ static void playback_result(struct queue *q, bool playing, OSStatus status)
 
 /* Diagnostics for allocator corruption: every native buffer handed out, and
    a ring of recent queue operations, both read by the crash handler. */
-enum { kHistory = 2048, kKnownBuffers = 16384 };
+enum { kHistory = 2048, kLifecycleHistory = 256, kKnownBuffers = 16384 };
 enum event_kind { kEventNew, kEventAllocate, kEventEnqueue, kEventStart, kEventStop, kEventPause,
-                  kEventDisposeBegin, kEventDisposeEnd, kEventCallback };
+                  kEventDisposeBegin, kEventDisposeEnd, kEventCallback, kEventNewBegin };
 static const char *const event_names[] = {"new", "allocate", "enqueue", "start", "stop", "pause",
-                                          "dispose-begin", "dispose-end", "callback"};
+                                          "dispose-begin", "dispose-end", "callback", "new-begin"};
 struct event { uint64_t time; uint32_t thread, queue; uint8_t kind; uint64_t object; uint32_t bytes; int32_t status; };
 static struct event history[kHistory];
 static unsigned history_next;
+static struct event lifecycle_history[kLifecycleHistory];
+static unsigned lifecycle_next;
 struct known_buffer { uint64_t data; uint32_t capacity, queue; uint64_t allocated, disposed; };
 static struct known_buffer known_buffers[kKnownBuffers];
 static unsigned known_buffer_count;
@@ -113,8 +115,15 @@ static unsigned known_buffer_count;
 static void note_event(uint8_t kind, uint32_t queue, const void *object, uint32_t bytes, int32_t status)
 {
     unsigned slot = __atomic_fetch_add(&history_next, 1, __ATOMIC_RELAXED) % kHistory;
-    history[slot] = (struct event){clock_gettime_nsec_np(CLOCK_UPTIME_RAW), pthread_mach_thread_np(pthread_self()),
-                                   queue, kind, (uint64_t)(uintptr_t)object, bytes, status};
+    struct event event = {clock_gettime_nsec_np(CLOCK_UPTIME_RAW), pthread_mach_thread_np(pthread_self()),
+                          queue, kind, (uint64_t)(uintptr_t)object, bytes, status};
+    history[slot] = event;
+    /* Refills can overwrite the ordinary history many times during a movie.
+       Keep creation/control/disposal evidence independently of that traffic. */
+    if (kind != kEventEnqueue && kind != kEventAllocate && kind != kEventCallback) {
+        unsigned lifecycle_slot = __atomic_fetch_add(&lifecycle_next, 1, __ATOMIC_RELAXED) % kLifecycleHistory;
+        lifecycle_history[lifecycle_slot] = event;
+    }
 }
 
 static void remember_buffer(uint32_t queue, AudioQueueBufferRef host)
@@ -160,10 +169,19 @@ void audio_queue_bridge32_crash_report(int fd, int extra_fd, const uint64_t *add
         }
     }
     unsigned next = __atomic_load_n(&history_next, __ATOMIC_RELAXED);
-    unsigned shown = next < 120 ? next : 120;
+    unsigned shown = next < 48 ? next : 48;
     REPORT("compat32: last %u audio queue operations (oldest first):\n", shown);
     for (unsigned i = next - shown; i != next; ++i) {
         const struct event *e = &history[i % kHistory];
+        REPORT("compat32:   -%.1f ms thread %u %s queue=%08x object=%#llx bytes=%u status=%d\n",
+               (now - e->time) / 1e6, e->thread, e->kind < sizeof(event_names) / sizeof(event_names[0]) ?
+               event_names[e->kind] : "?", e->queue, (unsigned long long)e->object, e->bytes, e->status);
+    }
+    next = __atomic_load_n(&lifecycle_next, __ATOMIC_RELAXED);
+    shown = next < 48 ? next : 48;
+    REPORT("compat32: last %u audio queue lifecycle operations (oldest first):\n", shown);
+    for (unsigned i = next - shown; i != next; ++i) {
+        const struct event *e = &lifecycle_history[i % kLifecycleHistory];
         REPORT("compat32:   -%.1f ms thread %u %s queue=%08x object=%#llx bytes=%u status=%d\n",
                (now - e->time) / 1e6, e->thread, e->kind < sizeof(event_names) / sizeof(event_names[0]) ?
                event_names[e->kind] : "?", e->queue, (unsigned long long)e->object, e->bytes, e->status);
@@ -189,15 +207,38 @@ static AudioQueueBufferRef host_buffer(struct queue *q, uint32_t guest)
     return NULL;
 }
 
+/* Asynchronous native disposal can return while an output callback is still
+   running. Its guest buffer records must survive until that callback returns.
+   Called under lock; only one caller takes ownership of the retired records. */
+static unsigned take_retired_buffers(struct queue *q)
+{
+    if (q->audio || !q->disposing || q->callbacks) return 0;
+    unsigned count = q->buffer_count;
+    q->buffer_count = 0;
+    return count;
+}
+
+static void release_guest_buffers(struct queue *q, unsigned count)
+{
+    for (unsigned i = 0; i < count; ++i)
+        compat_runtime32_deallocate(q->buffers[i].guest);
+}
+
 static void output(void *raw, AudioQueueRef audio, AudioQueueBufferRef buffer)
 {
     (void)audio;
     struct queue *q = raw;
     pthread_mutex_lock(&lock);
-    bool live = q->audio && !q->disposing;
+    uint32_t guest = 0;
+    if (q->audio && !q->disposing)
+        for (unsigned i = 0; i < q->buffer_count; ++i)
+            if (q->buffers[i].host == buffer) { guest = q->buffers[i].guest; break; }
+    if (guest) ++q->callbacks;
     pthread_mutex_unlock(&lock);
-    if (!live) return;
-    uint32_t arguments[] = {q->user_data, q->handle, (uint32_t)(uintptr_t)buffer->mUserData};
+    if (!guest) return;
+    /* Read the bridge's permanent association, not a native buffer that a
+       concurrent disposal may retire. */
+    uint32_t arguments[] = {q->user_data, q->handle, guest};
     if (getenv("LP32_TRACE_AUDIO_QUEUE")) {
         static unsigned calls;
         if (++calls % 200 == 1) fprintf(stderr, "compat32: AudioQueue output callback %u queue=%08x\n", calls, q->handle);
@@ -208,6 +249,11 @@ static void output(void *raw, AudioQueueRef audio, AudioQueueBufferRef buffer)
         compat_runtime32_call(q->callback, arguments, 3);
         callback_queue = previous;
     }
+    pthread_mutex_lock(&lock);
+    --q->callbacks;
+    unsigned retired = take_retired_buffers(q);
+    pthread_mutex_unlock(&lock);
+    release_guest_buffers(q, retired);
 }
 
 static OSStatus new_output(const uint32_t *a)
@@ -229,6 +275,7 @@ static OSStatus new_output(const uint32_t *a)
             q->handle, format->mSampleRate, (const char *)&format->mFormatID,
             format->mFormatFlags, format->mChannelsPerFrame,
             format->mBitsPerChannel, format->mBytesPerFrame);
+    note_event(kEventNewBegin, q->handle, format, format->mBytesPerFrame, noErr);
     OSStatus status = AudioQueueNewOutput(format, output, q, NULL, NULL, 0, &q->audio);
     note_event(kEventNew, q->handle, q->audio, 0, status);
     fprintf(stderr, "compat32: AudioQueue create queue=%08x status=%d\n",
@@ -300,8 +347,9 @@ static OSStatus finish_dispose(struct queue *q)
 {
     AudioQueueRef audio = q->audio;
     note_event(kEventDisposeBegin, q->handle, audio, q->dispose_immediate, noErr);
-    /* Not under lock: disposal waits for a running output callback, which
-       may itself be in enqueue(). */
+    /* Not under lock: synchronous disposal waits for an output callback,
+       which may itself be in enqueue(). Asynchronous disposal can return
+       before that callback finishes, so guest records remain pinned. */
     OSStatus disposed = AudioQueueDispose(audio, q->dispose_immediate);
     note_event(kEventDisposeEnd, q->handle, audio, q->dispose_immediate, disposed);
     if (disposed) {
@@ -314,13 +362,9 @@ static OSStatus finish_dispose(struct queue *q)
     forget_buffers(q->handle);
     pthread_mutex_lock(&lock);
     q->audio = NULL;
-    unsigned count = q->buffer_count;
-    q->buffer_count = 0;
+    unsigned count = take_retired_buffers(q);
     pthread_mutex_unlock(&lock);
-    /* Self-disposal may return while guest callback code still uses its
-       buffer record. Keep those guest records alive; slots are not reused. */
-    if (!q->preserve_guest_buffers)
-        for (unsigned i = 0; i < count; ++i) compat_runtime32_deallocate(q->buffers[i].guest);
+    release_guest_buffers(q, count);
     return noErr;
 }
 
@@ -334,7 +378,6 @@ static OSStatus dispose(struct queue *q, bool immediate)
     q->disposing = true;
     q->dispose_was_playing = q->playing;
     q->dispose_immediate = immediate;
-    q->preserve_guest_buffers = callback_queue == q;
     set_playing(q, false);
     /* A native control can synchronously invoke the requesting callback.
        Waiting here would deadlock that control. Retire after it returns. */

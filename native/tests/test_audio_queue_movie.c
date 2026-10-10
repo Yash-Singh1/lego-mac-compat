@@ -127,22 +127,43 @@ int main(void)
     dispose_during_start = true;
     operation("_AudioQueueStart", c, false);
     dispose_during_start = false;
-    /* Self-disposal must retain the guest buffer record still in use by
-       the callback. Disposal from another thread releases it normally. */
+    /* A running callback pins its guest record through self-disposal.
+       Once it returns the record can be reclaimed, without leaking it. */
     uint32_t d = create(1);
     struct queue *q = queue_for(d);
     q->buffer_count = 1;
     q->buffers[0].guest = 0x40000200;
+    q->callbacks = 1;
     callback_queue = q;
     operation("_AudioQueueDispose", d, false);
     callback_queue = NULL;
     assert(!guest_frees);
+    pthread_mutex_lock(&lock);
+    --q->callbacks;
+    unsigned retired = take_retired_buffers(q);
+    pthread_mutex_unlock(&lock);
+    release_guest_buffers(q, retired);
+    assert(guest_frees == 1);
     uint32_t e = create(1);
     q = queue_for(e);
     q->buffer_count = 1;
     q->buffers[0].guest = 0x40000200;
     operation("_AudioQueueDispose", e, false);
-    assert(guest_frees == 1);
-    puts("AudioQueue movie pacing lifecycle PASS");
+    assert(guest_frees == 2);
+    /* Refills must not erase the lifecycle leading up to allocator failure. */
+    for (unsigned i = 0; i < kHistory + 32; ++i)
+        note_event(kEventEnqueue, e, NULL, 1408, noErr);
+    int fds[2];
+    assert(!pipe(fds));
+    audio_queue_bridge32_crash_report(fds[1], -1, NULL, 0);
+    close(fds[1]);
+    char report[16384];
+    ssize_t length = read(fds[0], report, sizeof(report) - 1);
+    assert(length > 0);
+    report[length] = 0;
+    assert(strstr(report, "audio queue lifecycle operations"));
+    assert(strstr(report, "new-begin") && strstr(report, "dispose-begin"));
+    close(fds[0]);
+    puts("AudioQueue movie pacing lifecycle PASS (refill-independent crash history)");
     return 0;
 }

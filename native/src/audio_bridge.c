@@ -45,7 +45,18 @@ struct guest_audio_buffer {
     uint32_t data;
 };
 
+struct audio_callback_context;
+/* CoreAudio can still deliver an invocation that entered before replacement.
+   Retain a distinct native refcon for each registration for the process
+   lifetime. The larger guest buffers/context may be reused, but the refcon
+   must never identify a later registration at the same context address. */
+struct audio_callback_registration {
+    struct audio_callback_context *context;
+    bool is_input;
+};
+
 struct audio_callback_context {
+    struct audio_callback_registration *registration;
     uint32_t callback_index;
     const char *callback_kind;
     AUGraph owner_graph;
@@ -417,6 +428,9 @@ static struct audio_callback_context *new_audio_callback(uint32_t function,
     pthread_once(&audio_worker_once, start_audio_callback_worker);
     if (!audio_worker_available) return NULL;
 
+    struct audio_callback_registration *registration = calloc(1, sizeof(*registration));
+    if (!registration) return NULL;
+    registration->is_input = strcmp(kind, "render-notify") != 0;
     pthread_mutex_lock(&audio_callback_registry_lock);
     for (uint32_t index = 0; index < audio_callback_count; ++index) {
         struct audio_callback_context *context = audio_callbacks[index];
@@ -425,6 +439,8 @@ static struct audio_callback_context *new_audio_callback(uint32_t function,
         if (__atomic_load_n(&context->in_use, __ATOMIC_ACQUIRE)) continue;
         pthread_mutex_lock(&context->lock);
         if (!context->in_use) {
+            registration->context = context;
+            context->registration = registration;
             context->callback_kind = kind;
             context->owner_graph = owner_graph;
             context->owner_unit = NULL;
@@ -460,14 +476,18 @@ static struct audio_callback_context *new_audio_callback(uint32_t function,
         fprintf(stderr,
                 "compat32: audio callback capacity exhausted (%u active)\n",
                 audio_callback_count);
+        free(registration);
         return NULL;
     }
 
     struct audio_callback_context *context = calloc(1, sizeof(*context));
     if (!context) {
         pthread_mutex_unlock(&audio_callback_registry_lock);
+        free(registration);
         return NULL;
     }
+    registration->context = context;
+    context->registration = registration;
     context->callback_index = index;
     context->callback_kind = kind;
     context->owner_graph = owner_graph;
@@ -491,6 +511,7 @@ static struct audio_callback_context *new_audio_callback(uint32_t function,
         compat_runtime32_deallocate(context->guest_timestamp);
         compat_runtime32_deallocate(context->guest_buffer_list);
         free(context);
+        free(registration);
         pthread_mutex_unlock(&audio_callback_registry_lock);
         return NULL;
     }
@@ -516,6 +537,7 @@ static void clear_audio_callback_locked(struct audio_callback_context *context)
         if (unit_input_bindings[i].context == context)
             memset(&unit_input_bindings[i], 0, sizeof(unit_input_bindings[i]));
     pthread_mutex_unlock(&unit_input_binding_lock);
+    context->registration = NULL;
     context->callback_attached = false;
     context->owner_graph = NULL;
     context->owner_unit = NULL;
@@ -530,13 +552,28 @@ static void clear_audio_callback_locked(struct audio_callback_context *context)
     __atomic_store_n(&context->in_use, false, __ATOMIC_RELEASE);
 }
 
+static void release_audio_registration(struct audio_callback_registration *registration)
+{
+    if (!registration) return;
+    struct audio_callback_context *context = registration->context;
+    pthread_mutex_lock(&context->lock);
+    if (context->registration == registration) {
+        __atomic_store_n(&context->retired, true, __ATOMIC_RELEASE);
+        while (context->registration == registration && context->host_call_active)
+            pthread_cond_wait(&context->response_condition, &context->lock);
+        /* The final render can retire the context before this waiter resumes. */
+        if (context->registration == registration) clear_audio_callback_locked(context);
+    }
+    pthread_mutex_unlock(&context->lock);
+}
+
 static void release_audio_callback(struct audio_callback_context *context)
 {
     if (!context) return;
     pthread_mutex_lock(&context->lock);
-    while (context->host_call_active) pthread_cond_wait(&context->response_condition, &context->lock);
-    clear_audio_callback_locked(context);
+    struct audio_callback_registration *registration = context->registration;
     pthread_mutex_unlock(&context->lock);
+    release_audio_registration(registration);
 }
 
 static void finish_retired_audio_callback(struct audio_callback_context *context)
@@ -555,6 +592,7 @@ static uint32_t release_audio_callbacks_for_graph(AUGraph graph)
         struct audio_callback_context *context = audio_callbacks[index];
         pthread_mutex_lock(&context->lock);
         if (context->in_use && context->owner_graph == graph) {
+            __atomic_store_n(&context->retired, true, __ATOMIC_RELEASE);
             while (context->host_call_active) pthread_cond_wait(&context->response_condition, &context->lock);
             clear_audio_callback_locked(context);
             ++released;
@@ -652,10 +690,27 @@ static OSStatus host_audio_callback(void *refcon,
                                     UInt32 frame_count,
                                     AudioBufferList *host_list)
 {
-    struct audio_callback_context *context = refcon;
-    if (!context) return kAudio_ParamError;
+    const struct audio_callback_registration *registration = refcon;
+    if (!registration || !registration->context) return kAudio_ParamError;
+    struct audio_callback_context *context = registration->context;
+    /* The worker holds the context lock while guest code runs. A recursive
+       render of the same registration cannot wait for its own completion. */
+    if (current_audio_callback == context) return kAudioUnitErr_CannotDoInCurrentContext;
     pthread_mutex_lock(&context->lock);
-    bool is_input_callback = strcmp(context->callback_kind, "render-notify") != 0;
+    /* Each job uses shared staging and a stack-local queue node. Admit only
+       one host invocation until its own response and writeback have finished.
+       Recheck identity after every wait, since teardown may recycle context. */
+    while (context->registration == registration && context->in_use &&
+           !__atomic_load_n(&context->retired, __ATOMIC_ACQUIRE) && context->host_call_active)
+        pthread_cond_wait(&context->response_condition, &context->lock);
+    if (context->registration != registration || !context->in_use ||
+        __atomic_load_n(&context->retired, __ATOMIC_ACQUIRE)) {
+        pthread_mutex_unlock(&context->lock);
+        /* A detached invocation owns no sample storage. Even silencing its
+           old list can overwrite memory freed by AudioUnit teardown. */
+        return noErr;
+    }
+    bool is_input_callback = registration->is_input;
     /* A pre-render notification runs before the unit prepares its buffers.
        Its list can still contain pointers from the previous IO cycle. Reading
        or silencing those pointers can overwrite the audio allocator's free
@@ -681,9 +736,6 @@ static OSStatus host_audio_callback(void *refcon,
     }
     if (!context->in_use || !context->guest_function || held ||
         __atomic_load_n(&context->muted, __ATOMIC_ACQUIRE)) {
-        if (__atomic_load_n(&context->retired, __ATOMIC_ACQUIRE) && !context->host_call_active)
-            clear_audio_callback_locked(context);
-        pthread_mutex_unlock(&context->lock);
         if (is_input_callback && host_list) {
             for (UInt32 index = 0; index < host_list->mNumberBuffers; ++index) {
                 AudioBuffer *host_buffer = &host_list->mBuffers[index];
@@ -692,6 +744,7 @@ static OSStatus host_audio_callback(void *refcon,
                 }
             }
         }
+        pthread_mutex_unlock(&context->lock);
         return noErr;
     }
 
@@ -889,8 +942,8 @@ static uint32_t detach_audio_callbacks_for_graph(AUGraph graph,
             OSStatus status;
             if (strcmp(context->callback_kind, "render-notify") == 0) {
                 status = context->owner_unit ? AudioUnitRemoveRenderNotify(
-                    context->owner_unit, host_audio_callback, context) :
-                    AUGraphRemoveRenderNotify(graph, host_audio_callback, context);
+                    context->owner_unit, host_audio_callback, context->registration) :
+                    AUGraphRemoveRenderNotify(graph, host_audio_callback, context->registration);
             } else if (context->owner_unit && !strcmp(context->callback_kind,"unit-input")) {
                 AURenderCallbackStruct callback={NULL,NULL};
                 status=AudioUnitSetProperty(context->owner_unit,(AudioUnitPropertyID)context->callback_node,
@@ -963,9 +1016,9 @@ enum deferred_graph_kind {
 };
 
 struct deferred_graph_op {
+    struct audio_callback_registration *registration;
     AUGraph graph;
     enum deferred_graph_kind kind;
-    struct audio_callback_context *context;
     AudioUnit unit;
     AudioUnitParameterID parameter;
     AudioUnitScope scope;
@@ -1066,8 +1119,8 @@ static void perform_graph_op(const struct deferred_graph_op *op)
         if (trace_audio()) trace_audio_status("AUGraphInitialize(deferred)", status);
         return;
     case kDeferredGraphAddRenderNotify:
-        status = AUGraphAddRenderNotify(graph, host_audio_callback, op->context);
-        if (status != noErr) release_audio_callback(op->context);
+        status = AUGraphAddRenderNotify(graph, host_audio_callback, op->registration);
+        if (status != noErr) release_audio_registration(op->registration);
         if (trace_audio()) trace_audio_status("AUGraphAddRenderNotify(deferred)", status);
         return;
     case kDeferredGraphStart:
@@ -1079,8 +1132,8 @@ static void perform_graph_op(const struct deferred_graph_op *op)
         if (trace_audio()) trace_audio_status("AUGraphStop(deferred)", status);
         return;
     case kDeferredUnitRemoveRenderNotify:
-        status = AudioUnitRemoveRenderNotify(op->unit, host_audio_callback, op->context);
-        if (!status) release_audio_callback(op->context);
+        status = AudioUnitRemoveRenderNotify(op->unit, host_audio_callback, op->registration);
+        if (!status) release_audio_registration(op->registration);
         if (trace_audio()) trace_audio_status("AudioUnitRemoveRenderNotify(deferred)", status);
         return;
     case kDeferredUnitSetParameter:
@@ -1274,12 +1327,13 @@ static void enqueue_graph_teardown(AUGraph graph, enum deferred_graph_kind kind,
     struct deferred_graph_op *op = new_deferred_graph_op(graph, kind);
     if (!op) {
         struct deferred_graph_op inline_op = {
-            .graph = graph, .kind = kind, .context = context,
+            .graph = graph, .kind = kind,
+            .registration = context ? context->registration : NULL,
         };
         perform_graph_op(&inline_op);
         return;
     }
-    op->context = context;
+    op->registration = context ? context->registration : NULL;
     pthread_mutex_lock(&deferred_graph_lock);
     append_deferred_graph_op_locked(op);
     pthread_mutex_unlock(&deferred_graph_lock);
@@ -1976,7 +2030,7 @@ int audio_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
                                                 arguments[2]) : NULL;
         AURenderCallbackStruct callback = {
             .inputProc = context ? host_audio_callback : NULL,
-            .inputProcRefCon = context,
+            .inputProcRefCon = context ? context->registration : NULL,
         };
         OSStatus status = graph && context ? AUGraphSetNodeInputCallback(
             graph, (AUNode)arguments[1], arguments[2], &callback)
@@ -2005,7 +2059,7 @@ int audio_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
         OSStatus status = kAudio_ParamError;
         if (graph && context) {
             if (synchronous) {
-                status = AUGraphAddRenderNotify(graph, host_audio_callback, context);
+                status = AUGraphAddRenderNotify(graph, host_audio_callback, context->registration);
             } else {
                 /* The worker releases the context if the host call fails. */
                 enqueue_graph_teardown(graph, kDeferredGraphAddRenderNotify, context);
@@ -2036,7 +2090,7 @@ int audio_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
                     arguments[1], arguments[2], "render-notify", graph, 0, 0);
                 if (context) {
                     context->owner_unit = unit;
-                    status = AudioUnitAddRenderNotify(unit, host_audio_callback, context);
+                    status = AudioUnitAddRenderNotify(unit, host_audio_callback, context->registration);
                     if (status) release_audio_callback(context);
                 } else status = kAudio_MemFullError;
             } else {
@@ -2045,11 +2099,13 @@ int audio_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
                 for (uint32_t i = 0; i < count; ++i) {
                     struct audio_callback_context *context = audio_callbacks[i];
                     bool self = context == current_audio_callback;
+                    struct audio_callback_registration *registration;
                     if (!self) pthread_mutex_lock(&context->lock);
                     bool matches = context->in_use && context->owner_unit == unit &&
                         !strcmp(context->callback_kind,"render-notify") &&
                         context->guest_function == arguments[1] &&
                         context->guest_refcon == arguments[2];
+                    registration = context->registration;
                     if (!self) pthread_mutex_unlock(&context->lock);
                     if (matches) {
                         if (current_audio_callback) {
@@ -2058,15 +2114,18 @@ int audio_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
                             struct deferred_graph_op *op = new_deferred_graph_op(graph, kDeferredUnitRemoveRenderNotify);
                             if (!op) status = kAudio_MemFullError;
                             else {
-                                __atomic_store_n(&context->muted, true, __ATOMIC_RELEASE);
-                                op->unit = unit; op->context = context;
+                                if (!self) pthread_mutex_lock(&context->lock);
+                                if (context->registration == registration)
+                                    __atomic_store_n(&context->muted, true, __ATOMIC_RELEASE);
+                                if (!self) pthread_mutex_unlock(&context->lock);
+                                op->unit = unit; op->registration = registration;
                                 pthread_mutex_lock(&deferred_graph_lock);
                                 append_deferred_graph_op_locked(op);
                                 pthread_mutex_unlock(&deferred_graph_lock);
                             }
                         } else {
-                            status = AudioUnitRemoveRenderNotify(unit, host_audio_callback, context);
-                            if (!status) release_audio_callback(context);
+                            status = AudioUnitRemoveRenderNotify(unit, host_audio_callback, registration);
+                            if (!status) release_audio_registration(registration);
                         }
                         break;
                     }
@@ -2130,7 +2189,7 @@ int audio_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
                 guest[0],guest[1],"unit-input",owner_graph,(AUNode)arguments[1],arguments[3]) : NULL;
             if (guest[0] && !context) { *result=(uint32_t)kAudio_MemFullError;return 1; }
             if(context){context->owner_unit=unit;context->callback_scope=arguments[2];}
-            AURenderCallbackStruct callback={context ? host_audio_callback : NULL,context};
+            AURenderCallbackStruct callback={context ? host_audio_callback : NULL,context ? context->registration : NULL};
             struct audio_callback_context *old = NULL;
             pthread_mutex_lock(&unit_input_update_lock);
             pthread_mutex_lock(&unit_input_binding_lock);
