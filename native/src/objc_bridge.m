@@ -11618,6 +11618,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         if (objc_legacy32_message(arguments, result)) return 1;
         id receiver = object_for_receiver(arguments[0]);
         const char *selector_name = (const char *)(uintptr_t)arguments[1];
+        uint64_t sdl_present_swap = 0, sdl_pace_ns = 0;
         static int trace_selectors = -1;
         if (trace_selectors < 0) {
             trace_selectors = getenv("LP32_TRACE_OBJC_SELECTORS") != NULL;
@@ -11713,15 +11714,21 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             }
             /* SDL presents outside OpenGLView, so honor an explicit test
                or user frame cap here too. Leave its normal pacing intact. */
-            if (getenv("LP32_MAX_FPS"))
+            if (getenv("LP32_MAX_FPS")) {
+                uint64_t pace_start = hitch_recorder_enabled ? hitch_now() : 0;
                 frame_pacer_wait(nil);
+                if (hitch_recorder_enabled) sdl_pace_ns += hitch_now() - pace_start;
+            }
             frame_gamma_present((NSOpenGLContext *)receiver);
             log_frame_hitch();
+            uint64_t inactive_start = hitch_recorder_enabled ? hitch_now() : 0;
             inactive_pacing_before_present();
+            if (hitch_recorder_enabled) sdl_pace_ns += hitch_now() - inactive_start;
             texture_bind_cache_invalidate();
             __atomic_store_n(&presenting_context,
                              [(NSOpenGLContext *)receiver CGLContextObj], __ATOMIC_RELAXED);
             uint64_t swaps = ++objc_bridge_swap_count;
+            sdl_present_swap = swaps;
             if (swaps == 1) {
                 fprintf(stderr, "compat32: %s presented its first frame\n", lp32_profile()->name);
                 if (getenv("LP32_TRACE_GL_RENDER") ||
@@ -12115,8 +12122,18 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             NSEvent *e=object_for_argument(arguments[2]);
             if(e.type==NSEventTypeApplicationDefined)fprintf(stderr,"POST tid=%u token=%08x data=%lx,%lx subtype=%d\n",pthread_mach_thread_np(pthread_self()),arguments[2],(long)e.data1,(long)e.data2,(int)e.subtype);
         }
+        uint64_t sdl_flush_start = sdl_present_swap && hitch_recorder_enabled ? hitch_now() : 0;
         bool invoked = invoke_simple_message(receiver, selector_name,
                                              arguments, result, NULL, NULL);
+        if (invoked && sdl_flush_start) {
+            uint64_t end = hitch_now();
+            /* SDL paces before flushing. Move only those measured waits to
+               the recorder's pacing category, preserving the actual frame
+               interval and flush duration without changing presentation. */
+            hitch_frame(sdl_present_swap, sdl_flush_start - sdl_pace_ns,
+                        end - sdl_pace_ns, end, frame_pacer_interval_ns,
+                        [NSApp isActive] || getenv("LP32_BACKGROUND_TEST"));
+        }
         if (invoked && selector_name &&
             !strcmp(selector_name, "nextEventMatchingMask:untilDate:inMode:dequeue:") &&
             arguments[5] &&

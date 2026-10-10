@@ -265,3 +265,25 @@ These checks establish the buffer fix, not the cause of MW2 cave lighting.
 
 Local evidence is under `build/mw2-flicker-20261009/`, including the before/after
 index reports, `regression-*` reports and `multipass-final-arm64/`.
+
+## Deferred pipeline preparation and shared uploads, October 10
+
+GLMetal now retries recently skipped function pairs once their render recipe
+becomes confident. Retention and retry work are bounded; descriptor matching
+and compiler concurrency are unchanged. CPU mock tests pass on arm64 and
+Rosetta, including stale pairs, wrong targets, final-function variants and
+demand claiming queued work. A native compiler-only probe with twelve captured
+MW3 pairs reduces first-draw waits from 216 to 231 ms to 8 to 14 ms across two trials
+per architecture. This demonstrates preparation overlap, not gameplay FPS.
+
+Immediately submitted shared-context texture uploads use payload-sized pooled
+staging rather than a separate 4 MB transient reservation. Buffer lifetime and
+submission ordering are unchanged. A new shared-context texture lifetime case,
+four existing staging cases and fourteen depth-clamp/variant cases match Apple
+GL on each architecture, 38 comparisons with no mismatches or crashes.
+
+The compatibility bridge also feeds MW2/MW3 SDL flushes into the bounded hitch
+recorder. The recorder CPU test and a muted private MW3 presentation check pass;
+the latter generated a 41-frame report. The packaged native buffer check passes.
+Details and limits are in `MW3_RENDER_PERFORMANCE.md`; local evidence is under
+`build/mw3-area-20261010/`. Shader output and compiler cache identity are unchanged.

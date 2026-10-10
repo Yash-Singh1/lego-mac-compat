@@ -90,3 +90,79 @@ driver and compiler helper by atomic file replacement. An already running
 game keeps its old mapped binaries. Quit and reopen the app to load the update.
 Tests used copied profiles and muted background windows. User applications,
 profile files and the game's assets were not changed by the tests.
+
+## Remaining area-transition stalls
+
+After the index-arena update, read-only live samples caught further native
+pipeline creation during mission progression. One warning recorded an 848 ms
+frame with 34 pipeline acquisitions taking 582 ms. GLSL/SPIRV-Cross translation
+took 1 ms for that frame. Application-thread program compilation took 254 ms;
+these categories can overlap and must not be added as independent costs.
+Other recorded spikes included native function waits. A separate 385 ms frame
+had no measured compiler or pipeline cost. The captures do not establish the
+cause of every sustained 10 FPS interval reported by the player.
+
+GLMetal previously discarded a prewarm request if no sufficiently confident
+render recipe existed when its functions became ready. It now retains up to
+128 skipped pairs for ten seconds and retries at most four matching pairs per
+recipe observation. Demanded pairs leave that list. Full descriptor matching,
+the two background compiler jobs, 32 outstanding predictions and 512 cached
+pipelines are unchanged. Final shader variants or different render targets
+still require their own exact pipelines. Shader output and compiler cache
+identity are unchanged.
+
+The compiler-only `pipeline_compile` probe now has a `deferred` mode. It loads
+functions before learning recipes, then models preparation time before draws.
+Two trials per architecture used 12 captured MW3 pairs, fresh Metal entry names
+and a 10 ms gap. The baseline used the preceding prewarmer implementation with
+the same probe. Neither cohort submitted GPU work.
+
+| Architecture | Baseline first-draw pipeline waits | Updated waits | Updated reuse |
+| --- | ---: | ---: | ---: |
+| Native arm64 | 216.438 to 230.604 ms | 7.703 to 10.684 ms | 12 of 12 |
+| Rosetta x86_64 | 222.420 to 223.884 ms | 8.720 to 13.920 ms | 12 of 12 |
+
+Compilation moves into preparation time; it is not eliminated. This probe
+demonstrates the missed-prewarm fix, not an equivalent gameplay FPS improvement.
+The CPU mock also covers expiry, eviction, deduplication, demand removal,
+the four-retry limit, queued/running demands and descriptor mismatches.
+
+## Shared-loader upload staging
+
+Non-presenting shared contexts submit texture uploads immediately. Reserving a
+4 MB transient block for each tiny mip upload wasted staging capacity because
+those submissions cannot share an arena. These uploads now use payload-sized
+power-of-two pooled buffers. Their submission order is unchanged, and buffers
+return to the pool only after the copying command buffer completes.
+
+For 42 uploads covering six 64×64 RGBA mip chains, the size-class probe sums
+240 KiB of new reservations versus 168 MiB with one old block per upload.
+This is the reservation budget if all uploads remain in flight, not a measured
+gameplay memory peak. Actual retention depends on GPU completion. Optional
+`GLMETAL_UPLOAD_STAGING_STATS=1` logs reservations and pool reuse; it is disabled
+by default. The live profiles do not prove staging caused the reported dip.
+
+The new shared-context test checks 96 tiny mip/layer overwrites, client-byte
+reuse and producer destruction before consumer reads. It and four existing
+upload-staging cases match Apple GL on both architectures. Fourteen depth-clamp
+and shader-variant comparisons also match on each architecture, giving 38
+focused comparisons with no mismatches or crashes. The native buffer check
+passes against the packaged driver.
+
+## SDL presentation recording
+
+MW2 and MW3 present through `NSOpenGLContext flushBuffer`. That path counted
+swaps but never fed the detailed hitch recorder, leaving its log at the header.
+It now records after the actual flush. Measured waits before presentation enter
+the pacing category without changing their ordering; total frame intervals and
+flush durations stay intact. Normal thresholds catch roughly 100 ms frames
+that the separate 250 ms GLMetal warning threshold misses. Full import profiling
+remains disabled by default.
+
+The recorder CPU test passes. A private muted MW3 run produced a 41-frame
+history through the actual SDL path, including draw, upload, runtime, work,
+flush and pacing measurements. This was a startup/menu integration check,
+not a reproduction of the player's sustained gameplay slowdown. Local samples,
+probe results and comparison reports are under `build/mw3-area-20261010/` and
+are excluded from Git. Reopening the normal updated app enables this recording
+for the next mission progression capture.
