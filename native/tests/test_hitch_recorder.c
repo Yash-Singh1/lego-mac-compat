@@ -62,12 +62,25 @@ int main(void)
     assert(!!hitch_full_imports == !!(full && full[0] && strcmp(full, "0")));
     assert(hitch_classify("_strlen") == (hitch_full_imports ? HITCH_RUNTIME : HITCH_COUNTED_RUNTIME));
     assert(hitch_classify("_pthread_mutex_lock") == HITCH_WAIT);
+    /* Startup itself presents once before Backend takes over. Its later
+       imports and a scope spanning that handoff must not pollute Backend. */
+    hitch_frame(0, end - 2000000, end - 1000000, end, 16666667, false);
+    struct hitch_scope transferred;
+    hitch_scope_begin(&transferred, end);
     pthread_t thread;
     assert(!pthread_create(&thread, NULL, presenter, NULL));
     pthread_mutex_lock(&rendezvous);
     while (phase != 1) pthread_cond_wait(&startup_ready, &rendezvous);
     /* The startup thread continues to make imports while Backend presents.
        It must never write Backend's current frame or runtime counters. */
+    /* This earlier frame arrives after Backend's newer presentation. It
+       must not reclaim ownership or underflow the shared frame clock. */
+    struct hitch_scope late;
+    hitch_scope_begin(&late, end);
+    hitch_frame(999999, end - 5000000, end - 4000000, end - 3000000, 16666667, true);
+    hitch_scope_end(&late, HITCH_SHADER, "late-presentation-scope", 0, end + 90000000, 0);
+    hitch_scope_end(&transferred, HITCH_SHADER, "former-presenter-scope", 0, end + 90000000, 0);
+    hitch_note(HITCH_WAIT, "former-presenter-wait", 0, end, end + 90000000, 0);
     hitch_note(HITCH_SHADER, "cgCreateProgram", 0x1234, end, end + 9000000, 0);
     hitch_note(HITCH_AUDIO, "AudioQueueNewOutput", 0x5678, end, end + 3000000, 0);
     hitch_count_runtime();
@@ -96,9 +109,22 @@ int main(void)
     assert(strstr(text, "worker name=cgCreateProgram"));
     assert(strstr(text, "worker name=AudioQueueNewOutput"));
     assert(!strstr(text, "name=first-presentation"));
+    assert(!strstr(text, "former-presenter-scope"));
+    assert(!strstr(text, "late-presentation-scope"));
+    assert(!strstr(text, "frame=999999"));
+    assert(!strstr(text, "former-presenter-wait"));
     assert(!strstr(text, "shader=1/9.000"));
     assert(!strstr(text, "audio=1/3.000"));
     assert(strstr(text, "end reports=1 skipped=0"));
+    unlink(path);
+    /* Reusing the recorder in-process starts with a fresh writer and history. */
+    assert(!hitch_start(path,25));
+    hitch_frame(1,1000,2000,3000,16666667,true);
+    hitch_stop();
+    f = fopen(path,"r"); assert(f);
+    count = fread(text,1,sizeof(text)-1,f); text[count] = 0; fclose(f);
+    assert(strstr(text,"end reports=0 skipped=0"));
+    assert(!strstr(text,"hitch trigger="));
     unlink(path);
     puts("hitch-recorder PASS (threshold, history, workers, cooldown, exclusive nesting, presentation boundaries, pthread presentation ownership, startup imports, host metadata)");
     return 0;

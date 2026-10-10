@@ -41,7 +41,11 @@ static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t ready = PTHREAD_COND_INITIALIZER;
 static bool stopping, queued;
 static struct report pending, queue;
-static struct frame history[HISTORY], current;
+static struct frame history[HISTORY];
+static _Thread_local struct frame current;
+static pthread_mutex_t presentation_mutex = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t owner_token, next_owner_token, ownership_generation;
+static _Thread_local uint64_t presenter_token;
 static struct event workers[WORKERS];
 static unsigned history_count, history_next, worker_next, worker_count;
 static unsigned following, reports, skipped;
@@ -49,7 +53,10 @@ static uint64_t previous_end, last_trigger, threshold_ns;
 static _Thread_local uint32_t vertex_program, fragment_program;
 static _Thread_local struct hitch_scope *active_scope;
 static _Thread_local uint64_t frame_generation;
-static _Thread_local bool is_render_thread;
+static bool is_current_presenter(void)
+{
+    return presenter_token && presenter_token == __atomic_load_n(&owner_token, __ATOMIC_ACQUIRE);
+}
 
 static mach_timebase_info_data_t hitch_timebase;
 __attribute__((constructor)) static void initialize_hitch_clock(void)
@@ -181,9 +188,21 @@ int hitch_start(const char *path, double threshold_ms)
     fchmod(fileno(output), 0600);
     threshold_ns = (threshold_ms >= 1 && threshold_ms <= 10000) ?
         (uint64_t)(threshold_ms * 1e6) : 25000000;
+    /* Start/stop are called with guest recording quiescent. A new session
+       must not inherit queued reports, frame history or timestamps. */
+    memset(history, 0, sizeof(history));
+    memset(&current, 0, sizeof(current));
+    memset(&pending, 0, sizeof(pending));
+    memset(&queue, 0, sizeof(queue));
+    memset(workers, 0, sizeof(workers));
+    history_count = history_next = worker_next = worker_count = 0;
+    following = reports = skipped = 0;
+    previous_end = last_trigger = 0;
+    stopping = queued = false;
+    __atomic_add_fetch(&ownership_generation, 1, __ATOMIC_ACQ_REL);
     /* Startup may run on the application thread while a guest Backend
        thread presents. Ownership is established at the first presentation. */
-    is_render_thread = false;
+    __atomic_store_n(&owner_token, 0, __ATOMIC_RELEASE);
     const char *full = getenv("LP32_HITCH_FULL_IMPORTS");
     hitch_full_imports = full && full[0] && strcmp(full, "0");
     fprintf(output, "hitch-recorder v3 pid=%ld wall=%lld monotonic=%.3f threshold_ms=%.3f history=%d after=%d limit=%d full_imports=%d\n"
@@ -213,8 +232,9 @@ void hitch_stop(void)
     pthread_join(writer, NULL);
     fprintf(output, "end reports=%u skipped=%u\n", reports, skipped);
     fclose(output);
+    output = NULL;
     hitch_recorder_enabled = 0;
-    is_render_thread = false;
+    __atomic_store_n(&owner_token, 0, __ATOMIC_RELEASE);
 }
 void hitch_program(uint32_t target, uint32_t program)
 {
@@ -223,7 +243,8 @@ void hitch_program(uint32_t target, uint32_t program)
 }
 void hitch_scope_begin(struct hitch_scope *scope, uint64_t now)
 {
-    *scope = (struct hitch_scope){now, 0, frame_generation, active_scope};
+    *scope = (struct hitch_scope){now, 0, frame_generation, active_scope,
+        __atomic_load_n(&ownership_generation, __ATOMIC_ACQUIRE)};
     active_scope = scope;
 }
 void hitch_scope_end(struct hitch_scope *scope, unsigned kind, const char *name,
@@ -232,7 +253,8 @@ void hitch_scope_end(struct hitch_scope *scope, unsigned kind, const char *name,
     uint64_t elapsed = now - scope->start;
     active_scope = scope->parent;
     if (active_scope) active_scope->children += elapsed;
-    if (scope->generation != frame_generation) return;
+    if (scope->generation != frame_generation || scope->ownership_generation !=
+        __atomic_load_n(&ownership_generation, __ATOMIC_ACQUIRE)) return;
     uint64_t exclusive = elapsed > scope->children ? elapsed - scope->children : 0;
     hitch_note(kind, name, caller, scope->start, scope->start + exclusive, count);
 }
@@ -242,7 +264,7 @@ void hitch_note(unsigned kind, const char *name, uint32_t caller,
     if (!hitch_recorder_enabled || kind < HITCH_DRAW || kind >= HITCH_KIND_COUNT) return;
     uint64_t ns = end - start;
     struct event e = {name, start, ns, caller, vertex_program, fragment_program, draw_count};
-    if (!is_render_thread) {
+    if (!is_current_presenter()) {
         if (ns < 2000000 || kind == HITCH_WAIT) return;
         pthread_mutex_lock(&mutex);
         workers[worker_next++ % WORKERS] = e;
@@ -260,7 +282,7 @@ void hitch_note(unsigned kind, const char *name, uint32_t caller,
 }
 void hitch_count_runtime(void)
 {
-    if (hitch_recorder_enabled && is_render_thread) ++current.counted_runtime;
+    if (hitch_recorder_enabled && is_current_presenter()) ++current.counted_runtime;
 }
 void hitch_frame(uint64_t swap, uint64_t work_end, uint64_t flush_end,
                  uint64_t present_end, uint64_t target_ns, bool active)
@@ -268,7 +290,25 @@ void hitch_frame(uint64_t swap, uint64_t work_end, uint64_t flush_end,
     if (!hitch_recorder_enabled) return;
     /* One presentation producer owns current and its counters. Imports
        before its first presentation remain worker events. */
-    is_render_thread = true;
+    pthread_mutex_lock(&presentation_mutex);
+    /* Threads capture their timestamps before taking this lock. A delayed
+       presentation must neither move the clock backwards nor take ownership.
+       Its enclosing import still crosses a presentation boundary. */
+    if ((previous_end && present_end <= previous_end) ||
+        work_end > flush_end || flush_end > present_end) {
+        ++frame_generation;
+        memset(&current, 0, sizeof(current));
+        pthread_mutex_unlock(&presentation_mutex);
+        return;
+    }
+    if (work_end < previous_end) work_end = previous_end;
+    if (flush_end < work_end) flush_end = work_end;
+    if (!presenter_token) presenter_token = __atomic_add_fetch(&next_owner_token, 1, __ATOMIC_RELAXED);
+    if (!is_current_presenter()) {
+        memset(&current, 0, sizeof(current));
+        __atomic_add_fetch(&ownership_generation, 1, __ATOMIC_ACQ_REL);
+        __atomic_store_n(&owner_token, presenter_token, __ATOMIC_RELEASE);
+    }
     ++frame_generation;
     current.swap = swap; current.end = present_end; current.active = active;
     current.present = previous_end ? present_end - previous_end : 0;
@@ -293,4 +333,5 @@ void hitch_frame(uint64_t swap, uint64_t work_end, uint64_t flush_end,
     if (history_count < HISTORY) ++history_count;
     previous_end = present_end;
     memset(&current, 0, sizeof(current));
+    pthread_mutex_unlock(&presentation_mutex);
 }

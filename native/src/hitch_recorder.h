@@ -9,6 +9,7 @@ enum hitch_kind { HITCH_UNKNOWN, HITCH_NONE, HITCH_COUNTED_RUNTIME, HITCH_DRAW, 
 struct hitch_scope {
     uint64_t start, children, generation;
     struct hitch_scope *parent;
+    uint64_t ownership_generation;
 };
 extern int hitch_recorder_enabled;
 extern int hitch_full_imports;

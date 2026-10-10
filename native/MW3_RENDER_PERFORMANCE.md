@@ -166,3 +166,47 @@ not a reproduction of the player's sustained gameplay slowdown. Local samples,
 probe results and comparison reports are under `build/mw3-area-20261010/` and
 are excluded from Git. Reopening the normal updated app enables this recording
 for the next mission progression capture.
+
+## Buffer readback and completed queries, October 10
+
+The next live MW3 session recorded a 1.09 second frame during a shader burst,
+buffer mapping calls lasting 70 to 193 ms, and query getter calls lasting up to
+85 ms. Caller disassembly shows a query availability check followed by a result
+getter. These are individual call durations, not separate costs to add together.
+Other 383 to 416 ms frames had no recorded draws. Live samples also caught engine
+waiting, so these changes do not establish the cause of every loading stall.
+
+CPU-authored buffer readback previously submitted and waited for all pending GPU
+work. The command worker still applies earlier CPU uploads before readback, but
+GLMetal now skips that GPU wait when the buffer has no recorded GPU writer.
+Transform-feedback output retains the existing conservative submission and wait.
+This also removes the unrelated GPU wait from bridge map-buffer staging reads.
+
+Once a real query getter establishes completion, GLMetal retains the exact raw
+64-bit result for that query generation. A subsequent availability or 32-bit
+result getter returns it without another command-worker rendezvous. Signed and
+unsigned saturation remain intact. Begin, delete, timestamp, indexed-query and
+display-list paths invalidate the cache. The first availability check and all
+necessary GPU completion waits remain unchanged.
+
+The old hitch recorder allowed a startup presenter and the Backend presenter to
+write the same frame counters. That made category totals and call attribution
+unreliable after a thread handoff. Counters are now thread-local, and presentation
+ownership has an atomic generation. Stale timestamps cannot reclaim ownership;
+scopes crossing a handoff are discarded. Presentation history remains serialized,
+and repeat sessions clear their history. The selected-call regression measured
+roughly 25 to 27 ns per call, and nested scope recording roughly 37 to 38 ns.
+
+CPU mocks pass for upload ordering, GPU writer waits, exact query values,
+invalidation and error paths. AddressSanitizer query probes pass on both
+architectures. Thirty-eight focused Apple GL comparisons pass, nineteen each on
+arm64 and Rosetta. They cover buffer readback, first indexed draws after a flush,
+existing query cases and completed-query reuse with changing zero/nonzero values.
+There were no mismatches or crashes. Shader output and compiler identity are
+unchanged. Evidence is under `build/mw3-followup-20261010/` and excluded from Git.
+
+A muted private packaged MW3 startup run produced 41 recorded frames. Their
+category sums stayed within frame work time. The native buffer check and signed
+normal-app manifest checks passed. This was an integration check, not a replay
+of the player's mission or a gameplay performance benchmark. The normal app
+was refreshed atomically; the player's existing process stayed running.

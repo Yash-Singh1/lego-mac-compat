@@ -287,3 +287,24 @@ recorder. The recorder CPU test and a muted private MW3 presentation check pass;
 the latter generated a 41-frame report. The packaged native buffer check passes.
 Details and limits are in `MW3_RENDER_PERFORMANCE.md`; local evidence is under
 `build/mw3-area-20261010/`. Shader output and compiler cache identity are unchanged.
+
+## CPU buffer readback and completed-query reuse, October 10
+
+CPU-authored buffer reads still synchronize preceding command-worker uploads,
+but skip GPU completion unless the buffer has a recorded GPU writer. Completed
+32-bit query getters reuse the exact result established by a real worker getter.
+Mutation, deletion, indexed queries and display-list state refresh invalidate it.
+First polls and GPU-produced buffer reads retain necessary synchronization.
+
+Thirty-eight focused Apple GL comparisons pass across arm64 and x86_64, including
+CPU-upload/GPU-output readback, index publication and query lifecycle cases.
+CPU probes verify the absence of the unnecessary wait, exact query saturation,
+reuse invalidation and error handling. Query AddressSanitizer probes pass on both
+architectures. The recorder regression covers presentation thread handoffs,
+late timestamps and repeated sessions. Per-thread counters replace shared frame
+counters that contaminated prior live category totals.
+
+The packaged muted MW3 integration and native buffer check results are recorded
+with the other local evidence in `build/mw3-followup-20261010/`. These checks do
+not measure gameplay FPS or establish that every reported stall is fixed.
+See `MW3_RENDER_PERFORMANCE.md` for the measured calls and remaining limits.
