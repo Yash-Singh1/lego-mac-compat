@@ -4,6 +4,91 @@ The converter defaults to GLMetal again with the tested shader, command-stream,
 and upload fixes. GLMetal contains generic renderer changes. Sound Manager
 queue ownership and pause handling remain in the compatibility loader.
 
+## MW3 first-use shader stalls
+
+The live MW3 trace recorded frames of 1,145, 841, 514 and 1,279 ms. The
+1,279 ms frame linked 89 programs and created 91 pipelines. Application-thread
+program compilation took 576 ms, pipeline creation 559 ms, and native shader
+waits 96 ms. These categories overlap, particularly native waits and program
+linking, so their totals must not be added as independent wall time.
+
+The worker's reported 2 ms of GLSL compilation was a memory-cache replay of
+the application thread's result. It did not mean the cold compiler was cheap.
+Matrix-array interface preparation searched an entire shader with a regular
+expression whenever any identifier contained `mat`. Names such as `cinematic`
+triggered that scan even without matrix declarations. The compiler now requires
+an exact supported matrix-type token before scanning declarations.
+
+A CPU-only comparison checked 20 generated pairs and 20 captured MW2 proxy
+pairs, each compiled 20 times. Prepared GLSL and serialized results,
+including MSL and reflection, matched byte-for-byte for all 40 pairs. On
+arm64, total uncached compilation decreased from 5,231.32 to 4,146.74 ms,
+20.7%, and preparation decreased from 1,848.03 to 693.662 ms, 62.5%.
+These are compiler measurements, not an FPS improvement or proof that every
+multi-second gameplay stall is eliminated. An additional x86_64 run confirmed
+identical results; concurrent user gameplay makes its timings unsuitable for
+a performance ranking. The proxy result does not establish that MW3's area
+shaders are 20.7% faster.
+
+The checkpoint run then captured 280 actual MW3 program pairs. CPU profiling
+attributed most compilation time to glslang parsing and SPIRV-Cross MSL
+generation. Texture rewrites also constructed full reflection for vertex
+stages without images and stages without cube images. Two instruction-type
+guards now skip those rewrites when their required image type is absent.
+Malformed or truncated instructions retain the original path.
+
+Alternating trials of all 280 pairs reduced the texture-rewrite pass by about
+25 ms per pass through the workload. Total compilation improved about 2%,
+with overlapping measurement variation. The complete baseline comparison
+checked the 280 MW3 pairs and 27 generated fixtures, including matrix arrays,
+double precision, boolean uniforms, 2D/cube/shadow/rectangle textures and
+malformed scanner boundaries. All 307 prepared-source and serialized-result
+pairs matched exactly. This is a modest first-use optimization.
+
+The final driver also matched Apple GL exactly in 124 focused cases on each
+of arm64 and x86_64, 248 comparisons total. These checks disabled the disk
+shader cache and covered cube and rectangle sampling, varying-name linking
+and legacy GLSL. No case failed or crashed.
+
+Private muted checkpoint runs with disk shader caches disabled reproduced
+two 89-program bursts. Baseline frames took 2,676 and 2,375 ms; a matrix-guard
+build took 1,812 and 2,161 ms. The user was running a separate game during
+these tests, and native Metal caches warmed between runs, so these observations
+cannot isolate the compiler change or establish an FPS ranking. They confirm
+that large uncached linking bursts remain. Experimental helper QoS changes
+and a double-type shortcut did not show reliable improvements and are excluded.
+
+The build retains the previous compiler cache identity only for the exact
+verified source/dependency fingerprint of this equivalent optimization. A
+further compiler or dependency edit receives a new identity. This preserves
+existing `.prog` and `.ok` caches without accepting arbitrary older compiler
+results. The exact alias and subsequent-edit invalidation were checked.
+
+An experimental persistent Metal pipeline archive was also measured with
+three fresh stable-entry cohorts of 24 captured pipeline pairs. Average cold
+creation was 450.1 ms without harvesting and 470.4 ms with harvesting. Warm
+archive hits averaged 8.3 ms; the same warm identities with archives disabled
+also averaged 8.3 ms. Harvesting added 75 to 199 ms of background compilation.
+The archive experiment is excluded from the driver because these observations
+show no benefit over Apple's native warm cache.
+
+The final build also ran the copied checkpoint with the normal disk cache
+enabled. The two 89-program bursts took 680 and 552 ms, including 48 and
+59 ms of application-thread compilation and 115 and 62 ms of pipeline
+creation. The run reached the Berlin helicopter sequence and observed it
+for 20 seconds. No frame exceeded one second and no crash occurred before
+deliberate termination. Later hitches remained, including a 348 ms frame
+with a 251 ms native compiler wait. Some hitches contained little measured
+compiler work and need separate investigation. This cached run and the
+uncached runs measure different conditions; their difference must not be
+attributed to the approximately 2% compiler change.
+
+All 243 original MW3 profile files retained their recorded sizes and SHA256
+hashes after the private tests. The six local single-player/multiplayer game
+bundles and three standalone converters now contain the final driver and
+compiler helper. Their signatures and build-manifest hashes were verified.
+Published release assets were not changed.
+
 ## Rendering
 
 The complete offscreen suite ran sequentially on Apple GL and GLMetal with
