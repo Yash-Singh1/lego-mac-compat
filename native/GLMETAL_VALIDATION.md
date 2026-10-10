@@ -4,6 +4,20 @@ The converter defaults to GLMetal again with the tested shader, command-stream,
 and upload fixes. GLMetal contains generic renderer changes. Sound Manager
 queue ownership and pause handling remain in the compatibility loader.
 
+## MW3 steady-state index publication
+
+The [render performance investigation](MW3_RENDER_PERFORMANCE.md) found
+40.6% of the sampled render-thread time inside per-draw index `glBufferData`
+publication, including 26.7% in new Metal buffer allocation. The bridge now
+appends ranges to an orphaned index arena; GLMetal also caches immutable
+sampler reflection. The compiler identity and shader results are unchanged.
+
+Production-code offscreen probes passed queued draws and arena wraps with
+zero bad pixels on both architectures. Rosetta index-workload submission
+time decreased from 352.563 to 212.107 ms, 39.8%, for 131,072 draws. This is
+an isolated workload measurement, not a gameplay FPS claim. Fifty focused
+Apple GL rendering comparisons and native buffer checks also passed.
+
 ## MW3 upfront shader preparation
 
 The [shader preparation experiment](MW3_SHADER_PRECOMPILE.md) extracted

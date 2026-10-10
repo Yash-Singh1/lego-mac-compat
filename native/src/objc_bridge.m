@@ -5223,10 +5223,48 @@ struct index_shadow {
     GLenum usage;
     bool dirty;
     bool native_required; /* Also used through a non-element binding. */
+    uint64_t generation; /* Changes on every write and buffer name lifetime. */
 };
 enum { kIndexShadowCapacity = 64, kIndexShadowMaxSize = 16 << 20 };
 static struct index_shadow index_shadows[kIndexShadowCapacity];
 static pthread_mutex_t index_shadow_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t index_shadow_generation;
+struct index_shadow_stream {
+    CGLShareGroupObj share_group;
+    CGLContextObj context;
+    GLuint buffer, source;
+    uint64_t generation;
+    uint32_t offset;
+    GLsizei count;
+    GLenum type;
+    size_t capacity, used, published_offset;
+};
+static struct index_shadow_stream index_shadow_streams[8];
+
+/* index_shadow_lock held. Guest writes to an observed stream name must also
+   invalidate its publication, even though these buffers are bridge-owned. */
+static void index_shadow_invalidate_stream(CGLShareGroupObj share_group, GLuint buffer)
+{
+    for (unsigned i = 0; i < 8; ++i)
+        if (index_shadow_streams[i].share_group == share_group &&
+            index_shadow_streams[i].buffer == buffer)
+        {
+            index_shadow_streams[i].generation = 0;
+            index_shadow_streams[i].capacity = 0;
+        }
+}
+
+static void index_shadow_forget_context(CGLContextObj context)
+{
+    pthread_mutex_lock(&index_shadow_lock);
+    for (unsigned i = 0; i < 8; ++i)
+        if (index_shadow_streams[i].context == context) {
+            index_shadow_streams[i].generation = 0;
+            index_shadow_streams[i].capacity = 0;
+            index_shadow_streams[i].context = NULL;
+        }
+    pthread_mutex_unlock(&index_shadow_lock);
+}
 
 static bool index_shadow_enabled(void)
 {
@@ -5267,6 +5305,7 @@ static void index_shadow_buffer_data(GLenum target, GLsizeiptr size, const void 
     bool dynamic = usage == GL_DYNAMIC_DRAW || usage == GL_STREAM_DRAW;
     bool array_alias = bound_buffer_for_target(GL_ARRAY_BUFFER) == buffer;
     pthread_mutex_lock(&index_shadow_lock);
+    index_shadow_invalidate_stream(share_group, buffer);
     struct index_shadow *shadow = index_shadow_find(share_group, buffer);
     if (!dynamic || size <= 0 || size > kIndexShadowMaxSize) {
         if (shadow) { free(shadow->data); memset(shadow, 0, sizeof(*shadow)); }
@@ -5292,6 +5331,7 @@ static void index_shadow_buffer_data(GLenum target, GLsizeiptr size, const void 
                matches the GPU. */
             *shadow = (struct index_shadow){
                 share_group, buffer, copy, (size_t)size, usage, data == NULL, native_required,
+                ++index_shadow_generation,
             };
         } else {
             free(shadow->data);
@@ -5310,6 +5350,7 @@ static bool index_shadow_copy(GLuint buffer, GLintptr offset, GLsizeiptr size,
     if (size > 0 && !bytes) return false;
     CGLShareGroupObj share_group = current_share_group();
     pthread_mutex_lock(&index_shadow_lock);
+    if (into_shadow) index_shadow_invalidate_stream(share_group, buffer);
     struct index_shadow *shadow = index_shadow_find(share_group, buffer);
     bool ok = shadow && (size_t)offset <= shadow->size &&
               (size_t)size <= shadow->size - (size_t)offset;
@@ -5318,6 +5359,7 @@ static bool index_shadow_copy(GLuint buffer, GLintptr offset, GLsizeiptr size,
         if (into_shadow) {
             memcpy(slot, bytes, (size_t)size);
             shadow->dirty = true;
+            shadow->generation = ++index_shadow_generation;
         } else {
             memcpy(bytes, slot, (size_t)size);
         }
@@ -5352,6 +5394,7 @@ static void index_shadow_alias(GLenum target, GLuint buffer)
         if (!shadow->native_required && getenv("LP32_TRACE_INDEX_ALIAS"))
             fprintf(stderr, "compat32: index buffer alias buffer=%u target=%04x size=%zu\n", buffer, target, shadow->size);
         shadow->native_required = true;
+        shadow->generation = ++index_shadow_generation;
     }
     pthread_mutex_unlock(&index_shadow_lock);
 }
@@ -5376,6 +5419,12 @@ static void index_shadow_release_buffer(GLuint buffer, bool upload)
     if (!index_shadow_enabled() || !buffer) return;
     CGLShareGroupObj share_group = current_share_group();
     pthread_mutex_lock(&index_shadow_lock);
+    index_shadow_invalidate_stream(share_group, buffer);
+    if (!upload)
+        for (unsigned i = 0; i < 8; ++i)
+            if (index_shadow_streams[i].share_group == share_group &&
+                index_shadow_streams[i].buffer == buffer)
+                memset(&index_shadow_streams[i], 0, sizeof(index_shadow_streams[i]));
     struct index_shadow *shadow = index_shadow_find(share_group, buffer);
     if (shadow) {
         if (upload) glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, (GLsizeiptr)shadow->size, shadow->data);
@@ -5387,19 +5436,18 @@ static void index_shadow_release_buffer(GLuint buffer, bool upload)
 
 /* One stream element buffer per share group receives the indices of each
    draw from a shadowed buffer. index_shadow_lock held. */
-static GLuint index_shadow_stream_buffer(CGLShareGroupObj share_group)
+static struct index_shadow_stream *index_shadow_stream_buffer(CGLShareGroupObj share_group)
 {
-    static struct { CGLShareGroupObj share_group; GLuint buffer; } streams[8];
-    for (unsigned i = 0; i < sizeof(streams) / sizeof(streams[0]); ++i) {
-        if (streams[i].buffer && streams[i].share_group == share_group)
-            return streams[i].buffer;
-        if (!streams[i].buffer) {
-            glGenBuffers(1, &streams[i].buffer);
-            streams[i].share_group = share_group;
-            return streams[i].buffer;
+    for (unsigned i = 0; i < 8; ++i) {
+        struct index_shadow_stream *stream = &index_shadow_streams[i];
+        if (stream->buffer && stream->share_group == share_group) return stream;
+        if (!stream->buffer) {
+            glGenBuffers(1, &stream->buffer);
+            stream->share_group = share_group;
+            return stream->buffer ? stream : NULL;
         }
     }
-    return 0;
+    return NULL;
 }
 
 static size_t index_type_size(GLenum type)
@@ -5415,8 +5463,9 @@ static size_t index_type_size(GLenum type)
 /* Indexed draws from a shadowed buffer read the CPU copy. Republishing the
    whole buffer (MW2's is 2 MB) after every lock cost ~50 MB of uploads per
    frame for ~50 KB of changed indices, so only the draw's own index range is
-   uploaded, with its bytes in one glBufferData, to a separate stream buffer.
-   The draw then reads from offset 0; *buffer_out names the element buffer to
+   uploaded to a separate stream buffer.
+   Replacement backends append to an arena; *pointer is its byte offset.
+   Other backends publish at offset 0. *buffer_out names the element buffer to
    rebind afterwards. The shadowed buffer's GPU storage is left stale; maps
    read the CPU copy. Returns 1 when *pointer and *buffer_out were replaced. */
 int objc_bridge32_index_shadow_acquire(uint32_t offset, GLsizei count, GLenum type,
@@ -5434,13 +5483,65 @@ int objc_bridge32_index_shadow_acquire(uint32_t offset, GLsizei count, GLenum ty
         return 0;
     }
     size_t bytes = count > 0 && stride ? (size_t)count * stride : 0;
-    GLuint stream = index_shadow_stream_buffer(share_group);
+    struct index_shadow_stream *stream = index_shadow_stream_buffer(share_group);
     if (bytes && stream && offset <= shadow->size && bytes <= shadow->size - offset) {
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, stream);
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)bytes, shadow->data + offset,
-                     GL_STREAM_DRAW);
+        CGLContextObj context = CGLGetCurrentContext();
+        bool reused = stream->context == context && stream->source == buffer &&
+                      stream->generation == shadow->generation &&
+                      stream->offset == offset && stream->count == count && stream->type == type;
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, stream->buffer);
+        static int arena_enabled = -1;
+        if (arena_enabled < 0)
+            arena_enabled = lp32_gl_backend_is_replacement() && !getenv("LP32_NO_INDEX_ARENA");
+        bool arena_orphan = false;
+        if (!reused) {
+            size_t at = 0;
+            if (arena_enabled) {
+                /* Fresh appends never overwrite earlier draws. A wrap or a
+                   context change orphans storage, preserving queued readers.
+                   Split uploads to stay within GLMetal's inline marshal limit. */
+                at = (stream->used + 3) & ~(size_t)3;
+                if (stream->context != context || !stream->capacity ||
+                    bytes > stream->capacity || at > stream->capacity - bytes) {
+                    arena_orphan = true;
+                    stream->capacity = bytes > (2u << 20) ? bytes : (2u << 20);
+                    glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)stream->capacity, NULL, GL_STREAM_DRAW);
+                    at = 0;
+                }
+                for (size_t written = 0; written < bytes;) {
+                    size_t part = bytes - written > (64u << 10) ? (64u << 10) : bytes - written;
+                    glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, (GLintptr)(at + written),
+                                    (GLsizeiptr)part, shadow->data + offset + written);
+                    written += part;
+                }
+                stream->used = at + bytes;
+            } else {
+                glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)bytes, shadow->data + offset, GL_STREAM_DRAW);
+            }
+            stream->published_offset = at;
+            stream->context = context;
+            stream->source = buffer;
+            stream->generation = shadow->generation;
+            stream->offset = offset;
+            stream->count = count;
+            stream->type = type;
+        }
+        static int stats_enabled = -1;
+        static uint64_t calls, reused_calls, published_bytes, arena_orphans;
+        if (stats_enabled < 0) stats_enabled = getenv("LP32_INDEX_STATS") != NULL;
+        if (stats_enabled) {
+            ++calls;
+            reused_calls += reused;
+            published_bytes += reused ? 0 : bytes;
+            arena_orphans += arena_orphan;
+            if ((calls & (calls - 1)) == 0)
+                fprintf(stderr, "compat32: index publications calls=%llu reused=%llu bytes=%llu arena-orphans=%llu arena=%d\n",
+                        (unsigned long long)calls, (unsigned long long)reused_calls,
+                        (unsigned long long)published_bytes, (unsigned long long)arena_orphans, arena_enabled);
+        }
+        size_t published_offset = stream->published_offset;
         pthread_mutex_unlock(&index_shadow_lock);
-        *pointer = NULL;
+        *pointer = (const void *)(uintptr_t)published_offset;
         *buffer_out = buffer;
         return 1;
     }
@@ -9088,6 +9189,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     if (LP32_NAME_IS(import_name, import_length, "_CGLDestroyContext")) {
         NSValue *wrapper = object_for_argument(arguments[0]);
         CGLContextObj context = wrapper ? [wrapper pointerValue] : NULL;
+        index_shadow_forget_context(context);
         *result = context ? (uint32_t)CGLDestroyContext(context) : kCGLBadContext;
         return 1;
     }
@@ -12713,12 +12815,28 @@ int objc_bridge32_run_gl_buffer_self_test(void)
         int acquired = objc_bridge32_index_shadow_acquire(
             kPatchAt, kPatch / 2, GL_UNSIGNED_SHORT, &indices, &shadowed);
         if (expect_shadow) {
-            /* The draw reads just its indices from the stream buffer at 0. */
+            /* Each publication returns its own stream byte offset. */
             bool held = memcmp(gpu, initial, sizeof(gpu)) == 0;
             unsigned char slice[kPatch] = {0};
-            glGetBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, kPatch, slice);
-            bool published = indices == NULL && shadowed == element &&
+            glGetBufferSubData(GL_ELEMENT_ARRAY_BUFFER, (GLintptr)(uintptr_t)indices, kPatch, slice);
+            bool published = shadowed == element &&
                 memcmp(slice, patch, kPatch) == 0;
+            if (acquired && published && lp32_gl_backend_is_replacement() &&
+                !getenv("LP32_NO_INDEX_ARENA")) {
+                GLintptr previous_offset = (GLintptr)(uintptr_t)indices;
+                objc_bridge32_index_shadow_release(shadowed);
+                shadowed = 0;
+                const void *next_indices = NULL;
+                int next_acquired = objc_bridge32_index_shadow_acquire(
+                    0, kPatchAt / 2, GL_UNSIGNED_SHORT, &next_indices, &shadowed);
+                unsigned char previous[kPatch] = {0}, next[kPatchAt] = {0};
+                if (next_acquired) {
+                    glGetBufferSubData(GL_ELEMENT_ARRAY_BUFFER, previous_offset, kPatch, previous);
+                    glGetBufferSubData(GL_ELEMENT_ARRAY_BUFFER, (GLintptr)(uintptr_t)next_indices, kPatchAt, next);
+                }
+                published = next_acquired && next_indices != indices &&
+                    memcmp(previous, patch, kPatch) == 0 && memcmp(next, initial, kPatchAt) == 0;
+            }
             if (shadowed) objc_bridge32_index_shadow_release(shadowed);
             GLint rebound = 0;
             glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &rebound);
@@ -12768,7 +12886,7 @@ int objc_bridge32_run_gl_buffer_self_test(void)
         if (expect_shadow) {
             bool not_yet = memcmp(gpu + kPatchAt, staged, kPatch) != 0;
             unsigned char slice[kPatch] = {0};
-            glGetBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, kPatch, slice);
+            glGetBufferSubData(GL_ELEMENT_ARRAY_BUFFER, (GLintptr)(uintptr_t)indices, kPatch, slice);
             bool published = memcmp(slice, staged, kPatch) == 0;
             if (shadowed) objc_bridge32_index_shadow_release(shadowed);
             if (!not_yet || !acquired || !published) {
@@ -12836,7 +12954,7 @@ int objc_bridge32_run_gl_buffer_self_test(void)
         indices = NULL; shadowed = 0;
         acquired = objc_bridge32_index_shadow_acquire(kPatchAt, kPatch / 2, GL_UNSIGNED_SHORT, &indices, &shadowed);
         unsigned char alias_slice[kPatch];
-        glGetBufferSubData(GL_ELEMENT_ARRAY_BUFFER, acquired ? 0 : kPatchAt, kPatch, alias_slice);
+        glGetBufferSubData(GL_ELEMENT_ARRAY_BUFFER, acquired ? (GLintptr)(uintptr_t)indices : kPatchAt, kPatch, alias_slice);
         if (shadowed) objc_bridge32_index_shadow_release(shadowed);
         if (memcmp(alias_slice, (void *)(uintptr_t)guest_patch, kPatch)) {
             fputs("gl-buffer-selftest: alias write left stale draw indices\n", stderr);
@@ -12853,7 +12971,7 @@ int objc_bridge32_run_gl_buffer_self_test(void)
         const uint32_t alias_data[] = {GL_ARRAY_BUFFER, kPatch, guest_patch, GL_DYNAMIC_DRAW};
         objc_bridge32_dispatch("glBufferData", alias_data, &dispatch_result);
         acquired = objc_bridge32_index_shadow_acquire(0, kPatch / 2, GL_UNSIGNED_SHORT, &indices, &shadowed);
-        glGetBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, kPatch, alias_slice);
+        glGetBufferSubData(GL_ELEMENT_ARRAY_BUFFER, acquired ? (GLintptr)(uintptr_t)indices : 0, kPatch, alias_slice);
         if (shadowed) objc_bridge32_index_shadow_release(shadowed);
         if (memcmp(alias_slice, (void *)(uintptr_t)guest_patch, kPatch)) {
             fputs("gl-buffer-selftest: alias reallocation left stale draw indices\n", stderr);
