@@ -4,6 +4,23 @@ The converter defaults to GLMetal again with the tested shader, command-stream,
 and upload fixes. GLMetal contains generic renderer changes. Sound Manager
 queue ownership and pause handling remain in the compatibility loader.
 
+## MW3 upfront shader preparation
+
+The [shader preparation experiment](MW3_SHADER_PRECOMPILE.md) extracted
+bytecode inputs for 4,991 of 5,034 known recipes and captured 3,281 exact
+program requests. The new generic serial CLI compiled every request and
+6,562 Metal stage libraries without failure. A repeat hit every program
+cache. All 7,328 generated cache files matched game-generated files exactly.
+
+A muted normal-assets Berlin checkpoint run requested 317 unique programs.
+316 matched the prepared set; one was new. The first isolated CPU replay
+confirmed those 316 cache hits. Large program bursts took 23 ms of
+application-thread compiler work each, while whole frames still took 377
+and 474 ms. This does not establish complete coverage or stutter-free play.
+The prototype warms libraries, not every render pipeline descriptor. The
+original game's shader assets and all 243 original profile files stayed
+unchanged. Game extraction remains outside the generic GLMetal submodule.
+
 ## MW3 first-use shader stalls
 
 The live MW3 trace recorded frames of 1,145, 841, 514 and 1,279 ms. The
