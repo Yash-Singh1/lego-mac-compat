@@ -75,3 +75,34 @@ The final executable was installed into `build/MW2-Compat.app` and the bundle
 was signed and verified. Its Mach-O UUID matches the tested build,
 `890C2AD4-CAA2-3243-91AF-B2CABA7FD561`. The installed MW1 campaign and multiplayer
 executable hashes are unchanged. All isolated test game processes were stopped.
+
+## Cave-room brightness, October 9, 2026
+
+The reported cave-room effect switches the whole crate between brighter and
+dimmer lighting. The user confirmed that it does not consist of black patches
+or sharp edges moving across the crate. Muted private runs loaded a copy of
+`autosave/af_caves-5.svg`, with one GPU workload at a time and a 30 FPS cap.
+The original profile's file hashes remained unchanged.
+
+Apple GL reproduced stationary brightness changes at this work light. Twelve
+captures, separated by 60 frames, recorded mean crate-face RGB values from
+67.3 to 113.9 and nearby floor values from 103.3 to 146.5. Their correlation
+was 0.952. Five stationary GLMetal captures from another view of the same crate
+also changed together with the floor, with correlation 0.906. GLMetal startup
+was confirmed by its backend message and its loaded `libGLMetal.dylib` path.
+
+These observations show that this brightness pulsing is not unique to GLMetal.
+They suggest changing illumination from the work light. The views and game
+times differ, so this is not a pixel-for-pixel provider comparison, and it does
+not establish that the game intentionally animates this light or explain all
+reported lighting defects. No lighting effect was suppressed.
+
+The investigation independently reproduced and fixed a generic direct index
+buffer lifetime bug in GLMetal. Its focused tests match Apple GL on arm64 and
+x86_64. That fix is not established as the cause of the cave-room pulsing.
+The current local compatibility apps and converter bundles include the rebuilt
+driver. Published release archives retain their original contents.
+
+Evidence is under `build/mw2-flicker-20261009/`: `lighting-observations.json`,
+`apple-crate/4200.png` and `apple-crate/4860.png`, the retained stationary
+`metal-crate-manual/` captures, and the buffer regression reports.

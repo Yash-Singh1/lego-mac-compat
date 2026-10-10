@@ -130,3 +130,22 @@ did not change the user's saves or audio settings.
 Detailed local results are in `build/regression-20261009/`, including
 `validation-summary.json`, full image comparisons, private gameplay logs, and
 packaging results. These runtime artifacts are excluded from Git.
+
+## First indexed draw after a flush
+
+A direct element-buffer draw recorded its GPU read before `prepare_draw` opened
+the new Metal command buffer. The read could inherit the previous submission
+serial and look completed. An overlapping `glBufferSubData` or mapped write
+then overwrote indices still needed by the queued draw. Read tracking now runs
+after command-buffer creation, immediately before the indexed draw. Copied and
+rewritten index streams retain their existing ownership.
+
+The two new `core_buffer_index_read_after_flush` variants failed before the fix,
+each losing a red triangle at 676 pixels. Both match Apple GL exactly after the
+fix on arm64 and x86_64. The new ordinary and invariant multipass depth cases
+also match on both architectures. A focused x86_64 run covered 26 buffer, depth,
+client-index, index-type and primitive-restart cases with exact image matches.
+These checks establish the buffer fix, not the cause of MW2 cave lighting.
+
+Local evidence is under `build/mw2-flicker-20261009/`, including the before/after
+index reports, `regression-*` reports and `multipass-final-arm64/`.
