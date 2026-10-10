@@ -9,6 +9,10 @@ import tempfile
 from package_glmetal import install, run, DEFAULT_BUILD
 
 
+# Each standalone converter has its own development release sequence.
+BUILD_VERSIONS = {'cod4': '4', 'mw2': '1', 'mw3': '3'}
+
+
 def package(game, build, glmetal):
     title = {'cod4': 'Call of Duty 4', 'mw2': 'Modern Warfare 2', 'mw3': 'Modern Warfare 3'}[game]
     short = game.upper()
@@ -27,7 +31,7 @@ def package(game, build, glmetal):
         info = plistlib.loads((Path(__file__).resolve().parents[1] / 'cod4-converter/Info.plist').read_bytes())
         info.update(CFBundleExecutable=f'{short}Converter', CFBundleIdentifier=f'org.32bitgoofy.{short}Converter',
                     CFBundleName=f'{short} Converter', CFBundleDisplayName=f'{short} Converter',
-                    LP32ConverterGame=game, CFBundleVersion='3',
+                    LP32ConverterGame=game, CFBundleVersion=BUILD_VERSIONS[game],
                     NSHumanReadableCopyright=f'32bitgoofy. Requires your own Mac copy of {title}.')
         info['CFBundleDocumentTypes'][0]['CFBundleTypeName'] = f'{title} app or game folder'
         (contents / 'Info.plist').write_bytes(plistlib.dumps(info))
